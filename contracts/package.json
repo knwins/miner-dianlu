@@ -1,0 +1,15 @@
+{
+  "name": "bem-crowd-miner-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BEM 众筹挖矿合约：Campaign + CampaignFactory（状态机 funding→executing→mining，份额转让/退款/execute/harvest/claim）",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "node": "hardhat node"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.0"
+  }
+}

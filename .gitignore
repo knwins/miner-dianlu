@@ -1,0 +1,32 @@
+# ── 依赖 ──
+node_modules/
+
+# ── 密钥/环境（.env 含部署私钥，绝不入库；.env.example 模板保留）──
+.env
+.env.local
+.env.*.local
+
+# ── 构建产物 ──
+dist/
+build/
+.vite/
+
+# ── Hardhat ──
+artifacts/
+cache/
+typechain/
+typechain-types/
+coverage/
+coverage.json
+
+# ── 部署记录（含地址；按需保留，默认不入库）──
+contracts/deployments/*.json
+
+# ── 日志 / 系统 ──
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# ── WorkBuddy 内部数据（记忆/日志，不入库）──
+.workbuddy/
