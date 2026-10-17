@@ -106,15 +106,15 @@ export default function App() {
     fetchTaskBook()
       .then((book) => {
         setTaskbook(book);
-        setSimBook((current) => createScene(current.scene, round, book));
+        setSimBook((current) => createScene(current.scene, simRound, book));
       })
       .catch(() => setTaskbook({ tasks: [], total: 0, source: "error" }));
     return () => {
       unsubscribe();
       feed.stop();
     };
-    // round 变化时也要重建 book（开新期后 taskId 变了）
-  }, [feed, round.taskId]);
+    // 模拟期次参数变化时也要重建模拟 book（开新期后 taskId 变了）
+  }, [feed, simRound.taskId]);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
