@@ -4,7 +4,7 @@ import { OwnerCreate, OwnerHolders, OwnerOverview } from "./Owner.jsx";
 import OnChainPage from "./OnChain.jsx";
 import { IS_CONFIGURED as CHAIN_CONFIGURED, NETWORK, CHAIN_ID } from "./chain/config.js";
 import { useChain } from "./chain/useChain.js";
-import { send, tx as chainTx, parseEther, readHolders } from "./chain/client.js";
+import { send, tx as chainTx, parseEther, readHolders, hasInjected } from "./chain/client.js";
 import deployments from "./chain/deployments.json";
 import { keccak256, toUtf8Bytes } from "ethers";
 
@@ -394,12 +394,20 @@ export default function App() {
 
       <main className="main-content">
         {usingChain ? (
-          <div className="preview-bar">
+          <div className="preview-bar" style={{ flexWrap: "wrap", gap: "6px 14px" }}>
             <span>链上模式 · {NETWORK.name} · chainId {CHAIN_ID}</span>
-            <span className="preview-note">
-              身份：<strong>{actor.label}</strong>
-              {chain.account ? "" : " · 未连接钱包（只读，写操作需连接）"}
-            </span>
+            {chain.account ? (
+              <span className="preview-note">身份：<strong>{actor.label}</strong> · {shortAddress(account)}</span>
+            ) : hasInjected() ? (
+              <>
+                <span className="preview-note">未连接钱包（当前只读）</span>
+                <button className="btn btn-inline" type="button" onClick={handleConnect}>连接钱包</button>
+              </>
+            ) : (
+              <span className="preview-note" style={{ color: "var(--color-danger)" }}>
+                ⚠ 未检测到钱包插件——请在安装 MetaMask 的浏览器中打开本页并切到 BSC 测试网；当前为只读。若在内置预览中打开，请点右上角「在浏览器打开」。
+              </span>
+            )}
             <button className="btn btn-inline" type="button" onClick={chain.refresh}>刷新</button>
             {chain.error && <span className="preview-note" style={{ color: "var(--color-danger)" }}>{chain.error}</span>}
           </div>
