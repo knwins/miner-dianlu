@@ -129,6 +129,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     error NotListed();
     error AlreadyReady();
     error TransferFailed();
+    error CanStillAfford();
+    error AlreadyAborted();
 
     constructor(
         uint256 sharePriceBnb_,
@@ -305,6 +307,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice Owner 手动调用 tapeout.net 挂单逻辑：记录锁定报价快照，进入「挂单中」。
     function placeTransistorOrder(uint256 count, uint256 unitPriceBnb) external onlyOwner {
         if (scene != Scene.Executing) revert WrongScene();
+        if (executionFailed) revert RefundNotAvailable();
         if (phase == Phase.Ready) revert AlreadyReady();
         if (phase == Phase.Listed) revert AlreadyListed();
         if (count == 0 || unitPriceBnb == 0) revert ZeroShares();
@@ -313,6 +316,19 @@ contract Campaign is Ownable, ReentrancyGuard {
         priceLock = unitPriceBnb; // 锁定报价快照
         phase = Phase.Listed;
         emit TransistorOrderPlaced(count, unitPriceBnb);
+    }
+
+    /// @notice 待挂单时买不起晶体管：Owner 提交当前报价，成本高于募集额才开放退款。
+    ///         之后持份人用 refund() 原路退还。已挂单须先取消。买得起时拒绝。
+    function abortUnaffordable(uint256 count, uint256 unitPriceBnb) external onlyOwner {
+        if (scene != Scene.Executing) revert WrongScene();
+        if (phase != Phase.Buying) revert AlreadyListed();
+        if (executionFailed) revert AlreadyAborted();
+        if (count == 0 || unitPriceBnb == 0) revert ZeroShares();
+        uint256 cost = count * unitPriceBnb;
+        if (cost <= raisedBnb) revert CanStillAfford();
+        executionFailed = true;
+        emit ExecutionFailed(cost, raisedBnb);
     }
 
     /// @notice 取消挂单，回到待挂单并清空锁价。

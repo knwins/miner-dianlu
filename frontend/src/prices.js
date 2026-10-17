@@ -783,10 +783,10 @@ export function adviseProcessor({ processorId, plan, hardCapBnb }) {
 const round4 = (v) => Math.round((Number(v) || 0) * 10000) / 10000;
 
 /** 成本占募资总额的健康区间 */
-const COST_RATIO_MIN = 0.2;
-const COST_RATIO_MAX = 0.75;
+export const COST_RATIO_MIN = 0.2;
+export const COST_RATIO_MAX = 0.75;
 /** 理想占比：越接近这个值，风险与收益越平衡 */
-const COST_RATIO_IDEAL = 0.45;
+export const COST_RATIO_IDEAL = 0.45;
 
 /**
  * 对单个题目，横向比较四种元件组合（NAND/LATCH × 两个处理器）。

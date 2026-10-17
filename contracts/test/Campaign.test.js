@@ -99,7 +99,7 @@ async function miningFixture() {
 }
 
 describe("CampaignFactory", () => {
-  it("仅工厂 Owner 可开期", async () => {
+  it("仅 Factory Owner 可开期", async () => {
     const { factory, alice, feeRecipient } = await loadFixture(deployFixture);
     await expect(
       factory
@@ -248,6 +248,31 @@ describe("晶体管挂单 + execute（F3 仅 Owner / 锁价 / 硬闸门）", () 
     const receipt = await tx.wait();
     const after = await ethers.provider.getBalance(alice.address);
     expect(after + receipt.gasUsed * receipt.gasPrice - before).to.equal(SHARE_PRICE * 100n);
+  });
+
+  it("待挂单买不起 → Owner 发起退款，持份人可原路退还", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).buy(100n, { value: SHARE_PRICE * 100n });
+    expect(await campaign.status()).to.equal(SCENE.Executing);
+    expect(await campaign.executePhase()).to.equal(PHASE.Buying);
+
+    await expect(campaign.connect(alice).abortUnaffordable(100n, ethers.parseEther("0.02")))
+      .to.be.revertedWithCustomError(campaign, "NotOwner");
+    // 0.005 × 100 = 0.5 ≤ 募集 1 BNB
+    await expect(campaign.connect(owner).abortUnaffordable(100n, ethers.parseEther("0.005")))
+      .to.be.revertedWithCustomError(campaign, "CanStillAfford");
+    await expect(campaign.connect(owner).abortUnaffordable(100n, ethers.parseEther("0.02")))
+      .to.emit(campaign, "ExecutionFailed");
+    expect(await campaign.executionFailed()).to.equal(true);
+    await expect(campaign.connect(owner).placeTransistorOrder(100n, ethers.parseEther("0.005")))
+      .to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+
+    const before = await ethers.provider.getBalance(alice.address);
+    const tx = await campaign.connect(alice).refund();
+    const receipt = await tx.wait();
+    const after = await ethers.provider.getBalance(alice.address);
+    expect(after + receipt.gasUsed * receipt.gasPrice - before).to.equal(SHARE_PRICE * 100n);
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
   });
 });
 

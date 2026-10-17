@@ -28,6 +28,10 @@ export const CAMPAIGN_ABI = [
   "function bem() view returns (address)",
   "function pod() view returns (address)",
   "function minter() view returns (address)",
+  "function taskId() view returns (uint256)",
+  "function feeRecipient() view returns (address)",
+  "function netWeightVerified() view returns (uint256)",
+  "function netWeightUnverified() view returns (uint256)",
   "function sharesOf(address) view returns (uint256)",
   "function escrowOf(address) view returns (uint256)",
   "function claimedOf(address) view returns (uint256)",
@@ -42,6 +46,7 @@ export const CAMPAIGN_ABI = [
   "function cancelListing(uint256 id)",
   "function takeListing(uint256 id, uint256 count) payable",
   "function placeTransistorOrder(uint256 count, uint256 unitPriceBnb)",
+  "function abortUnaffordable(uint256 count, uint256 unitPriceBnb)",
   "function cancelTransistorOrder()",
   "function confirmTransistors()",
   "function execute(bytes tapeoutData, bytes startData)",
@@ -69,7 +74,14 @@ export const ERC20_ABI = [
 ];
 
 export const FACTORY_ABI = [
+  "function owner() view returns (address)",
   "function campaignCount() view returns (uint256)",
   "function campaigns(uint256) view returns (address)",
   "function allCampaigns() view returns (address[])",
+  "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint16 feePercent,uint64 fundingDays,address feeRecipient,uint256 taskId,address pod_,uint64 executeDelay,bytes32 netlistHash) returns (address)",
+  "event CampaignCreated(uint256 indexed index, address indexed campaign, address feeRecipient, uint256 taskId, bytes32 netlistHash, uint256 sharePriceBnb, uint256 totalShares)",
+  "error NotOwner(address caller)",
+  "error ZeroAddress()",
+  "error ZeroCampaignParam()",
+  "error BadFee()",
 ];

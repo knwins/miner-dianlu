@@ -356,7 +356,7 @@ ok(funding2.dailyBem === 0, "未执行时日产按实际算力算= 0");
 console.log("\n=== 18. execute 按实际报价判定成败 ===");
 // 用已过观察期的 book。晶体管来自二级市场，execute 前必须先确认到账（executePhase=ready），
 // 故这里把子状态置为 ready，模拟「Owner 已在二级市场买入并确认到账」。
-// F3：execute 不可逆，仅工厂 Owner 可触发。
+// F3：execute 不可逆，仅 Factory Owner 可触发。
 const execBook = { ...createScene("executing", ROUND, BOOK), sold: ROUND.totalShares, soldOutAt: Date.now() - 49 * 3600_000, executePhase: "ready" };
 const EXEC_OWNER = { role: "owner", shares: 0 };
 const HOLDER_ACTOR = { role: "holder", shares: 4 };
@@ -366,7 +366,7 @@ ok(okExec.ok && okExec.book.scene === "mining", `正常报价 -> mining，实际
 ok(okExec.book.hashpower === est.hashpower, "实际算力 = 预估值（价格没变）");
 ok(okExec.book.actualQuote !== null, "记录了执行时的报价");
 // F3：持份用户不能 execute（不可逆操作，仅 Owner）
-ok(!applyExecute(ROUND, execBook, snap, HOLDER_ACTOR, BOOK).ok, "持份用户不能触发 execute（仅工厂 Owner，不可逆）");
+ok(!applyExecute(ROUND, execBook, snap, HOLDER_ACTOR, BOOK).ok, "持份用户不能触发 execute（仅 Factory Owner，不可逆）");
 
 const badQuote = { ...QUOTE, prices: { ...QUOTE.prices, [ROUND.transistorId]: priceOf(ROUND.transistorId) * 60 } };
 const badExec = applyExecute(ROUND, execBook, badQuote, EXEC_OWNER, BOOK);
@@ -460,7 +460,7 @@ ok(!lockedExec.ok, `时间锁内 Owner 也被拒: "${lockedExec.message.slice(0,
 const matured = soldOut;
 ok(applyExecute(ROUND, matured, QUOTE, { role: "owner", shares: 0 }, BOOK).ok, "期满后 Owner 可执行");
 
-console.log("\n=== 25. execute 权限：仅工厂 Owner（不可逆） ===");
+console.log("\n=== 25. execute 权限：仅 Factory Owner（不可逆） ===");
 const maturedBook = { ...createScene("executing", ROUND, BOOK), sold: ROUND.totalShares, soldOutAt: Date.now() - 49 * 3600_000, executePhase: "ready" };
 const byHolder = applyExecute(ROUND, maturedBook, QUOTE, { role: "holder", shares: 4 }, BOOK);
 ok(!byHolder.ok, `持份用户不能触发 execute（不可逆，仅 Owner）: "${byHolder.message}"`);

@@ -6,7 +6,7 @@ import {Campaign} from "./Campaign.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
 
 /// @title CampaignFactory —— 开期工厂
-/// @notice 仅工厂 Owner 可 createCampaign。参数写入后不可改（链上不可变）。
+/// @notice 仅 Factory Owner 可 createCampaign。参数写入后不可改（链上不可变）。
 ///         全局注入 PoD / BEM / 晶体管铸造器地址，每期可覆盖 pod 与观察期。
 contract CampaignFactory is Ownable {
     address public immutable pod;
@@ -79,7 +79,7 @@ contract CampaignFactory is Ownable {
             address(bem),
             minter,
             netlistHash,
-            owner, // Campaign Owner = 工厂 Owner
+            owner, // Campaign Owner = Factory Owner
             DEFAULT_NET_WEIGHT_VERIFIED,
             DEFAULT_NET_WEIGHT_UNVERIFIED
         );

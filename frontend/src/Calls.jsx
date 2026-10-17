@@ -16,31 +16,35 @@ import {
   seedCalls,
   shortAddress,
 } from "./fixtures.js";
+import { FACTORY_ADDRESS, POD_ADDRESS, CAMPAIGN_ADDRESS } from "./chain/config.js";
+import { getCampaignAddress, liveReadView } from "./chain/client.js";
 
-const FACTORY = "0xF4c7000000000000000000000000000000000F4c";
 const ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E";
-const POD = "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46";
 
 export function contractCatalog(round) {
+  const factoryAddr = FACTORY_ADDRESS || "0xF4c7000000000000000000000000000000000F4c";
+  const campaignAddr = round?.contract || getCampaignAddress() || CAMPAIGN_ADDRESS;
+  const podAddr = POD_ADDRESS || "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46";
   return [
     {
       id: "factory",
       name: "CampaignFactory",
-      address: FACTORY,
+      address: factoryAddr,
       methods: [
         {
           name: "createCampaign",
           kind: "write",
-          caller: "工厂 Owner",
-          signature: "createCampaign(uint256,uint256,uint256,uint256,address,uint256,address,uint256,bytes32)",
-          summary: "创建一期。参数写入后不能改。",
+          caller: "Factory Owner",
+          signature: "createCampaign(uint256,uint256,uint256,uint256,address,uint256,address,uint64,bytes32)",
+          summary: "发布众筹挖矿（CampaignFactory.createCampaign）。成功后自动切换到新合约。参数写入后不能改。网表默认 netlist-v1。",
           fields: [
             ["sharePriceBnb", "每份 BNB", round.sharePriceBnb],
             ["totalShares", "总份数", round.totalShares],
             ["feePercent", "服务费 %", round.feeBps / 100],
             ["fundingDays", "募集天数", round.fundingDays],
             ["taskId", "官方题目", round.taskId],
-            ["feeRecipient", "收费地址", round.feeRecipient],
+            ["feeRecipient", "服务费收费地址", round.feeRecipient],
+            ["executeDelayHours", "观察期(小时，0=默认48)", 48],
           ],
         },
       ],
@@ -48,7 +52,7 @@ export function contractCatalog(round) {
     {
       id: "campaign",
       name: "Campaign",
-      address: round.contract,
+      address: campaignAddr,
       methods: [
         { name: "status", kind: "read", caller: "任何人", signature: "status() view", summary: "当前状态。", fields: [] },
         { name: "sold", kind: "read", caller: "任何人", signature: "sold() view", summary: "已售份数。", fields: [] },
@@ -92,9 +96,9 @@ export function contractCatalog(round) {
         {
           name: "execute",
           kind: "write",
-          caller: "仅工厂 Owner",
+          caller: "仅 Factory Owner",
           signature: "execute(bytes,bytes)",
-          summary: `售罄满 ${ROUND.executeDelayHours} 小时后，仅工厂 Owner 可触发（不可逆：把全期募集款换成元件并烧掉）。按**锁定报价快照**结算，避免被抢跑/抬价。实际算力低于下限则判本期失败并全额退款。网表必须匹配开期时的哈希。晶体管须已由 Owner 调用 tapeout.net 挂单逻辑并确认成交到账（executePhase=ready）。`,
+          summary: `售罄满 ${ROUND.executeDelayHours} 小时后，仅 Factory Owner 可触发（不可逆：把全期募集款换成元件并烧掉）。按**锁定报价快照**结算，避免被抢跑/抬价。实际算力低于下限则判本期失败并全额退款。网表必须匹配开期时的哈希。晶体管须已由 Owner 调用 tapeout.net 挂单逻辑并确认成交到账（executePhase=ready）。`,
           fields: [
             ["tapeoutData", "流片数据", "0xnetlist"],
             ["startData", "开矿数据", "0xstart"],
@@ -103,7 +107,7 @@ export function contractCatalog(round) {
         {
           name: "confirmTransistors",
           kind: "write",
-          caller: "仅工厂 Owner",
+          caller: "仅 Factory Owner",
           signature: "confirmTransistors()",
           summary: "Owner 确认已调用 tapeout.net 挂单逻辑买入的晶体管成交并到账，解锁 execute 流片开矿。须先 placeTransistorOrder 进入挂单中，再调用本函数确认到账；合约无法替人工操作 tapeout.net，由 Owner 手动发起链上交易完成。",
           fields: [],
@@ -111,7 +115,7 @@ export function contractCatalog(round) {
         {
           name: "placeTransistorOrder",
           kind: "write",
-          caller: "仅工厂 Owner",
+          caller: "仅 Factory Owner",
           signature: "placeTransistorOrder()",
           summary: "Owner 手动调用 tapeout.net 挂单逻辑，为本期买入所需晶体管（链上交易）。挂单后进入「挂单中」，可 cancelTransistorOrder 取消，或成交后 confirmTransistors 确认到账。合约无法替人工操作 tapeout.net，由 Owner 手动发起链上交易完成。",
           fields: [],
@@ -119,9 +123,9 @@ export function contractCatalog(round) {
         {
           name: "cancelTransistorOrder",
           kind: "write",
-          caller: "仅工厂 Owner",
+          caller: "仅 Factory Owner",
           signature: "cancelTransistorOrder()",
-          summary: "取消正在进行的 tapeout.net 晶体管挂单，回到待挂单状态。仅工厂 Owner，且仅当处于「挂单中」时有效。",
+          summary: "取消正在进行的 tapeout.net 晶体管挂单，回到待挂单状态。仅 Factory Owner，且仅当处于「挂单中」时有效。",
           fields: [],
         },
         { name: "harvest", kind: "write", caller: "任何人", signature: "harvest()", summary: "领取 BEM，先扣服务费，再按份入账。", fields: [] },
@@ -161,7 +165,7 @@ export function contractCatalog(round) {
           kind: "internal",
           caller: "仅本期合约",
           signature: "PoD.arm / start / claim",
-          summary: `挖矿合约 ${shortAddress(POD)}。管理页不能绕过本期合约直接领取到别的地址。`,
+          summary: `挖矿合约 ${shortAddress(podAddr)}。管理页不能绕过本期合约直接领取到别的地址。`,
           fields: [],
         },
       ],
@@ -169,12 +173,13 @@ export function contractCatalog(round) {
   ];
 }
 
-export function ContractCalls({ round, book, connected, wallet, pending, onInvoke, actor, quote }) {
+export function ContractCalls({ round, book, connected, wallet, pending, onInvoke, actor, quote, chainMode = false, embedded = false }) {
   const catalog = useMemo(() => contractCatalog(round), [round]);
   const [selected, setSelected] = useState("campaign.status");
   const [args, setArgs] = useState({});
   const [result, setResult] = useState(null);
-  const [logs, setLogs] = useState(() => seedCalls(round));
+  const [logs, setLogs] = useState(() => (chainMode ? [] : seedCalls(round)));
+  const [reading, setReading] = useState(false);
   const method = findMethod(catalog, selected);
   const gate = method ? callGate(method, book, round, connected, actor) : { ok: false, reason: "未选择函数" };
   const fields = method ? method.fields.map(([key, label, fallback]) => [key, label, args[key] ?? String(fallback)]) : [];
@@ -185,10 +190,27 @@ export function ContractCalls({ round, book, connected, wallet, pending, onInvok
     setResult(null);
   }
 
-  function submit(event) {
+  async function submit(event) {
     event.preventDefault();
     if (!method || !gate.ok) return;
     const payload = Object.fromEntries(fields.map(([key, , value]) => [key, value]));
+    // 链上模式：读操作实时 eth_call，不读本地缓存
+    if (chainMode && method.kind === "read") {
+      setReading(true);
+      try {
+        const message = await liveReadView(method.name, payload, wallet);
+        const outcome = { ok: true, message: message || "（空）" };
+        setResult(outcome);
+        setLogs((current) => [{ time: Date.now(), method: method.name, ok: true, message: outcome.message }, ...current]);
+      } catch (e) {
+        const outcome = { ok: false, message: e.message || String(e) };
+        setResult(outcome);
+        setLogs((current) => [{ time: Date.now(), method: method.name, ok: false, message: outcome.message }, ...current]);
+      } finally {
+        setReading(false);
+      }
+      return;
+    }
     const outcome = onInvoke(method.name, payload);
     setResult(outcome);
     setLogs((current) => [{ time: Date.now(), method: method.name, ok: outcome.ok, message: outcome.message }, ...current]);
@@ -196,12 +218,18 @@ export function ContractCalls({ round, book, connected, wallet, pending, onInvok
 
   return (
     <section>
-      <header className="page-header">
-        <div>
-          <h1>合约调用</h1>
-          <p className="page-subtitle">从这里读取和发送本期会用到的函数。上游合约只能由本期合约内部调用。</p>
-        </div>
-      </header>
+      {!embedded && (
+        <header className="page-header">
+          <div>
+            <h1>合约调用</h1>
+            <p className="page-subtitle">
+              {chainMode
+                ? "链上模式：写操作会发起真实交易；读操作展示 BEM挖矿认购 状态。"
+                : "从这里读取和发送本期会用到的函数。上游合约只能由本期合约内部调用。"}
+            </p>
+          </div>
+        </header>
+      )}
 
       <div className="layout">
         <article className="card">
@@ -249,8 +277,8 @@ export function ContractCalls({ round, book, connected, wallet, pending, onInvok
               ))}
             </div>
             {gate.ok ? <p className="check-ok">当前状态可以调用。</p> : <div className="issues"><p>{gate.reason}</p></div>}
-            <button className="btn btn-primary" type="submit" disabled={!gate.ok || Boolean(pending)}>
-              {pending || (method?.kind === "read" ? "读取" : "发送交易")}
+            <button className="btn btn-primary" type="submit" disabled={!gate.ok || Boolean(pending) || reading}>
+              {reading ? "链上读取中…" : pending || (method?.kind === "read" ? (chainMode ? "链上读取" : "读取") : "发送交易")}
             </button>
             {result && (
               <div className={result.ok ? "result-box ok" : "result-box fail"}>
@@ -308,7 +336,11 @@ function kindLabel(kind) {
 export function callGate(method, book, round, connected, actor = { role: "user", shares: 0 }) {
   if (method.kind === "internal") return { ok: false, reason: "这个函数只允许本期合约内部调用。" };
   if (method.kind === "read") return { ok: true, reason: "" };
-  if (method.name === "createCampaign") return { ok: true, reason: "" };
+  if (method.name === "createCampaign") {
+    if (!connected) return { ok: false, reason: "createCampaign 需要连 Factory Owner 钱包。" };
+    if (actor.role !== "owner") return { ok: false, reason: "仅 Factory Owner 可发布众筹挖矿。" };
+    return { ok: true, reason: "将发布众筹挖矿，成功后切换到新合约。" };
+  }
   if (method.name === "buy") {
     if (!connected) return { ok: false, reason: "buy 需要已连接的用户钱包。" };
     if (book.scene !== "funding") return { ok: false, reason: "只有募集中可以 buy。" };
@@ -319,7 +351,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (book.scene !== "mining") return { ok: false, reason: "只有在挖矿中才能进行份额转让。" };
     if (book.mine <= 0) return { ok: false, reason: "当前钱包没有可用份额可挂牌。" };
     if (actor.role !== "owner" && actor.shares <= 0) {
-      return { ok: false, reason: "只有持份用户或工厂 Owner 可以发布出售。" };
+      return { ok: false, reason: "只有持份用户 Factory Owner 可以发布出售。" };
     }
     return { ok: true, reason: "挂单后份额锁定，不能领取或转让，直到成交或撤单。" };
   }
@@ -358,20 +390,20 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     return { ok: true, reason: "" };
   }
   if (method.name === "placeTransistorOrder") {
-    if (actor.role !== "owner") return { ok: false, reason: "只有工厂 Owner 能调用 tapeout.net 挂单逻辑。" };
+    if (actor.role !== "owner") return { ok: false, reason: "只 Factory Owner 能调用 tapeout.net 挂单逻辑。" };
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态需要调用 tapeout.net 挂单逻辑。" };
     if (book.executePhase === "ready") return { ok: false, reason: "晶体管已到账，无需再挂单。" };
     if (book.executePhase === "listed") return { ok: false, reason: "已经调用 tapeout.net 挂单逻辑，待成交或取消。" };
     return { ok: true, reason: "调用挂单逻辑后进入「挂单中」，可取消或成交后确认到账。" };
   }
   if (method.name === "cancelTransistorOrder") {
-    if (actor.role !== "owner") return { ok: false, reason: "只有工厂 Owner 能取消 tapeout.net 晶体管挂单。" };
+    if (actor.role !== "owner") return { ok: false, reason: "只 Factory Owner 能取消 tapeout.net 晶体管挂单。" };
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态有 tapeout.net 挂单可取消。" };
     if (book.executePhase !== "listed") return { ok: false, reason: "当前没有进行中的 tapeout.net 晶体管挂单。" };
     return { ok: true, reason: "取消后回到待挂单状态。" };
   }
   if (method.name === "confirmTransistors") {
-    if (actor.role !== "owner") return { ok: false, reason: "只有工厂 Owner 能确认 tapeout.net 晶体管成交到账。" };
+    if (actor.role !== "owner") return { ok: false, reason: "只 Factory Owner 能确认 tapeout.net 晶体管成交到账。" };
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态需要确认 tapeout.net 到账。" };
     if (book.executePhase === "ready") return { ok: false, reason: "晶体管已确认到账，直接执行流片开矿即可。" };
     if (book.executePhase !== "listed") return { ok: false, reason: "请先调用 tapeout.net 挂单逻辑，再确认成交到账。" };
@@ -382,9 +414,9 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (book.executePhase && book.executePhase !== "ready") {
       return { ok: false, reason: "晶体管尚未到位，请先由 Owner 调用 tapeout.net 挂单逻辑并确认成交到账后再执行流片。" };
     }
-    // F3：execute 不可逆（把全期募集款换成元件并烧掉），权限收紧为仅工厂 Owner
+    // F3：execute 不可逆（把全期募集款换成元件并烧掉），权限收紧为仅 Factory Owner
     if (actor.role !== "owner") {
-      return { ok: false, reason: "只有工厂 Owner 可以执行换币流片（不可逆操作）。" };
+      return { ok: false, reason: "只 Factory Owner 可以执行换币流片（不可逆操作）。" };
     }
     const wait = executeUnlockIn(round, book);
     if (wait > 0) {
@@ -398,7 +430,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     const harvest = computeHarvest(round, book);
     // 领取次数不设上限，只要还在出矿（userPart > 0）即可领取
     if (harvest.userPart <= 0) return { ok: false, reason: "当前没有出矿，暂无可领取的 BEM。" };
-    return { ok: true, reason: `第 ${harvest.rounds + 1} 次，本次可分得 ${harvest.userPart} BEM（次数不限）。` };
+    return { ok: true, reason: `第 ${harvest.rounds + 1} 次，本次可分得 ${formatBem(harvest.userPart)} BEM（次数不限）。` };
   }
   return { ok: false, reason: "未知函数。" };
 }
@@ -415,7 +447,10 @@ export function readCall(method, args, round, book, wallet, quote = QUOTE) {
       : `预估 ${estimateHashpower(round, quote, round.totalShares).hashpower.toLocaleString("zh-CN")} H（未执行，实际未知）`;
   }
   if (method === "estHashpower") return `${estimateHashpower(round, quote, round.totalShares).hashpower.toLocaleString("zh-CN")} H`;
-  if (method === "dailyBem") return `${formatBem(book.hashpower > 0 ? bemRate(book.hashpower) : estimateHashpower(round, quote, round.totalShares).dailyBem)} BEM`;
+  if (method === "dailyBem") {
+    if (book._chain && book.dailyBem != null) return `${formatBem(book.dailyBem)} BEM`;
+    return `${formatBem(book.hashpower > 0 ? bemRate(book.hashpower) : estimateHashpower(round, quote, round.totalShares).dailyBem)} BEM`;
+  }
   if (method === "harvestCount") {
     const h = computeHarvest(round, book);
     // 只报已领次数，不暴露任何总次数上限——领取次数不限，只要还在出矿即可领取
@@ -426,9 +461,16 @@ export function readCall(method, args, round, book, wallet, quote = QUOTE) {
   const account = String(args.account || "").toLowerCase();
   const rows = buildHolders(book.sold, book.mine);
   const row = rows.find((item) => item.address.toLowerCase() === account);
-  if (method === "sharesOf") return row ? `${row.shares} 份` : "0 份";
+  if (method === "sharesOf") {
+    if (book._chain && account && String(book.selfAddress || "").toLowerCase() === account) {
+      return `${book.mine || 0} 份`;
+    }
+    return row ? `${row.shares} 份` : "0 份";
+  }
   if (method === "pendingBem") {
-    // F1：收益账本按持有人隔离，按传入地址各自算 pending，不再用一份全局池冒充
+    if (book._chain && account && String(book.selfAddress || "").toLowerCase() === account) {
+      return `${formatBem(book.claimable || 0)} BEM`;
+    }
     const amount = computeHarvest(round, book, account).pending;
     return `${formatBem(amount)} BEM`;
   }

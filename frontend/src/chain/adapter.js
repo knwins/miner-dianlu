@@ -2,9 +2,13 @@
 // 使主页面（认购/份数/转让/概览）无需改动即可展示真实测试网数据。
 import { formatEther } from "ethers";
 import { ROUND } from "../fixtures.js";
+import { getCampaignAddress } from "./client.js";
 
 const SCENE_NAME = ["funding", "executing", "mining"];
 const PHASE_NAME = [undefined, "buying", "listed", "ready"];
+const SCENE_TONE = ["live", "wait", "mine"];
+const SCENE_STATUS = ["募集中", "待执行", "挖矿中"];
+
 const bem = (v) => {
   try { return Number(formatEther(v)); } catch { return 0; }
 };
@@ -24,8 +28,28 @@ export function roundFromDeployment(dep) {
     taskId: p.taskId ?? ROUND.taskId,
     fundingDays: p.fundingDays ?? ROUND.fundingDays,
     executeDelayHours: Math.round((p.executeDelay ?? 172800) / 3600),
-    contract: dep.campaign || ROUND.contract,
+    contract: dep.campaign || getCampaignAddress() || ROUND.contract,
     feeRecipient: dep.deployer || ROUND.feeRecipient,
+    netlistHash: p.netlistHash || null,
+  };
+}
+
+/** 用链上权威字段覆盖 / 补齐 round（切换期次或刷新后调用）。 */
+export function roundFromState(state, baseRound = ROUND, campaignIndex = 1) {
+  const sharePriceBnb = bem(state.sharePriceBnb);
+  const totalShares = Number(state.totalShares);
+  return {
+    ...baseRound,
+    id: campaignIndex,
+    sharePriceBnb,
+    totalShares,
+    hardCapBnb: Number((sharePriceBnb * totalShares).toFixed(8)),
+    feeBps: state.feeBps,
+    taskId: state.taskId ?? baseRound.taskId,
+    executeDelayHours: Math.round((state.executeDelay || 0) / 3600),
+    contract: state.campaign || getCampaignAddress() || baseRound.contract,
+    feeRecipient: state.feeRecipient || baseRound.feeRecipient,
+    netlistHash: state.netlistHash || baseRound.netlistHash || null,
   };
 }
 
@@ -33,14 +57,17 @@ export function roundFromDeployment(dep) {
 export function bookFromState(state, account, extra = {}) {
   const scene = SCENE_NAME[state.scene] || "funding";
   const phase = PHASE_NAME[state.phase];
-  const self = state.self || { shares: 0n, escrow: 0n, claimed: 0n, refunded: 0n, pending: 0n, bemBalance: 0n };
+  const self = state.self || {
+    shares: 0n, escrow: 0n, claimed: 0n, refunded: 0n, pending: 0n, bemBalance: 0n, bnb: 0n,
+  };
   const addr = String(account || "").toLowerCase();
+  const bnb = bem(self.bnb);
   const listings = (state.listings || []).map((l) => ({
     id: l.id,
     seller: l.seller,
     shares: Number(l.shares),
     priceBnbPerShare: bem(l.priceBnbPerShare),
-    _priceWei: l.priceBnbPerShare, // 精确 wei，供 takeListing 付款
+    _priceWei: l.priceBnbPerShare,
     totalBnb: bem(l.priceBnbPerShare * l.shares),
     open: l.open,
   }));
@@ -66,18 +93,66 @@ export function bookFromState(state, account, extra = {}) {
     bnbPool: bem(state.raisedBnb),
     refundedSelf: bem(self.refunded),
     bemBalance: bem(self.bemBalance),
+    bnb,
     capped: state.capped,
     owner: state.owner,
     selfAddress: account,
     totalShares: Number(state.totalShares),
     transistorCount: Number(state.transistorCount),
+    estHashpower: Number(state.estHashpower),
+    taskId: state.taskId,
     priceLock: bem(state.priceLock),
     _sharePriceWei: state.sharePriceBnb,
-    picked: 1,
-    approved: true,
-    wallets: addr ? { [addr]: { mine: Number(self.shares), listingShares: Number(self.escrow), claimed: bem(self.claimed), refunded: bem(self.refunded), bnb: 0 } } : {},
+    _netlistHash: state.netlistHash,
+    netWeightVerified: state.netWeightVerified,
+    netWeightUnverified: state.netWeightUnverified,
+    picked: extra.picked ?? 1,
+    approved: true, // 原生 BNB 支付，无需 ERC20 approve
+    wallets: addr
+      ? {
+          [addr]: {
+            mine: Number(self.shares),
+            listingShares: Number(self.escrow),
+            claimed: bem(self.claimed),
+            refunded: bem(self.refunded),
+            bnb,
+          },
+        }
+      : {},
     circuitId: Number(state.hashpower) > 0 ? `H${Number(state.hashpower)}` : "—",
     actualQuote: null,
-    estimate: extra.estimate || { hashpower: Number(state.estHashpower), usedParts: Number(state.transistorCount) || 0 },
+    estimate: extra.estimate || {
+      hashpower: Number(state.estHashpower),
+      usedParts: Number(state.transistorCount) || 0,
+    },
+  };
+}
+
+/** 历史期次行（替换 PAST_ROUNDS 假数据）。 */
+export function historyRowFromSummary(summary, index) {
+  const tone = SCENE_TONE[summary.scene] || "live";
+  return {
+    id: index,
+    address: summary.address,
+    status: SCENE_STATUS[summary.scene] || "—",
+    tone,
+    shares: `${summary.sold}/${summary.totalShares}`,
+    sold: summary.sold,
+    totalShares: summary.totalShares,
+    sharePriceBnb: summary.sharePriceBnb,
+    hardCapBnb: summary.sharePriceBnb * summary.totalShares,
+    raisedBnb: summary.raisedBnb,
+    raised: `${summary.raisedBnb.toFixed(4)} BNB`,
+    hashpower: summary.hashpower > 0
+      ? String(summary.hashpower)
+      : summary.estHashpower > 0
+        ? `${summary.estHashpower}（预估）`
+        : "—",
+    hashpowerRaw: Number(summary.hashpower) || 0,
+    bem: `${Number(summary.distributed).toFixed(4)} BEM`,
+    fee: `${Number(summary.feeBem).toFixed(4)} BEM`,
+    taskId: summary.taskId,
+    estHashpower: summary.estHashpower,
+    transistorCount: summary.transistorCount,
   };
 }
