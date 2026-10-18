@@ -102,7 +102,7 @@ export const FACTORY_ABI = [
   "function campaignCount() view returns (uint256)",
   "function campaigns(uint256) view returns (address)",
   "function allCampaigns() view returns (address[])",
-  "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint16 feePercent,uint64 fundingDays,address[] feeRecipients,uint16[] feeShareBps,uint256 taskId,address pod_,bytes32 netlistHash) returns (address)",
+  "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint16 feePercent,uint64 fundingDays,address[] feeRecipients,uint16[] feeShareBps,uint256 taskId,address pod_,bytes32 netlistHash,address transistors_) returns (address)",
   "function removeCampaign(uint256 index)",
   "function removeCampaign(address campaign)",
   "function setPod(address pod_)",

@@ -2,6 +2,8 @@
 // 使主页面（认购/份数/转让/概览）无需改动即可展示真实测试网数据。
 import { formatEther } from "ethers";
 import { ROUND } from "../fixtures.js";
+import { transistorIdFor } from "../prices.js";
+import { processorFromPartsContract } from "../tapeout.js";
 import { getCampaignAddress } from "./client.js";
 
 const SCENE_NAME = ["funding", "executing", "mining"];
@@ -55,6 +57,11 @@ export function roundFromState(state, baseRound = ROUND, campaignIndex = 1) {
         ? state.feeShares
         : [{ address: state.feeRecipient || baseRound.feeRecipient, shareBps: 10_000 }],
     netlistHash: state.netlistHash || baseRound.netlistHash || null,
+    // 开期写入的 transistors 地址 = TapeOut / Behemoth 元件合约；不能沿用 ROUND 默认 Behemoth。
+    processorId: processorFromPartsContract(state.transistors) || null,
+    transistorId: processorFromPartsContract(state.transistors)
+      ? transistorIdFor(processorFromPartsContract(state.transistors))
+      : null,
   };
 }
 
@@ -125,6 +132,8 @@ export function bookFromState(state, account, extra = {}) {
     latchQty: Number(state.latchQty || 0),
     nandPrice: bem(state.nandPrice || 0),
     latchPrice: bem(state.latchPrice || 0),
+    nandRemaining: state.nandRemaining == null ? null : Number(state.nandRemaining),
+    latchRemaining: state.latchRemaining == null ? null : Number(state.latchRemaining),
     transistors: state.transistors || "",
     _sharePriceWei: state.sharePriceBnb,
     _netlistHash: state.netlistHash,
@@ -155,6 +164,7 @@ export function bookFromState(state, account, extra = {}) {
 /** 历史期次行（替换 PAST_ROUNDS 假数据）。 */
 export function historyRowFromSummary(summary, index) {
   const tone = SCENE_TONE[summary.scene] || "live";
+  const processor = processorFromPartsContract(summary.transistors);
   return {
     id: index,
     address: summary.address,
@@ -178,5 +188,7 @@ export function historyRowFromSummary(summary, index) {
     taskId: summary.taskId,
     estHashpower: summary.estHashpower,
     transistorCount: summary.transistorCount,
+    transistors: summary.transistors || "",
+    processor: processor || null,
   };
 }

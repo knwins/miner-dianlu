@@ -75,16 +75,15 @@ export function useChain(extra = {}) {
     if (!CHAIN_CONFIGURED) return [];
     try {
       const addrs = await listCampaigns();
-      const rows = [];
-      // 最多拉最近 12 期，避免公共 RPC 过载
-      for (let i = 0; i < Math.min(addrs.length, 12); i++) {
+      const slice = addrs.slice(0, 12);
+      const rows = await Promise.all(slice.map(async (addr, i) => {
+        const id = addrs.length - i;
         try {
-          const s = await readCampaignSummary(addrs[i]);
-          rows.push(historyRowFromSummary(s, addrs.length - i));
+          return historyRowFromSummary(await readCampaignSummary(addr), id);
         } catch {
-          rows.push({
-            id: addrs.length - i,
-            address: addrs[i],
+          return {
+            id,
+            address: addr,
             status: "—",
             tone: "live",
             shares: "—",
@@ -92,15 +91,15 @@ export function useChain(extra = {}) {
             hashpower: "—",
             bem: "—",
             fee: "—",
-          });
+          };
         }
-      }
+      }));
       setCampaignAddrs(addrs);
       setCampaigns(rows);
       return addrs;
-    } catch {
-      /* 工厂未部署或 RPC 失败时保留空列表 */
-      return [];
+    } catch (e) {
+      setError(e.shortMessage || e.message || String(e));
+      throw e;
     }
   }, []);
 
@@ -270,17 +269,28 @@ export function useChain(extra = {}) {
     const onAcc = async (accs) => {
       const next = accs && accs[0] ? accs[0] : null;
       if (!next) {
+        try {
+          if (sessionStorage.getItem("miner.holdAccount") === "1") return;
+        } catch {
+          /* ignore */
+        }
         if (connectBusy.current > 0) return;
+        try {
+          const still = await target.request({ method: "eth_accounts" });
+          if (still?.length) return;
+        } catch {
+          return;
+        }
         setSigner(null);
         setAccount(null);
         return;
       }
       try {
-        const w = await restoreWallet(target) || await connectWallet(target);
-        applyWallet(w);
+        const w = await restoreWallet(target);
+        if (w) applyWallet(w);
+        else setAccount(next);
       } catch {
         setAccount(next);
-        setSigner(null);
       }
     };
     const onChain = async () => {

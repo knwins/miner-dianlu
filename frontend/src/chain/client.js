@@ -1,6 +1,6 @@
 // 链上对接客户端（ethers v6）。读取 Campaign 实时状态、发送写交易。
 // 无钱包时用公共 RPC 只读；有钱包（window.ethereum）时签名发送。
-import { BrowserProvider, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress, id } from "ethers";
+import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress, id } from "ethers";
 import { CAMPAIGN_ABI, ERC20_ABI, FACTORY_ABI } from "./abis.js";
 import {
   CAMPAIGN_ADDRESS,
@@ -11,7 +11,7 @@ import {
   NETWORK,
   IS_CONFIGURED,
 } from "./config.js";
-import { discoverWallets, explainConnectError, inAppWalletName } from "./wallets.js";
+import { discoverWallets, explainConnectError, inAppWalletName, rememberWallet, rememberedWalletId } from "./wallets.js";
 import deployments from "./deployments.json";
 
 export { formatEther, parseEther, ZeroAddress };
@@ -72,7 +72,10 @@ export function getRawProvider() {
 
 function makeStaticProvider(url) {
   const network = Network.from(CHAIN_ID);
-  return new JsonRpcProvider(url, network, { staticNetwork: network });
+  const request = new FetchRequest(url);
+  // 公共节点有时不返回也不报错。不设超时的话，开页会一直停在「正在读取」。
+  request.timeout = 8_000;
+  return new JsonRpcProvider(request, network, { staticNetwork: network });
 }
 
 /** 读链用公共 RPC；某个节点额度/403 时换下一个，避免前端卡在单一节点。 */
@@ -102,25 +105,32 @@ export async function withReadProvider(run) {
     } catch (err) {
       lastErr = err;
       const text = String(err?.shortMessage || err?.message || err || "");
-      const rotatable = /usage limit|1rpc|#pricing|-32001|403|timeout|failed to fetch|ECONNRESET|network|BAD_DATA|missing response|coalesce/i.test(text);
+      const contractRevert = /execution reverted/i.test(text) && !/missing revert|coalesce/i.test(text);
+      const rotatable = !contractRevert;
       if (!rotatable || offset === urls.length - 1) throw err;
     }
   }
   throw lastErr;
 }
 
-async function resolveInjected(preferred) {
-  if (preferred && typeof preferred.request === "function") return preferred;
+async function injectedChoices() {
   const choices = await discoverWallets();
-  const injected = choices.filter((item) => item.kind === "injected");
+  return choices.filter((item) => item.kind === "injected");
+}
+
+function pickInjected(injected, { allowPrompt } = { allowPrompt: false }) {
   const inApp = inAppWalletName();
   if (inApp) {
     const named = injected.find((item) => item.name === inApp);
     if (named) return named.provider;
   }
-  const tokenPocket = injected.find((item) => item.walletId === "tokenpocket");
-  if (tokenPocket && injected.length === 1) return tokenPocket.provider;
+  const saved = rememberedWalletId();
+  if (saved) {
+    const remembered = injected.find((item) => item.walletId === saved);
+    if (remembered) return remembered.provider;
+  }
   if (injected.length === 1) return injected[0].provider;
+  if (!allowPrompt) return null;
   if (injected.length > 1) {
     const err = new Error("检测到多个钱包，请先选择要连接的钱包");
     err.code = "NEED_CHOICE";
@@ -131,6 +141,11 @@ async function resolveInjected(preferred) {
     : "未检测到钱包。手机请用 TokenPocket 打开本页");
   err.code = "NO_WALLET";
   throw err;
+}
+
+async function resolveInjected(preferred) {
+  if (preferred && typeof preferred.request === "function") return preferred;
+  return pickInjected(await injectedChoices(), { allowPrompt: true });
 }
 
 function chainAddParams() {
@@ -177,9 +192,78 @@ async function readWalletChainId(raw) {
   }
 }
 
-async function bindWallet(raw, { request = true, updateRpc = true } = {}) {
-  // 固定 chainId，避免 BrowserProvider 探测网络时打到钱包里已超额的 1rpc
-  const provider = new BrowserProvider(raw, CHAIN_ID);
+function isWalletSimError(err) {
+  const text = String(err?.shortMessage || err?.message || err || "");
+  return /missing revert data|could not coalesce|usage limit|1rpc|#pricing|-32001|missing response|403|archive|personal token|exceeded maximum retry/i.test(text);
+}
+
+function holdAccount(on) {
+  try {
+    if (on) sessionStorage.setItem("miner.holdAccount", "1");
+    else sessionStorage.removeItem("miner.holdAccount");
+  } catch {
+    /* 隐私模式 */
+  }
+}
+
+/** 估 gas / eth_call 走公共节点。钱包自带的 1rpc 超额时会回空数据，ethers 显示 missing revert data。 */
+function hardenSigner(signer, raw) {
+  if (!signer || signer.__publicRpc) return signer;
+  const sendTransaction = signer.sendTransaction.bind(signer);
+  const fromOf = () => signer.getAddress();
+
+  signer.estimateGas = async (tx) => {
+    const from = tx.from || await fromOf();
+    try {
+      return await withReadProvider((provider) => provider.estimateGas({ ...tx, from }));
+    } catch (err) {
+      // 节点没带回回退数据时，不要让钱包再用坏 RPC 估一次。给足 gas，实际只扣消耗的部分。
+      if (isWalletSimError(err)) return 8_000_000n;
+      throw err;
+    }
+  };
+  signer.call = async (tx) => {
+    const from = tx.from || await fromOf();
+    return withReadProvider((provider) => provider.call({ ...tx, from }));
+  };
+  signer.sendTransaction = async (tx) => {
+    let next = tx;
+    if (next.gasLimit == null) {
+      try {
+        const gas = await signer.estimateGas(next);
+        next = { ...next, gasLimit: (gas * 120n) / 100n };
+      } catch (err) {
+        if (!isWalletSimError(err)) throw err;
+        next = { ...next, gasLimit: 8_000_000n };
+      }
+    }
+    try {
+      return await sendTransaction(next);
+    } catch (err) {
+      if (!isWalletSimError(err) || !raw?.request) throw err;
+      // 钱包仍用自己的 BSC 节点模拟。改成公共节点后再发一次。
+      holdAccount(true);
+      try {
+        await raw.request({ method: "wallet_addEthereumChain", params: chainAddParams() });
+        markRpcUpdated();
+        return await sendTransaction(next);
+      } finally {
+        holdAccount(false);
+      }
+    }
+  };
+  signer.__publicRpc = true;
+  return signer;
+}
+
+function browserProvider(raw) {
+  // staticNetwork 让 ethers 不再为了探测网络去打钱包的 eth_chainId。
+  // OKX 会把 eth_chainId 转到当前 RPC；1rpc 超额时这条请求会失败，但账户其实已经授权。
+  const network = Network.from(CHAIN_ID);
+  return new BrowserProvider(raw, network, { staticNetwork: network });
+}
+
+async function bindWallet(raw, { request = true, updateRpc = false } = {}) {
   let accounts;
   if (request) {
     accounts = await raw.request({ method: "eth_requestAccounts" });
@@ -190,21 +274,24 @@ async function bindWallet(raw, { request = true, updateRpc = true } = {}) {
   const account = String(accounts[0] || "");
   if (!/^0x[a-fA-F0-9]{40}$/.test(account)) return null;
 
-  // 先写入账号，再尽力切链/换 RPC。RPC 额度用尽时也不能阻断「已连接」。
+  // 账户已经拿到。切链失败（含坏 RPC）不能把「已连接」清掉。
+  if (updateRpc) {
+    try {
+      await ensureChain(raw, { updateRpc: true });
+    } catch {
+      /* 签名前再提示链或节点 */
+    }
+  }
+
+  const provider = browserProvider(raw);
+  let signer = null;
   try {
-    await ensureChain(raw, { updateRpc });
+    signer = hardenSigner(await provider.getSigner(account), raw);
   } catch {
-    /* 切链失败不阻断；签名时若链不对会再提示 */
+    signer = null;
   }
 
-  let signer;
-  try {
-    signer = await provider.getSigner(account);
-  } catch (err) {
-    if (request) throw err;
-    return null;
-  }
-
+  rememberWallet(raw);
   _browser = provider;
   _rawProvider = raw;
   return { provider, signer, account, raw };
@@ -228,8 +315,11 @@ export async function connectWallet(preferred) {
  */
 export async function restoreWallet(preferred) {
   try {
-    const raw = await resolveInjected(preferred);
-    return await bindWallet(raw, { request: false, updateRpc: true });
+    const raw = preferred && typeof preferred.request === "function"
+      ? preferred
+      : pickInjected(await injectedChoices(), { allowPrompt: false });
+    if (!raw) return null;
+    return await bindWallet(raw, { request: false, updateRpc: false });
   } catch {
     return null;
   }
@@ -252,21 +342,16 @@ export async function ensureChain(raw, { updateRpc = true } = {}) {
   try {
     current = await readWalletChainId(eip1193);
   } catch (err) {
-    if (!isRpcQuotaError(err)) throw err;
+    // 节点超额时 eth_chainId 会失败。不要因此 wallet_addEthereumChain，否则 OKX 会弹窗并把连接状态冲掉。
+    if (isRpcQuotaError(err)) return;
+    throw err;
   }
+  if (!current) return;
 
-  // 读不到 chainId，或本会话还没写过新节点时，把 publicnode / dataseed 写进钱包
-  if (updateRpc && (!current || !rpcAlreadyUpdated())) {
-    try {
-      await add();
-      markRpcUpdated();
-      current = await readWalletChainId(eip1193).catch(() => current);
-    } catch {
-      /* 用户取消或不支持更新 RPC 时忽略 */
-    }
+  if (String(current).toLowerCase() === target) {
+    if (updateRpc && !rpcAlreadyUpdated()) markRpcUpdated();
+    return;
   }
-
-  if (String(current).toLowerCase() === target) return;
 
   try {
     await switchChain();
@@ -331,29 +416,34 @@ async function readFeeShares(c, fallbackRecipient) {
 /** 读取 Campaign 全量状态（含当前账户的分账）。account 为空则跳过账户相关字段。 */
 export async function readState(account, campaignAddr = getCampaignAddress()) {
   if (!IS_CONFIGURED && !isAddr(campaignAddr)) throw new Error("尚未配置 Campaign 地址（请先部署）");
-  const runner = _browser ? await _browser.getSigner().catch(() => getReadProvider()) : getReadProvider();
+  // 读状态走公共节点。钱包自带的 BSC 节点（例如超额的 1rpc）会让整页读失败，看起来像工厂没有期次。
+  return withReadProvider((runner) => readStateOn(runner, account, campaignAddr));
+}
+
+async function readStateOn(runner, account, campaignAddr) {
   const c = campaignContract(runner, campaignAddr);
   const [
     scene, phase, sold, totalShares, sharePriceBnb, feeBps, hashpower, estHashpower,
     dailyBem, harvestCount, totalDistributed, totalFeeCollected, totalClaimed, totalRefunded,
     raisedBnb, netlistHash, soldOutAt, executionFailed, priceLock, transistorCount, capped,
     owner, fundingDeadline, bemAddr, podAddr, minterAddr, listingCount,
-    taskId, feeRecipient, netWeightVerified, netWeightUnverified,
+    taskId, feeRecipient, netWeightVerified, netWeightUnverified, transistorsAddr,
   ] = await Promise.all([
     c.scene(), c.phase(), c.sold(), c.totalShares(), c.sharePriceBnb(), c.feeBps(),
     c.hashpower(), c.estHashpower(), c.dailyBem(), c.harvestCount(), c.totalDistributed(),
     c.totalFeeCollected(), c.totalClaimed(), c.totalRefunded(), c.raisedBnb(), c.netlistHash(),
     c.soldOutAt(), c.executionFailed(), c.priceLock(), c.transistorCount(), c.capped(),
     c.owner(), c.fundingDeadline(), c.bem(), c.pod(), c.minter(), c.listingCount(),
-    c.taskId(), c.feeRecipient(), c.netWeightVerified(), c.netWeightUnverified(),
+    c.taskId(), c.feeRecipient(), c.netWeightVerified(), c.netWeightUnverified(), c.transistors(),
   ]);
   const order = await readMarketOrder(c);
 
   const n = Number(listingCount);
-  const [rawListings, takenById] = await Promise.all([
-    Promise.all(Array.from({ length: n }, (_, i) => c.getListing(i))),
-    readTakenByListing(c),
-  ]);
+  // 没有挂单时不必扫 ListingTaken。公共节点对大范围 eth_getLogs 会失败，扫下去会把整页读状态卡住。
+  const rawListings = n > 0
+    ? await Promise.all(Array.from({ length: n }, (_, i) => c.getListing(i)))
+    : [];
+  const takenById = n > 0 ? await readTakenByListing(c) : new Map();
   const listings = rawListings.map((l, i) => {
     const fill = takenById.get(i);
     return {
@@ -377,6 +467,8 @@ export async function readState(account, campaignAddr = getCampaignAddress()) {
     owner, fundingDeadline: Number(fundingDeadline),
     bem: bemAddr, pod: podAddr, minter: minterAddr, listings,
     ...order,
+    // 开期即写入的元件合约优先；挂单后的 market 字段若为空也不要盖掉
+    transistors: order.transistors && order.transistors !== ZeroAddress ? order.transistors : transistorsAddr,
     taskId: Number(taskId), feeRecipient,
     feeShares: await readFeeShares(c, feeRecipient),
     netWeightVerified: Number(netWeightVerified), netWeightUnverified: Number(netWeightUnverified),
@@ -385,11 +477,10 @@ export async function readState(account, campaignAddr = getCampaignAddress()) {
 
   if (account) {
     const bem = bemContract(runner);
-    const provider = getReadProvider();
     const [shares, escrow, claimed, refunded, pending, bemBal, bnbBal] = await Promise.all([
       c.sharesOf(account), c.escrowOf(account), c.claimedOf(account),
       c.refundedOf(account), c.pendingBem(account), bem.balanceOf(account),
-      provider.getBalance(account),
+      runner.getBalance(account),
     ]);
     state.self = { shares, escrow, claimed, refunded, pending, bemBalance: bemBal, bnb: bnbBal };
   }
@@ -400,11 +491,17 @@ export async function readState(account, campaignAddr = getCampaignAddress()) {
 const LOG_SPAN = 20000;
 const LOG_MAX_LOOKBACK = 250000;
 
+function logRangeTooWide(err) {
+  const text = String(err?.shortMessage || err?.message || err || "");
+  return /limit|range|too many|exceed|more than|query returned more|response size/i.test(text);
+}
+
 async function querySpan(contract, filter, start, end) {
   try {
     return await contract.queryFilter(filter, start, end);
-  } catch {
-    if (end <= start) return [];
+  } catch (err) {
+    // 节点拒绝大范围日志时才对半拆。额度、403、超时不能拆，否则会打出成千上万次请求，页面一直停在读取中。
+    if (!logRangeTooWide(err) || end <= start) return [];
     const mid = start + Math.floor((end - start) / 2);
     const left = await querySpan(contract, filter, start, mid);
     const right = await querySpan(contract, filter, mid + 1, end);
@@ -633,22 +730,43 @@ async function readMarketOrder(c) {
       c.nandBidId(), c.latchBidId(), c.nandQty(), c.latchQty(), c.nandPrice(), c.latchPrice(),
       c.transistors(), c.orderFilled(),
     ]);
-    return { nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled, marketOrders: true };
+    const marketAddr = await c.market().catch(() => null);
+    const [nandRemaining, latchRemaining] = await Promise.all([
+      readLegRemaining(c.runner, marketAddr, nandBidId, nandQty),
+      readLegRemaining(c.runner, marketAddr, latchBidId, latchQty),
+    ]);
+    return { nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled, marketOrders: true, nandRemaining, latchRemaining };
   } catch {
     return empty;
   }
 }
 
-async function campaignsOf(factoryAddr) {
-  const f = factoryContract(getReadProvider(), factoryAddr);
+async function readLegRemaining(runner, marketAddr, id, qty) {
+  if (marketAddr == null) return null;
+  if (marketAddr === ZeroAddress || id === 0n || qty === 0n) return 0n;
   try {
-    return [...await f.allCampaigns()].reverse();
+    const market = new Contract(marketAddr, [
+      "function bids(uint256) view returns (address buyer, address transistors, uint96 price, uint8 tokenId, uint16 feeBps, uint256 remaining)",
+    ], runner);
+    const bid = await market.bids(id);
+    return bid.remaining;
   } catch {
-    const n = Number(await f.campaignCount());
-    const out = [];
-    for (let i = 0; i < n; i++) out.push(await f.campaigns(i));
-    return out.reverse();
+    return null;
   }
+}
+
+async function campaignsOf(factoryAddr) {
+  return withReadProvider(async (provider) => {
+    const f = factoryContract(provider, factoryAddr);
+    try {
+      return [...await f.allCampaigns()].reverse();
+    } catch {
+      const n = Number(await f.campaignCount());
+      const out = [];
+      for (let i = 0; i < n; i++) out.push(await f.campaigns(i));
+      return out.reverse();
+    }
+  });
 }
 
 /** 列出当前工厂期次（新→旧）。旧工厂地址仅保留在 deployments.legacyFactories，不再并入主列表。 */
@@ -659,16 +777,19 @@ export async function listCampaigns() {
 
 /** 读某期轻量摘要（历史列表用）。 */
 export async function readCampaignSummary(address) {
-  const runner = getReadProvider();
+  return withReadProvider((runner) => readCampaignSummaryOn(runner, address));
+}
+
+async function readCampaignSummaryOn(runner, address) {
   const c = campaignContract(runner, address);
   const [
     scene, sold, totalShares, sharePriceBnb, hashpower, estHashpower,
-    totalDistributed, totalFeeCollected, raisedBnb, taskId, transistorCount,
+    totalDistributed, totalFeeCollected, raisedBnb, taskId, transistorCount, transistors,
   ] = await Promise.all([
     c.scene(), c.sold(), c.totalShares(), c.sharePriceBnb(),
     c.hashpower(), c.estHashpower(),
     c.totalDistributed(), c.totalFeeCollected(), c.raisedBnb(),
-    c.taskId(), c.transistorCount(),
+    c.taskId(), c.transistorCount(), c.transistors(),
   ]);
   return {
     address,
@@ -683,6 +804,7 @@ export async function readCampaignSummary(address) {
     raisedBnb: Number(formatEther(raisedBnb)),
     taskId: Number(taskId),
     transistorCount: Number(transistorCount),
+    transistors,
   };
 }
 
@@ -774,11 +896,16 @@ export async function readFactoryOwner() {
  * 开期：预检 Owner → staticCall → 发交易 → 解析新地址（事件失败则读 campaigns[n-1]）。
  * 返回 { hash, receipt, campaign }。
  */
-// 工厂开期签名演进：V1 多 executeDelay；V2 单收费地址；V3 多地址分成。
+// 工厂开期签名演进：V1 多 executeDelay；V2 单收费地址；V3 多地址分成；V4 写入晶体管合约（处理器）。
 const CREATE_V1 =
   "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint16 feePercent,uint64 fundingDays,address feeRecipient,uint256 taskId,address pod_,uint64 executeDelay,bytes32 netlistHash) returns (address)";
 const CREATE_V2 =
   "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint16 feePercent,uint64 fundingDays,address feeRecipient,uint256 taskId,address pod_,bytes32 netlistHash) returns (address)";
+const CREATE_V3 =
+  "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint16 feePercent,uint64 fundingDays,address[] feeRecipients,uint16[] feeShareBps,uint256 taskId,address pod_,bytes32 netlistHash) returns (address)";
+const CREATE_V4_SELECTOR = id(
+  "createCampaign(uint256,uint256,uint16,uint64,address[],uint16[],uint256,address,bytes32,address)"
+).slice(2, 10);
 const CREATE_V3_SELECTOR = id(
   "createCampaign(uint256,uint256,uint16,uint64,address[],uint16[],uint256,address,bytes32)"
 ).slice(2, 10);
@@ -816,6 +943,7 @@ function normalizeFeeShares(params) {
 async function factoryCreateVersion(runner) {
   const provider = runner?.provider || runner;
   const code = String(await provider.getCode(FACTORY_ADDRESS)).toLowerCase();
+  if (code.includes(CREATE_V4_SELECTOR)) return 4;
   if (code.includes(CREATE_V3_SELECTOR)) return 3;
   if (code.includes(CREATE_V2_SELECTOR)) return 2;
   return 1;
@@ -824,42 +952,52 @@ async function factoryCreateVersion(runner) {
 function createArgs(params, version) {
   const { recipients, shareBps } = normalizeFeeShares(params);
   const commonHead = [params.sharePriceWei, params.totalShares, params.feePercent, params.fundingDays];
+  const transistors = params.transistors || ZeroAddress;
   const tail = [params.taskId, params.pod || ZeroAddress, params.netlistHash];
+  if (version === 4) {
+    if (!isAddr(transistors) || transistors === ZeroAddress) {
+      throw new Error("请选择目标处理器（TapeOut / Behemoth），开期会把对应晶体管合约写入链上");
+    }
+    return [...commonHead, recipients, shareBps, ...tail, transistors];
+  }
   if (version === 3) return [...commonHead, recipients, shareBps, ...tail];
   if (version === 2) return [...commonHead, recipients[0], ...tail];
   return [...commonHead, recipients[0], params.taskId, params.pod || ZeroAddress, 1n, params.netlistHash];
 }
 
-async function createCampaignTx(signer, params) {
-  if (!signer) throw new Error("请先连接钱包");
-  const version = await factoryCreateVersion(signer);
-  const abi =
-    version === 3
-      ? FACTORY_ABI
-      : FACTORY_ABI.map((item) =>
-          item.startsWith("function createCampaign") ? (version === 2 ? CREATE_V2 : CREATE_V1) : item
-        );
-  const f = new Contract(FACTORY_ADDRESS, abi, signer);
-  return f.createCampaign(...createArgs(params, version));
+function createCampaignAbi(version) {
+  if (version === 4) return FACTORY_ABI;
+  if (version === 3) {
+    return FACTORY_ABI.map((item) => (item.startsWith("function createCampaign") ? CREATE_V3 : item));
+  }
+  return FACTORY_ABI.map((item) =>
+    item.startsWith("function createCampaign") ? (version === 2 ? CREATE_V2 : CREATE_V1) : item
+  );
 }
 
 function factoryWriter(signer, version) {
-  if (version === 3) return factoryContract(signer);
+  if (version === 4) return factoryContract(signer);
   return new Contract(
     FACTORY_ADDRESS,
     [
-      version === 2 ? CREATE_V2 : CREATE_V1,
+      version === 3 ? CREATE_V3 : version === 2 ? CREATE_V2 : CREATE_V1,
       ...FACTORY_ABI.filter((item) => !item.startsWith("function createCampaign")),
     ],
     signer
   );
 }
 
+async function createCampaignTx(signer, params) {
+  if (!signer) throw new Error("请先连接钱包");
+  const version = await factoryCreateVersion(signer);
+  const f = new Contract(FACTORY_ADDRESS, createCampaignAbi(version), signer);
+  return f.createCampaign(...createArgs(params, version));
+}
+
 export async function createCampaignOnChain(signer, params) {
   if (!signer) throw new Error("请先连接钱包");
-  const f = factoryContract(signer);
   const caller = await signer.getAddress();
-  const owner = await f.owner();
+  const owner = await withReadProvider((provider) => factoryContract(provider).owner());
   if (String(caller).toLowerCase() !== String(owner).toLowerCase()) {
     throw new Error(
       `需 Factory Owner 钱包签名。当前 ${caller.slice(0, 6)}…${caller.slice(-4)}，Owner 为 ${owner.slice(0, 6)}…${owner.slice(-4)}`
@@ -867,6 +1005,9 @@ export async function createCampaignOnChain(signer, params) {
   }
 
   const version = await withReadProvider((provider) => factoryCreateVersion(provider));
+  if (version < 4) {
+    throw new Error("当前工厂开期不会把目标处理器写进期次合约。请先部署带晶体管地址参数的新工厂，再开期。");
+  }
   const args = createArgs(params, version);
   const writer = factoryWriter(signer, version);
   const iface = writer.interface;
@@ -876,22 +1017,28 @@ export async function createCampaignOnChain(signer, params) {
   try {
     gasLimit = await withReadProvider(async (provider) => {
       const reader = factoryWriter(provider, version);
-      await reader.createCampaign.staticCall(...args, { from: caller });
+      // 开期会在内部部署 Campaign。eth_call 默认 gas 不够时，节点只回空回退，ethers 显示 missing revert data。
+      const call = { from: caller, gasLimit: 12_000_000n };
+      await reader.createCampaign.staticCall(...args, call);
       const estimated = await reader.createCampaign.estimateGas(...args, { from: caller });
       return (estimated * 120n) / 100n;
     });
   } catch (err) {
-    throw new Error(decodeRevert(err, iface));
+    if (!isWalletSimError(err)) throw new Error(decodeRevert(err, iface));
+    gasLimit = 6_000_000n;
   }
 
   try {
     const t = await writer.createCampaign(...args, { gasLimit });
-    const receipt = await t.wait();
+    const receipt = await waitForReceipt(t.hash);
     if (receipt.status === 0) throw new Error("交易上链失败（status=0）");
     let campaign = parseCreatedCampaign(receipt);
     if (!campaign) {
-      const n = await f.campaignCount();
-      if (n > 0n) campaign = await f.campaigns(n - 1n);
+      campaign = await withReadProvider(async (provider) => {
+        const factory = factoryContract(provider);
+        const n = await factory.campaignCount();
+        return n > 0n ? factory.campaigns(n - 1n) : null;
+      });
     }
     if (!campaign) throw new Error("开期交易已确认，但未能解析新 Campaign 地址，请到顶栏切换期次或刷新");
     return { hash: t.hash, receipt, campaign };
@@ -1002,14 +1149,14 @@ function decodeRevert(err, iface) {
   if (/no data present/i.test(raw)) {
     return "合约拒绝了这笔交易，钱包没有带回具体原因。若是发布或流片，请确认当前钱包权限与晶体管子态后再试。";
   }
+  if (/missing revert data/i.test(raw)) {
+    return "节点没有带回失败原因（missing revert data）。开期请确认钱包 BSC 节点是 https://bsc-rpc.publicnode.com，不要用已超额的 1rpc。";
+  }
   if (/usage limit|1rpc\.io|#pricing|-32001/i.test(raw)) {
     return "当前 RPC 额度用尽。请硬刷新本页，并在钱包里把 BSC 主网节点改成 https://bsc-rpc.publicnode.com 后重试。";
   }
-  if (/could not coalesce error/i.test(raw)) {
-    if (/403|archive|personal token/i.test(raw)) {
-      return "钱包或节点 RPC 拒绝了估 gas。请把 BSC 主网 RPC 改成 https://bsc-dataseed.binance.org 后重试。";
-    }
-    return "钱包 RPC 估 gas 失败。请确认已切到 BSC 主网，并把节点改成 https://bsc-rpc.publicnode.com 后重试发布。";
+  if (/could not coalesce error|403|archive|personal token/i.test(raw)) {
+    return "公共节点暂时拒绝了这笔模拟。请刷新后再试；若钱包弹出更新 BSC 网络，点确认，节点用 https://bsc-rpc.publicnode.com。";
   }
   if (/insufficient funds|exceeds the balance/i.test(raw)) {
     return "钱包 BNB 不够付部署期次合约的 gas。开一期大约需要约 0.0002 BNB（按当前 gas 价）。";
@@ -1018,10 +1165,18 @@ function decodeRevert(err, iface) {
 }
 
 /** 统一发送并等待，返回 { hash, receipt }，出错抛出可读信息。 */
+async function waitForReceipt(hash) {
+  return withReadProvider(async (provider) => {
+    const receipt = await provider.waitForTransaction(hash, 1, 120_000);
+    if (!receipt) throw new Error("timeout");
+    return receipt;
+  });
+}
+
 export async function send(promiseTx) {
   try {
     const t = await promiseTx;
-    const receipt = await t.wait();
+    const receipt = await waitForReceipt(t.hash);
     return { hash: t.hash, receipt };
   } catch (err) {
     if (err?.code === "ACTION_REJECTED" || /user rejected|denied/i.test(err?.message || "")) {
@@ -1034,7 +1189,8 @@ export async function send(promiseTx) {
     const iface = new Interface([
       ...FACTORY_ABI,
       ...CAMPAIGN_ABI,
-      OLD_CREATE,
+      CREATE_V1,
+      CREATE_V2,
       "error NotOwner(address caller)",
       "error ZeroAddress()",
       "error ObservationPeriodActive(uint64 unlockAt)",

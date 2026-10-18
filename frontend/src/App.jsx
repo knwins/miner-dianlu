@@ -17,7 +17,7 @@ import {
 } from "./chain/client.js";
 import { discoverWallets, isMobile } from "./chain/wallets.js";
 import deployments from "./chain/deployments.json";
-import { OFFICIAL_PARTS } from "./tapeout.js";
+import { OFFICIAL_PARTS, partsContractForProcessor } from "./tapeout.js";
 import { buildExecuteStartData } from "./podStart.js";
 import { keccak256, toUtf8Bytes } from "ethers";
 
@@ -56,7 +56,6 @@ import {
   createPriceFeed,
   NETWORK_WEIGHT,
   NETWORK_DAILY_EMISSION,
-  MINE_GATE_LIMIT,
   fetchTaskBook,
   estimateHashpower,
   executeUnlockIn,
@@ -150,7 +149,8 @@ export default function App() {
   // ── 数据源切换：已部署则只用链上；未部署才走本地模拟 ──
   const usingChain = chain.active && chain.book != null;
   const chainEmpty = chain.active && chain.empty && !chain.book;
-  const chainBooting = chain.active && chain.loading && !chain.book;
+  // 工厂已部署时，读失败不能退回本地演示数据，否则会把真期次盖成「还没有」或假的第 3 期。
+  const chainBooting = chain.active && !chain.book && !chain.empty;
   /** 从链上 taskId + setPlan 算力反推题目与目标处理器，写入 round 供全页消费 */
   const design = useMemo(() => {
     const baseRound = usingChain ? chain.round : simRound;
@@ -351,12 +351,10 @@ export default function App() {
           if ((nandQty > 0n && nandPrice <= 0n) || (latchQty > 0n && latchPrice <= 0n)) {
             throw new Error("有数量的元件必须填写大于 0 的单价");
           }
-          const transistors = args?.transistors || OFFICIAL_PARTS.TAPE_OUT_NAND.contract;
-          const count = nandQty + latchQty;
-          const estHp = BigInt(Math.round((chainEst && chainEst.hashpower) || book.estimate?.hashpower || 0));
-          const capped =
-            Boolean(chainEst && chainEst.usedParts > MINE_GATE_LIMIT) || Boolean(book.capped);
-          await send(chainTx.setPlan(signer, estHp, capped, count));
+          const transistors = args?.transistors
+            || book.transistors
+            || partsContractForProcessor(round.processorId)
+            || OFFICIAL_PARTS.TAPE_OUT_NAND.contract;
           await send(chainTx.placeTransistorOrder(signer, transistors, nandQty, nandPrice, latchQty, latchPrice));
         } else if (method === "openRefund") {
           await send(chainTx.openRefund(signer));
@@ -366,7 +364,9 @@ export default function App() {
         }
         setNotice(method === "openRefund"
           ? "链上已退款。认筹 BNB 已按认筹地址原路退回。"
-          : `已确认：${method} ✓`);
+          : method === "placeTransistorOrder"
+            ? "已向材料市场挂单。保证金从本期募集款托管。"
+            : `已确认：${method} ✓`);
         await chain.refresh();
         if (
           method === "claim"
@@ -452,6 +452,8 @@ export default function App() {
       activeSigner = w.signer;
     }
 
+    const transistors = partsContractForProcessor(draft.processorId);
+    if (!transistors) throw new Error("请选择目标处理器 TapeOut 或 Behemoth");
     const { campaign: created, hash } = await createCampaignOnChain(activeSigner, {
       sharePriceWei,
       totalShares,
@@ -461,6 +463,7 @@ export default function App() {
       feeShares,
       taskId,
       netlistHash,
+      transistors,
     });
 
     setCampaignAddress(created);
@@ -780,11 +783,11 @@ export default function App() {
               </div>
               <div className="topbar-wallet">
                 <div className="wallet-menu">
-                  {usingChain && chain.account ? (
+                  {chain.account ? (
                     <>
                       <button className="wallet-chip" type="button">
-                        <span className="topbar-role">{actor.label}</span>
-                        {shortAddress(account)}
+                        <span className="topbar-role">{chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Factory Owner" : "已连接"}</span>
+                        {shortAddress(chain.account)}
                       </button>
                       <div className="wallet-pop" role="dialog" aria-label="钱包详情">
                         <div className="wallet-pop-head">
@@ -795,8 +798,8 @@ export default function App() {
                           <div className="wallet-addr">
                             <div className="wallet-addr-top">
                               <div>
-                                <span>当前钱包 · {actor.label}</span>
-                                <strong>{shortAddress(account)}</strong>
+                                <span>当前钱包 · {chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Factory Owner" : "已连接"}</span>
+                                <strong>{shortAddress(chain.account)}</strong>
                               </div>
                               <button
                                 className="wallet-copy"
@@ -804,7 +807,7 @@ export default function App() {
                                 onClick={() => {
                                   const done = () => setNotice("已复制钱包地址");
                                   if (navigator.clipboard?.writeText) {
-                                    navigator.clipboard.writeText(account).then(done).catch(() => setNotice("复制失败"));
+                                    navigator.clipboard.writeText(chain.account).then(done).catch(() => setNotice("复制失败"));
                                   } else {
                                     setNotice("复制失败");
                                   }
@@ -813,13 +816,17 @@ export default function App() {
                                 复制地址
                               </button>
                             </div>
-                            <code>{account}</code>
+                            <code>{chain.account}</code>
                           </div>
-                          <dl className="wallet-stats">
-                            <div><dt>BNB</dt><dd>{Number(book.bnb || 0).toFixed(4)}</dd></div>
-                            <div><dt>BEM</dt><dd>{formatBem(book.bemBalance || 0)}</dd></div>
-                            <div><dt>本期份额</dt><dd>{(book.mine || 0) + (book.listingShares || 0)} 份</dd></div>
-                          </dl>
+                          {chain.book ? (
+                            <dl className="wallet-stats">
+                              <div><dt>BNB</dt><dd>{Number(chain.book.bnb || 0).toFixed(4)}</dd></div>
+                              <div><dt>BEM</dt><dd>{formatBem(chain.book.bemBalance || 0)}</dd></div>
+                              <div><dt>本期份额</dt><dd>{(chain.book.mine || 0) + (chain.book.listingShares || 0)} 份</dd></div>
+                            </dl>
+                          ) : (
+                            <p className="wallet-pop-label">钱包已连接。当前工厂还没有期次，开期后这里会显示余额和份额。</p>
+                          )}
                           <button
                             className="wallet-disconnect"
                             type="button"
@@ -1253,7 +1260,7 @@ function RoundHub({
             tone={ended ? "done" : copy.tone}
             periods={periods}
             onSwitchPeriod={onSwitchPeriod}
-            processor={estimateHashpower(round, quote, round.totalShares, taskbook).processor || round.processorId}
+            processor={round.processorId || "未记录"}
           />
           <RoundFacts round={round} book={book} quote={quote} taskbook={taskbook} />
           <article className="card progress-card">
@@ -1636,7 +1643,7 @@ function OwnerDesk({
           pendingTarget={pendingTarget}
           actor={actor}
           executeWait={executeWait}
-          history={usingChain ? chain.campaigns : null}
+          history={chain.active ? chain.campaigns : null}
           onSwitchCampaign={usingChain ? chain.switchCampaign : null}
           onPlaceTransistorOrder={onPlaceTransistorOrder}
           onOpenRefund={onOpenRefund}
@@ -1690,6 +1697,7 @@ function ProcessorGlyph({ name, size = 18 }) {
 function RoundFacts({ round, book, quote, taskbook }) {
   const est = estimateHashpower(round, quote, round.totalShares, taskbook);
   const executed = book.hashpower > 0;
+  const namedProcessor = Boolean(round.processorId);
   const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
   const harvest = computeHarvest(round, book);
   return (
@@ -1708,7 +1716,7 @@ function RoundFacts({ round, book, quote, taskbook }) {
         <article className="stat-card">
           <div className="stat-label">目标处理器</div>
           <div className="stat-value processor-value">
-            <span>{est.processor || round.processorId || "—"}</span>
+            <span>{round.processorId || est.processor || "未记录"}</span>
             <span className="processor-scale">P={est.processorScale || "—"}</span>
           </div>
         </article>
@@ -1770,22 +1778,24 @@ function RoundFacts({ round, book, quote, taskbook }) {
               预估算力
               <em className="est-tag">按当前报价</em>
             </div>
-            <div className="stat-value">{est.hashpower.toLocaleString("zh-CN")} H</div>
+            <div className="stat-value">{namedProcessor ? `${est.hashpower.toLocaleString("zh-CN")} H` : "—"}</div>
           </article>
           <article className="stat-card">
             <div className="stat-label">预估日产</div>
-            <div className="stat-value">{formatBem(est.dailyBem)} BEM</div>
+            <div className="stat-value">{namedProcessor ? `${formatBem(est.dailyBem)} BEM` : "—"}</div>
           </article>
           <article className="stat-card">
             <div className="stat-label">募资总额可买元件</div>
-            <div className="stat-value">{est.affordableParts.toLocaleString("zh-CN")} 个</div>
+            <div className="stat-value">{namedProcessor ? `${est.affordableParts.toLocaleString("zh-CN")} 个` : "—"}</div>
           </article>
           <article className="stat-card">
             <div className="stat-label">{book.executionFailed ? "合约剩余" : "报价余量"}</div>
-            <div className="stat-value" style={!book.executionFailed && !est.capCoversFloor ? { color: "var(--color-danger)" } : undefined}>
+            <div className="stat-value" style={!book.executionFailed && namedProcessor && !est.capCoversFloor ? { color: "var(--color-danger)" } : undefined}>
               {book.executionFailed
                 ? `${round4(book.bnbPool || 0)} BNB`
-                : est.capCoversFloor
+                : !namedProcessor
+                  ? "—"
+                  : est.capCoversFloor
                   ? `${(est.hardCapBnb - est.needBnb).toFixed(4)} BNB`
                   : `缺 ${(est.needBnb - est.hardCapBnb).toFixed(4)} BNB`}
             </div>
@@ -1795,20 +1805,22 @@ function RoundFacts({ round, book, quote, taskbook }) {
           </article>
           <article className="stat-card">
             <div className="stat-label">预估日产（已扣服务费）</div>
-            <div className="stat-value">{formatBem(est.dailyBem * (1 - feeRate(round)))} BEM</div>
+            <div className="stat-value">{namedProcessor ? `${formatBem(est.dailyBem * (1 - feeRate(round)))} BEM` : "—"}</div>
           </article>
           <article className="stat-card wide-stat note-card">
             <div className="stat-label">预估随报价浮动，不是承诺</div>
             <p className="note-copy">
               {book.executionFailed
                 ? `本期已退款。合约里剩余 ${round4(book.bnbPool || 0)} BNB，累计已退回 ${round4(book.refundedTotal || 0)} BNB。上面的算力和元件个数仍按募资总额与当前报价估算，不是合约余额。`
-                : <>
-                  募资总额 {est.hardCapBnb.toFixed(4)} BNB，按 {est.processor} 当前报价（NAND {est.priceNand.toFixed(4)}{est.latch > 0 ? ` / LATCH ${est.priceLatch.toFixed(4)}` : ""} BNB，混合均价{" "}
+                : round.processorId ? <>
+                  募资总额 {est.hardCapBnb.toFixed(4)} BNB，按 {round.processorId} 当前报价（NAND {est.priceNand.toFixed(4)}{est.latch > 0 ? ` / LATCH ${est.priceLatch.toFixed(4)}` : ""} BNB，混合均价{" "}
                   {est.usedParts > 0 ? (est.needBnb / est.usedParts).toFixed(4) : "0.0000"} BNB/个）可买 {est.affordableParts} 个；本期题目 {est.usedParts} 个元件（
                   {est.nand} NAND + {est.latch} LATCH{est.latch === 0 ? "，纯组合逻辑" : ""}），权重 H ={" "}
                   {est.hashpower} = {est.usedParts} ×{est.processorScale}
                   {est.optimal ? ` + 溢价 ${est.refParts}×${est.q}` : "（非最优，无设计溢价）"}。
                   报价余量是募资总额减去当前元件成本，不是合约里还剩多少 BNB。
+                </> : <>
+                  募资总额 {est.hardCapBnb.toFixed(4)} BNB。本期合约没有写入目标处理器，名称是未记录，P 留空。
                 </>}
             </p>
           </article>
@@ -1840,7 +1852,7 @@ function ProductPage({ round, book, copy, quote, taskbook, remaining, pay, count
         tone={copy.tone}
         periods={periods}
         onSwitchPeriod={onSwitchPeriod}
-        processor={est.processor || round.processorId}
+        processor={round.processorId || est.processor || "未记录"}
       />
 
       <RoundFacts round={round} book={book} quote={quote} taskbook={taskbook} />
@@ -2483,7 +2495,7 @@ function RulesPage({ campaigns = [] }) {
       address: deployments.pod,
       verify: podIsAdapter,
       use: podIsAdapter
-        ? `各期共用。对外仍是 IPoD，对内调官方 ${officialPod.slice(0, 10)}…。execute 前当期须持有电路 NFT，startData 须带官方证明。`
+        ? `各期共用。对外仍是 IPoD，对内调官方 ${officialPod}。execute 前当期须持有电路 NFT，startData 须带官方证明。`
         : podIsOfficial
           ? "各期共用。流片调 start，harvest 调 claim，入账金额是实收。"
           : "官方 PoD 认的是电路 NFT 持有人：调用 start 的地址必须是 ownerOf。手里还有晶体管不算。主网这一期仍接同接口替身。流片调 start，分发调 claim。",
@@ -2511,26 +2523,23 @@ function RulesPage({ campaigns = [] }) {
     : [];
   const campaignRows = periodContracts.length ? periodContracts : fallbackPeriod;
 
-  function renderContractRows(items, { fullAddress = false } = {}) {
+  function renderContractRows(items) {
     return items.filter((item) => item.address).map((item) => {
       const href = item.href || explorerAddress(item.address);
-      const label = fullAddress ? item.address : shortAddress(item.address);
       return (
         <li key={`${item.name}-${item.address}`}>
-          <div className="rules-contract-main">
+          <div className="rules-contract-head">
             <strong>{item.name}</strong>
-            {item.use ? <p>{item.use}</p> : null}
-          </div>
-          <div className="rules-contract-side">
-            {href ? (
-              <a className={`mono${fullAddress ? " is-full" : ""}`} href={href} target="_blank" rel="noreferrer" title={item.address}>{label}</a>
-            ) : (
-              <code className={`mono${fullAddress ? " is-full" : ""}`} title={item.address}>{label}</code>
-            )}
             {item.verify ? (
               <a className="rules-verify" href={sourcifySource(item.address)} target="_blank" rel="noreferrer">开源验证</a>
             ) : null}
           </div>
+          {item.use ? <p>{item.use}</p> : null}
+          {href ? (
+            <a className="mono rules-contract-addr" href={href} target="_blank" rel="noreferrer">{item.address}</a>
+          ) : (
+            <code className="mono rules-contract-addr">{item.address}</code>
+          )}
         </li>
       );
     });
@@ -2638,7 +2647,7 @@ function RulesPage({ campaigns = [] }) {
               服务费分成地址写在每一期里。
             </p>
           </div>
-          <ul className="rules-contracts">{renderContractRows(sharedContracts, { fullAddress: true })}</ul>
+          <ul className="rules-contracts">{renderContractRows(sharedContracts)}</ul>
         </section>
         <section className="rules-block">
           <div className="rules-block-head">
@@ -2646,7 +2655,7 @@ function RulesPage({ campaigns = [] }) {
             <p>每一期有独立 Campaign，认筹、托管、退款、流片和领取都走它。</p>
           </div>
           {campaignRows.length ? (
-            <ul className="rules-contracts is-compact">{renderContractRows(campaignRows)}</ul>
+            <ul className="rules-contracts">{renderContractRows(campaignRows)}</ul>
           ) : (
             <p className="rules-note">尚未开期。工厂已部署，期次合约要等发布后才会出现。</p>
           )}

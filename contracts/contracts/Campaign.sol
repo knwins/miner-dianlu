@@ -133,9 +133,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     event FeeSharesUpdated(uint256 count);
     /// @notice One fee split. remainder is the rounding dust sent to the owner.
     event FeeDistributed(uint256 totalFee, uint256 remainder);
-    /// @notice Owner pulled ERC1155 transistors out of this campaign. `to` is the owner at that moment.
+    /// @notice Test rescue: Owner pulled ERC1155 parts out so they are not left in the campaign. `to` is the owner.
     event TransistorsRecovered(address indexed token, uint256 indexed id, uint256 amount, address indexed to);
-    /// @notice Owner pulled BNB out of this campaign. `to` is the owner at that moment.
+    /// @notice Test rescue: Owner pulled BNB that was stuck in the campaign. `to` is the owner.
     event BnbRecovered(uint256 amount, address indexed to);
 
     // ─────────────────────── errors ───────────────────────
@@ -161,13 +161,15 @@ contract Campaign is Ownable, ReentrancyGuard {
     error NotListed();
     error AlreadyReady();
     error TransferFailed();
-    error OrderTouched();
+    error OrderFilled();
+    error BadBidId();
     error BadFeeShares();
     error PodCallFailed();
 
     /// @param minter_ Material-market address. The storage name stays minter; read it via minter().
     /// @param feeRecipients_ / feeShareBps_ Fee-share table. Shares must sum to 10000.
     /// @param netlistHash_ Compared with keccak256(tapeoutData) inside execute.
+    /// @param transistors_ Official ERC1155 parts contract for this round (TapeOut or Behemoth). Locked at create; placeBid uses it.
     constructor(
         uint256 sharePriceBnb_,
         uint256 totalShares_,
@@ -182,9 +184,12 @@ contract Campaign is Ownable, ReentrancyGuard {
         bytes32 netlistHash_,
         address owner_,
         uint256 netWeightVerified_,
-        uint256 netWeightUnverified_
+        uint256 netWeightUnverified_,
+        address transistors_
     ) Ownable(owner_) {
-        if (pod_ == address(0) || bem_ == address(0) || minter_ == address(0)) revert ZeroAddress();
+        if (pod_ == address(0) || bem_ == address(0) || minter_ == address(0) || transistors_ == address(0)) {
+            revert ZeroAddress();
+        }
         if (totalShares_ == 0 || sharePriceBnb_ == 0) revert ZeroShares();
         sharePriceBnb = sharePriceBnb_;
         totalShares = totalShares_;
@@ -195,6 +200,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         bem = IERC20(bem_);
         market = IMaterialMarket(minter_);
         netlistHash = netlistHash_;
+        transistors = transistors_;
         scene = Scene.Funding;
         phase = Phase.None;
         netWeightVerified = netWeightVerified_;
@@ -324,13 +330,15 @@ contract Campaign is Ownable, ReentrancyGuard {
     // ─────────────────────────── refund (pull) ───────────────────────────
 
     /// @notice The subscriber pulls their principal. Nothing runs automatically at the deadline.
-    ///         Allowed when Funding and timestamp > fundingDeadline, or Executing and executionFailed.
-    ///         Returns count × sharePriceBnb, zeroes shares, and rolls sold and raisedBnb back.
+    ///         Allowed when Funding and timestamp > fundingDeadline, Executing and executionFailed,
+    ///         or Executing/Buying when raisedBnb can no longer cover every share (a partial fill was settled).
+    ///         A full pool pays count × sharePriceBnb. A short pool pays pro-rata of raisedBnb.
     ///         Reverts if this wallet still has escrowed shares.
     function refund() external nonReentrant {
         bool fundingExpired = scene == Scene.Funding && block.timestamp > fundingDeadline;
         bool execFailed = scene == Scene.Executing && executionFailed;
-        if (!fundingExpired && !execFailed) revert RefundNotAvailable();
+        bool short = scene == Scene.Executing && phase == Phase.Buying && _shortfall();
+        if (!fundingExpired && !execFailed && !short) revert RefundNotAvailable();
 
         // A failed send must revert the whole tx. Soft-fail would surface as ZeroShares.
         if (_refundHolder(msg.sender, false) == 0) revert ZeroShares();
@@ -342,13 +350,17 @@ contract Campaign is Ownable, ReentrancyGuard {
         _holders.push(who);
     }
 
-    /// @dev Refund this wallet's remaining principal. Returns 0 if shares are 0 or any shares are escrowed.
+    /// @dev Refund this wallet. Returns 0 if shares are 0, any shares are escrowed, or the pro-rata share rounds to 0.
+    ///      A full pool pays count × sharePriceBnb. A short pool pays raisedBnb × shares / sold.
     ///      soft=true (openRefund): a failed send restores this wallet and is skipped.
     ///      soft=false: a failed send reverts the whole transaction.
     function _refundHolder(address who, bool soft) internal returns (uint256 amount) {
         uint256 s = _shares[who];
-        if (s == 0 || _escrow[who] != 0) return 0;
-        amount = s * sharePriceBnb;
+        if (s == 0 || _escrow[who] != 0 || sold == 0) return 0;
+        uint256 owed = s * sharePriceBnb;
+        uint256 poolOwed = sold * sharePriceBnb;
+        amount = raisedBnb >= poolOwed ? owed : (raisedBnb * s) / sold;
+        if (amount == 0) return 0;
         _shares[who] = 0;
         sold -= s;
         raisedBnb -= amount;
@@ -429,6 +441,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     // ─────────────────────────── secondary-market bids (owner) ───────────────────────────
 
     /// @notice Place bids on the material market. NAND tokenId is 0, LATCH is 1. Owner only, phase must be Buying.
+    ///         Uses the transistors address locked at create. `transistors_` must be address(0) or equal that address.
     ///         Escrow is debited from raisedBnb and sent with placeBid. A zero-qty leg is skipped and its bid id stays 0.
     ///         If cost > raisedBnb, sets executionFailed and returns. The tx does not revert and no bid is placed.
     ///         Reverts if already failed and (not sold out or raisedBnb is 0). A sold-out round with BNB left clears the flag and places.
@@ -442,7 +455,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (scene != Scene.Executing) revert WrongScene();
         if (phase == Phase.Ready) revert AlreadyReady();
         if (phase == Phase.Listed) revert AlreadyListed();
-        if (transistors_ == address(0)) revert ZeroAddress();
+        if (transistors == address(0)) revert ZeroAddress();
+        if (transistors_ != address(0) && transistors_ != transistors) revert ZeroAddress();
         if (nandQty_ == 0 && latchQty_ == 0) revert ZeroShares();
         if ((nandQty_ > 0 && nandPrice_ == 0) || (latchQty_ > 0 && latchPrice_ == 0)) revert ZeroPrice();
         if (executionFailed && (sold < totalShares || raisedBnb == 0)) revert RefundNotAvailable();
@@ -458,7 +472,6 @@ contract Campaign is Ownable, ReentrancyGuard {
 
         executionFailed = false;
         raisedBnb -= cost;
-        transistors = transistors_;
         nandQty = nandQty_;
         latchQty = latchQty_;
         nandPrice = nandPrice_;
@@ -466,10 +479,12 @@ contract Campaign is Ownable, ReentrancyGuard {
         transistorCount = nandQty_ + latchQty_;
         priceLock = cost;
         if (nandQty_ > 0) {
-            nandBidId = market.placeBid{value: nandCost}(transistors_, 0, nandPrice_, nandQty_);
+            nandBidId = market.placeBid{value: nandCost}(transistors, 0, nandPrice_, nandQty_);
+            if (nandBidId == 0) revert BadBidId();
         }
         if (latchQty_ > 0) {
-            latchBidId = market.placeBid{value: latchCost}(transistors_, 1, latchPrice_, latchQty_);
+            latchBidId = market.placeBid{value: latchCost}(transistors, 1, latchPrice_, latchQty_);
+            if (latchBidId == 0) revert BadBidId();
         }
         phase = Phase.Listed;
         emit TransistorOrderPlaced(transistorCount, cost);
@@ -490,28 +505,32 @@ contract Campaign is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @notice Listed only, and both legs' remaining must equal the ordered qty. Any touched leg reverts the whole call.
-    ///         After cancelBid the market refunds escrow into receive. This function does not credit raisedBnb itself.
-    ///         Then it clears the order and returns to Buying.
-    function cancelTransistorOrder() external onlyOwner nonReentrant {
+    /// @notice Cancel whatever is still open on the market, then return to Buying.
+    ///         An untouched order can be cancelled by the owner only.
+    ///         Once any quantity has filled, anyone may cancel the remainder so the escrow comes back.
+    ///         A fully filled order whose parts are already in this contract cannot be cancelled.
+    ///         cancelBid refunds the unfilled escrow into receive. Filled quantity stays spent.
+    function cancelTransistorOrder() external nonReentrant {
         if (scene != Scene.Executing) revert WrongScene();
         if (phase != Phase.Listed) revert NotListed();
-        _assertUntouched(nandBidId, nandQty);
-        _assertUntouched(latchBidId, latchQty);
-        if (nandBidId != 0) market.cancelBid(nandBidId);
-        if (latchBidId != 0) market.cancelBid(latchBidId);
+        bool touched = _filledSome(nandBidId, nandQty) || _filledSome(latchBidId, latchQty);
+        if (orderFilled() && _partsOnHand()) revert OrderFilled();
+        if (!touched && msg.sender != owner) revert NotOwner(msg.sender);
+        _cancelOpenLeg(nandBidId, nandQty);
+        _cancelOpenLeg(latchBidId, latchQty);
         _clearOrder();
         phase = Phase.Buying;
         emit TransistorOrderCancelled();
     }
 
-    /// @notice Anyone may call. Does not move tokens. Parts should already have arrived via fillBid ERC1155.
-    ///         Moves Listed → Ready only when both legs have remaining == 0. A zero-qty leg counts as filled.
+    /// @notice Anyone may call. Does not move tokens.
+    ///         Moves Listed → Ready only when both legs have remaining == 0 and this contract holds the parts.
+    ///         A zero-qty leg counts as filled.
     function confirmTransistors() external {
         if (scene != Scene.Executing) revert WrongScene();
         if (phase == Phase.Ready) revert AlreadyReady();
         if (phase != Phase.Listed) revert NotListed();
-        if (!orderFilled()) revert TransistorsNotReady();
+        if (!orderFilled() || !_partsOnHand()) revert TransistorsNotReady();
         phase = Phase.Ready;
         emit TransistorsConfirmed();
     }
@@ -532,7 +551,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (phase != Phase.Ready) revert TransistorsNotReady();
         if (keccak256(tapeoutData) != netlistHash) revert NetlistMismatch();
         if (transistorCount == 0 || priceLock == 0) revert ZeroPrice();
-        if (!orderFilled()) revert TransistorsNotReady();
+        if (!orderFilled() || !_partsOnHand()) revert TransistorsNotReady();
 
         uint256 spent = priceLock;
         // Part cost was already escrowed in placeBid. Return leftover BNB, then start mining.
@@ -616,7 +635,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     // ─────────────────────────── internal ───────────────────────────
 
     /// @dev After a successful tape-out, return unused raisedBnb pro-rata. Rounding dust goes to the owner.
-    ///      A rejecting address leaves that slice in raisedBnb and does not abort execute. Owner may later rescueUnsentBnb.
+    ///      A rejecting address leaves that slice in raisedBnb and does not abort execute. During tests, rescueUnsentBnb can pull it out.
     function _returnSurplus() internal {
         uint256 leftover = raisedBnb;
         if (leftover == 0 || sold == 0) return;
@@ -688,9 +707,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit FeeSharesUpdated(n);
     }
 
-    /// @notice Owner only. Moves ERC1155 transistors held by this campaign to the current owner.
-    ///         Blocked while an order is live (Listed) or confirmed for tape-out (Ready): those parts belong to the round.
-    ///         Allowed in Buying / Funding / Mining (and after cancel). Execute does not burn parts, so Mining is the usual rescue.
+    /// @notice Test rescue. Sends ERC1155 parts held by this campaign to the current owner so a test transfer is not lost.
+    ///         Blocked while an order is live (Listed) or waiting for tape-out (Ready).
     ///         Does not change the order, price lock, or scene. Recipient is always `owner`.
     function recoverTransistors(address token, uint256 id, uint256 amount) external onlyOwner nonReentrant {
         if (phase == Phase.Listed) revert AlreadyListed();
@@ -701,10 +719,10 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit TransistorsRecovered(token, id, amount, owner);
     }
 
-    /// @notice Owner only. Sends BNB held by this campaign to the current owner and emits BnbRecovered.
-    ///         Funding / Executing: only the excess over raisedBnb (ledger dust). Subscription escrow stays locked.
-    ///         Mining: can also pull remaining raisedBnb (rejected surplus / leftover after tape-out).
-    ///         Recipient is always `owner`, not an arbitrary address.
+    /// @notice Test rescue. Sends BNB stuck in this campaign to the current owner and emits BnbRecovered.
+    ///         Funding / Executing: only the excess over raisedBnb, so subscription escrow stays put.
+    ///         Mining: can also take remaining raisedBnb left after a rejected surplus transfer.
+    ///         Recipient is always `owner`.
     function recoverBnb(uint256 amount) external onlyOwner nonReentrant {
         if (amount == 0) revert ZeroShares();
         uint256 bal = address(this).balance;
@@ -720,7 +738,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit BnbRecovered(amount, owner);
     }
 
-    /// @notice Mining only. Sends the entire remaining raisedBnb to `to`. Prefer recoverBnb when the recipient is the owner.
+    /// @notice Test rescue. Mining only. Sends the remaining raisedBnb to `to` when a holder rejected the surplus
+    ///         and the BNB would otherwise sit in this campaign. `to` may be the rejected address or the owner.
     function rescueUnsentBnb(address to) external onlyOwner nonReentrant {
         if (scene != Scene.Mining) revert WrongScene();
         if (to == address(0)) revert ZeroAddress();
@@ -735,9 +754,31 @@ contract Campaign is Ownable, ReentrancyGuard {
         return _remaining(id) == 0;
     }
 
-    function _assertUntouched(uint256 id, uint256 qty) internal view {
-        if (qty == 0) return;
-        if (_remaining(id) != qty) revert OrderTouched();
+    /// @dev True when the seller has taken at least one unit, including a leg whose remaining is already 0.
+    function _filledSome(uint256 id, uint256 qty) internal view returns (bool) {
+        if (qty == 0) return false;
+        return _remaining(id) < qty;
+    }
+
+    /// @dev Cancel the unfilled remainder. A filled leg (remaining == 0) is left alone; cancelBid would revert.
+    function _cancelOpenLeg(uint256 id, uint256 qty) internal {
+        if (qty == 0 || id == 0) return;
+        if (_remaining(id) == 0) return;
+        market.cancelBid(id);
+    }
+
+    /// @dev True when raised BNB can no longer repay every outstanding share at the subscription price.
+    function _shortfall() internal view returns (bool) {
+        if (sold == 0) return false;
+        return raisedBnb < sold * sharePriceBnb;
+    }
+
+    /// @dev Parts for the live order are in this contract. Token id 0 is NAND, 1 is LATCH.
+    function _partsOnHand() internal view returns (bool) {
+        IERC1155 token = IERC1155(transistors);
+        if (nandQty > 0 && token.balanceOf(address(this), 0) < nandQty) return false;
+        if (latchQty > 0 && token.balanceOf(address(this), 1) < latchQty) return false;
+        return true;
     }
 
     function _remaining(uint256 id) internal view returns (uint256 remaining) {
@@ -752,7 +793,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         latchQty = 0;
         nandPrice = 0;
         latchPrice = 0;
-        transistors = address(0);
+        // transistors stays: locked at create for this round's TapeOut / Behemoth parts contract
         transistorCount = 0;
         priceLock = 0;
     }

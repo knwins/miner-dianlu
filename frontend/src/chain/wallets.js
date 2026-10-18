@@ -34,7 +34,7 @@ export function inAppWalletName() {
   if (/TokenPocket/i.test(ua)) return "TokenPocket";
   if (/MetaMask/i.test(ua)) return "MetaMask";
   if (/Trust/i.test(ua)) return "Trust Wallet";
-  if (/OKApp|OKEx/i.test(ua)) return "OKX Wallet";
+  if (/OKApp|OKEx|\bOKX\b/i.test(ua)) return "OKX Wallet";
   if (/imToken/i.test(ua)) return "imToken";
   if (/BitKeep|Bitget/i.test(ua)) return "Bitget Wallet";
   if (/Coinbase/i.test(ua)) return "Coinbase Wallet";
@@ -215,6 +215,28 @@ export async function discoverWallets() {
     );
   }
   return list;
+}
+
+const WALLET_ID_KEY = "miner.walletId";
+
+export function walletIdOf(provider) {
+  return labelOf(provider).id;
+}
+
+export function rememberWallet(provider) {
+  try {
+    sessionStorage.setItem(WALLET_ID_KEY, walletIdOf(provider));
+  } catch {
+    /* 隐私模式 */
+  }
+}
+
+export function rememberedWalletId() {
+  try {
+    return sessionStorage.getItem(WALLET_ID_KEY) || "";
+  } catch {
+    return "";
+  }
 }
 
 export function explainConnectError(error) {

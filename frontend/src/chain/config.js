@@ -35,10 +35,7 @@ const NETWORKS = {
     // 不用 1rpc：免费额度用尽会回 -32001。读链会按顺序自动换节点。
     rpcUrls: [
       "https://bsc-rpc.publicnode.com",
-      "https://bsc-dataseed.binance.org",
-      "https://bsc-dataseed1.binance.org",
-      "https://bsc-dataseed2.binance.org",
-      "https://bsc-dataseed1.defibit.io",
+      "https://bsc-mainnet.public.blastapi.io",
     ],
     explorer: "https://bscscan.com",
     currency: { name: "BNB", symbol: "BNB", decimals: 18 },
@@ -69,5 +66,6 @@ export function explorerCode(addr) {
   return base ? `${base}#code` : "";
 }
 export function sourcifySource(addr) {
-  return addr ? `https://repo.sourcify.dev/contracts/full_match/${CHAIN_ID}/${addr}/` : "";
+  // 新版仓库页：/56/0x…；旧路径 /contracts/full_match/… 已不再提供 metadata.json
+  return addr ? `https://repo.sourcify.dev/${CHAIN_ID}/${addr}` : "";
 }

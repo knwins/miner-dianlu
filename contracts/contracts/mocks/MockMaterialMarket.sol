@@ -17,10 +17,16 @@ contract MockMaterialMarket is IMaterialMarket {
     }
 
     uint256 public nextBidId = 1;
+    /// @dev Test switch. When set, placeBid returns 0 and keeps the escrow, matching a market that fails to assign an id.
+    bool public returnZeroId;
     mapping(uint256 => Bid) private _bids;
 
     error BadBid();
     error NotBuyer();
+
+    function setReturnZeroId(bool on) external {
+        returnZeroId = on;
+    }
 
     function placeBid(address transistors, uint8 tokenId, uint96 price, uint256 quantity)
         external
@@ -29,6 +35,7 @@ contract MockMaterialMarket is IMaterialMarket {
     {
         if (transistors == address(0) || price == 0 || quantity == 0) revert BadBid();
         if (msg.value != uint256(price) * quantity) revert BadBid();
+        if (returnZeroId) return 0;
         id = nextBidId++;
         _bids[id] = Bid({
             buyer: msg.sender,

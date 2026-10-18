@@ -64,6 +64,22 @@ export const OFFICIAL_PARTS = {
   BEHEMOTH_LATCH: { cpu: OFFICIAL_CPUS.Behemoth, contract: "0xE2DfD802081C7a05341E20b6582b04b908e8550c", tokenId: 1 },
 };
 
+/** 开期选的处理器 → 官方晶体管 ERC1155 地址（挂单 placeBid 用同一个）。 */
+export function partsContractForProcessor(processorId) {
+  if (processorId === "TapeOut") return OFFICIAL_PARTS.TAPE_OUT_NAND.contract;
+  if (processorId === "Behemoth") return OFFICIAL_PARTS.BEHEMOTH_NAND.contract;
+  return "";
+}
+
+/** 链上 transistors 地址 → 处理器名。旧期次未写入时返回空。 */
+export function processorFromPartsContract(address) {
+  const a = String(address || "").toLowerCase();
+  if (!a || a === "0x0000000000000000000000000000000000000000") return "";
+  if (a === OFFICIAL_PARTS.TAPE_OUT_NAND.contract.toLowerCase()) return "TapeOut";
+  if (a === OFFICIAL_PARTS.BEHEMOTH_NAND.contract.toLowerCase()) return "Behemoth";
+  return "";
+}
+
 async function fetchJson(url, timeoutMs = 12000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);

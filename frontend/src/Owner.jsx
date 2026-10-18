@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ContractCalls } from "./Calls.jsx";
 import OnChainPage from "./OnChain.jsx";
 import { formatEther } from "./chain/client.js";
 import { OFFICIAL_CPU_TAPEOUT } from "./podStart.js";
+import { processorFromPartsContract } from "./tapeout.js";
 import deployments from "./chain/deployments.json";
 import {
   MARKET,
@@ -119,8 +120,12 @@ export function OwnerOverview({
   const [latchQty, setLatchQty] = useState("0");
   const [nandPrice, setNandPrice] = useState("0");
   const [latchPrice, setLatchPrice] = useState("0");
+  const priceTouched = useRef(false);
   useEffect(() => {
-    if (book.executePhase !== "buying") return;
+    priceTouched.current = false;
+  }, [book.address]);
+  useEffect(() => {
+    if (book.executePhase !== "buying" || priceTouched.current) return;
     const est = book.estimate || {};
     setNandQty(String(est.nand || 0));
     setLatchQty(String(est.latch || 0));
@@ -130,7 +135,7 @@ export function OwnerOverview({
   const historyRows = (history != null ? history : PAST_ROUNDS).map((item) => {
     const onChainRow = history != null;
     const rowDesign = resolveCampaignDesign(
-      { taskId: item.taskId, transistorId: onChainRow ? null : item.transistorId, processorId: onChainRow ? null : item.processor },
+      { taskId: item.taskId, transistorId: onChainRow ? null : item.transistorId, processorId: onChainRow ? (item.processor || processorFromPartsContract(item.transistors) || null) : item.processor },
       onChainRow
         ? {
             _chain: true,
@@ -287,68 +292,159 @@ export function OwnerOverview({
                     book.executePhase === "ready" ? "已到账 · 待流片"
                       : book.executePhase === "listed" ? "挂单中 · 待成交"
                         : "待挂单";
-                  const nandN = Math.max(0, Math.floor(Number(nandQty) || 0));
-                  const latchN = Math.max(0, Math.floor(Number(latchQty) || 0));
+                  // 图纸不需要的腿数量固定为 0，不展示、不挂单
+                  const showNand = Number(est.nand) > 0;
+                  const showLatch = Number(est.latch) > 0;
+                  const nandN = showNand ? Math.max(0, Math.floor(Number(nandQty) || 0)) : 0;
+                  const latchN = showLatch ? Math.max(0, Math.floor(Number(latchQty) || 0)) : 0;
                   const nandP = Number(nandPrice) || 0;
                   const latchP = Number(latchPrice) || 0;
                   const orderCost = round4(nandN * nandP + latchN * latchP);
-                  const canPlace = isOwner && (nandN > 0 || latchN > 0) && (nandN === 0 || nandP > 0) && (latchN === 0 || latchP > 0);
+                  const canPlace = isOwner && (nandN > 0 || latchN > 0) && (!showNand || nandP > 0) && (!showLatch || latchP > 0);
                   const overBudget = orderCost > raised && raised > 0;
+                  const partLabel = [
+                    showNand ? `${est.nand || nandN} NAND` : null,
+                    showLatch ? `${est.latch || latchN} LATCH` : null,
+                  ].filter(Boolean).join(" + ") || "无需元件";
+                  const bidRows = [
+                    Number(book.nandQty) > 0
+                      ? { part: "NAND", id: book.nandBidId || "—", qty: book.nandQty, price: book.nandPrice, remaining: book.nandRemaining }
+                      : null,
+                    Number(book.latchQty) > 0
+                      ? { part: "LATCH", id: book.latchBidId || "—", qty: book.latchQty, price: book.latchPrice, remaining: book.latchRemaining }
+                      : null,
+                  ].filter(Boolean);
+                  const legOpen = (remaining) => {
+                    if (book.executePhase !== "listed") return false;
+                    if (remaining == null) return !book.orderFilled;
+                    return Number(remaining) > 0;
+                  };
                   return (
                     <>
-                      <ul className="bill">
+                      <ul className="bill ops-bill">
                         <li><span>子状态</span><strong>{phaseLabel}</strong></li>
-                        <li><span>目标处理器</span><strong>{est.processor || design.processorId || "—"}</strong></li>
-                        <li><span>图纸建议</span><strong>{need} 颗 · {est.nand || 0} NAND + {est.latch || 0} LATCH</strong></li>
+                        <li><span>目标处理器</span><strong>{design.processorId || round.processorId || "未记录"}</strong></li>
+                        <li><span>图纸建议</span><strong>{need} 颗 · {partLabel}</strong></li>
                         {mixedUnit > 0 && (
                           <li><span>混合成本折合</span><strong>{round4(mixedUnit)} BNB/颗（need ÷ count）</strong></li>
                         )}
                         <li className="due"><span>本阶段 Owner 可做</span><strong>调用官方市场 placeBid，或直接退款</strong></li>
                       </ul>
                       {book.executePhase === "buying" && (
-                        <div className="form-grid publish-fields" style={{ marginBottom: 12 }}>
-                          <label className="field">
-                            <span>NAND 数量（tokenId 0）</span>
-                            <input inputMode="numeric" value={nandQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setNandQty(e.target.value)} />
-                          </label>
-                          <label className="field">
-                            <span>NAND 单价（BNB）</span>
-                            <input inputMode="decimal" value={nandPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => setNandPrice(e.target.value)} />
-                          </label>
-                          <label className="field">
-                            <span>LATCH 数量（tokenId 1）</span>
-                            <input inputMode="numeric" value={latchQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setLatchQty(e.target.value)} />
-                          </label>
-                          <label className="field">
-                            <span>LATCH 单价（BNB）</span>
-                            <input inputMode="decimal" value={latchPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => setLatchPrice(e.target.value)} />
-                          </label>
-                          <div className="field wide">
-                            <span>托管保证金</span>
-                            <strong style={overBudget ? { color: "var(--color-danger)" } : undefined}>
-                              {orderCost} BNB
-                              {raised > 0 ? ` · 募集 ${round4(raised)} BNB` : ""}
-                              {overBudget ? " · 超过募集，不会挂出" : ""}
-                            </strong>
-                          </div>
+                        <div className="form-grid publish-fields bid-form">
+                          {showNand && (
+                            <>
+                              <label className="field">
+                                <span>NAND 数量（tokenId 0）</span>
+                                <input inputMode="numeric" value={nandQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setNandQty(e.target.value)} />
+                              </label>
+                              <div className="field">
+                                <span>NAND 单价（BNB）</span>
+                                <input inputMode="decimal" value={nandPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => { priceTouched.current = true; setNandPrice(e.target.value); }} />
+                                {Number(est.priceNand) > 0 && (
+                                  <button
+                                    className="price-latest"
+                                    type="button"
+                                    onClick={() => {
+                                      priceTouched.current = true;
+                                      setNandPrice(String(round4(est.priceNand)));
+                                    }}
+                                  >
+                                    最新价 {round4(est.priceNand)}
+                                  </button>
+                                )}
+                              </div>
+                            </>
+                          )}
+                          {showLatch && (
+                            <>
+                              <label className="field">
+                                <span>LATCH 数量（tokenId 1）</span>
+                                <input inputMode="numeric" value={latchQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setLatchQty(e.target.value)} />
+                              </label>
+                              <div className="field">
+                                <span>LATCH 单价（BNB）</span>
+                                <input inputMode="decimal" value={latchPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => { priceTouched.current = true; setLatchPrice(e.target.value); }} />
+                                {Number(est.priceLatch || est.priceNand) > 0 && (
+                                  <button
+                                    className="price-latest"
+                                    type="button"
+                                    onClick={() => {
+                                      priceTouched.current = true;
+                                      setLatchPrice(String(round4(est.priceLatch || est.priceNand)));
+                                    }}
+                                  >
+                                    最新价 {round4(est.priceLatch || est.priceNand)}
+                                  </button>
+                                )}
+                              </div>
+                            </>
+                          )}
+                          {!showNand && !showLatch && (
+                            <div className="field wide">
+                              <span>挂单</span>
+                              <strong className="fine">本期图纸不需要 NAND / LATCH，无需挂单</strong>
+                            </div>
+                          )}
+                          {(showNand || showLatch) && (
+                            <div className="field wide">
+                              <span>托管保证金（{[showNand && "NAND", showLatch && "LATCH"].filter(Boolean).join(" + ")}）</span>
+                              <strong style={overBudget ? { color: "var(--color-danger)" } : undefined}>
+                                {orderCost} BNB
+                                {raised > 0 ? ` · 募集 ${round4(raised)} BNB` : ""}
+                                {overBudget ? " · 超过募集，不会挂出" : ""}
+                              </strong>
+                            </div>
+                          )}
                         </div>
                       )}
+                      <div className="bid-records">
+                        <h3>已挂单</h3>
+                        {bidRows.length === 0 ? (
+                          <p className="bid-empty">还没有挂单。</p>
+                        ) : (
+                          <ul className="bid-record-list">
+                            {bidRows.map((row) => {
+                              const open = legOpen(row.remaining);
+                              const bidStatus = open ? "挂单中" : "已成交";
+                              return (
+                                <li key={row.part}>
+                                  <span>{row.part} · 单号 {row.id}</span>
+                                  <strong>{row.qty} 颗 × {round4(row.price || 0)} BNB · {bidStatus}</strong>
+                                  {open && (
+                                    <button
+                                      className="btn btn-inline"
+                                      type="button"
+                                      disabled={!isOwner || Boolean(pending)}
+                                      onClick={onCancelTransistorOrder}
+                                    >
+                                      {pending === "cancelTransistorOrder" ? "取消中…" : "取消挂单"}
+                                    </button>
+                                  )}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </div>
                       <div className="actions">
                         {book.executePhase === "buying" && (
                           <>
-                            <button
-                              className="btn btn-primary"
-                              type="button"
-                              disabled={!canPlace || Boolean(pending)}
-                              onClick={() => onPlaceTransistorOrder?.({
-                                nandQty: nandN,
-                                latchQty: latchN,
-                                nandPrice: String(nandP),
-                                latchPrice: String(latchP),
-                              })}
-                            >
-                              {pending || (book.executionFailed ? "降价后重新 placeBid" : "向官方市场挂单")}
-                            </button>
+                            {(showNand || showLatch) && (
+                              <button
+                                className="btn btn-primary"
+                                type="button"
+                                disabled={!canPlace || Boolean(pending)}
+                                onClick={() => onPlaceTransistorOrder?.({
+                                  nandQty: nandN,
+                                  latchQty: latchN,
+                                  nandPrice: nandN > 0 ? String(nandP) : "0",
+                                  latchPrice: latchN > 0 ? String(latchP) : "0",
+                                })}
+                              >
+                                {pending || (book.executionFailed ? "降价后重新 placeBid" : "向官方市场挂单")}
+                              </button>
+                            )}
                             <button
                               className="btn btn-inline"
                               type="button"
@@ -371,9 +467,6 @@ export function OwnerOverview({
                           <>
                             <button className="btn btn-primary" type="button" disabled={!isOwner || Boolean(pending) || (book.marketOrders && !book.orderFilled)} onClick={onConfirmTransistors}>
                               {pending || (book.orderFilled ? "成交已齐，进入待流片" : "同步官方成交")}
-                            </button>
-                            <button className="btn btn-inline" type="button" disabled={!isOwner || Boolean(pending)} onClick={onCancelTransistorOrder}>
-                              {pending || "取消挂单"}
                             </button>
                           </>
                         )}
@@ -439,21 +532,21 @@ export function OwnerOverview({
                           </label>
                         </div>
                       ) : null}
-                      <p className="fine">
+                      <p className="fine ops-note">
                         {book.executePhase === "buying" && !book.executionFailed && (
                           <>
-                            挂单会调用材料市场 placeBid：NAND 为 tokenId 0，LATCH 为 tokenId 1，保证金从本期募集款托管。
+                            {showNand || showLatch
+                              ? `只挂图纸需要的元件（${[showNand && "NAND", showLatch && "LATCH"].filter(Boolean).join(" / ")}）。单价框里的数字就是 placeBid 的价格，改完再挂单；报价刷新不会把改过的单价盖回去。保证金从本期募集款托管。`
+                              : "本期图纸不需要 NAND / LATCH。"}
                             成交与否只看 bids(id).remaining，不需要到官网点确认。
                             {book._chain && book.marketOrders === false ? " 当前这期仍是旧合约，需要重新部署后新开一期才会真正调用市场。" : ""}
                           </>
                         )}
                         {book.executePhase === "buying" && book.executionFailed && "保证金超过募集余额，没有挂出。可改低单价后重试，或退款。"}
                         {book.executePhase === "listed" && (
-                          <>
-                            NAND 单 #{book.nandBidId || "—"} · {book.nandQty || 0} 颗 × {round4(book.nandPrice || 0)} BNB；
-                            LATCH 单 #{book.latchBidId || "—"} · {book.latchQty || 0} 颗 × {round4(book.latchPrice || 0)} BNB。
-                            {book.orderFilled ? "官方订单簿已全部成交。" : "还有未成交数量，取消会调用 cancelBid 退回保证金。"}
-                          </>
+                          book.orderFilled
+                            ? "官方订单簿已全部成交。"
+                            : "还有未成交数量。取消挂单会调用 cancelBid，把没成交的保证金退回本期。"
                         )}
                         {book.executePhase === "ready" && !needsOfficialStart && "官方买单已成交，可以流片。元件款已在挂单时托管，流片只退还剩余募集款。"}
                         {book.executePhase === "ready" && needsOfficialStart && "官方买单已成交。适配器路径还要把电路 NFT 转给当期，并带上证明再 execute。"}
@@ -521,7 +614,6 @@ export function OwnerOverview({
                             {shortAddress(row.address)} · {Math.round(Number(row.shareBps) / 100)}%
                           </div>
                         ))}
-                        <span className="fine">整除余数进 Owner</span>
                       </dd>
                     </div>
                     <div><dt>本次可分得</dt><dd>{formatBem(harvest.userPart)} BEM</dd></div>

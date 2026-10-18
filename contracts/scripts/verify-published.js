@@ -67,7 +67,7 @@ async function sourcifyVerify(chainId, address, contractIdentifier, compilerVers
   const body = await res.json().catch(() => ({}));
   if (res.status === 409 || body.customCode === "already_verified") {
     console.log(`${address} 已在 Sourcify 开源验证（exact_match）`);
-    console.log(`开源验证：https://repo.sourcify.dev/contracts/full_match/${chainId}/${address}/`);
+    console.log(`开源验证：https://repo.sourcify.dev/${chainId}/${address}`);
     return;
   }
   if (!res.ok) {
@@ -90,14 +90,14 @@ async function sourcifyVerify(chainId, address, contractIdentifier, compilerVers
       const message = status.error.message || "";
       if (code === "already_verified" || /already verified/i.test(message)) {
         console.log(`${address} 已在 Sourcify 开源验证（exact_match）`);
-        console.log(`开源验证：https://repo.sourcify.dev/contracts/full_match/${chainId}/${address}/`);
+        console.log(`开源验证：https://repo.sourcify.dev/${chainId}/${address}`);
         return;
       }
       throw new Error(`${address} ${code} ${message}`);
     }
     const match = status.contract?.runtimeMatch || status.contract?.match;
     console.log(`${address} Sourcify ${match || "verified"}`);
-    console.log(`开源验证：https://repo.sourcify.dev/contracts/full_match/${chainId}/${address}/`);
+    console.log(`开源验证：https://repo.sourcify.dev/${chainId}/${address}`);
     return;
   }
   throw new Error(`Sourcify 仍在处理 ${address} ${id}`);
@@ -165,6 +165,7 @@ async function verifyPublished() {
     "function owner() view returns (address)",
     "function netWeightVerified() view returns (uint256)",
     "function netWeightUnverified() view returns (uint256)",
+    "function transistors() view returns (address)",
   ];
 
   for (const factoryAddr of factories) {
@@ -201,7 +202,7 @@ async function verifyPublished() {
         recipients.push(recipient);
         shares.push(shareBps);
       }
-      await verifyOne(chainId, addr, "contracts/Campaign.sol:Campaign", compilerVersion, [
+      const ctor = [
         await c.sharePriceBnb(),
         await c.totalShares(),
         await c.feeBps(),
@@ -216,7 +217,13 @@ async function verifyPublished() {
         await c.owner(),
         await c.netWeightVerified(),
         await c.netWeightUnverified(),
-      ]);
+      ];
+      try {
+        ctor.push(await c.transistors());
+      } catch {
+        /* 旧期次构造函数没有 transistors */
+      }
+      await verifyOne(chainId, addr, "contracts/Campaign.sol:Campaign", compilerVersion, ctor);
     }
   }
 }

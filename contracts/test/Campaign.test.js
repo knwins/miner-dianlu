@@ -19,11 +19,21 @@ const TT = "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087";
 const UNIT = ethers.parseEther("0.005");
 
 function place(campaign, signer, qty, price) {
-  return campaign.connect(signer).placeTransistorOrder(TT, qty, price, 0, 0);
+  return campaign.transistors().then((tt) => campaign.connect(signer).placeTransistorOrder(tt, qty, price, 0, 0));
 }
 
 async function fillAndConfirm(campaign, market) {
-  await market.fillBid(await campaign.nandBidId(), await campaign.nandQty());
+  const qty = await campaign.nandQty();
+  const latch = await campaign.latchQty();
+  const parts = await ethers.getContractAt("MockERC1155", await campaign.transistors());
+  if (qty > 0n) {
+    await market.fillBid(await campaign.nandBidId(), qty);
+    await parts.mint(await campaign.getAddress(), 0, qty);
+  }
+  if (latch > 0n) {
+    await market.fillBid(await campaign.latchBidId(), latch);
+    await parts.mint(await campaign.getAddress(), 1, latch);
+  }
   await campaign.confirmTransistors();
 }
 
@@ -32,6 +42,7 @@ async function deployFixture() {
   const bem = await ethers.deployContract("MockBEM");
   const pod = await ethers.deployContract("MockPoD", [await bem.getAddress(), HASHPOWER]);
   const minter = await ethers.deployContract("MockMaterialMarket");
+  const parts = await ethers.deployContract("MockERC1155");
   const factory = await ethers.deployContract("CampaignFactory", [
     await pod.getAddress(),
     await bem.getAddress(),
@@ -48,10 +59,11 @@ async function deployFixture() {
       [10_000],
       TASK_ID,
       ethers.ZeroAddress,
-      NETLIST
+      NETLIST,
+      await parts.getAddress()
     );
   const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
-  return { bem, pod, minter, factory, campaign, owner, alice, bob, carol, feeRecipient };
+  return { bem, pod, minter, parts, factory, campaign, owner, alice, bob, carol, feeRecipient };
 }
 
 async function miningFixture() {
@@ -85,7 +97,8 @@ describe("CampaignFactory", () => {
           [10_000],
           TASK_ID,
           ethers.ZeroAddress,
-          NETLIST
+          NETLIST,
+          TT
         )
     ).to.be.revertedWithCustomError(factory, "NotOwner");
   });
@@ -95,7 +108,7 @@ describe("CampaignFactory", () => {
     expect(await factory.campaignCount()).to.equal(1n);
     await factory
       .connect(owner)
-      .createCampaign(SHARE_PRICE, 50n, FEE_PERCENT, FUNDING_DAYS, [feeRecipient.address], [10_000], 5n, ethers.ZeroAddress, NETLIST);
+      .createCampaign(SHARE_PRICE, 50n, FEE_PERCENT, FUNDING_DAYS, [feeRecipient.address], [10_000], 5n, ethers.ZeroAddress, NETLIST, TT);
     expect(await factory.campaignCount()).to.equal(2n);
     const all = await factory.allCampaigns();
     expect(all.length).to.equal(2);
@@ -137,7 +150,7 @@ describe("CampaignFactory", () => {
     const first = await factory.campaigns(0);
     await factory
       .connect(owner)
-      .createCampaign(SHARE_PRICE, 50n, FEE_PERCENT, FUNDING_DAYS, [feeRecipient.address], [10_000], 5n, ethers.ZeroAddress, NETLIST);
+      .createCampaign(SHARE_PRICE, 50n, FEE_PERCENT, FUNDING_DAYS, [feeRecipient.address], [10_000], 5n, ethers.ZeroAddress, NETLIST, TT);
     const second = await factory.campaigns(1);
     expect(await factory.campaignCount()).to.equal(2n);
 
@@ -215,6 +228,7 @@ describe("transistor order + execute", () => {
     await expect(place(campaign, alice, 100n, UNIT)).to.be.revertedWithCustomError(campaign, "NotOwner");
     await place(campaign, owner, 100n, UNIT);
     expect(await campaign.phase()).to.equal(PHASE.Listed);
+    await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "NotOwner");
     expect(await campaign.nandBidId()).to.not.equal(0n);
     const raisedAfterBid = await campaign.raisedBnb();
     expect(raisedAfterBid).to.equal(SHARE_PRICE * 100n - 100n * UNIT);
@@ -292,13 +306,67 @@ describe("transistor order + execute", () => {
     expect(after + receipt.gasUsed * receipt.gasPrice - before).to.equal(SHARE_PRICE * 100n);
   });
 
-  it("filled bid cannot be cancelled", async () => {
-    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
-    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+  it("partial fill can be cancelled and holders refund the remaining pool", async () => {
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
+    await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
     await campaign.connect(owner).setPlan(408n, false, 100n);
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
-    await expect(campaign.connect(owner).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "OrderTouched");
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+    const pool = SHARE_PRICE * 100n - UNIT;
+    await expect(campaign.connect(alice).cancelTransistorOrder()).to.emit(campaign, "TransistorOrderCancelled");
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    expect(await campaign.raisedBnb()).to.equal(pool);
+    const aliceBefore = await ethers.provider.getBalance(alice.address);
+    const tx = await campaign.connect(alice).refund();
+    const receipt = await tx.wait();
+    expect(await ethers.provider.getBalance(alice.address) + receipt.gasUsed * receipt.gasPrice - aliceBefore).to.equal(
+      (pool * 60n) / 100n
+    );
+    await campaign.connect(bob).refund();
+    expect(await campaign.raisedBnb()).to.equal(0n);
+    expect(await campaign.sharesOf(bob.address)).to.equal(0n);
+  });
+
+  it("a filled order with parts on hand cannot be cancelled", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 100n);
+    await parts.mint(await campaign.getAddress(), 0, 100n);
+    await expect(campaign.connect(owner).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "OrderFilled");
+    await campaign.confirmTransistors();
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+  });
+
+  it("filled book without parts does not confirm, and cancel lets holders take the leftover", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 50n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 50n);
+    await expect(campaign.confirmTransistors()).to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
+    await campaign.connect(alice).cancelTransistorOrder();
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    const leftover = SHARE_PRICE * 100n - 50n * UNIT;
+    expect(await campaign.raisedBnb()).to.equal(leftover);
+    const before = await ethers.provider.getBalance(alice.address);
+    const tx = await campaign.connect(alice).refund();
+    const receipt = await tx.wait();
+    expect(await ethers.provider.getBalance(alice.address) + receipt.gasUsed * receipt.gasPrice - before).to.equal(leftover);
+  });
+
+  it("placeBid that returns id 0 reverts and keeps the pool", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await minter.setReturnZeroId(true);
+    await expect(place(campaign, owner, 100n, UNIT)).to.be.revertedWithCustomError(campaign, "BadBidId");
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    expect(await campaign.raisedBnb()).to.equal(SHARE_PRICE * 100n);
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(SHARE_PRICE * 100n);
   });
 
   it("setPlan blocked after listed / mining; count cannot be 0", async () => {
@@ -507,6 +575,7 @@ describe("harvest / claim", () => {
     await expect(live.campaign.connect(live.owner).recoverTransistors(await parts.getAddress(), 0, 1n))
       .to.be.revertedWithCustomError(live.campaign, "AlreadyListed");
     await live.minter.fillBid(await live.campaign.nandBidId(), await live.campaign.nandQty());
+    await live.parts.mint(await live.campaign.getAddress(), 0, await live.campaign.nandQty());
     await live.campaign.confirmTransistors();
     await expect(live.campaign.connect(live.owner).recoverTransistors(await parts.getAddress(), 0, 1n))
       .to.be.revertedWithCustomError(live.campaign, "AlreadyReady");

@@ -35,7 +35,8 @@ async function main() {
     [10_000], // 100% 分给上述地址；整除余数进 Owner
     54, // 官方题目
     ethers.ZeroAddress, // pod 用工厂默认
-    netlist
+    netlist,
+    "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087" // TapeOut 元件合约
   );
   await tx.wait();
   const campaignAddr = await factory.campaigns(0);

@@ -77,12 +77,12 @@ mining 主动退出：份额转让；被动：仅超时/失败可 refund（挖�
 |---|---|---|---|
 | `setPlan(uint256 estHashpower, bool capped, uint256 transistorCount)` | 写 | 仅 `funding` 或 `executing`+`buying`；`transistorCount > 0` | 写入预估算力、闸门、需买晶体管数；Listed/Ready/Mining 不可改 |
 | `placeTransistorOrder(uint256 count, uint256 unitPriceBnb)` | 写 | `buying` → `listed` | 锁价；失败后仍售罄时可重挂并清 `executionFailed` |
-| `cancelTransistorOrder()` | 写 | `listed` 或 `ready` → `buying` | 取消/从 Ready 逃生；清锁价与晶体管数 |
+| `cancelTransistorOrder()` | 写 | `listed` → `buying` | 未成交仅 owner 可撤。已有成交时任何人可撤剩余买单。全部成交且元件到账则不能撤 |
 | `confirmTransistors()` | 写 | `listed` → `ready` | 确认二级市场成交到账；保留 `priceLock` |
 | `execute(bytes tapeoutData, bytes startData)` | 写 | 须 `ready` + 有效锁价/元件数 + 网表匹配 | 买不起 → 失败回 `buying`；买得起 → mint、**余量按份退回**、开矿；禁 cost=0 |
-| `rescueUnsentBnb(address to)` | 写 | Owner；`mining` | 救出流片余量中拒收地址滞留的 `raisedBnb`（可指定地址） |
-| `recoverBnb(uint256 amount)` | 写 | 仅 Owner | 把合约里的 BNB 转给当前 Owner，并记 `BnbRecovered`。募集/待执行只可转出超过 `raisedBnb` 的多余余额；挖矿中还可转出剩余 `raisedBnb` |
-| `recoverTransistors(address token, uint256 id, uint256 amount)` | 写 | 仅 Owner；禁止 `listed` / `ready` | 把本期持有的 ERC1155 晶体管转给当前 Owner，并记 `TransistorsRecovered`。挂单中或待流片不可转，以免拆掉本轮元件。Buying / Mining 可转。不改挂单和场景 |
+| `rescueUnsentBnb(address to)` | 写 | Owner；`mining` | 测试救援。流片余量被拒收后，把滞留的 `raisedBnb` 转到指定地址，避免卡在本期 |
+| `recoverBnb(uint256 amount)` | 写 | 仅 Owner | 测试救援。把卡在本期的 BNB 转给当前 Owner，并记 `BnbRecovered`。募集/待执行只可转出超过 `raisedBnb` 的多余余额；挖矿中还可转出剩余 `raisedBnb` |
+| `recoverTransistors(address token, uint256 id, uint256 amount)` | 写 | 仅 Owner；禁止 `listed` / `ready` | 测试救援。把卡在本期的 ERC1155 晶体管转给当前 Owner，并记 `TransistorsRecovered`。挂单中或待流片不可转。不改挂单和场景 |
 | `setPod` / `setBem` / `setMinter` | 写 | 仅 Owner | 更换本期外部依赖（主网替换 Mock）；不改经济参数 |
 | `setFeeShares(recipients, shareBps)` | 写 | 仅 Owner | 重写服务费分成表；比例之和须为 10000；最多 20 项 |
 | `transferOwnership(address)` | 写 | 仅 Owner | 转让本期 Owner |

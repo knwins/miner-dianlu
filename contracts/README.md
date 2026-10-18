@@ -109,7 +109,7 @@ npx hardhat test            # 跑逻辑测试（EVM 实跑）
 1. **PoD**：`harvest` 从 PoD `claim()` 拉 BEM，`execute` 调 PoD `start()` 返回权重 H。需 PoD 授权本合约领取。
 2. **晶体管铸造器**：`mint(count)` 为 payable，实现方须校验 `msg.value == count × 锁定单价`，保证报价快照生效。
 3. **全网权重**：`dailyBem` 依赖 `netWeightVerified/Unverified`，零和机制下需 oracle 定期 `updateNetworkWeight`。
-4. **execute 余量**：成功后按份 `_returnSurplus`；拒收地址份额留在 `raisedBnb`，Owner 可 `rescueUnsentBnb`。
+4. **execute 余量**：成功后按份 `_returnSurplus`。拒收地址的份额留在 `raisedBnb`，测试时 Owner 用 `rescueUnsentBnb` 取出，避免卡在本期。`recoverBnb` / `recoverTransistors` 同样只用于把测试中卡住的 BNB 和元件取回。
 5. **转让与 claimed**：`takeListing` 按卖方持仓比例转移 `_claimed`，避免买方重领卖方已领历史轮次。
 
 ---

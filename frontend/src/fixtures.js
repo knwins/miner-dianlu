@@ -301,8 +301,8 @@ export function findTask(round, book = null) {
 /**
  * 从链上 / 本地期次字段解析「题目 + 目标处理器」。
  * - 题目：权威来源是 Campaign.taskId（不可变）
- * - 处理器：合约未单独存名字；用 setPlan 写入的 estHashpower / transistorCount
- *   （或执行后的 hashpower）反推 P≈H/元件数 → Behemoth(6) / TapeOut(1)
+ * - 处理器：新工厂开期写入 transistors（元件合约地址）；旧期次可用 setPlan 的
+ *   estHashpower / transistorCount（或执行后 hashpower）反推 P≈H/元件数
  */
 export function resolveCampaignDesign(round, book = null, taskbook = null) {
   const task = findTask(round, taskbook);
@@ -328,6 +328,10 @@ export function resolveCampaignDesign(round, book = null, taskbook = null) {
       const scale = hp / denom;
       processorId = scale >= 3.5 ? "Behemoth" : "TapeOut";
     }
+  }
+  // 开期写入的 transistors → round.processorId（见 adapter.roundFromState）
+  if (!processorId && PROCESSOR_IDS.includes(round?.processorId)) {
+    processorId = round.processorId;
   }
   if (!processorId && !chain) processorId = PROCESSOR_IDS[0];
 
@@ -403,7 +407,13 @@ export function estimateHashpower(round, quote = QUOTE, sold = null, taskbook = 
   const hardCapBnb = shares * round.sharePriceBnb;
   const bnbUsdt = quote.bnbUsdt || MARKET.bnbUsdt;
 
-  const model = findTransistor(round.transistorId || DEFAULT_TRANSISTOR);
+  const chosenTransistor = round.transistorId
+    || (round.processorId === "TapeOut"
+      ? "TAPE_OUT_NAND"
+      : round.processorId === "Behemoth"
+        ? "BEHEMOTH_NAND"
+        : "");
+  const model = findTransistor(chosenTransistor || DEFAULT_TRANSISTOR);
   const priceBnb = quote.prices?.[model.id] ?? model.priceBnb;
   const P = processorScale(model.processor);
 
@@ -445,8 +455,8 @@ export function estimateHashpower(round, quote = QUOTE, sold = null, taskbook = 
     hardCapUsdt: round4(hardCapBnb * bnbUsdt),
     transistorId: model.id,
     transistorName: model.name,
-    processor: model.processor,
-    processorScale: P,
+    processor: chosenTransistor ? model.processor : null,
+    processorScale: chosenTransistor ? P : null,
     partType: model.part,
     priceBnb,
     /** 两种元件的实时单价，按种类归位（不依赖型号自身是 NAND 还是 LATCH）*/

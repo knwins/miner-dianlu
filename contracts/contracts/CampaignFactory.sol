@@ -80,6 +80,7 @@ contract CampaignFactory is Ownable {
     /// @param feeRecipients Service-fee recipient list.
     /// @param feeShareBps Each recipient's share of the fee, in bps. Must sum to 10000. Dust goes to the owner.
     /// @param pod_ Mining contract. address(0) uses the factory default.
+    /// @param transistors_ Official ERC1155 parts contract (TapeOut or Behemoth). Written into the new Campaign.
     function createCampaign(
         uint256 sharePriceBnb,
         uint256 totalShares,
@@ -89,9 +90,10 @@ contract CampaignFactory is Ownable {
         uint16[] calldata feeShareBps,
         uint256 taskId,
         address pod_,
-        bytes32 netlistHash
+        bytes32 netlistHash,
+        address transistors_
     ) external onlyOwner returns (address campaign) {
-        if (feeRecipients.length == 0) revert ZeroAddress();
+        if (feeRecipients.length == 0 || transistors_ == address(0)) revert ZeroAddress();
         if (totalShares == 0 || sharePriceBnb == 0) revert ZeroCampaignParam();
         if (feePercent < 1 || feePercent > 20) revert BadFee();
 
@@ -111,7 +113,8 @@ contract CampaignFactory is Ownable {
             netlistHash,
             owner, // Campaign owner = factory owner
             DEFAULT_NET_WEIGHT_VERIFIED,
-            DEFAULT_NET_WEIGHT_UNVERIFIED
+            DEFAULT_NET_WEIGHT_UNVERIFIED,
+            transistors_
         );
         campaign = address(c);
         campaigns.push(campaign);

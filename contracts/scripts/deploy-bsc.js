@@ -132,6 +132,8 @@ async function main() {
   const fundingDays = Number(process.env.FUNDING_DAYS || 7);
   const taskId = BigInt(process.env.TASK_ID || 54);
 
+  const transistors =
+    process.env.TRANSISTORS_ADDRESS || "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087"; // 默认 TapeOut 元件
   const tx = await factory.createCampaign(
     sharePrice,
     totalShares,
@@ -141,7 +143,8 @@ async function main() {
     [10_000],
     taskId,
     ethers.ZeroAddress, // pod 用工厂默认
-    netlist
+    netlist,
+    transistors
   );
   await tx.wait();
   const campaignAddr = await factory.campaigns(0);

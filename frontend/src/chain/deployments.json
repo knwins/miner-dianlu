@@ -1,14 +1,15 @@
 {
   "network": "bsc",
   "chainId": 56,
-  "deployedAt": "2026-10-18T13:21:49.222Z",
+  "deployedAt": "2026-10-18T15:55:00.000Z",
   "bem": "0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a",
   "bemConfigured": "0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a",
   "bemIsMock": false,
   "pod": "0x3647c71F0B947fd3CFAcF480Ab5a723dF18Bb3c4",
   "minter": "0xA6a80C1919a8326022d7c601a488888C13aA16E4",
-  "factory": "0x638744e7308D8dCe3444d6991137f7405f5Ab2ED",
+  "factory": "0x19a47311FC280f146D1992dD99DC7Fa5735e10BA",
   "legacyFactories": [
+    "0x638744e7308D8dCe3444d6991137f7405f5Ab2ED",
     "0xB4315F55CD614d09092f0Fcf75ef34C5ee252c3b"
   ],
   "campaign": "",
@@ -16,5 +17,5 @@
   "deployer": "0xebA1B24d36487a75C533233A07D6899a268Bb9AA",
   "podIsAdapter": true,
   "officialPod": "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46",
-  "notes": "BSC 工厂已部署，尚未开期。PoD 为 OfficialPodAdapter，指向官方挖矿代理。execute 前当期须持有电路 NFT，startData 须打包官方证明。"
+  "notes": "新工厂已部署，尚未开期。createCampaign 会把目标处理器的晶体管合约地址写入期次。PoD 仍是 OfficialPodAdapter，材料市场与 BEM 为官方合约。上一台工厂 0x638744e7308D8dCe3444d6991137f7405f5Ab2ED 的期次不会出现在新列表里。部署交易 0xa92ae2c3c341ea8376123f46acf8520a937aad0a3e12e9553222283a706c498b。"
 }

@@ -32,8 +32,8 @@ export function contractCatalog(round) {
           name: "createCampaign",
           kind: "write",
           caller: "Factory Owner",
-          signature: "createCampaign(uint256,uint256,uint16,uint64,address[],uint16[],uint256,address,bytes32)",
-          summary: "发布众筹挖矿。服务费可多地址分成，每项为 1–100 的整数%，之和须为 100；整除余数进 Owner。网表默认 netlist-v1。",
+          signature: "createCampaign(uint256,uint256,uint16,uint64,address[],uint16[],uint256,address,bytes32,address)",
+          summary: "发布众筹挖矿。末参为晶体管合约（TapeOut / Behemoth）。服务费可多地址分成，之和须为 100%；网表默认 netlist-v1。",
           fields: [
             ["sharePriceBnb", "每份 BNB", round.sharePriceBnb],
             ["totalShares", "总份数", round.totalShares],
@@ -187,9 +187,9 @@ export function contractCatalog(round) {
         {
           name: "cancelTransistorOrder",
           kind: "write",
-          caller: "仅 Factory Owner",
+          caller: "未成交仅 Factory Owner；已有成交时任何人",
           signature: "cancelTransistorOrder()",
-          summary: "取消挂单或从 Ready 逃生：listed / ready → buying，清锁价与晶体管数。仅 Factory Owner。",
+          summary: "撤销市场上还没成交的部分，保证金退回本期并回到待挂单。全部成交且元件已到账时不能取消。",
           fields: [],
         },
         {
@@ -260,7 +260,7 @@ export function contractCatalog(round) {
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "recoverBnb(uint256)",
-          summary: "把本期合约持有的 BNB 转给当前 Owner，并写出 BnbRecovered。募集/待执行只可转出超过 raisedBnb 的多余余额；挖矿中还可转出剩余 raisedBnb。",
+          summary: "测试救援。把卡在本期的 BNB 转给当前 Owner。募集/待执行只可转出超过 raisedBnb 的多余余额；挖矿中还可转出剩余 raisedBnb。",
           fields: [["amountWei", "数量（wei）", "0"]],
         },
         {
@@ -268,7 +268,7 @@ export function contractCatalog(round) {
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "recoverTransistors(address,uint256,uint256)",
-          summary: "把本期合约持有的晶体管转给当前 Owner，并写出 TransistorsRecovered。挂单中（listed）或待流片（ready）不可转。NAND 的 id 为 0，LATCH 为 1。",
+          summary: "测试救援。把卡在本期的晶体管转给当前 Owner。挂单中（listed）或待流片（ready）不可转。NAND 的 id 为 0，LATCH 为 1。",
           fields: [
             ["token", "晶体管合约", "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087"],
             ["id", "tokenId", "0"],
@@ -487,14 +487,14 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (method.name === "recoverBnb") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (actor.role !== "owner") return { ok: false, reason: "仅 Owner 可以把 BNB 转给自己。" };
-    return { ok: true, reason: "转给当前 Owner，并记一笔 BnbRecovered。募集中不能动认筹本金。" };
+    return { ok: true, reason: "测试救援：把卡住的 BNB 转给当前 Owner。募集中不能动认筹本金。" };
   }
   if (method.name === "recoverTransistors") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (actor.role !== "owner") return { ok: false, reason: "仅 Owner 可以把晶体管转给自己。" };
     if (book.phase === "listed") return { ok: false, reason: "挂单中不能转出晶体管，先撤单或等流片。" };
     if (book.phase === "ready") return { ok: false, reason: "待流片不能转出晶体管，流片完成后再转。" };
-    return { ok: true, reason: "转给当前 Owner，并记一笔 TransistorsRecovered。" };
+    return { ok: true, reason: "测试救援：把卡住的晶体管转给当前 Owner。" };
   }
   if (
     method.name === "setPod" || method.name === "setBem" || method.name === "setMinter"
