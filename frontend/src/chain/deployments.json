@@ -1,22 +1,20 @@
 {
-  "network": "bscTestnet",
-  "chainId": 97,
-  "deployedAt": "2026-10-17T08:11:18.569Z",
-  "bem": "0xEC792B857613AC428dedCB7Bcec3F564B9833b4B",
+  "network": "bsc",
+  "chainId": 56,
+  "deployedAt": "2026-10-18T13:21:49.222Z",
+  "bem": "0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a",
   "bemConfigured": "0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a",
-  "bemIsMock": true,
-  "pod": "0xB4315F55CD614d09092f0Fcf75ef34C5ee252c3b",
-  "minter": "0x3647c71F0B947fd3CFAcF480Ab5a723dF18Bb3c4",
-  "factory": "0x7B07673F48D12B1599658eCfbF2Ad1927c7FBf7E",
-  "campaign": "0xd5843D00f84518D67F88497D488438d7662d28cf",
-  "campaignParams": {
-    "sharePriceBnb": "0.01",
-    "totalShares": 100,
-    "feePercent": 5,
-    "fundingDays": 7,
-    "taskId": 54,
-    "executeDelay": 172800,
-    "netlistHash": "0x462626e624e84c285bafb1402deec2ab614748354898283be95c6cd8dd29de85"
-  },
-  "deployer": "0xebA1B24d36487a75C533233A07D6899a268Bb9AA"
+  "bemIsMock": false,
+  "pod": "0x3647c71F0B947fd3CFAcF480Ab5a723dF18Bb3c4",
+  "minter": "0xA6a80C1919a8326022d7c601a488888C13aA16E4",
+  "factory": "0x638744e7308D8dCe3444d6991137f7405f5Ab2ED",
+  "legacyFactories": [
+    "0xB4315F55CD614d09092f0Fcf75ef34C5ee252c3b"
+  ],
+  "campaign": "",
+  "campaignParams": null,
+  "deployer": "0xebA1B24d36487a75C533233A07D6899a268Bb9AA",
+  "podIsAdapter": true,
+  "officialPod": "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46",
+  "notes": "BSC 工厂已部署，尚未开期。PoD 为 OfficialPodAdapter，指向官方挖矿代理。execute 前当期须持有电路 NFT，startData 须打包官方证明。"
 }

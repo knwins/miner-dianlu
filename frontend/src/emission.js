@@ -15,9 +15,9 @@
  *   2. 系数 = 池日产 / 全池权重，会持续变化，不是常数
  *   3. 官网明确提示「实际产出随全网算力变化」，不是承诺
  *
- * 链上实读（mining 合约 0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46）：
- *   totalVerifWeight()   = 1,575,427
- *   totalUnverWeight()   = 40,823
+ * 链上实读（mining 合约 0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46，2026-10-18）：
+ *   totalVerifWeight()   = 1,579,178
+ *   totalUnverWeight()   = 40,680
  */
 
 /** 全网理论日产 BEM（官网口径，对应第 1 纪元） */
@@ -44,8 +44,8 @@ export const POOL = {
  * 保守起见：若实读失败，用偏大的分母（让产出估算偏低，不高估收益）。
  */
 export const NETWORK_WEIGHT = {
-  verified: 1_575_427,
-  unverified: 40_823,
+  verified: 1_579_178,
+  unverified: 40_680,
   source: "chain",
   /** 区块时间戳口径 */
   updatedAt: 1792157941,

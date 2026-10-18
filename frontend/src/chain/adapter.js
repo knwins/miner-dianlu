@@ -27,9 +27,10 @@ export function roundFromDeployment(dep) {
     feeBps: Math.round((p.feePercent ?? 5) * 100),
     taskId: p.taskId ?? ROUND.taskId,
     fundingDays: p.fundingDays ?? ROUND.fundingDays,
-    executeDelayHours: Math.round((p.executeDelay ?? 172800) / 3600),
+    executeDelayHours: 0,
     contract: dep.campaign || getCampaignAddress() || ROUND.contract,
     feeRecipient: dep.deployer || ROUND.feeRecipient,
+    feeShares: [{ address: dep.deployer || ROUND.feeRecipient, shareBps: 10_000 }],
     netlistHash: p.netlistHash || null,
   };
 }
@@ -46,9 +47,13 @@ export function roundFromState(state, baseRound = ROUND, campaignIndex = 1) {
     hardCapBnb: Number((sharePriceBnb * totalShares).toFixed(8)),
     feeBps: state.feeBps,
     taskId: state.taskId ?? baseRound.taskId,
-    executeDelayHours: Math.round((state.executeDelay || 0) / 3600),
+    executeDelayHours: 0,
     contract: state.campaign || getCampaignAddress() || baseRound.contract,
     feeRecipient: state.feeRecipient || baseRound.feeRecipient,
+    feeShares:
+      Array.isArray(state.feeShares) && state.feeShares.length
+        ? state.feeShares
+        : [{ address: state.feeRecipient || baseRound.feeRecipient, shareBps: 10_000 }],
     netlistHash: state.netlistHash || baseRound.netlistHash || null,
   };
 }
@@ -62,15 +67,24 @@ export function bookFromState(state, account, extra = {}) {
   };
   const addr = String(account || "").toLowerCase();
   const bnb = bem(self.bnb);
-  const listings = (state.listings || []).map((l) => ({
-    id: l.id,
-    seller: l.seller,
-    shares: Number(l.shares),
-    priceBnbPerShare: bem(l.priceBnbPerShare),
-    _priceWei: l.priceBnbPerShare,
-    totalBnb: bem(l.priceBnbPerShare * l.shares),
-    open: l.open,
-  }));
+  const listings = (state.listings || []).map((l) => {
+    const remain = Number(l.shares);
+    const taken = Number(l.takenShares || 0);
+    // 关单后剩余份额仍写在 listing.shares：剩 0 且有成交 → 完成；否则是撤单（含部分成交后再撤）
+    const status = l.open ? "open" : (remain === 0 && taken > 0 ? "done" : "cancelled");
+    const shares = status === "done" ? (taken || remain) : remain;
+    const totalWei = status === "done" && l.takenPaid != null ? l.takenPaid : l.priceBnbPerShare * BigInt(shares);
+    return {
+      id: l.id,
+      seller: l.seller,
+      shares,
+      priceBnbPerShare: bem(l.priceBnbPerShare),
+      _priceWei: l.priceBnbPerShare,
+      totalBnb: bem(totalWei),
+      open: Boolean(l.open),
+      status,
+    };
+  });
 
   return {
     _chain: true,
@@ -91,6 +105,7 @@ export function bookFromState(state, account, extra = {}) {
     soldOutAt: state.soldOutAt > 0 ? state.soldOutAt * 1000 : null,
     endsAt: scene === "funding" ? state.fundingDeadline * 1000 : undefined,
     bnbPool: bem(state.raisedBnb),
+    refundedTotal: bem(state.totalRefunded),
     refundedSelf: bem(self.refunded),
     bemBalance: bem(self.bemBalance),
     bnb,
@@ -102,6 +117,15 @@ export function bookFromState(state, account, extra = {}) {
     estHashpower: Number(state.estHashpower),
     taskId: state.taskId,
     priceLock: bem(state.priceLock),
+    marketOrders: Boolean(state.marketOrders),
+    orderFilled: Boolean(state.orderFilled),
+    nandBidId: state.nandBidId != null ? String(state.nandBidId) : "0",
+    latchBidId: state.latchBidId != null ? String(state.latchBidId) : "0",
+    nandQty: Number(state.nandQty || 0),
+    latchQty: Number(state.latchQty || 0),
+    nandPrice: bem(state.nandPrice || 0),
+    latchPrice: bem(state.latchPrice || 0),
+    transistors: state.transistors || "",
     _sharePriceWei: state.sharePriceBnb,
     _netlistHash: state.netlistHash,
     netWeightVerified: state.netWeightVerified,

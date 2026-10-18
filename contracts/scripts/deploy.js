@@ -10,7 +10,7 @@ async function main() {
   await bem.waitForDeployment();
   const pod = await ethers.deployContract("MockPoD", [await bem.getAddress(), 408]);
   await pod.waitForDeployment();
-  const minter = await ethers.deployContract("MockMinter", [ethers.parseEther("0.005")]);
+  const minter = await ethers.deployContract("MockMaterialMarket");
   await minter.waitForDeployment();
 
   const factory = await ethers.deployContract("CampaignFactory", [
@@ -31,10 +31,10 @@ async function main() {
     100, // 总份数
     5, // 服务费 5%
     7, // 募集 7 天
-    deployer.address, // 收费地址
+    [deployer.address], // 服务费收费地址
+    [10_000], // 100% 分给上述地址；整除余数进 Owner
     54, // 官方题目
     ethers.ZeroAddress, // pod 用工厂默认
-    48 * 3600, // 观察期 48h
     netlist
   );
   await tx.wait();

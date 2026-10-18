@@ -5,8 +5,9 @@ import {
 } from "./chain/config.js";
 import {
   hasInjected, connectWallet, readState, send, tx, formatEther, parseEther,
-  getCampaignAddress,
+  getCampaignAddress, getRawProvider,
 } from "./chain/client.js";
+import { discoverWallets } from "./chain/wallets.js";
 
 const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "—");
 const fmt = (v, d = 4) => {
@@ -34,9 +35,10 @@ export default function OnChainPage({ embedded = false }) {
     try {
       const s = await readState(account);
       setState(s);
-      if (account && window.ethereum) {
+      const raw = getRawProvider();
+      if (account && raw) {
         const { BrowserProvider } = await import("ethers");
-        const p = new BrowserProvider(window.ethereum);
+        const p = new BrowserProvider(raw);
         setBnb(await p.getBalance(account));
       }
       setErr("");
@@ -50,7 +52,11 @@ export default function OnChainPage({ embedded = false }) {
   async function onConnect() {
     setErr("");
     try {
-      const w = await connectWallet();
+      const choices = await discoverWallets();
+      const injected = choices.filter((item) => item.kind === "injected");
+      const pick = injected.find((item) => item.walletId === "tokenpocket") || injected[0];
+      if (!pick) throw new Error("未检测到钱包。手机请用 TokenPocket 打开本页");
+      const w = await connectWallet(pick.provider);
       setWallet(w);
     } catch (e) { setErr(e.message || String(e)); }
   }
@@ -148,11 +154,11 @@ export default function OnChainPage({ embedded = false }) {
             <div className="card-body">
               {s.scene === 0 && (
                 <div className="form-grid cols-2">
-                  <label className="field"><span>认购份数</span><input inputMode="numeric" value={form.buyCount} onChange={(e) => setForm({ ...form, buyCount: e.target.value })} /></label>
+                  <label className="field"><span>认筹份数</span><input inputMode="numeric" value={form.buyCount} onChange={(e) => setForm({ ...form, buyCount: e.target.value })} /></label>
                   <div className="field"><span>应付</span>
                     <button className="btn btn-primary" type="button" disabled={busy || !account}
-                      onClick={() => run("认购", (sg) => tx.buy(sg, BigInt(form.buyCount), parseEther(fmt(s.sharePriceBnb)) * BigInt(form.buyCount)))}>
-                      {busy === "认购" ? "认购中…" : `认购 ${form.buyCount} 份（${(Number(fmt(s.sharePriceBnb)) * Number(form.buyCount)).toFixed(4)} BNB）`}
+                      onClick={() => run("认筹", (sg) => tx.subscribe(sg, BigInt(form.buyCount), parseEther(fmt(s.sharePriceBnb)) * BigInt(form.buyCount)))}>
+                      {busy === "认筹" ? "认筹中…" : `认筹 ${form.buyCount} 份（${(Number(fmt(s.sharePriceBnb)) * Number(form.buyCount)).toFixed(4)} BNB）`}
                     </button>
                   </div>
                   {Date.now() / 1000 > s.fundingDeadline && s.sold < s.totalShares && (
@@ -163,18 +169,18 @@ export default function OnChainPage({ embedded = false }) {
 
               {s.scene === 1 && (
                 <div>
-                  <p className="fine">待执行 · {PHASE_LABEL[s.phase]} · 售罄于 {fmtTime(s.soldOutAt)} · 观察期 {s.executeDelay / 3600}h · 锁价 {s.priceLock > 0 ? `${fmt(s.priceLock)} BNB/颗 × ${s.transistorCount}` : "未锁"}</p>
-                  {s.executionFailed && <p className="fine chain-warn">本期已判流片失败，可原路退款或待降价由 Owner 重试。</p>}
+                  <p className="fine">待执行 · {PHASE_LABEL[s.phase]} · 售罄于 {fmtTime(s.soldOutAt)} · 锁价 {s.priceLock > 0 ? `${fmt(s.priceLock)} BNB/颗 × ${s.transistorCount}` : "未锁"}</p>
+                  {s.executionFailed && <p className="fine chain-warn">本期已判流片失败并回到待挂单。可降价重挂，或原路退款；勿在锁价/元件数为 0 时 execute。</p>}
                   {isOwner && (
                     <div className="chain-actions">
                       {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est), form.capped, BigInt(form.trCount)))}>setPlan</button>}
-                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("挂单", (sg) => tx.placeTransistorOrder(sg, BigInt(form.trCount), parseEther(form.trPrice)))}>挂单买晶体管</button>}
-                      {s.phase === 2 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("确认到账", (sg) => tx.confirmTransistors(sg))}>确认成交到账</button>}
+                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("挂单", (sg) => tx.placeTransistorOrder(sg, "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087", BigInt(form.trCount), parseEther(form.trPrice), 0n, 0n))}>placeBid</button>}
+                      {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("退款", (sg) => tx.openRefund(sg))}>发起退款</button>}
+                      {s.phase === 2 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("同步成交", (sg) => tx.confirmTransistors(sg))}>同步官方成交</button>}
                       {s.phase === 2 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("取消挂单", (sg) => tx.cancelTransistorOrder(sg))}>取消挂单</button>}
-                      {s.phase === 3 && Date.now() / 1000 >= s.soldOutAt + s.executeDelay && (
+                      {s.phase === 3 && !s.executionFailed && (
                         <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("execute", (sg) => tx.execute(sg, new TextEncoder().encode(form.tapeout), "0x12345678"))}>execute 流片开矿</button>
                       )}
-                      {s.phase === 3 && Date.now() / 1000 < s.soldOutAt + s.executeDelay && <span className="fine">观察期未满，{(s.soldOutAt + s.executeDelay) - Math.floor(Date.now() / 1000)}s 后可执行</span>}
                     </div>
                   )}
                   {s.executionFailed && s.self && s.self.shares > 0 && (
@@ -187,7 +193,14 @@ export default function OnChainPage({ embedded = false }) {
 
               {s.scene === 2 && (
                 <div className="chain-actions">
-                  <button className="btn btn-primary" type="button" disabled={busy || !account} onClick={() => run("harvest", (sg) => tx.harvest(sg))}>全网分发 harvest</button>
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    disabled={busy || !account}
+                    onClick={() => run("harvest", (sg) => tx.harvest(sg))}
+                  >
+                    全网分发 harvest
+                  </button>
                   <button className="btn btn-primary" type="button" disabled={busy || !account} onClick={() => run("claim", (sg) => tx.claim(sg))}>领取我的 BEM</button>
                 </div>
               )}

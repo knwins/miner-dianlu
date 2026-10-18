@@ -4,9 +4,10 @@
   "private": true,
   "description": "BEM 众筹挖矿合约：Campaign + CampaignFactory（状态机 funding→executing→mining，份额转让/退款/execute/harvest/claim）",
   "scripts": {
-    "compile": "hardhat compile",
-    "test": "hardhat test",
-    "node": "hardhat node"
+    "compile": "node ./node_modules/hardhat/internal/cli/bootstrap.js compile",
+    "test": "node ./node_modules/hardhat/internal/cli/bootstrap.js test",
+    "verify:published": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-published.js --network bscTestnet",
+    "node": "node ./node_modules/hardhat/internal/cli/bootstrap.js node"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",

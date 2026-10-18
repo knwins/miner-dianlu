@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @notice 测试用 BEM（ERC20，18 位）。仅演示，可自由 mint。
+/// @notice Test BEM (ERC20, 18 decimals). Demo only. Anyone may mint.
 contract MockBEM {
     string public constant name = "BEM";
     string public constant symbol = "BEM";

@@ -295,7 +295,7 @@ export function computeHashpower({ nand, latch, depth = 1, refCost, refParts, pr
  *
  * 项目方统一流片：用户不自己设计电路，权重由图纸决定。
  * 所以这里不反推「达标需要多少」，而是看「募资总额按当前报价能买多少元件」——
- * 买不够图纸所需元件就会流片失败并全额退款。
+ * 买不够图纸所需元件就会流片失败，本金可退或降价重挂。
  *
  * @param {object} params
  * @param {string} params.transistorId 元件组合
@@ -758,7 +758,7 @@ export function adviseProcessor({ processorId, plan, hardCapBnb }) {
   if (!affordable) {
     return (
       `${name}：流片需 ${cost.toFixed(4)} BNB，募资总额只有 ${hardCapBnb.toFixed(4)} BNB，` +
-      `执行时将买不到元件，本期判失败并全额退款`
+      `执行时将买不到元件，判失败后可退款或降价重挂`
     );
   }
   if (ratio < COST_RATIO_MIN) {

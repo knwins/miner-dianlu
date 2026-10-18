@@ -1,15 +1,15 @@
 // 链上数据源钩子：CHAIN_CONFIGURED 时轮询 readState → 适配成 book/round。
 // 无钱包时用公共 RPC 只读；连接钱包后可签名写操作。本地模拟作为回退保留在 App。
-// BEM挖矿认购默认展示工厂最新一期；顶栏可手动切到历史期。
+// BEM挖矿认筹默认展示工厂最新一期；顶栏可手动切到历史期。
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Contract } from "ethers";
 import { IS_CONFIGURED as CHAIN_CONFIGURED, CAMPAIGN_ADDRESS } from "./config.js";
 import {
   readState,
   connectWallet,
-  getReadProvider,
+  restoreWallet,
   getCampaignAddress,
   setCampaignAddress,
+  clearCampaignAddress,
   listCampaigns,
   readCampaignSummary,
   readAccountAcrossCampaigns,
@@ -37,16 +37,20 @@ export function useChain(extra = {}) {
   const [positions, setPositions] = useState([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
   const [loading, setLoading] = useState(CHAIN_CONFIGURED);
-  const [transistorUnitPrice, setTransistorUnitPrice] = useState(null);
+  const [empty, setEmpty] = useState(false);
   const [error, setError] = useState("");
   const [picked, setPicked] = useState(1);
   /** 是否已完成「默认最新一期」引导；之后用户手动切换不再被拉回 */
   const bootedRef = useRef(false);
   const extraRef = useRef(extra);
   extraRef.current = extra;
+  /** 只采纳最新一次读取，避免慢请求把刚切换的期次盖回去 */
+  const readGen = useRef(0);
 
   const applyState = useCallback(async (addr, acc, addrs = campaignAddrs) => {
+    const gen = ++readGen.current;
     const state = await readState(acc, addr);
+    if (gen !== readGen.current) return;
     const idx = indexOfCampaign(addrs, addr);
     setRound((prev) => roundFromState(state, prev || roundFromDeployment(deployments), idx));
     setBook(bookFromState(state, acc, extraRef.current));
@@ -57,6 +61,7 @@ export function useChain(extra = {}) {
   const refresh = useCallback(async () => {
     if (!CHAIN_CONFIGURED) return;
     const addr = getCampaignAddress();
+    if (!addr) return;
     try {
       await applyState(addr, account);
     } catch (e) {
@@ -108,10 +113,22 @@ export function useChain(extra = {}) {
       try {
         const addrs = await refreshHistory();
         if (cancelled) return;
-        const latest = addrs[0] || getCampaignAddress() || CAMPAIGN_ADDRESS;
-        if (addrs[0]) setCampaignAddress(addrs[0]);
+        const saved = getCampaignAddress();
+        const savedOk = addrs.some((a) => String(a).toLowerCase() === String(saved).toLowerCase());
+        // 仅当前工厂期次有效；localStorage 若仍指向旧工厂期，强制切到最新一期
+        const latest = addrs[0] || "";
+        const target = savedOk ? saved : latest;
+        if (!target) {
+          clearCampaignAddress();
+          setEmpty(true);
+          setBook(null);
+          bootedRef.current = true;
+          return;
+        }
+        setEmpty(false);
+        setCampaignAddress(target);
         bootedRef.current = true;
-        await applyState(latest, account, addrs);
+        await applyState(target, account, addrs);
       } catch (e) {
         if (!cancelled) setError(e.shortMessage || e.message || String(e));
       } finally {
@@ -131,7 +148,8 @@ export function useChain(extra = {}) {
     let cancelled = false;
     (async () => {
       try {
-        await applyState(getCampaignAddress(), account);
+        const addr = getCampaignAddress();
+        if (addr) await applyState(addr, account);
       } catch (e) {
         if (!cancelled) setError(e.shortMessage || e.message || String(e));
       }
@@ -179,37 +197,54 @@ export function useChain(extra = {}) {
     };
   }, [account, campaignAddrs]);
 
-  // 读取晶体管铸造器单价（execute 锁价用）
-  useEffect(() => {
-    if (!CHAIN_CONFIGURED || !deployments.minter) return;
-    (async () => {
-      try {
-        const c = new Contract(
-          deployments.minter,
-          ["function quote(uint256) view returns (uint256)"],
-          getReadProvider()
-        );
-        setTransistorUnitPrice(await c.quote(1));
-      } catch {
-        /* 忽略：非 Owner 也用不到 */
-      }
-    })();
-  }, []);
+  const rawRef = useRef(null);
+  const [rawProvider, setRawProvider] = useState(null);
+  const connectBusy = useRef(0);
 
-  const connect = useCallback(async () => {
-    const w = await connectWallet();
+  const applyWallet = useCallback((w) => {
+    if (!w) return null;
+    rawRef.current = w.raw;
+    setRawProvider(w.raw);
     setSigner(w.signer);
     setAccount(w.account);
     return w;
   }, []);
 
+  const connect = useCallback(async (preferred) => {
+    connectBusy.current += 1;
+    try {
+      const w = await connectWallet(preferred || rawRef.current || undefined);
+      return applyWallet(w);
+    } finally {
+      window.setTimeout(() => {
+        connectBusy.current = Math.max(0, connectBusy.current - 1);
+      }, 1500);
+    }
+  }, [applyWallet]);
+
   const disconnect = useCallback(() => {
+    rawRef.current = null;
+    setRawProvider(null);
     setSigner(null);
     setAccount(null);
   }, []);
 
+  // 页面加载时静默恢复已授权钱包，避免「钱包已连上、顶栏仍显示尚未连接」
+  useEffect(() => {
+    if (!CHAIN_CONFIGURED) return undefined;
+    let cancelled = false;
+    (async () => {
+      const w = await restoreWallet();
+      if (!cancelled && w) applyWallet(w);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyWallet]);
+
   const switchCampaign = useCallback(
     async (addr) => {
+      setEmpty(false);
       setCampaignAddress(addr);
       setCampaignAddr(addr);
       setLoading(true);
@@ -217,43 +252,56 @@ export function useChain(extra = {}) {
       try {
         await applyState(addr, account);
       } catch (e) {
-        setError(e.shortMessage || e.message || String(e));
+        if (String(getCampaignAddress()).toLowerCase() === String(addr).toLowerCase()) {
+          setError(e.shortMessage || e.message || String(e));
+        }
       } finally {
-        setLoading(false);
+        if (String(getCampaignAddress()).toLowerCase() === String(addr).toLowerCase()) {
+          setLoading(false);
+        }
       }
     },
     [account, applyState]
   );
 
   useEffect(() => {
-    if (!window.ethereum) return;
+    const target = rawProvider;
+    if (!target?.on) return;
     const onAcc = async (accs) => {
       const next = accs && accs[0] ? accs[0] : null;
-      setAccount(next);
       if (!next) {
+        if (connectBusy.current > 0) return;
         setSigner(null);
+        setAccount(null);
         return;
       }
-      // 切账户后重新拿 signer，避免开期时 signer 为空
       try {
-        const w = await connectWallet();
-        setSigner(w.signer);
-        setAccount(w.account);
+        const w = await restoreWallet(target) || await connectWallet(target);
+        applyWallet(w);
       } catch {
+        setAccount(next);
         setSigner(null);
       }
     };
-    const onChain = () => window.location.reload();
-    window.ethereum.on?.("accountsChanged", onAcc);
-    window.ethereum.on?.("chainChanged", onChain);
-    return () => {
-      window.ethereum.removeListener?.("accountsChanged", onAcc);
-      window.ethereum.removeListener?.("chainChanged", onChain);
+    const onChain = async () => {
+      try {
+        const w = await restoreWallet(target);
+        if (w) applyWallet(w);
+      } catch {
+        /* 切链期间 RPC 失败时保留已连接地址 */
+      }
     };
-  }, []);
+    target.on("accountsChanged", onAcc);
+    target.on("chainChanged", onChain);
+    return () => {
+      target.removeListener?.("accountsChanged", onAcc);
+      target.removeListener?.("chainChanged", onChain);
+    };
+  }, [rawProvider, applyWallet]);
 
   return {
     active: CHAIN_CONFIGURED,
+    empty,
     loading,
     account,
     signer,
@@ -264,7 +312,7 @@ export function useChain(extra = {}) {
     refresh,
     refreshHistory,
     error,
-    transistorUnitPrice,
+    transistorUnitPrice: null,
     owner: book?.owner || deployments.deployer || "",
     campaignAddress,
     campaigns,

@@ -4,34 +4,36 @@ pragma solidity ^0.8.24;
 import {Ownable} from "./access/Ownable.sol";
 import {ReentrancyGuard} from "./security/ReentrancyGuard.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
+import {IERC1155} from "./interfaces/IERC1155.sol";
 import {IPoD} from "./interfaces/IPoD.sol";
-import {ITransistorMinter} from "./interfaces/ITransistorMinter.sol";
+import {IMaterialMarket} from "./interfaces/IMaterialMarket.sol";
 import {Emission} from "./libraries/Emission.sol";
 
-/// @title Campaign —— BEM 众筹挖矿单期合约
-/// @notice 忠实实现前端 fixtures.js 的状态机与资金流：
-///         funding → executing → mining；executing 子态 buying→listed→ready；
-///         退出两条互不相交路径：份额转让（主动·仅 mining）+ 退款（被动安全阀·募资超时/流片失败）。
+/// @title Campaign — one BEM crowdfunding-mining round
+/// @notice Scenes: Funding → Executing → Mining. Executing phases: Buying → Listed → Ready.
 ///
-/// 关键设计（与前端 apply* 一一对应）：
-///  - 多钱包账本：shares / escrow / claimed / refunded 均按地址记，收益 pending 按地址隔离（F1）。
-///  - BNB 原子结算（F4）：认购款进 raisedBnb 托管；转让接收时买方 BNB 立即付给卖方；退款/流片从托管支出。
-///  - execute 不可逆、仅 Owner（F3）：按锁定报价快照 priceLock 结算，买不起→判失败可退，成功清脏状态（F5）。
-///  - 退款 per-wallet（F6）：refunded[addr] + 全局 totalRefunded 区分「你的」与「全网」。
+/// Funds:
+///  - Subscription BNB sits in raisedBnb. Subscribe is still allowed at the exact deadline.
+///    After the deadline, if the round is not sold out, each subscriber calls refund.
+///  - Transistor minting has ended. The owner spends raisedBnb on material-market placeBid.
+///    Sellers fillBid and parts arrive as ERC1155. If the bid is unaffordable the tx succeeds,
+///    sets executionFailed, and does not place. Only the market may refund escrow via receive.
+///  - execute does not pay the market. Part cost was already escrowed. It checks the netlist
+///    hash and fills, returns leftover BNB, then calls pod.start.
+///  - Share transfer is Mining-only. Buyer BNB is paid straight to the seller, not into raisedBnb.
+///  - pendingBem uses available _shares only. Escrowed shares do not accrue.
 contract Campaign is Ownable, ReentrancyGuard {
-    using Emission for uint256;
-
-    // ─────────────────────────── 状态机 ───────────────────────────
+    // ─────────────────────────── state machine ───────────────────────────
     enum Scene {
         Funding,
         Executing,
         Mining
     }
     enum Phase {
-        None, // 非 executing 场景
-        Buying, // 待挂单（买晶体管）
-        Listed, // 挂单中（可取消）
-        Ready // 晶体管已到账，待 execute
+        None, // not Executing
+        Buying, // ready to place transistor bids
+        Listed, // bids live; cancel still allowed
+        Ready // parts filled; waiting for execute
     }
 
     struct Listing {
@@ -41,75 +43,106 @@ contract Campaign is Ownable, ReentrancyGuard {
         bool open;
     }
 
+    /// @notice One service-fee share. shareBps is a whole-percent slice (100 = 1%). The table must sum to 10000.
+    struct FeeShare {
+        address recipient;
+        uint16 shareBps;
+    }
+
     uint16 internal constant BPS = 10_000;
+    uint256 internal constant MAX_FEE_SHARES = 20;
 
-    // ─────────────────────── 不可变配置（开期写死） ───────────────────────
-    uint256 public immutable sharePriceBnb; // 每份价格（wei）
-    uint256 public immutable totalShares; // 总份数
-    uint16 public immutable feeBps; // 服务费基点
-    uint64 public immutable fundingDeadline; // 募集截止（unix 秒）
-    address public immutable feeRecipient; // 收费地址
-    uint256 public immutable taskId; // 官方题目
-    bytes32 public immutable netlistHash; // 开期承诺的网表哈希
-    uint64 public immutable executeDelay; // 售罄后观察期（秒）
-    IPoD public immutable pod; // 挖矿合约
-    IERC20 public immutable bem; // BEM 代币
-    ITransistorMinter public immutable minter; // 晶体管二级市场铸造器
+    // ─────────────────────── immutable config (fixed at creation) ───────────────────────
+    uint256 public immutable sharePriceBnb; // price per share (wei)
+    uint256 public immutable totalShares; // share cap
+    uint16 public immutable feeBps; // service fee in bps of daily emission
+    uint64 public immutable fundingDeadline; // funding deadline (unix seconds)
+    uint256 public immutable taskId; // official task id
+    bytes32 public immutable netlistHash; // netlist hash committed at creation
+    // Owner may replace external deps (material market / PoD). Ownership via transferOwnership.
+    IPoD public pod;
+    IERC20 public bem;
+    /// @notice Material market (placeBid / cancelBid / bids). Testnets may use a matching mock.
+    IMaterialMarket public market;
 
-    // ─────────────────────── 可变状态 ───────────────────────
+    // ─────────────────────── mutable state ───────────────────────
     Scene public scene;
     Phase public phase;
     uint256 public sold;
     uint64 public soldOutAt;
     bool public executionFailed;
 
-    uint256 public raisedBnb; // 合约代持 BNB 池（认购款托管，与钱包余额隔离）
+    uint256 public raisedBnb; // subscription escrow. Bids debit it; market refunds credit it via receive
     uint256 public harvestCount;
-    uint256 public totalDistributed; // 本期已分配给全部持有人的净 BEM（wei）
-    uint256 public totalFeeCollected; // 累计服务费 BEM
-    uint256 public totalClaimed; // 累计被领取 BEM
-    uint256 public totalRefunded; // 累计退款 BNB（全网）
+    uint256 public totalDistributed; // net BEM allocated to holders this round (wei)
+    uint256 public totalFeeCollected; // cumulative service-fee BEM
+    uint256 public totalClaimed; // cumulative claimed BEM
+    uint256 public totalRefunded; // cumulative refunded BNB (all wallets)
 
-    uint256 public hashpower; // 实际算力 H（execute 成功后由 PoD 返回）
-    uint256 public estHashpower; // 预估算力（开期设计值，未执行时展示）
-    bool public capped; // 是否被挖矿闸门拦住（true → 未验证池）
-    uint256 public transistorCount; // 需买入晶体管数（图纸元件数）
-    uint256 public priceLock; // execute 锁定的报价快照（每颗 BNB）；0 = 未锁
+    uint256 public hashpower; // live weight H returned by PoD.start
+    uint256 public estHashpower; // design estimate shown before execute
+    bool public capped; // mining gate (true → unverified pool)
+    uint256 public transistorCount; // NAND qty + LATCH qty for the live order
+    uint256 public priceLock; // total bid escrow (wei), not a unit price. 0 = no live order
+    address public transistors;
+    uint256 public nandBidId;
+    uint256 public latchBidId;
+    uint256 public nandQty;
+    uint256 public latchQty;
+    uint96 public nandPrice;
+    uint96 public latchPrice;
 
-    // 全网权重（oracle 更新，默认取链上实读值）
+    // network weights (oracle). Defaults are the on-chain snapshot at deploy.
     uint256 public netWeightVerified;
     uint256 public netWeightUnverified;
 
-    // ─────────────────────── 多钱包账本（F1/F4/F6） ───────────────────────
-    mapping(address => uint256) private _shares; // 可用份额
-    mapping(address => uint256) private _escrow; // 挂单锁定份额
-    mapping(address => uint256) private _claimed; // 已领 BEM（按地址隔离）
-    mapping(address => uint256) private _refunded; // 已退 BNB（按地址）
+    // ─────────────────────── per-wallet ledger ───────────────────────
+    mapping(address => uint256) private _shares; // available shares
+    mapping(address => uint256) private _escrow; // shares locked in a listing
+    mapping(address => uint256) private _claimed; // BEM already claimed by this wallet
+    mapping(address => uint256) private _refunded; // BNB already refunded to this wallet
+    address[] private _holders; // subscribers and listing buyers. openRefund and surplus use this list
+    mapping(address => bool) private _holderSeen;
 
     Listing[] private _listings;
+    FeeShare[] private _feeShares;
 
-    // ─────────────────────── 事件 ───────────────────────
-    event Bought(address indexed buyer, uint256 count, uint256 paidBnb);
+    // ─────────────────────── events ───────────────────────
+    event Subscribed(address indexed subscriber, uint256 count, uint256 paidBnb);
     event Refunded(address indexed holder, uint256 amountBnb);
     event Listed(uint256 indexed id, address indexed seller, uint256 count, uint256 priceBnbPerShare);
     event ListingCancelled(uint256 indexed id, address indexed seller, uint256 shares);
     event ListingTaken(uint256 indexed id, address indexed buyer, address indexed seller, uint256 count, uint256 paidBnb);
+    /// @notice The second argument is total escrowed BNB, not a unit price. The name is kept for the old ABI.
     event TransistorOrderPlaced(uint256 count, uint256 unitPriceBnb);
     event TransistorOrderCancelled();
     event TransistorsConfirmed();
+    /// @notice needBnb is the bid escrow that could not be paid. openRefund emits 0. The tx does not revert.
     event ExecutionFailed(uint256 needBnb, uint256 raisedBnb);
     event Executed(uint256 spentBnb, uint256 hashpower);
+    event SurplusReturned(address indexed holder, uint256 amountBnb);
+    event SurplusSendFailed(address indexed holder, uint256 amountBnb);
+    event RefundSendFailed(address indexed holder, uint256 amountBnb);
     event Harvested(uint256 round, uint256 grossBem, uint256 feeBem, uint256 netBem);
     event Claimed(address indexed holder, uint256 amountBem);
     event NetworkWeightUpdated(uint256 verified, uint256 unverified);
     event PlanUpdated(uint256 estHashpower, bool capped, uint256 transistorCount);
+    event PodUpdated(address indexed previous, address indexed next);
+    event BemUpdated(address indexed previous, address indexed next);
+    event MinterUpdated(address indexed previous, address indexed next);
+    event FeeSharesUpdated(uint256 count);
+    /// @notice One fee split. remainder is the rounding dust sent to the owner.
+    event FeeDistributed(uint256 totalFee, uint256 remainder);
+    /// @notice Owner pulled ERC1155 transistors out of this campaign. `to` is the owner at that moment.
+    event TransistorsRecovered(address indexed token, uint256 indexed id, uint256 amount, address indexed to);
+    /// @notice Owner pulled BNB out of this campaign. `to` is the owner at that moment.
+    event BnbRecovered(uint256 amount, address indexed to);
 
-    // ─────────────────────── 自定义错误 ───────────────────────
+    // ─────────────────────── errors ───────────────────────
     error DirectTransferNotAllowed();
     error WrongScene();
     error FundingEnded();
     error NotSoldOut();
-    error ObservationPeriodActive(uint64 unlockAt);
     error NetlistMismatch();
     error TransistorsNotReady();
     error RefundNotAvailable();
@@ -121,7 +154,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     error InsufficientShares();
     error ExceedsRemaining();
     error WrongPayment();
-    error EscrowLocked();
     error NoListing();
     error NotSeller();
     error CannotTakeOwnListing();
@@ -129,18 +161,22 @@ contract Campaign is Ownable, ReentrancyGuard {
     error NotListed();
     error AlreadyReady();
     error TransferFailed();
-    error CanStillAfford();
-    error AlreadyAborted();
+    error OrderTouched();
+    error BadFeeShares();
+    error PodCallFailed();
 
+    /// @param minter_ Material-market address. The storage name stays minter; read it via minter().
+    /// @param feeRecipients_ / feeShareBps_ Fee-share table. Shares must sum to 10000.
+    /// @param netlistHash_ Compared with keccak256(tapeoutData) inside execute.
     constructor(
         uint256 sharePriceBnb_,
         uint256 totalShares_,
         uint16 feeBps_,
         uint64 fundingDeadline_,
-        address feeRecipient_,
+        address[] memory feeRecipients_,
+        uint16[] memory feeShareBps_,
         uint256 taskId_,
         address pod_,
-        uint64 executeDelay_,
         address bem_,
         address minter_,
         bytes32 netlistHash_,
@@ -148,70 +184,124 @@ contract Campaign is Ownable, ReentrancyGuard {
         uint256 netWeightVerified_,
         uint256 netWeightUnverified_
     ) Ownable(owner_) {
-        if (
-            feeRecipient_ == address(0) || pod_ == address(0) || bem_ == address(0) || minter_ == address(0)
-        ) revert ZeroAddress();
+        if (pod_ == address(0) || bem_ == address(0) || minter_ == address(0)) revert ZeroAddress();
         if (totalShares_ == 0 || sharePriceBnb_ == 0) revert ZeroShares();
         sharePriceBnb = sharePriceBnb_;
         totalShares = totalShares_;
         feeBps = feeBps_;
         fundingDeadline = fundingDeadline_;
-        feeRecipient = feeRecipient_;
         taskId = taskId_;
         pod = IPoD(pod_);
-        executeDelay = executeDelay_;
         bem = IERC20(bem_);
-        minter = ITransistorMinter(minter_);
+        market = IMaterialMarket(minter_);
         netlistHash = netlistHash_;
         scene = Scene.Funding;
         phase = Phase.None;
         netWeightVerified = netWeightVerified_;
         netWeightUnverified = netWeightUnverified_;
+        _writeFeeShares(feeRecipients_, feeShareBps_);
     }
 
-    /// @dev 资金只准经由 buy / takeListing 进入，拒绝直接转账，保证 raisedBnb 记账精确。
+    /// @dev Subscribe and share sales do not use receive. Only unfilled bid escrow from the market is accepted and credited to raisedBnb.
     receive() external payable {
-        revert DirectTransferNotAllowed();
+        if (msg.sender != address(market)) revert DirectTransferNotAllowed();
+        raisedBnb += msg.value;
     }
 
-    // ─────────────────────────── 产出口径 ───────────────────────────
+    /// @notice Legacy reader. Returns the material-market address.
+    function minter() external view returns (address) {
+        return address(market);
+    }
 
-    /// @notice 本矿机日产 BEM（wei）。execute 前为 0。
+    /// @notice Legacy reader. Returns the first fee-share recipient. Use feeShares or feeShareAt for the full table.
+    function feeRecipient() external view returns (address) {
+        return _feeShares.length == 0 ? address(0) : _feeShares[0].recipient;
+    }
+
+    function feeShareCount() external view returns (uint256) {
+        return _feeShares.length;
+    }
+
+    function feeShareAt(uint256 index) external view returns (address recipient, uint16 shareBps) {
+        if (index >= _feeShares.length) revert BadFeeShares();
+        FeeShare storage item = _feeShares[index];
+        return (item.recipient, item.shareBps);
+    }
+
+    function feeShares() external view returns (FeeShare[] memory) {
+        return _feeShares;
+    }
+
+    // ─────────────────────────── external deps (owner) ───────────────────────────
+
+    /// @notice Replace PoD. Swapping it mid-mining can change claim/start. Trust the owner.
+    function setPod(address pod_) external onlyOwner {
+        if (pod_ == address(0)) revert ZeroAddress();
+        emit PodUpdated(address(pod), pod_);
+        pod = IPoD(pod_);
+    }
+
+    /// @notice Replace BEM. Pending is still claimed from this contract's balance. Check the ledger before switching tokens.
+    function setBem(address bem_) external onlyOwner {
+        if (bem_ == address(0)) revert ZeroAddress();
+        emit BemUpdated(address(bem), bem_);
+        bem = IERC20(bem_);
+    }
+
+    /// @notice Replace the material market (official placeBid contract, or a matching test mock).
+    function setMinter(address minter_) external onlyOwner {
+        if (minter_ == address(0)) revert ZeroAddress();
+        emit MinterUpdated(address(market), minter_);
+        market = IMaterialMarket(minter_);
+    }
+
+    /// @notice Replace the fee-share table. Shares must sum to 10000. Rounding dust is paid to the owner on harvest.
+    function setFeeShares(address[] calldata recipients, uint16[] calldata shareBps) external onlyOwner {
+        _writeFeeShares(recipients, shareBps);
+    }
+
+    // ─────────────────────────── emission ───────────────────────────
+
+    /// @notice This round's daily BEM (wei). Zero before execute.
     function dailyBem() public view returns (uint256) {
         return Emission.dailyBem(hashpower, capped, netWeightVerified, netWeightUnverified);
     }
 
-    /// @notice 某地址当前可领 BEM（F1：按地址隔离）。
-    ///         pending = 每轮净产出 × 领取轮数 × 该地址份额占比 − 该地址已领。
+    /// @notice Claimable = totalDistributed × available shares / totalShares − claimed.
+    ///         totalDistributed is the sum of nets actually pulled from PoD, not dailyBem × rounds.
+    ///         Uses _shares only. Escrowed shares do not accrue. takeListing moves the seller's claimed pro-rata.
     function pendingBem(address account) public view returns (uint256) {
-        if (scene != Scene.Mining || totalShares == 0) return 0;
-        uint256 daily = dailyBem();
-        if (daily == 0) return 0;
-        uint256 netPerRound = (daily * (BPS - feeBps)) / BPS;
-        uint256 accrued = (netPerRound * harvestCount * _shares[account]) / totalShares;
+        if (scene != Scene.Mining || totalDistributed == 0) return 0;
+        uint256 accrued = (totalDistributed * _shares[account]) / totalShares;
         uint256 done = _claimed[account];
         return accrued > done ? accrued - done : 0;
     }
 
-    /// @notice 更新全网权重（oracle）。零和机制下权重持续变化，需定期刷新。
+    /// @notice Update network weights (oracle). Weights keep moving, so refresh them.
     function updateNetworkWeight(uint256 verified, uint256 unverified) external onlyOwner {
         netWeightVerified = verified;
         netWeightUnverified = unverified;
         emit NetworkWeightUpdated(verified, unverified);
     }
 
-    /// @notice 设定开期图纸派生量：预估算力、是否被闸门拦住、需买入晶体管数。execute 前由 Owner 设定一次。
+    /// @notice Set the estimate, unverified-pool flag, and display part count. Zero count reverts.
+    ///         Writable in Funding, and in Executing only while Buying. Not writable in Listed, Ready, or Mining.
+    ///         The live order quantity is whatever placeTransistorOrder writes. This function does not place a bid.
     function setPlan(uint256 estHashpower_, bool capped_, uint256 transistorCount_) external onlyOwner {
+        if (scene == Scene.Mining) revert WrongScene();
+        if (scene == Scene.Executing && phase != Phase.Buying) revert WrongScene();
+        if (transistorCount_ == 0) revert ZeroShares();
         estHashpower = estHashpower_;
         capped = capped_;
         transistorCount = transistorCount_;
         emit PlanUpdated(estHashpower_, capped_, transistorCount_);
     }
 
-    // ─────────────────────────── 认购 ───────────────────────────
+    // ─────────────────────────── subscribe ───────────────────────────
 
-    /// @notice 按整数份认购，支付 count × sharePriceBnb BNB。自然售罄即进入待执行并启动观察期。
-    function buy(uint256 count) external payable nonReentrant {
+    /// @notice Buy an integer number of shares. msg.value must equal count × sharePriceBnb.
+    ///         Subscribe is still allowed when timestamp == fundingDeadline. A sell-out moves the round to Executing / Buying.
+    function subscribe(uint256 count) external payable nonReentrant {
         if (scene != Scene.Funding) revert WrongScene();
         if (block.timestamp > fundingDeadline) revert FundingEnded();
         if (count == 0) revert ZeroShares();
@@ -221,42 +311,63 @@ contract Campaign is Ownable, ReentrancyGuard {
         _shares[msg.sender] += count;
         sold += count;
         raisedBnb += msg.value;
+        _trackHolder(msg.sender);
 
         if (sold == totalShares) {
             scene = Scene.Executing;
             phase = Phase.Buying;
             soldOutAt = uint64(block.timestamp);
         }
-        emit Bought(msg.sender, count, msg.value);
+        emit Subscribed(msg.sender, count, msg.value);
     }
 
-    // ─────────────────────────── 退款（被动安全阀） ───────────────────────────
+    // ─────────────────────────── refund (pull) ───────────────────────────
 
-    /// @notice 原路退还本金：仅「募集中 + 超过截止仍未售罄」或「待执行 + 已判流片失败」可调。
-    ///         退还 count × sharePriceBnb、份额清零、已售份数回退、BNB 退回认购地址。
+    /// @notice The subscriber pulls their principal. Nothing runs automatically at the deadline.
+    ///         Allowed when Funding and timestamp > fundingDeadline, or Executing and executionFailed.
+    ///         Returns count × sharePriceBnb, zeroes shares, and rolls sold and raisedBnb back.
+    ///         Reverts if this wallet still has escrowed shares.
     function refund() external nonReentrant {
         bool fundingExpired = scene == Scene.Funding && block.timestamp > fundingDeadline;
         bool execFailed = scene == Scene.Executing && executionFailed;
         if (!fundingExpired && !execFailed) revert RefundNotAvailable();
 
-        uint256 s = _shares[msg.sender];
-        if (s == 0) revert ZeroShares();
-        if (_escrow[msg.sender] != 0) revert EscrowLocked();
-
-        uint256 amount = s * sharePriceBnb;
-        _shares[msg.sender] = 0;
-        sold -= s;
-        raisedBnb -= amount;
-        _refunded[msg.sender] += amount;
-        totalRefunded += amount;
-
-        _send(msg.sender, amount);
-        emit Refunded(msg.sender, amount);
+        // A failed send must revert the whole tx. Soft-fail would surface as ZeroShares.
+        if (_refundHolder(msg.sender, false) == 0) revert ZeroShares();
     }
 
-    // ─────────────────────────── 份额转让（唯一主动退出，仅 mining） ───────────────────────────
+    function _trackHolder(address who) internal {
+        if (_holderSeen[who]) return;
+        _holderSeen[who] = true;
+        _holders.push(who);
+    }
 
-    /// @notice 发布出售挂单：挂出份额立即从可用余额锁定到 escrow，不能领取/转让，直到卖出或撤单。
+    /// @dev Refund this wallet's remaining principal. Returns 0 if shares are 0 or any shares are escrowed.
+    ///      soft=true (openRefund): a failed send restores this wallet and is skipped.
+    ///      soft=false: a failed send reverts the whole transaction.
+    function _refundHolder(address who, bool soft) internal returns (uint256 amount) {
+        uint256 s = _shares[who];
+        if (s == 0 || _escrow[who] != 0) return 0;
+        amount = s * sharePriceBnb;
+        _shares[who] = 0;
+        sold -= s;
+        raisedBnb -= amount;
+        if (!_trySend(who, amount)) {
+            _shares[who] = s;
+            sold += s;
+            raisedBnb += amount;
+            if (!soft) revert TransferFailed();
+            emit RefundSendFailed(who, amount);
+            return 0;
+        }
+        _refunded[who] += amount;
+        totalRefunded += amount;
+        emit Refunded(who, amount);
+    }
+
+    // ─────────────────────────── share transfer (Mining only) ───────────────────────────
+
+    /// @notice Mining only. Moves shares into escrow. They stop accruing pendingBem until sold or cancelled.
     function listShares(uint256 count, uint256 priceBnbPerShare) external {
         if (scene != Scene.Mining) revert WrongScene();
         if (count == 0) revert ZeroShares();
@@ -269,7 +380,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit Listed(_listings.length - 1, msg.sender, count, priceBnbPerShare);
     }
 
-    /// @notice 撤销自己的挂单，释放锁定份额回可用余额。仅挂单方或 Owner。
+    /// @notice Cancel your listing and unlock the shares. Seller or owner only.
     function cancelListing(uint256 id) external {
         if (scene != Scene.Mining) revert WrongScene();
         if (id >= _listings.length || !_listings[id].open) revert NoListing();
@@ -282,7 +393,10 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit ListingCancelled(id, l.seller, l.shares);
     }
 
-    /// @notice 接收（买入）挂单：份额过户到买方，买方 BNB 立即付给卖方（原子结算，不进合约托管）。
+    /// @notice Mining only. Moves shares from the seller's escrow to the buyer's _shares.
+    ///         msg.value must equal count × price and is paid straight to the seller.
+    ///         Moves _claimed pro-rata to the buyer's share of the seller's available plus escrowed shares,
+    ///         so the buyer cannot reclaim rounds the seller already claimed.
     function takeListing(uint256 id, uint256 count) external payable nonReentrant {
         if (scene != Scene.Mining) revert WrongScene();
         if (id >= _listings.length || !_listings[id].open) revert NoListing();
@@ -293,122 +407,169 @@ contract Campaign is Ownable, ReentrancyGuard {
         uint256 pay = count * l.priceBnbPerShare;
         if (msg.value != pay) revert WrongPayment();
 
+        uint256 sellerHeld = _shares[l.seller] + _escrow[l.seller];
+        if (sellerHeld > 0) {
+            uint256 moveClaimed = (_claimed[l.seller] * count) / sellerHeld;
+            if (moveClaimed > 0) {
+                _claimed[l.seller] -= moveClaimed;
+                _claimed[msg.sender] += moveClaimed;
+            }
+        }
+
         _escrow[l.seller] -= count;
         _shares[msg.sender] += count;
+        _trackHolder(msg.sender);
         l.shares -= count;
         if (l.shares == 0) l.open = false;
 
-        _send(l.seller, pay); // BNB 实时付给卖方
+        _send(l.seller, pay); // BNB paid to the seller immediately
         emit ListingTaken(id, msg.sender, l.seller, count, pay);
     }
 
-    // ─────────────────────────── 晶体管二级市场挂单（仅 Owner） ───────────────────────────
+    // ─────────────────────────── secondary-market bids (owner) ───────────────────────────
 
-    /// @notice Owner 手动调用 tapeout.net 挂单逻辑：记录锁定报价快照，进入「挂单中」。
-    function placeTransistorOrder(uint256 count, uint256 unitPriceBnb) external onlyOwner {
+    /// @notice Place bids on the material market. NAND tokenId is 0, LATCH is 1. Owner only, phase must be Buying.
+    ///         Escrow is debited from raisedBnb and sent with placeBid. A zero-qty leg is skipped and its bid id stays 0.
+    ///         If cost > raisedBnb, sets executionFailed and returns. The tx does not revert and no bid is placed.
+    ///         Reverts if already failed and (not sold out or raisedBnb is 0). A sold-out round with BNB left clears the flag and places.
+    function placeTransistorOrder(
+        address transistors_,
+        uint256 nandQty_,
+        uint96 nandPrice_,
+        uint256 latchQty_,
+        uint96 latchPrice_
+    ) external onlyOwner nonReentrant {
         if (scene != Scene.Executing) revert WrongScene();
-        if (executionFailed) revert RefundNotAvailable();
         if (phase == Phase.Ready) revert AlreadyReady();
         if (phase == Phase.Listed) revert AlreadyListed();
-        if (count == 0 || unitPriceBnb == 0) revert ZeroShares();
+        if (transistors_ == address(0)) revert ZeroAddress();
+        if (nandQty_ == 0 && latchQty_ == 0) revert ZeroShares();
+        if ((nandQty_ > 0 && nandPrice_ == 0) || (latchQty_ > 0 && latchPrice_ == 0)) revert ZeroPrice();
+        if (executionFailed && (sold < totalShares || raisedBnb == 0)) revert RefundNotAvailable();
 
-        transistorCount = count;
-        priceLock = unitPriceBnb; // 锁定报价快照
-        phase = Phase.Listed;
-        emit TransistorOrderPlaced(count, unitPriceBnb);
-    }
-
-    /// @notice 待挂单时买不起晶体管：Owner 提交当前报价，成本高于募集额才开放退款。
-    ///         之后持份人用 refund() 原路退还。已挂单须先取消。买得起时拒绝。
-    function abortUnaffordable(uint256 count, uint256 unitPriceBnb) external onlyOwner {
-        if (scene != Scene.Executing) revert WrongScene();
-        if (phase != Phase.Buying) revert AlreadyListed();
-        if (executionFailed) revert AlreadyAborted();
-        if (count == 0 || unitPriceBnb == 0) revert ZeroShares();
-        uint256 cost = count * unitPriceBnb;
-        if (cost <= raisedBnb) revert CanStillAfford();
-        executionFailed = true;
-        emit ExecutionFailed(cost, raisedBnb);
-    }
-
-    /// @notice 取消挂单，回到待挂单并清空锁价。
-    function cancelTransistorOrder() external onlyOwner {
-        if (scene != Scene.Executing) revert WrongScene();
-        if (phase != Phase.Listed) revert NotListed();
-
-        phase = Phase.Buying;
-        transistorCount = 0;
-        priceLock = 0;
-        emit TransistorOrderCancelled();
-    }
-
-    /// @notice 确认成交到账，解锁 execute。priceLock 保留为锁定快照。
-    function confirmTransistors() external onlyOwner {
-        if (scene != Scene.Executing) revert WrongScene();
-        if (phase == Phase.Ready) revert AlreadyReady();
-        if (phase != Phase.Listed) revert NotListed();
-
-        phase = Phase.Ready;
-        emit TransistorsConfirmed();
-    }
-
-    // ─────────────────────────── 流片开矿（不可逆，仅 Owner） ───────────────────────────
-
-    /// @notice 换币 + 流片 + 开户挖矿。按锁定报价快照结算：
-    ///         买不起 → 判 executionFailed、留在待执行、本金未动、可原路退还（清锁价允许降价重试）；
-    ///         买得起 → 支出募集款买入晶体管并烧掉、流片开户，进入 mining（F5 清脏状态）。
-    function execute(bytes calldata tapeoutData, bytes calldata startData) external onlyOwner nonReentrant {
-        if (scene != Scene.Executing) revert WrongScene();
-        if (sold < totalShares) revert NotSoldOut();
-        if (phase != Phase.Ready) revert TransistorsNotReady();
-        if (block.timestamp < uint256(soldOutAt) + executeDelay) {
-            revert ObservationPeriodActive(soldOutAt + executeDelay);
-        }
-        if (keccak256(tapeoutData) != netlistHash) revert NetlistMismatch();
-
-        uint256 cost = transistorCount * priceLock; // 锁定报价快照结算
+        uint256 nandCost = nandQty_ * uint256(nandPrice_);
+        uint256 latchCost = latchQty_ * uint256(latchPrice_);
+        uint256 cost = nandCost + latchCost;
         if (cost > raisedBnb) {
             executionFailed = true;
-            priceLock = 0; // 清锁价，允许元件降价后由 Owner 重试
             emit ExecutionFailed(cost, raisedBnb);
             return;
         }
 
+        executionFailed = false;
         raisedBnb -= cost;
-        ITransistorMinter(minter).mint{value: cost}(transistorCount); // 买入晶体管并烧掉
-        uint256 hp = IPoD(pod).start(startData); // 流片开户，返回权重
-        hashpower = hp;
-        scene = Scene.Mining;
-        phase = Phase.None;
-        executionFailed = false; // F5：清脏状态
-        harvestCount = 0;
-        emit Executed(cost, hp);
+        transistors = transistors_;
+        nandQty = nandQty_;
+        latchQty = latchQty_;
+        nandPrice = nandPrice_;
+        latchPrice = latchPrice_;
+        transistorCount = nandQty_ + latchQty_;
+        priceLock = cost;
+        if (nandQty_ > 0) {
+            nandBidId = market.placeBid{value: nandCost}(transistors_, 0, nandPrice_, nandQty_);
+        }
+        if (latchQty_ > 0) {
+            latchBidId = market.placeBid{value: latchCost}(transistors_, 1, latchPrice_, latchQty_);
+        }
+        phase = Phase.Listed;
+        emit TransistorOrderPlaced(transistorCount, cost);
     }
 
-    // ─────────────────────────── 领取 / 分发 ───────────────────────────
+    /// @notice Buying only. The owner sets executionFailed if needed, then refunds each holder.
+    ///         Quotes are ignored. A rejecting address is skipped. Already Listed must be cancelled first.
+    function openRefund() external onlyOwner nonReentrant {
+        if (scene != Scene.Executing) revert WrongScene();
+        if (phase != Phase.Buying) revert AlreadyListed();
+        if (!executionFailed) {
+            executionFailed = true;
+            emit ExecutionFailed(0, raisedBnb);
+        }
+        uint256 n = _holders.length;
+        for (uint256 i = 0; i < n; i++) {
+            _refundHolder(_holders[i], true);
+        }
+    }
 
-    /// @notice 全网分发一轮：从 PoD 拉取当日 BEM，扣服务费打给收费地址，净额按份累计给全部持有人。
-    ///         领取次数不设上限，只要还在出矿（日产 > 0）即可一直分发。
+    /// @notice Listed only, and both legs' remaining must equal the ordered qty. Any touched leg reverts the whole call.
+    ///         After cancelBid the market refunds escrow into receive. This function does not credit raisedBnb itself.
+    ///         Then it clears the order and returns to Buying.
+    function cancelTransistorOrder() external onlyOwner nonReentrant {
+        if (scene != Scene.Executing) revert WrongScene();
+        if (phase != Phase.Listed) revert NotListed();
+        _assertUntouched(nandBidId, nandQty);
+        _assertUntouched(latchBidId, latchQty);
+        if (nandBidId != 0) market.cancelBid(nandBidId);
+        if (latchBidId != 0) market.cancelBid(latchBidId);
+        _clearOrder();
+        phase = Phase.Buying;
+        emit TransistorOrderCancelled();
+    }
+
+    /// @notice Anyone may call. Does not move tokens. Parts should already have arrived via fillBid ERC1155.
+    ///         Moves Listed → Ready only when both legs have remaining == 0. A zero-qty leg counts as filled.
+    function confirmTransistors() external {
+        if (scene != Scene.Executing) revert WrongScene();
+        if (phase == Phase.Ready) revert AlreadyReady();
+        if (phase != Phase.Listed) revert NotListed();
+        if (!orderFilled()) revert TransistorsNotReady();
+        phase = Phase.Ready;
+        emit TransistorsConfirmed();
+    }
+
+    /// @notice True when the official book has fully filled this round's bids.
+    function orderFilled() public view returns (bool) {
+        return _legFilled(nandBidId, nandQty) && _legFilled(latchBidId, latchQty);
+    }
+
+    // ─────────────────────────── tape-out (irreversible, owner) ───────────────────────────
+
+    /// @notice Owner only. Requires a sell-out, phase Ready, keccak256(tapeoutData) == netlistHash, and a still-filled order.
+    ///         Does not pay the market. Returns leftover raisedBnb pro-rata, then pod.start(startData), and enters Mining.
+    ///         Rejected surplus stays in raisedBnb.
+    function execute(bytes calldata tapeoutData, bytes calldata startData) external onlyOwner nonReentrant {
+        if (scene != Scene.Executing) revert WrongScene();
+        if (sold < totalShares) revert NotSoldOut();
+        if (phase != Phase.Ready) revert TransistorsNotReady();
+        if (keccak256(tapeoutData) != netlistHash) revert NetlistMismatch();
+        if (transistorCount == 0 || priceLock == 0) revert ZeroPrice();
+        if (!orderFilled()) revert TransistorsNotReady();
+
+        uint256 spent = priceLock;
+        // Part cost was already escrowed in placeBid. Return leftover BNB, then start mining.
+        _returnSurplus();
+        hashpower = _podStart(startData); // weight returned by PoD, or burn weight from the official adapter
+        scene = Scene.Mining;
+        phase = Phase.None;
+        executionFailed = false;
+        emit Executed(spent, hashpower);
+    }
+
+    // ─────────────────────────── harvest / claim ───────────────────────────
+
+    /// @notice Anyone may call. Credits the BEM PoD actually paid, not the dailyBem estimate.
+    ///         A short pull is still distributed. A larger pull (verified-pool premium over b*×P) is distributed too.
+    ///         The fee is split by the share table; rounding dust goes to the owner.
+    ///         Net BEM is not credited per wallet — only totalDistributed and harvestCount increase.
     function harvest() external nonReentrant {
         if (scene != Scene.Mining) revert WrongScene();
-        uint256 daily = dailyBem();
-        if (daily == 0) revert NoEmission();
+
+        uint256 pulled = _podClaim();
+        if (pulled == 0) revert NoEmission();
+        uint256 fee = (pulled * feeBps) / BPS;
+        uint256 net = pulled - fee;
+        if (net == 0) revert NoEmission();
 
         harvestCount += 1;
-        uint256 fee = (daily * feeBps) / BPS;
-        uint256 net = daily - fee;
         totalFeeCollected += fee;
         totalDistributed += net;
 
-        uint256 pulled = IPoD(pod).claim(); // 拉取本日产 BEM 到本合约
-        uint256 feeToSend = fee <= pulled ? fee : pulled;
-        if (feeToSend > 0 && feeRecipient != address(0)) {
-            bem.transfer(feeRecipient, feeToSend);
+        if (fee > 0) {
+            _distributeFee(fee);
         }
-        emit Harvested(harvestCount, daily, feeToSend, net);
+        emit Harvested(harvestCount, pulled, fee, net);
     }
 
-    /// @notice 领取本钱包已累计的 BEM（F1：只领自己的 pending）。
+    /// @notice Claim msg.sender's pending. If the contract's BEM is short, only the balance is sent and claimed is increased by that amount.
     function claim() external nonReentrant returns (uint256) {
         if (scene != Scene.Mining) revert WrongScene();
         uint256 pending = pendingBem(msg.sender);
@@ -419,20 +580,13 @@ contract Campaign is Ownable, ReentrancyGuard {
 
         _claimed[msg.sender] += amount;
         totalClaimed += amount;
-        bem.transfer(msg.sender, amount);
+        if (!bem.transfer(msg.sender, amount)) revert TransferFailed();
         emit Claimed(msg.sender, amount);
         return amount;
     }
 
-    // ─────────────────────────── 视图 ───────────────────────────
-
-    function status() external view returns (Scene) {
-        return scene;
-    }
-
-    function executePhase() external view returns (Phase) {
-        return phase;
-    }
+    // ─────────────────────────── views ───────────────────────────
+    // scene and phase already have public getters. Do not wrap them again.
 
     function sharesOf(address account) external view returns (uint256) {
         return _shares[account];
@@ -459,10 +613,208 @@ contract Campaign is Ownable, ReentrancyGuard {
         return _listings[id];
     }
 
-    // ─────────────────────────── 内部 ───────────────────────────
+    // ─────────────────────────── internal ───────────────────────────
+
+    /// @dev After a successful tape-out, return unused raisedBnb pro-rata. Rounding dust goes to the owner.
+    ///      A rejecting address leaves that slice in raisedBnb and does not abort execute. Owner may later rescueUnsentBnb.
+    function _returnSurplus() internal {
+        uint256 leftover = raisedBnb;
+        if (leftover == 0 || sold == 0) return;
+        raisedBnb = 0;
+        uint256 distributed;
+        uint256 n = _holders.length;
+        for (uint256 i = 0; i < n; i++) {
+            address who = _holders[i];
+            uint256 s = _shares[who];
+            if (s == 0) continue;
+            uint256 part = (leftover * s) / sold;
+            if (part == 0) continue;
+            if (!_trySend(who, part)) {
+                raisedBnb += part;
+                emit SurplusSendFailed(who, part);
+                continue;
+            }
+            distributed += part;
+            _refunded[who] += part;
+            totalRefunded += part;
+            emit SurplusReturned(who, part);
+        }
+        uint256 dust = leftover - distributed - raisedBnb;
+        if (dust > 0) {
+            if (!_trySend(owner, dust)) {
+                raisedBnb += dust;
+                emit SurplusSendFailed(owner, dust);
+            }
+        }
+    }
+
+    /// @dev Split the fee by the share table. Rounding dust goes to the owner. Any failed transfer reverts the whole call.
+    function _distributeFee(uint256 fee) internal {
+        uint256 paid;
+        uint256 n = _feeShares.length;
+        for (uint256 i = 0; i < n; i++) {
+            FeeShare storage item = _feeShares[i];
+            uint256 part = (fee * uint256(item.shareBps)) / BPS;
+            if (part == 0) continue;
+            if (!bem.transfer(item.recipient, part)) revert TransferFailed();
+            paid += part;
+        }
+        uint256 rem = fee - paid;
+        if (rem > 0) {
+            if (!bem.transfer(owner, rem)) revert TransferFailed();
+        }
+        emit FeeDistributed(fee, rem);
+    }
+
+    /// @dev Replace the fee-share table. Length 1..MAX_FEE_SHARES, non-zero addresses,
+    ///      each share is a whole percent (multiple of 100 bps, 1..100), sum == 10000.
+    function _writeFeeShares(address[] memory recipients, uint16[] memory shareBps) internal {
+        uint256 n = recipients.length;
+        if (n == 0 || n > MAX_FEE_SHARES || n != shareBps.length) revert BadFeeShares();
+        uint256 sum;
+        for (uint256 i = 0; i < n; i++) {
+            uint16 bps = shareBps[i];
+            // Whole percent only: 100, 200, …, 10000. No fractional percents.
+            if (recipients[i] == address(0) || bps == 0 || bps > BPS || bps % 100 != 0) revert BadFeeShares();
+            sum += bps;
+        }
+        if (sum != BPS) revert BadFeeShares();
+        while (_feeShares.length > 0) {
+            _feeShares.pop();
+        }
+        for (uint256 i = 0; i < n; i++) {
+            _feeShares.push(FeeShare({recipient: recipients[i], shareBps: shareBps[i]}));
+        }
+        emit FeeSharesUpdated(n);
+    }
+
+    /// @notice Owner only. Moves ERC1155 transistors held by this campaign to the current owner.
+    ///         Blocked while an order is live (Listed) or confirmed for tape-out (Ready): those parts belong to the round.
+    ///         Allowed in Buying / Funding / Mining (and after cancel). Execute does not burn parts, so Mining is the usual rescue.
+    ///         Does not change the order, price lock, or scene. Recipient is always `owner`.
+    function recoverTransistors(address token, uint256 id, uint256 amount) external onlyOwner nonReentrant {
+        if (phase == Phase.Listed) revert AlreadyListed();
+        if (phase == Phase.Ready) revert AlreadyReady();
+        if (token == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroShares();
+        IERC1155(token).safeTransferFrom(address(this), owner, id, amount, "");
+        emit TransistorsRecovered(token, id, amount, owner);
+    }
+
+    /// @notice Owner only. Sends BNB held by this campaign to the current owner and emits BnbRecovered.
+    ///         Funding / Executing: only the excess over raisedBnb (ledger dust). Subscription escrow stays locked.
+    ///         Mining: can also pull remaining raisedBnb (rejected surplus / leftover after tape-out).
+    ///         Recipient is always `owner`, not an arbitrary address.
+    function recoverBnb(uint256 amount) external onlyOwner nonReentrant {
+        if (amount == 0) revert ZeroShares();
+        uint256 bal = address(this).balance;
+        if (amount > bal) revert ExceedsRemaining();
+
+        uint256 reserved = raisedBnb;
+        uint256 excess = bal > reserved ? bal - reserved : 0;
+        if (amount > excess) {
+            if (scene != Scene.Mining) revert WrongScene();
+            raisedBnb = reserved - (amount - excess);
+        }
+        _send(owner, amount);
+        emit BnbRecovered(amount, owner);
+    }
+
+    /// @notice Mining only. Sends the entire remaining raisedBnb to `to`. Prefer recoverBnb when the recipient is the owner.
+    function rescueUnsentBnb(address to) external onlyOwner nonReentrant {
+        if (scene != Scene.Mining) revert WrongScene();
+        if (to == address(0)) revert ZeroAddress();
+        uint256 amt = raisedBnb;
+        if (amt == 0) revert ZeroShares();
+        raisedBnb = 0;
+        _send(to, amt);
+    }
+
+    function _legFilled(uint256 id, uint256 qty) internal view returns (bool) {
+        if (qty == 0) return true;
+        return _remaining(id) == 0;
+    }
+
+    function _assertUntouched(uint256 id, uint256 qty) internal view {
+        if (qty == 0) return;
+        if (_remaining(id) != qty) revert OrderTouched();
+    }
+
+    function _remaining(uint256 id) internal view returns (uint256 remaining) {
+        if (id == 0) return 0;
+        (,,,,, remaining) = market.bids(id);
+    }
+
+    function _clearOrder() internal {
+        nandBidId = 0;
+        latchBidId = 0;
+        nandQty = 0;
+        latchQty = 0;
+        nandPrice = 0;
+        latchPrice = 0;
+        transistors = address(0);
+        transistorCount = 0;
+        priceLock = 0;
+    }
+
+    /// @dev Official fillBid uses ERC1155 safeTransfer. The caller is not checked; the hook only returns the receiver selector.
+    function onERC1155Received(address, address, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return this.onERC1155BatchReceived.selector;
+    }
+
+    /// @dev Official PoD start requires this campaign to own the circuit NFT. Accept safeTransferFrom so the
+    ///      owner can move a taped-out circuit in before execute. No accounting change.
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    /// @dev OfficialPodAdapter reports podUsesDelegatecall() == true. Delegatecall keeps
+    ///      msg.sender of the inner official call equal to this campaign, which is what Ownr() checks.
+    ///      A normal IPoD (the test mock) is called directly. A malicious pod can be delegatecalled
+    ///      only after the owner points setPod at it.
+    function _podStart(bytes calldata startData) internal returns (uint256) {
+        if (_podDelegatecall()) {
+            (bool ok, bytes memory ret) = address(pod).delegatecall(abi.encodeCall(IPoD.start, (startData)));
+            if (!ok) _bubble(ret);
+            return abi.decode(ret, (uint256));
+        }
+        return IPoD(pod).start(startData);
+    }
+
+    function _podClaim() internal returns (uint256) {
+        if (_podDelegatecall()) {
+            (bool ok, bytes memory ret) = address(pod).delegatecall(abi.encodeCall(IPoD.claim, ()));
+            if (!ok) _bubble(ret);
+            return abi.decode(ret, (uint256));
+        }
+        return IPoD(pod).claim();
+    }
+
+    function _podDelegatecall() internal view returns (bool) {
+        (bool ok, bytes memory ret) = address(pod).staticcall(abi.encodeWithSelector(bytes4(keccak256("podUsesDelegatecall()"))));
+        return ok && ret.length >= 32 && abi.decode(ret, (bool));
+    }
+
+    function _bubble(bytes memory ret) private pure {
+        if (ret.length == 0) revert PodCallFailed();
+        assembly {
+            revert(add(ret, 32), mload(ret))
+        }
+    }
+
+    function _trySend(address to, uint256 amount) internal returns (bool ok) {
+        (ok, ) = to.call{value: amount}("");
+    }
 
     function _send(address to, uint256 amount) internal {
-        (bool ok, ) = to.call{value: amount}("");
-        if (!ok) revert TransferFailed();
+        if (!_trySend(to, amount)) revert TransferFailed();
     }
 }

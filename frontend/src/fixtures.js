@@ -104,6 +104,7 @@ export const ROUND = {
   optimal: false,
   contract: "0xA11cE9010000000000000000000000000000E901",
   feeRecipient: "0x0000000000000000000000000000000000000fee",
+  feeShares: [{ address: "0x0000000000000000000000000000000000000fee", shareBps: 10_000 }],
 };
 
 /**
@@ -174,11 +175,9 @@ export function identify(address, book, state = null) {
   };
 }
 
-/** 观察期剩余毫秒。未售罄返回 0。 */
-export function executeUnlockIn(round, book, now = Date.now()) {
-  if (book.scene !== "executing") return 0;
-  const unlockedAt = (book.soldOutAt || 0) + round.executeDelayHours * 3600_000;
-  return Math.max(0, unlockedAt - now);
+/** 不再设观察期。保留函数是为了旧调用点，始终表示可以立即流片。 */
+export function executeUnlockIn() {
+  return 0;
 }
 
 export function executeUnlocked(round, book, now = Date.now()) {
@@ -201,12 +200,12 @@ export const SCENE_COPY = {
   funding: {
     badge: "募集中",
     tone: "live",
-    lead: "本期开放认购，份额售罄后进入换币流片。募集期内只能按当前报价预估。份额转让（唯一的退出途径）仅在售罄并进入挖矿中后才开放，募集期与待执行期不可挂牌。",
+    lead: "本期开放认筹，份额售罄后进入换币流片。募集到期仍未满时，由认筹地址自己点退回，只退该钱包的本金。",
   },
   executing: {
     badge: "待执行",
     tone: "wait",
-    lead: "本期份数已售完。晶体管须由 Owner 钱包在合约侧调用 tapeout.net 挂单逻辑、成交后再调用确认到账，才能触发 execute 流片开矿；若元件涨价导致募资总额买不起，则判失败并全额退款。合约无法替人工操作 tapeout.net，但 Owner 可手动发起链上交易完成这两步。",
+    lead: "本期份数已售完。晶体管须由 Owner 调用 tapeout.net 挂单并确认到账后才能流片；买不起则判失败、本金不动，持份人可原路退还，Owner 也可降价重挂。成功流片后未花完的募集款按份退回。",
   },
   mining: {
     badge: "挖矿中",
@@ -393,7 +392,7 @@ export const PAST_ROUNDS = [
  *
  * 图纸由项目方统一提供且开期后不可改，所以权重是确定的。
  * 唯一会变的是「募资总额按当前报价能买到多少元件」——
- * 买不够图纸所需元件就流片失败并全额退款。
+ * 买不够图纸所需元件就流片失败，本金不动，可退款或降价重挂。
  *
  * 报价来自实时价格源（`prices.js`），同一期在不同时刻结果不同。
  * execute 之后 book.hashpower 才是实际值。
@@ -820,8 +819,8 @@ export function seedCalls(round = ROUND) {
     { time: now - 3 * 86400_000, method: "claim", ok: true, message: `${shortAddress(WALLET)} 领取 ${formatBem(book.claimable)} BEM` },
     { time: now - 5 * 86400_000, method: "claim", ok: true, message: "0x8b21…B21A 领取 18.60 BEM" },
     { time: now - 12 * 86400_000, method: "execute", ok: true, message: `购入元件完成流片，权重 ${book.hashpower}，电路 ${book.circuitId}` },
-    { time: now - 13 * 86400_000, method: "buy", ok: true, message: `0x8b21…B21A 买入 6 份，支付 ${(6 * round.sharePriceBnb).toFixed(4)} BNB` },
-    { time: now - 14 * 86400_000, method: "buy", ok: true, message: `${shortAddress(WALLET)} 买入 4 份，支付 ${(4 * round.sharePriceBnb).toFixed(4)} BNB` },
+    { time: now - 13 * 86400_000, method: "subscribe", ok: true, message: `0x8b21…B21A 认筹 6 份，支付 ${(6 * round.sharePriceBnb).toFixed(4)} BNB` },
+    { time: now - 14 * 86400_000, method: "subscribe", ok: true, message: `${shortAddress(WALLET)} 认筹 4 份，支付 ${(4 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000 - 3600_000, method: "createCampaign", ok: true, message: `第 ${round.id} 期创建，${round.totalShares} 份 × ${round.sharePriceBnb} BNB，服务费 ${round.feeBps / 100}%` },
     { time: now - 20 * 86400_000, method: "swapExactTokensForETH", ok: false, message: "拒绝：仅本期合约可调用" },
   ];
@@ -829,9 +828,9 @@ export function seedCalls(round = ROUND) {
 
 /* ── 写操作：页面按钮和合约调用页共用同一套实现，避免两份逻辑漂移 ── */
 
-export function applyBuy(round, book, shares) {
-  if (book.scene !== "funding") return { ok: false, message: "只有募集中可以买入。" };
-  if (Date.now() > (book.endsAt || Infinity)) return { ok: false, message: "募集已结束，不能继续认购；超时未售罄的份额可原路退还 BNB。" };
+export function applySubscribe(round, book, shares) {
+  if (book.scene !== "funding") return { ok: false, message: "只有募集中可以认筹。" };
+  if (Date.now() > (book.endsAt || Infinity)) return { ok: false, message: "募集已结束，不能继续认筹；超时未售罄的份额可原路退还 BNB。" };
   const count = Number(shares);
   if (!Number.isInteger(count) || count < 1) return { ok: false, message: "份数必须是正整数" };
   if (book.sold + count > round.totalShares) return { ok: false, message: `超过剩余份数，本期只剩 ${round.totalShares - book.sold} 份` };
@@ -840,11 +839,11 @@ export function applyBuy(round, book, shares) {
   const wallet = book.wallets[buyer] || { mine: 0, listingShares: 0, claimed: 0, refunded: 0, bnb: DEMO_BNB };
   const cost = round4(count * round.sharePriceBnb);
   if ((wallet.bnb || 0) < cost) {
-    return { ok: false, message: `BNB 余额不足，无法支付 ${cost} BNB 认购款。` };
+    return { ok: false, message: `BNB 余额不足，无法支付 ${cost} BNB 认筹款。` };
   }
   return {
     ok: true,
-    message: filled ? `已买入 ${count} 份，本期售罄` : `已买入 ${count} 份`,
+    message: filled ? `已认筹 ${count} 份，本期售罄` : `已认筹 ${count} 份`,
     book: recomputeSelf({
       ...book,
       sold: book.sold + count,
@@ -867,8 +866,8 @@ export function applyBuy(round, book, shares) {
  *
  * 与已删除的「exit 赎回」不同：exit 是流片前/后主动退出（已移除），
  * 这里只在「募集中 + 已超过募集截止时间 endsAt + 仍未售罄」时，
- * 把当前钱包认购的 BNB 原路退给认购地址、份额清零（已售份数相应回退）。
- * 这是保护认购人、避免资金卡死于募集失败的安全阀，不进入挖矿/转让流程。
+ * 把当前钱包认筹的 BNB 原路退给认筹地址、份额清零（已售份数相应回退）。
+ * 这是保护认筹人、避免资金卡死于募集失败的安全阀，不进入挖矿/转让流程。
  */
 export function applyRefund(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
@@ -1008,9 +1007,11 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
   if (count > listing.shares) return { ok: false, message: `挂单仅剩 ${listing.shares} 份` };
   const pay = round4(count * listing.priceBnbPerShare);
   const rest = listing.shares - count;
-  const nextListings = rest > 0
-    ? listings.map((l) => (l.id === listingId ? { ...l, shares: rest, totalBnb: round4(rest * l.priceBnbPerShare) } : l))
-    : listings.filter((l) => l.id !== listingId);
+  const nextListings = listings.map((l) => {
+    if (l.id !== listingId) return l;
+    if (rest > 0) return { ...l, shares: rest, totalBnb: round4(rest * l.priceBnbPerShare), status: "open", open: true };
+    return { ...l, shares: count, totalBnb: pay, status: "done", open: false };
+  });
 
   const buyerKey = String(who.address).toLowerCase();
   const sellerKey = String(listing.seller).toLowerCase();
@@ -1020,6 +1021,11 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
   if ((buyer.bnb || 0) < pay) {
     return { ok: false, message: `BNB 余额不足，无法支付 ${pay} BNB 接收款。` };
   }
+  // 与合约一致：按卖方当前持仓（可用+托管）比例转移已领 BEM 债，避免买方重领历史轮次
+  const sellerHeld = Number(seller.mine || 0) + Number(seller.listingShares || 0);
+  const moveClaimed = sellerHeld > 0
+    ? round4((Number(seller.claimed || 0) * count) / sellerHeld)
+    : 0;
   return {
     ok: true,
     message: `已接收 ${count} 份，支付 ${pay} BNB 给 ${shortAddress(listing.seller)}`,
@@ -1027,8 +1033,18 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
       ...book,
       wallets: {
         ...book.wallets,
-        [buyerKey]: { ...buyer, mine: buyer.mine + count, bnb: round4((buyer.bnb || 0) - pay) },
-        [sellerKey]: { ...seller, listingShares: Math.max(0, seller.listingShares - count), bnb: round4((seller.bnb || 0) + pay) },
+        [buyerKey]: {
+          ...buyer,
+          mine: buyer.mine + count,
+          claimed: round4((buyer.claimed || 0) + moveClaimed),
+          bnb: round4((buyer.bnb || 0) - pay),
+        },
+        [sellerKey]: {
+          ...seller,
+          listingShares: Math.max(0, seller.listingShares - count),
+          claimed: round4(Math.max(0, (seller.claimed || 0) - moveClaimed)),
+          bnb: round4((seller.bnb || 0) + pay),
+        },
       },
       listings: nextListings,
     }),
@@ -1062,7 +1078,7 @@ export function applyClaim(round, book) {
  * 手动调用本函数发起链上交易：先 placeTransistorOrder 进入「挂单中」，成交后 confirmTransistors 确认到账。
  * 仅 Factory Owner 可调，避免状态竞争；非 Owner 或已挂单/已到账均拒绝。
  */
-export function applyPlaceTransistorOrder(round, book, actor = null) {
+export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
     return { ok: false, message: "只 Factory Owner 能调用 tapeout.net 挂单逻辑。" };
@@ -1070,52 +1086,108 @@ export function applyPlaceTransistorOrder(round, book, actor = null) {
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行状态需要调用 tapeout.net 挂单逻辑。" };
   }
-  if (book.executionFailed) {
-    return { ok: false, message: "已经因买不起晶体管开放退款，不能再挂单。" };
-  }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "晶体管已到账，无需再挂单。" };
+    return { ok: false, message: "晶体管已到账，无需再挂单。若要重挂请先取消。" };
   }
   if (book.executePhase === "listed") {
     return { ok: false, message: "已经调用挂单逻辑，待成交或取消。" };
   }
+  // 买不起失败后可降价重挂；若已退光本金则不可再挂（对齐合约）
+  if (book.executionFailed && (book.sold < round.totalShares || (book.bnbPool || 0) <= 0)) {
+    return { ok: false, message: "本金已退或份数已回退，不能再挂单。" };
+  }
+  const nand = Math.floor(Number(args.nandQty) || 0);
+  const latch = Math.floor(Number(args.latchQty) || 0);
+  const count = nand + latch || Math.floor(Number(
+    args.count ?? book.transistorCount ?? book.estimate?.usedParts ?? 0
+  ));
+  const unit = Number(
+    args.nandPrice ?? args.unitPriceBnb ?? (book.priceLock > 0 ? book.priceLock : quoteUnitFallback(book))
+  );
+  if (!Number.isFinite(count) || count <= 0) {
+    return { ok: false, message: "挂单数量须为正整数（与 tapeout.net 一致）。" };
+  }
+  if (!Number.isFinite(unit) || unit <= 0) {
+    return { ok: false, message: "挂单单价须大于 0（与 tapeout.net 一致）。" };
+  }
   return {
     ok: true,
-    message: "已调用 tapeout.net 挂单逻辑，等待成交。",
-    book: { ...book, executePhase: "listed" },
+    message: book.executionFailed
+      ? `已降价重挂：${count} 颗 × ${round4(unit)} BNB，等待成交。`
+      : `已锁价挂单：${count} 颗 × ${round4(unit)} BNB，等待成交。`,
+    book: {
+      ...book,
+      executionFailed: false,
+      executePhase: "listed",
+      transistorCount: count,
+      priceLock: round4(unit),
+    },
   };
 }
 
+function quoteUnitFallback(book) {
+  const est = book.estimate || {};
+  if (est.usedParts > 0 && est.needBnb > 0) return round4(est.needBnb / est.usedParts);
+  return 0.005;
+}
+
 /**
- * 待挂单且当前报价买不起晶体管时，Factory Owner 开放退款。
- * 持份人再到「我的资产」原路退还。买得起、已挂单、非 Owner 均拒绝。
+ * 待挂单时由 Factory Owner 决定开放退款，不判断当前报价买不买得起。
+ * 持份人再到「我的资产」原路退还。已挂单、非 Owner 均拒绝。
  */
+/** @deprecated 请用 applyOpenRefund；保留别名避免旧引用 */
 export function applyAbortUnaffordable(round, book, actor = null) {
+  return applyOpenRefund(round, book, actor);
+}
+
+export function applyOpenRefund(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只 Factory Owner 能因买不起晶体管发起退款。" };
+    return { ok: false, message: "只 Factory Owner 能发起退款。" };
   }
   if (book.scene !== "executing") {
-    return { ok: false, message: "只有待执行可以因买不起晶体管而退款。" };
+    return { ok: false, message: "只有待执行可以由 Owner 发起退款。" };
   }
   if (book.executePhase && book.executePhase !== "buying") {
     return { ok: false, message: "请先取消挂单，再发起退款。" };
   }
-  if (book.executionFailed) return { ok: false, message: "已经开放退款。" };
-  const est = book.estimate || {};
-  if (!(Number(est.usedParts) > 0) || est.capCoversFloor !== false) {
-    return { ok: false, message: "募资总额买得起晶体管，不能退款。" };
+  // 对齐 openRefund：同笔交易按钱包退光仍持有的本金
+  let next = { ...book, executionFailed: true, wallets: { ...book.wallets } };
+  let paid = 0;
+  let pool = Number(book.bnbPool || 0);
+  let sold = Number(book.sold || 0);
+  for (const [addr, wallet] of Object.entries(book.wallets || {})) {
+    const free = Number(wallet.mine || 0);
+    if (free <= 0 || Number(wallet.listingShares || 0) > 0) continue;
+    const refundBnb = round4(free * Number(round.sharePriceBnb || 0));
+    if (refundBnb <= 0) continue;
+    paid = round4(paid + refundBnb);
+    pool = round4(Math.max(0, pool - refundBnb));
+    sold = Math.max(0, sold - free);
+    next.wallets[addr] = {
+      ...wallet,
+      mine: 0,
+      refunded: round4((wallet.refunded || 0) + refundBnb),
+      bnb: round4((wallet.bnb || 0) + refundBnb),
+    };
   }
+  next = recomputeSelf({
+    ...next,
+    sold,
+    bnbPool: pool,
+    refundedBnb: round4((book.refundedBnb || 0) + paid),
+  });
   return {
     ok: true,
-    message: "已因买不起晶体管开放退款。持份人可到「我的资产」原路退还。",
-    book: { ...book, executionFailed: true },
+    message: paid > 0
+      ? `已退款。认筹 BNB 已按认筹地址原路退回（共 ${paid} BNB）。`
+      : "已标记流片失败；没有可退份额（可能已全部自助退款）。",
+    book: next,
   };
 }
 
 /**
- * Owner 取消 tapeout.net 晶体管挂单，回到待挂单状态。仅 Factory Owner 可调。
- * 仅当处于 listed（挂单中）时有效；已到账或尚未挂单均拒绝。
+ * Owner 取消挂单或从 Ready 撤回，回到待挂单。对齐合约 cancelTransistorOrder。
  */
 export function applyCancelTransistorOrder(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
@@ -1125,13 +1197,20 @@ export function applyCancelTransistorOrder(round, book, actor = null) {
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行状态有 tapeout.net 晶体管挂单可取消。" };
   }
-  if (book.executePhase !== "listed") {
+  if (book.executePhase !== "listed" && book.executePhase !== "ready") {
     return { ok: false, message: "当前没有进行中的 tapeout.net 晶体管挂单。" };
   }
   return {
     ok: true,
-    message: "已取消 tapeout.net 晶体管挂单，回到待挂单状态。",
-    book: { ...book, executePhase: "buying" },
+    message: book.executePhase === "ready"
+      ? "已从待流片撤回，回到待挂单状态。"
+      : "已取消 tapeout.net 晶体管挂单，回到待挂单状态。",
+    book: {
+      ...book,
+      executePhase: "buying",
+      transistorCount: 0,
+      priceLock: undefined,
+    },
   };
 }
 
@@ -1165,9 +1244,8 @@ export function applyConfirmTransistors(round, book, actor = null) {
 /**
  * 执行换币 + 流片。这是「预估」变成「实际」的唯一地方。
  *
- * 权限：持份用户或 Owner 都可触发（Owner 只是先动手那一个，无独占权）。
- * 时间：售罄后必须等 executeDelayHours 观察期，让用户核对网表与报价。
- * 执行逻辑：按执行时的实时报价，自动判断募资总额是否买得起图纸所需元件。
+ * 权限：仅 Factory Owner。晶体管到账后即可执行，不再等待观察期。
+ * 执行逻辑：按锁定报价判断募资总额是否买得起图纸所需元件。
  *          买得起 → 直接换币、买入晶体管、流片并开矿，进入 mining；
  *          买不起 → 判 executionFailed，本金尚未支出，持份人可原路退还 BNB。
  */
@@ -1177,7 +1255,7 @@ export function applyExecute(round, book, quote = MARKET, actor = null, taskbook
   /**
    * 晶体管须已通过调用 tapeout.net 挂单逻辑并确认到账（executePhase === "ready"）才能流片。
    * executePhase 缺失（旧数据/非 executing）按 ready 处理，避免误拦截；
-   * 自然售罄进入 executing 时已补 executePhase="buying"（见 applyBuy），故此处会正确拦住。
+   * 自然售罄进入 executing 时已补 executePhase="buying"（见 applySubscribe），故此处会正确拦住。
    */
   if (book.executePhase && book.executePhase !== "ready") {
     return { ok: false, message: "晶体管尚未到位，请先由 Owner 调用 tapeout.net 挂单逻辑并确认成交到账后再执行流片。" };
@@ -1190,13 +1268,7 @@ export function applyExecute(round, book, quote = MARKET, actor = null, taskbook
     return { ok: false, message: "只 Factory Owner 可以执行换币流片（不可逆操作）。" };
   }
 
-  const wait = executeUnlockIn(round, book);
-  if (wait > 0) {
-    const hours = Math.ceil(wait / 3600_000);
-    return { ok: false, message: `观察期未满，还要等 ${hours} 小时。售罄后 ${round.executeDelayHours} 小时内不可执行换币。` };
-  }
-
-  // F3：价格快照锁价——以本次执行的报价（或首次进入时锁定的报价）结算，
+  // 价格快照锁价——以本次执行的报价（或首次进入时锁定的报价）结算，
   // 避免「按调用瞬间实时价」被抢跑/抬价导致机会损失。失败重试时清除锁价，重新按当时价评估。
   const lockUsed = book.priceLock || quote;
   const actual = estimateHashpower(round, lockUsed, book.sold, taskbook);
@@ -1213,33 +1285,52 @@ export function applyExecute(round, book, quote = MARKET, actor = null, taskbook
     const why =
       `按${actual.processor}当前报价（NAND ${actual.priceNand.toFixed(4)} × ${actual.nand} + LATCH ${actual.priceLatch.toFixed(4)} × ${actual.latch}` +
       ` = ${actual.needBnb} BNB）超过募资总额 ${actual.hardCapBnb} BNB，缺口 ${round4(actual.needBnb - actual.hardCapBnb)} BNB`;
-    /**
-     * 执行失败不转入任何「退款」终态：标记 executionFailed、留在待执行，
-     * 本金尚未支出，持份用户可在「我的份额」页把 BNB 原路退还；
-     * 也可等待元件降价后由 Owner 重试流片。
-     */
     return {
       ok: true,
-      message: `execute 后校验不通过：${why}。本期判失败，可原路退还本金 BNB，或待元件降价后由 Owner 重试流片。`,
+      message: `execute 后校验不通过：${why}。本期判失败，已回到待挂单；可原路退还，或由 Owner 降价重挂。`,
       book: {
         ...book,
         executionFailed: true,
+        executePhase: "buying",
+        transistorCount: 0,
         actualBnb: actual.bnb,
         actualQuote: actual.quote,
-        // 失败重试时清除锁价，下次执行按当时报价重新评估（F3）
         priceLock: undefined,
       },
     };
+  }
+
+  // 流片成功：支出购件成本，余量按份退回各钱包（对齐 _returnSurplus）
+  const cost = actual.needBnb;
+  const poolBefore = Number(book.bnbPool || 0);
+  const surplus = round4(Math.max(0, poolBefore - cost));
+  let wallets = { ...book.wallets };
+  let refundedExtra = 0;
+  if (surplus > 0 && book.sold > 0) {
+    for (const [addr, wallet] of Object.entries(wallets)) {
+      const free = Number(wallet.mine || 0);
+      if (free <= 0) continue;
+      const part = round4((surplus * free) / book.sold);
+      if (part <= 0) continue;
+      refundedExtra = round4(refundedExtra + part);
+      wallets[addr] = {
+        ...wallet,
+        refunded: round4((wallet.refunded || 0) + part),
+        bnb: round4((wallet.bnb || 0) + part),
+      };
+    }
   }
 
   return {
     ok: true,
     scene: "mining",
     message: `${label}触发 execute：募集 ${actual.hardCapBnb} BNB，购入 ${actual.usedParts} 个${actual.transistorName}，` +
-      `流片权重 ${actual.hashpower}（${actual.usedParts} 元件 ×${actual.processorScale}` +
-      `${actual.optimal ? ` + 溢价 q=${actual.q}` : ""}）。`,
+      `流片权重 ${actual.hashpower}` +
+      (surplus > 0 ? `；余量 ${surplus} BNB 已按份退回` : "") +
+      `。`,
     book: recomputeSelf({
       ...book,
+      wallets,
       scene: "mining",
       hashpower: actual.hashpower,
       dailyBem: actual.dailyBem,
@@ -1249,14 +1340,12 @@ export function applyExecute(round, book, quote = MARKET, actor = null, taskbook
       actualBnb: actual.bnb,
       actualQuote: actual.quote,
       executedBy: who.role,
-      // F5：成功进入挖矿时清掉执行失败的脏状态，避免残留误导下游
       executionFailed: false,
       executePhase: undefined,
-      // F3：锁定本次执行所用的报价快照
       priceLock: lockUsed,
-      // F4：流片把募集款换成元件并烧掉，从合约代持 BNB 池支出
-      bnbPool: round4(Math.max(0, (book.bnbPool || 0) - actual.needBnb)),
-      // 挖矿不设截止日：领取次数不限，只要还在出矿就可一直领取
+      transistorCount: actual.usedParts,
+      bnbPool: 0,
+      refundedBnb: round4((book.refundedBnb || 0) + refundedExtra),
       endsAt: undefined,
     }),
   };
@@ -1269,13 +1358,14 @@ export function applyHarvest(round, book) {
   const dailyBem = bemRate(book.hashpower, {
     pool: book.capped ? "unverified" : "verified",
   });
-  // 领取次数不设上限：只要本期仍在出矿（日产 > 0）就可一直分发
-  if (dailyBem <= 0) return { ok: false, message: "当前没有出矿，暂无可领取的 BEM。" };
+  // 领取次数不设上限：须有可分发日产，且扣费后净额 > 0
+  if (dailyBem <= 0) return { ok: false, message: "当前没有可分发数量（日产为 0），无法 harvest。" };
+  const rate = feeRate(round);
+  if (dailyBem * (1 - rate) <= 0) return { ok: false, message: "扣除服务费后没有可分发净额，无法 harvest。" };
   const addr = String(book.selfAddress || WALLET).toLowerCase();
   const wallet = book.wallets[addr] || { mine: 0, listingShares: 0, claimed: 0 };
   const hBefore = computeHarvest(round, book, addr);
   const nextCount = (book.harvestCount || 0) + 1;
-  const rate = feeRate(round);
   // harvest 是**全网分发**：把第 nextCount 轮日产出计入每位持有人的 pending，
   // 所有地址按各自份额自动 accrual（pending = accruedNet − claimed 在 recomputeSelf 里按地址重算）。
   return {
@@ -1301,6 +1391,7 @@ export function applyCreate(round, draft, snapshot = QUOTE, taskbook = null) {
       taskId: draft.taskId,
       optimal: draft.optimal,
       feeRecipient: draft.feeRecipient,
+      feeShares: draft.feeShares,
       partCount: draft.partCount,
     },
     snapshot,
@@ -1311,6 +1402,13 @@ export function applyCreate(round, draft, snapshot = QUOTE, taskbook = null) {
 
   const nextId = round.id + 1;
   const model = findTransistor(draft.transistorId || DEFAULT_TRANSISTOR);
+  const feeShares =
+    Array.isArray(draft.feeShares) && draft.feeShares.length
+      ? draft.feeShares.map((row) => ({
+          address: String(row.address || "").trim(),
+          shareBps: Math.round(Number(row.shareBps)),
+        }))
+      : [{ address: draft.feeRecipient, shareBps: 10_000 }];
   const nextRound = {
     ...round,
     id: nextId,
@@ -1333,7 +1431,8 @@ export function applyCreate(round, draft, snapshot = QUOTE, taskbook = null) {
     feeBps: Number(draft.feePercent) * 100,
     transistorId: model.id,
     processor: draft.processor,
-    feeRecipient: draft.feeRecipient,
+    feeRecipient: feeShares[0]?.address || draft.feeRecipient,
+    feeShares,
     contract: previewAddress(nextId),
     /** 开期时锁定的报价快照，作为本期预估基准，用户可核对 */
     lockedQuote: {
@@ -1435,7 +1534,38 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND, taskbook = nu
         `不够图纸所需的 ${needParts} 个（需 ${needBnb.toFixed(4)} BNB，缺 ${needParts - affordableParts} 个）`,
     );
   }
-  if (!/^0x[a-fA-F0-9]{40}$/.test(draft.feeRecipient)) issues.push("服务费收费地址格式不正确");
+  const feeShareRows =
+    Array.isArray(draft.feeShares) && draft.feeShares.length
+      ? draft.feeShares
+      : draft.feeRecipient
+        ? [{ address: draft.feeRecipient, shareBps: 10_000 }]
+        : [];
+  if (feeShareRows.length === 0) {
+    issues.push("至少填写一个服务费收费地址");
+  } else {
+    let shareSum = 0;
+    for (const row of feeShareRows) {
+      const address = String(row.address || "").trim();
+      // Accept whole-percent input (sharePercent) or on-chain bps (shareBps, multiples of 100).
+      const rawPercent =
+        row.sharePercent != null && row.sharePercent !== ""
+          ? Number(row.sharePercent)
+          : Number(row.shareBps) / 100;
+      const percent = Math.round(rawPercent);
+      if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+        issues.push("服务费收费地址格式不正确");
+        break;
+      }
+      if (!Number.isInteger(percent) || percent < 1 || percent > 100 || percent !== rawPercent) {
+        issues.push("服务费分成比例须为 1 到 100 的整数");
+        break;
+      }
+      shareSum += percent;
+    }
+    if (shareSum !== 100) {
+      issues.push(`所有分成地址比例之和必须等于 100，当前合计为 ${shareSum}`);
+    }
+  }
 
   return {
     hardCapBnb: round4(hardCapBnb),

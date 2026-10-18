@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {IERC20} from "../interfaces/IERC20.sol";
 import {IPoD} from "../interfaces/IPoD.sol";
 
-/// @notice 测试用 PoD：每日 claim 把 amount BEM 打给调用方；start 返回固定权重。
+/// @notice Test PoD. claim sends `amount` BEM to the caller. start returns a fixed weight.
 contract MockPoD is IPoD {
     IERC20 public immutable bem;
     uint256 public immutable hashpower;
@@ -19,7 +19,7 @@ contract MockPoD is IPoD {
         dailyAmount = amount;
     }
 
-    /// @dev 预先 mint 给本合约，claim 时转给调用方（Campaign）。
+    /// @dev Pre-mint BEM to this contract. claim transfers it to the caller (the Campaign).
     function claim() external returns (uint256) {
         uint256 amt = dailyAmount;
         if (amt == 0) return 0;
@@ -28,9 +28,7 @@ contract MockPoD is IPoD {
         return amt;
     }
 
-    function start(bytes calldata) external returns (uint256) {
+    function start(bytes calldata) external view returns (uint256) {
         return hashpower;
     }
-
-    function arm() external {}
 }

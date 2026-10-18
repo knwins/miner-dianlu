@@ -27,6 +27,13 @@ module.exports = {
     version: "0.8.24",
     settings: { optimizer: { enabled: true, runs: 200 }, viaIR: true },
   },
+  sourcify: {
+    enabled: true,
+  },
+  etherscan: {
+    apiKey: process.env.BSCSCAN_API_KEY || "",
+    enabled: Boolean(process.env.BSCSCAN_API_KEY),
+  },
   networks: {
     hardhat: { chainId: 31337 },
     bscTestnet: {

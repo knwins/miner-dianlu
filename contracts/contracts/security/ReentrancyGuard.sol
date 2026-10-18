@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @title ReentrancyGuard（最小自包含实现）
-/// @notice 所有涉及外部调用（转 BNB / 转 BEM / 调 minter·pod）的写函数都加 nonReentrant，
-///         杜绝退款/领取时的重入双击。
+/// @title ReentrancyGuard — minimal, no external dependency
+/// @notice Writes that call out (BNB, BEM, market, PoD) use nonReentrant so refund and claim cannot be reentered.
 abstract contract ReentrancyGuard {
     uint256 private constant _NOT_ENTERED = 1;
     uint256 private constant _ENTERED = 2;

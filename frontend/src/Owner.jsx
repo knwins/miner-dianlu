@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { ContractCalls } from "./Calls.jsx";
 import OnChainPage from "./OnChain.jsx";
+import { formatEther } from "./chain/client.js";
+import { OFFICIAL_CPU_TAPEOUT } from "./podStart.js";
+import deployments from "./chain/deployments.json";
 import {
   MARKET,
   OWNER,
@@ -62,13 +65,15 @@ const EMPTY_FORM = {
   fundingDays: "15",
   feePercent: "5",
   feeRecipient: "0x0000000000000000000000000000000000000fee",
+  feeShares: [{ address: "0x0000000000000000000000000000000000000fee", sharePercent: "100" }],
 };
 
 export function OwnerOverview({
-  round, book, copy, pending, actor, executeWait, history, taskbook,
-  onSwitchCampaign, onPlaceTransistorOrder, onAbortUnaffordable, onCancelTransistorOrder, onConfirmTransistors,
-  onExecute, onHarvest, onSetPlan, onOpenRound, onOpenAssets,
-  account = "", connected = false, chainHolders = null, quote, onInvoke,
+  round, book, copy, pending, pendingTarget = "", actor, executeWait, history, taskbook,
+  onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onCancelTransistorOrder, onConfirmTransistors,
+  onExecute, onHarvest, onSetPlan, onRemoveCampaign, onOpenRound, onOpenAssets,
+  account = "", connected = false, chainHolders = null, holdersCampaign = "", quote, onInvoke,
+  transistorUnitPrice = null,
 }) {
   // 链上：托管池 raisedBnb 为权威；模拟：份数×单价
   const raised = book._chain ? Number(book.bnbPool || 0) : book.sold * round.sharePriceBnb;
@@ -81,6 +86,47 @@ export function OwnerOverview({
   );
   const dailyBem = book._chain && book.dailyBem != null ? book.dailyBem : harvest.dailyBem;
   const design = resolveCampaignDesign(round, book, taskbook);
+  const needsOfficialStart = Boolean(deployments.podIsAdapter);
+  const [startForm, setStartForm] = useState({
+    cpu: OFFICIAL_CPU_TAPEOUT,
+    circuitId: "",
+    taskId: String(round?.taskId || book?.taskId || "54"),
+    anchor: "0",
+    salt: "",
+    circuits: "",
+    proofs: "",
+    pubs: "",
+    startData: "",
+  });
+
+  const mixedUnit = (() => {
+    const est = book.estimate || {};
+    if (est.usedParts > 0 && est.needBnb > 0) return est.needBnb / est.usedParts;
+    return 0;
+  })();
+  const minterUnit = (() => {
+    if (transistorUnitPrice != null && transistorUnitPrice > 0n) {
+      try { return Number(formatEther(transistorUnitPrice)); } catch { return 0; }
+    }
+    return 0;
+  })();
+  const suggestedUnit = (() => {
+    if (mixedUnit > 0) return mixedUnit;
+    if (minterUnit > 0) return minterUnit;
+    return 0.005;
+  })();
+  const [nandQty, setNandQty] = useState("0");
+  const [latchQty, setLatchQty] = useState("0");
+  const [nandPrice, setNandPrice] = useState("0");
+  const [latchPrice, setLatchPrice] = useState("0");
+  useEffect(() => {
+    if (book.executePhase !== "buying") return;
+    const est = book.estimate || {};
+    setNandQty(String(est.nand || 0));
+    setLatchQty(String(est.latch || 0));
+    setNandPrice(String(round4(est.priceNand || suggestedUnit)));
+    setLatchPrice(String(round4(est.priceLatch || est.priceNand || suggestedUnit)));
+  }, [book.address, book.executePhase, book.estimate, suggestedUnit]);
   const historyRows = (history != null ? history : PAST_ROUNDS).map((item) => {
     const onChainRow = history != null;
     const rowDesign = resolveCampaignDesign(
@@ -152,8 +198,8 @@ export function OwnerOverview({
   }, [dialog]);
 
   const isOwner = actor?.role === "owner";
-  const canExecute = isOwner && executeWait === 0;
-  const waitHours = Math.ceil(executeWait / 3600_000);
+  // 买不起后合约回到待挂单；未重挂前不可 execute（priceLock/元件数已清）
+  const canExecute = isOwner && !book.executionFailed && Number(book.priceLock || 0) > 0 && Number(book.transistorCount || 0) > 0;
   const planWritten = Number(book.estHashpower) > 0 || Number(book.transistorCount) > 0;
   const sceneTitle =
     book.scene === "funding" ? "募集中"
@@ -174,6 +220,12 @@ export function OwnerOverview({
   const rangeFrom = visibleRows.length === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
   const rangeTo = Math.min(page * PAGE_SIZE, visibleRows.length);
   const dialogRow = dialog ? historyRows.find((row) => rowKey(row) === dialog.key) : null;
+  const holdersForRound = book._chain
+    && holdersCampaign
+    && round.contract
+    && String(holdersCampaign).toLowerCase() === String(round.contract).toLowerCase()
+    ? chainHolders
+    : null;
   const dialogLive = Boolean(
     dialogRow && (
       (dialogRow.address && String(round.contract || "").toLowerCase() === String(dialogRow.address).toLowerCase())
@@ -217,12 +269,12 @@ export function OwnerOverview({
                       </button>
                       {onOpenRound && (
                         <button className="btn btn-inline" type="button" onClick={onOpenRound}>
-                          去 BEM挖矿认购
+                          去 BEM挖矿认筹
                         </button>
                       )}
                     </div>
                     <p className="fine">
-                      募集期用户在「BEM挖矿认购」按份买入。Owner 可先 setPlan，把预估算力与需买元件数写上链，供用户核对。
+                      募集期用户在「BEM挖矿认筹」按份认筹。Owner 可先 setPlan，把预估算力与需买元件数写上链，供用户核对。
                       {!isOwner && " 当前钱包不是 Factory Owner，无法写 setPlan。"}
                     </p>
                   </>
@@ -235,73 +287,176 @@ export function OwnerOverview({
                     book.executePhase === "ready" ? "已到账 · 待流片"
                       : book.executePhase === "listed" ? "挂单中 · 待成交"
                         : "待挂单";
+                  const nandN = Math.max(0, Math.floor(Number(nandQty) || 0));
+                  const latchN = Math.max(0, Math.floor(Number(latchQty) || 0));
+                  const nandP = Number(nandPrice) || 0;
+                  const latchP = Number(latchPrice) || 0;
+                  const orderCost = round4(nandN * nandP + latchN * latchP);
+                  const canPlace = isOwner && (nandN > 0 || latchN > 0) && (nandN === 0 || nandP > 0) && (latchN === 0 || latchP > 0);
+                  const overBudget = orderCost > raised && raised > 0;
                   return (
                     <>
                       <ul className="bill">
                         <li><span>子状态</span><strong>{phaseLabel}</strong></li>
                         <li><span>目标处理器</span><strong>{est.processor || design.processorId || "—"}</strong></li>
-                        <li><span>需买入</span><strong>{need} 颗 · {est.nand || 0} NAND + {est.latch || 0} LATCH</strong></li>
-                        <li><span>观察期</span><strong>售罄后 {round.executeDelayHours} 小时{executeWait > 0 ? ` · 还剩约 ${waitHours} 小时` : " · 已满"}</strong></li>
-                        <li className="due"><span>本阶段 Owner 可做</span><strong>买得起则挂单；买不起则退款</strong></li>
+                        <li><span>图纸建议</span><strong>{need} 颗 · {est.nand || 0} NAND + {est.latch || 0} LATCH</strong></li>
+                        {mixedUnit > 0 && (
+                          <li><span>混合成本折合</span><strong>{round4(mixedUnit)} BNB/颗（need ÷ count）</strong></li>
+                        )}
+                        <li className="due"><span>本阶段 Owner 可做</span><strong>调用官方市场 placeBid，或直接退款</strong></li>
                       </ul>
+                      {book.executePhase === "buying" && (
+                        <div className="form-grid publish-fields" style={{ marginBottom: 12 }}>
+                          <label className="field">
+                            <span>NAND 数量（tokenId 0）</span>
+                            <input inputMode="numeric" value={nandQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setNandQty(e.target.value)} />
+                          </label>
+                          <label className="field">
+                            <span>NAND 单价（BNB）</span>
+                            <input inputMode="decimal" value={nandPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => setNandPrice(e.target.value)} />
+                          </label>
+                          <label className="field">
+                            <span>LATCH 数量（tokenId 1）</span>
+                            <input inputMode="numeric" value={latchQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setLatchQty(e.target.value)} />
+                          </label>
+                          <label className="field">
+                            <span>LATCH 单价（BNB）</span>
+                            <input inputMode="decimal" value={latchPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => setLatchPrice(e.target.value)} />
+                          </label>
+                          <div className="field wide">
+                            <span>托管保证金</span>
+                            <strong style={overBudget ? { color: "var(--color-danger)" } : undefined}>
+                              {orderCost} BNB
+                              {raised > 0 ? ` · 募集 ${round4(raised)} BNB` : ""}
+                              {overBudget ? " · 超过募集，不会挂出" : ""}
+                            </strong>
+                          </div>
+                        </div>
+                      )}
                       <div className="actions">
                         {book.executePhase === "buying" && (
                           <>
                             <button
                               className="btn btn-primary"
                               type="button"
-                              disabled={!isOwner || Boolean(pending) || book.executionFailed || est.capCoversFloor === false}
-                              onClick={onPlaceTransistorOrder}
+                              disabled={!canPlace || Boolean(pending)}
+                              onClick={() => onPlaceTransistorOrder?.({
+                                nandQty: nandN,
+                                latchQty: latchN,
+                                nandPrice: String(nandP),
+                                latchPrice: String(latchP),
+                              })}
                             >
-                              {pending || "调用 tapeout.net 挂单"}
+                              {pending || (book.executionFailed ? "降价后重新 placeBid" : "向官方市场挂单")}
                             </button>
                             <button
                               className="btn btn-inline"
                               type="button"
-                              disabled={!isOwner || Boolean(pending) || book.executionFailed || est.capCoversFloor !== false}
-                              onClick={onAbortUnaffordable}
+                              disabled={!isOwner || Boolean(pending)}
+                              onClick={onOpenRefund}
                             >
-                              {book.executionFailed ? "已开放退款" : (pending || "退款")}
+                              {pending || (book.executionFailed ? "退款剩余" : "退款")}
                             </button>
+                            <a
+                              className="btn btn-inline"
+                              href="https://tapeout.net/"
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              打开 tapeout.net
+                            </a>
                           </>
                         )}
                         {book.executePhase === "listed" && (
                           <>
-                            <button className="btn btn-primary" type="button" disabled={!isOwner || Boolean(pending)} onClick={onConfirmTransistors}>
-                              {pending || "确认成交到账"}
+                            <button className="btn btn-primary" type="button" disabled={!isOwner || Boolean(pending) || (book.marketOrders && !book.orderFilled)} onClick={onConfirmTransistors}>
+                              {pending || (book.orderFilled ? "成交已齐，进入待流片" : "同步官方成交")}
                             </button>
                             <button className="btn btn-inline" type="button" disabled={!isOwner || Boolean(pending)} onClick={onCancelTransistorOrder}>
                               {pending || "取消挂单"}
                             </button>
                           </>
                         )}
-                        {book.executePhase === "ready" && (
+                        {book.executePhase === "ready" && !book.executionFailed && (
                           <button
                             className="btn btn-primary"
                             type="button"
                             disabled={!canExecute || Boolean(pending)}
-                            onClick={onExecute}
+                            onClick={() => onExecute?.(startForm)}
                           >
-                            {pending === "execute"
-                              ? "流片中…"
-                              : executeWait > 0
-                                ? `观察期未满（剩 ${waitHours} 小时）`
-                                : "流片并开户挖矿"}
+                            {pending === "execute" ? "流片中…" : "流片并开户挖矿"}
                           </button>
                         )}
                       </div>
+                      {book.executePhase === "ready" && needsOfficialStart ? (
+                        <div className="fee-share-block" style={{ marginTop: 12 }}>
+                          <p className="fine">
+                            当前 PoD 是官方适配器。execute 前请把电路 NFT 转到当期合约，再填官方 start 参数或粘贴已打包的 startData。
+                            证明数据来自 tapeout.net，不能留空。
+                          </p>
+                          <label className="field">
+                            <span>startData（已打包，优先）</span>
+                            <input
+                              className="mono"
+                              placeholder="0x… abi.encode 整包"
+                              value={startForm.startData}
+                              onChange={(e) => setStartForm((s) => ({ ...s, startData: e.target.value }))}
+                            />
+                          </label>
+                          <div className="form-grid cols-3">
+                            <label className="field">
+                              <span>处理器 cpu</span>
+                              <input className="mono" value={startForm.cpu} onChange={(e) => setStartForm((s) => ({ ...s, cpu: e.target.value }))} />
+                            </label>
+                            <label className="field">
+                              <span>circuitId</span>
+                              <input inputMode="numeric" value={startForm.circuitId} onChange={(e) => setStartForm((s) => ({ ...s, circuitId: e.target.value }))} />
+                            </label>
+                            <label className="field">
+                              <span>taskId</span>
+                              <input inputMode="numeric" value={startForm.taskId} onChange={(e) => setStartForm((s) => ({ ...s, taskId: e.target.value }))} />
+                            </label>
+                            <label className="field">
+                              <span>anchor</span>
+                              <input inputMode="numeric" value={startForm.anchor} onChange={(e) => setStartForm((s) => ({ ...s, anchor: e.target.value }))} />
+                            </label>
+                            <label className="field">
+                              <span>salt（bytes32）</span>
+                              <input className="mono" placeholder="留空=0x00…00" value={startForm.salt} onChange={(e) => setStartForm((s) => ({ ...s, salt: e.target.value }))} />
+                            </label>
+                          </div>
+                          <label className="field">
+                            <span>circuits（hex，逗号分隔）</span>
+                            <input className="mono" value={startForm.circuits} onChange={(e) => setStartForm((s) => ({ ...s, circuits: e.target.value }))} />
+                          </label>
+                          <label className="field">
+                            <span>proofs（hex，逗号分隔）</span>
+                            <input className="mono" value={startForm.proofs} onChange={(e) => setStartForm((s) => ({ ...s, proofs: e.target.value }))} />
+                          </label>
+                          <label className="field">
+                            <span>pubs（JSON bytes32[][]）</span>
+                            <input className="mono" placeholder='[["0x…"]]' value={startForm.pubs} onChange={(e) => setStartForm((s) => ({ ...s, pubs: e.target.value }))} />
+                          </label>
+                        </div>
+                      ) : null}
                       <p className="fine">
-                        {book.executePhase === "buying" && (
-                          est.capCoversFloor === false
-                            ? "当前报价买不起晶体管，可发起退款。持份人到「我的资产」原路退还。"
-                            : "买得起晶体管，先挂单锁价，成交后再确认到账。"
+                        {book.executePhase === "buying" && !book.executionFailed && (
+                          <>
+                            挂单会调用材料市场 placeBid：NAND 为 tokenId 0，LATCH 为 tokenId 1，保证金从本期募集款托管。
+                            成交与否只看 bids(id).remaining，不需要到官网点确认。
+                            {book._chain && book.marketOrders === false ? " 当前这期仍是旧合约，需要重新部署后新开一期才会真正调用市场。" : ""}
+                          </>
                         )}
-                        {book.executePhase === "listed" && "成交后点确认；也可取消挂单重新走。"}
-                        {book.executePhase === "ready" && (
-                          executeWait > 0
-                            ? "晶体管已到位，观察期结束后才能流片。流片不可逆。"
-                            : "晶体管已到位且观察期满，可流片开矿。流片不可逆，仅 Factory Owner。"
+                        {book.executePhase === "buying" && book.executionFailed && "保证金超过募集余额，没有挂出。可改低单价后重试，或退款。"}
+                        {book.executePhase === "listed" && (
+                          <>
+                            NAND 单 #{book.nandBidId || "—"} · {book.nandQty || 0} 颗 × {round4(book.nandPrice || 0)} BNB；
+                            LATCH 单 #{book.latchBidId || "—"} · {book.latchQty || 0} 颗 × {round4(book.latchPrice || 0)} BNB。
+                            {book.orderFilled ? "官方订单簿已全部成交。" : "还有未成交数量，取消会调用 cancelBid 退回保证金。"}
+                          </>
                         )}
+                        {book.executePhase === "ready" && !needsOfficialStart && "官方买单已成交，可以流片。元件款已在挂单时托管，流片只退还剩余募集款。"}
+                        {book.executePhase === "ready" && needsOfficialStart && "官方买单已成交。适配器路径还要把电路 NFT 转给当期，并带上证明再 execute。"}
                         {!isOwner && " 当前钱包不是 Factory Owner，无法执行本阶段写操作。"}
                       </p>
                     </>
@@ -317,7 +472,13 @@ export function OwnerOverview({
                       <li className="due"><span>本阶段可做</span><strong>全网 harvest；个人 claim 在「我的资产」</strong></li>
                     </ul>
                     <div className="actions">
-                      <button className="btn btn-primary" type="button" disabled={Boolean(pending)} onClick={onHarvest}>
+                      <button
+                        className="btn btn-primary"
+                        type="button"
+                        disabled={Boolean(pending) || (!book._chain && !(dailyBem > 0))}
+                        onClick={onHarvest}
+                        title={book._chain || dailyBem > 0 ? undefined : "当前没有可分发数量"}
+                      >
                         {pending === "harvest" ? "分发中…" : "领取并分配（harvest）"}
                       </button>
                       {onOpenAssets && (
@@ -327,14 +488,16 @@ export function OwnerOverview({
                       )}
                     </div>
                     <p className="fine">
-                      harvest 任何人可调用：从 PoD 拉日产、扣服务费、按份入账。个人要把 pending 提到钱包，请到「我的资产」claim。
+                      harvest 任何人可调用：从 PoD 拉本轮实收 BEM（估算日产只作参考）、扣服务费、按份入账。
+                      个人要把 pending 提到钱包，请到「我的资产」claim。
+                      {book._chain && " 测试网若 bemIsMock，前端会先给 MockPoD 注资再 harvest；主网无此捷径，PoD 须已有真实排放。"}
                     </p>
                   </>
                 )}
 
                 {book.executionFailed && (
                   <p className="fine warn-text">
-                    本期流片失败。持份人可到「我的资产」退款；Owner 修正后可重新走待执行流程。
+                    若 Owner 已发起退款，认筹 BNB 会按认筹地址原路退回。仍有可用份额的地址到「我的资产」点原路退还；有挂单锁定须先撤单。
                   </p>
                 )}
               </div>
@@ -347,7 +510,20 @@ export function OwnerOverview({
                   <dl className="param-grid">
                     <div><dt>合约</dt><dd className="mono">{shortAddress(round.contract)}</dd></div>
                     <div><dt>Owner</dt><dd className="mono">{shortAddress(book.owner)}</dd></div>
-                    <div><dt>服务费收费地址</dt><dd className="mono">{shortAddress(round.feeRecipient)}</dd></div>
+                    <div>
+                      <dt>服务费分成</dt>
+                      <dd>
+                        {(Array.isArray(round.feeShares) && round.feeShares.length
+                          ? round.feeShares
+                          : [{ address: round.feeRecipient, shareBps: 10_000 }]
+                        ).map((row) => (
+                          <div key={`${row.address}-${row.shareBps}`} className="mono">
+                            {shortAddress(row.address)} · {Math.round(Number(row.shareBps) / 100)}%
+                          </div>
+                        ))}
+                        <span className="fine">整除余数进 Owner</span>
+                      </dd>
+                    </div>
                     <div><dt>本次可分得</dt><dd>{formatBem(harvest.userPart)} BEM</dd></div>
                     <div><dt>已领次数</dt><dd>{harvest.rounds} 次</dd></div>
                     <div>
@@ -385,7 +561,7 @@ export function OwnerOverview({
               </span>
               <div>
                 <h1>众筹挖矿列表</h1>
-                <p>按状态筛选。详情进入该期 BEM挖矿认购；合约操作在弹出框里完成。</p>
+                <p>按状态筛选。详情进入该期 BEM挖矿认筹；合约操作在弹出框里完成。</p>
               </div>
             </div>
           </div>
@@ -474,6 +650,22 @@ export function OwnerOverview({
                       <button className="campaign-link" type="button" onClick={() => openTool(item, "calls")}>合约调用</button>
                       <button className="campaign-link" type="button" onClick={() => openTool(item, "onchain")}>链上调试</button>
                       <button className="campaign-link" type="button" onClick={() => openTool(item, "ops")}>合约操作</button>
+                      {item.address && isOwner && onRemoveCampaign && (
+                        <button
+                          className="campaign-link tone-danger"
+                          type="button"
+                          disabled={Boolean(pending)}
+                          title="仅从工厂列表移除，不销毁链上合约"
+                          onClick={() => {
+                            const ok = window.confirm(
+                              `从工厂列表移除第 ${item.id} 期？\n${item.address}\n\n不会销毁链上合约；有份额仍可用该地址直连。`
+                            );
+                            if (ok) onRemoveCampaign(item.address);
+                          }}
+                        >
+                          {pending === "removeCampaign" && String(pendingTarget).toLowerCase() === String(item.address).toLowerCase() ? "移除中…" : "移除"}
+                        </button>
+                      )}
                       <button className="btn btn-primary btn-inline" type="button" onClick={() => openRound(item)}>详情</button>
                     </div>
                   </footer>
@@ -517,7 +709,7 @@ export function OwnerOverview({
                   round={round}
                   book={book}
                   account={account}
-                  holders={book._chain ? chainHolders : null}
+                  holders={holdersForRound}
                   chainMode={Boolean(book._chain)}
                 />
               ) : dialog.pane === "calls" ? (
@@ -718,7 +910,7 @@ export function OwnerOverview({
               round={round}
               book={book}
               account={account}
-              holders={book._chain ? chainHolders : null}
+              holders={holdersForRound}
               chainMode={Boolean(book._chain)}
             />
           </div>
@@ -765,18 +957,73 @@ export function OwnerCreate({
   const [draft, setDraft] = useState(() => ({
     ...EMPTY_FORM,
     feeRecipient: defaultFeeRecipient || EMPTY_FORM.feeRecipient,
+    feeShares: [
+      {
+        address: defaultFeeRecipient || EMPTY_FORM.feeRecipient,
+        sharePercent: "100",
+      },
+    ],
   }));
-  // 连接钱包后把服务费收费地址默认填成当前账户（尚未手改占位地址时）
+  // 连接钱包后把第一条服务费地址默认填成当前账户（尚未手改占位地址时）
   useEffect(() => {
     if (!defaultFeeRecipient) return;
     setDraft((cur) => {
+      const rows = Array.isArray(cur.feeShares) ? cur.feeShares : [];
+      const first = rows[0]?.address || cur.feeRecipient;
       const isPlaceholder =
-        !cur.feeRecipient ||
-        cur.feeRecipient === EMPTY_FORM.feeRecipient ||
-        /^0x0+fee$/i.test(cur.feeRecipient);
-      return isPlaceholder ? { ...cur, feeRecipient: defaultFeeRecipient } : cur;
+        !first ||
+        first === EMPTY_FORM.feeRecipient ||
+        /^0x0+fee$/i.test(first);
+      if (!isPlaceholder) return cur;
+      const nextShares =
+        rows.length === 0
+          ? [{ address: defaultFeeRecipient, sharePercent: "100" }]
+          : rows.map((row, i) => (i === 0 ? { ...row, address: defaultFeeRecipient } : row));
+      return { ...cur, feeRecipient: defaultFeeRecipient, feeShares: nextShares };
     });
   }, [defaultFeeRecipient]);
+
+  const updateFeeShare = (index, key, value) => {
+    setDraft((cur) => {
+      let nextValue = value;
+      if (key === "sharePercent") {
+        const digits = String(value).replace(/\D/g, "");
+        if (digits === "") {
+          nextValue = "";
+        } else {
+          const n = Math.min(100, Number(digits));
+          nextValue = String(Number.isFinite(n) ? n : "");
+        }
+      }
+      const rows = (Array.isArray(cur.feeShares) ? cur.feeShares : []).map((row, i) =>
+        i === index ? { ...row, [key]: nextValue } : row
+      );
+      return {
+        ...cur,
+        feeShares: rows,
+        feeRecipient: rows[0]?.address || cur.feeRecipient,
+      };
+    });
+  };
+
+  const addFeeShare = () => {
+    setDraft((cur) => {
+      const rows = [...(Array.isArray(cur.feeShares) ? cur.feeShares : [])];
+      if (rows.length >= 20) return cur;
+      const used = rows.reduce((sum, row) => sum + (Math.round(Number(row.sharePercent)) || 0), 0);
+      const remain = Math.max(0, 100 - used);
+      rows.push({ address: "", sharePercent: String(remain) });
+      return { ...cur, feeShares: rows };
+    });
+  };
+
+  const removeFeeShare = (index) => {
+    setDraft((cur) => {
+      const rows = (Array.isArray(cur.feeShares) ? cur.feeShares : []).filter((_, i) => i !== index);
+      const next = rows.length ? rows : [{ address: defaultFeeRecipient || "", sharePercent: "100" }];
+      return { ...cur, feeShares: next, feeRecipient: next[0]?.address || "" };
+    });
+  };
   const isFactoryOwner =
     !chainMode ||
     !factoryOwner ||
@@ -848,6 +1095,17 @@ export function OwnerCreate({
    * taskbook 必须传——不传会退回离线兜底题库，校验的权重就跟上面展示的对不上了。
    */
   /** 开期校验与预估值都用选定的处理器 + 解析后的单价/份数/元件数。 */
+  const feeSharesForChain = (Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row) => {
+    const percent = Math.round(Number(row.sharePercent ?? 0));
+    return {
+      address: String(row.address || "").trim(),
+      shareBps: percent * 100,
+    };
+  });
+  const feeSharePercentSum = (Array.isArray(draft.feeShares) ? draft.feeShares : []).reduce(
+    (sum, row) => sum + (Math.round(Number(row.sharePercent)) || 0),
+    0
+  );
   const effectiveDraft = {
     ...draft,
     transistorId,
@@ -856,6 +1114,8 @@ export function OwnerCreate({
     /** 派生每份：非法输入退为 0，避免下游 NaN 传播 */
     sharePriceBnb: Number.isFinite(perShareBnb) ? String(perShareBnb) : "0",
     totalShares: sharesInput,
+    feeShares: feeSharesForChain,
+    feeRecipient: feeSharesForChain[0]?.address || draft.feeRecipient,
   };
   const review = reviewRound(effectiveDraft, quote, undefined, taskbook);
 
@@ -1029,8 +1289,8 @@ export function OwnerCreate({
       {chainMode && (
         <article className="card" style={{ marginBottom: 16 }}>
           <div className="card-header">发布权限</div>
-          <div className="card-body">
-            <ul className="bill">
+          <div className="card-body auth-body">
+            <ul className="bill auth-bill">
               <li>
                 <span>Factory Owner</span>
                 <strong>{factoryOwner ? shortAddress(factoryOwner) : "—"}</strong>
@@ -1050,7 +1310,7 @@ export function OwnerCreate({
             )}
             {connectedAccount && !isFactoryOwner && (
               <p className="fine warn-text" style={{ marginTop: 8 }}>
-                当前钱包不是 Factory Owner。请在 MetaMask 切换到 {shortAddress(factoryOwner)} 后再发布。
+                当前钱包不是 Factory Owner。请在钱包里切换到 {shortAddress(factoryOwner)} 后再发布。
               </p>
             )}
           </div>
@@ -1099,7 +1359,7 @@ export function OwnerCreate({
           <p className="fine">
             先定这期总共募多少 BNB、分成多少份，每份 BNB 自动算成「募资总额 ÷ 总份数」（只读）。
             募资总额决定你能选多大的题目——下方选题列表里标红的题目是流片成本超出募资总额的。
-            总份数越多每份越便宜，但单份认购门槛更低、持有人更分散。
+            总份数越多每份越便宜，但单份认筹门槛更低、持有人更分散。
           </p>
         </div>
       </div>
@@ -1429,7 +1689,7 @@ export function OwnerCreate({
             )}
           </p>
           <p className="fine">
-            成本随元件实时价格变动。若执行时涨价导致募资总额买不起所需元件，本期全额退款。
+            成本随元件实时价格变动。若执行时涨价导致募资总额买不起所需元件，判失败、本金不动，可退款或降价重挂。
           </p>
         </div>
       </div>
@@ -1447,7 +1707,16 @@ export function OwnerCreate({
             <div className="form-grid cols-3">
               <label className="field">
                 <span>募集天数</span>
-                <input value={draft.fundingDays} onChange={(event) => update("fundingDays", event.target.value)} />
+                <input
+                  value={draft.fundingDays}
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  title="须为正整数天数"
+                  onChange={(event) => {
+                    const digits = event.target.value.replace(/\D/g, "");
+                    update("fundingDays", digits);
+                  }}
+                />
               </label>
               <label className="field">
                 <span>服务费 %</span>
@@ -1461,10 +1730,46 @@ export function OwnerCreate({
                   title="在上方「目标处理器」卡片中点选"
                 />
               </label>
-              <label className="field wide">
-                <span>服务费收费地址</span>
-                <input value={draft.feeRecipient} onChange={(event) => update("feeRecipient", event.target.value)} />
-              </label>
+            </div>
+            <div className="fee-share-block">
+              <div className="fee-share-row is-head">
+                <span>服务费分成地址</span>
+                <span>比例 %</span>
+              </div>
+              {(Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row, index) => (
+                <div className="fee-share-row" key={`fee-${index}`}>
+                  <input
+                    className="mono"
+                    placeholder="0x…"
+                    value={row.address}
+                    onChange={(event) => updateFeeShare(index, "address", event.target.value)}
+                  />
+                  <div className="fee-share-percent">
+                    <input
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      max={100}
+                      title="1 到 100 的整数。所有地址比例之和必须等于 100"
+                      value={row.sharePercent}
+                      onChange={(event) => updateFeeShare(index, "sharePercent", event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn fee-share-remove"
+                      disabled={(draft.feeShares || []).length <= 1}
+                      onClick={() => removeFeeShare(index)}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </div>
+              ))}
+              <button type="button" className="btn fee-share-add" onClick={addFeeShare}>
+                添加地址
+              </button>
+              <p className={`fine${feeSharePercentSum !== 100 ? " warn-text" : ""}`}>
+                所有分成地址比例之和必须等于 100（当前合计 {feeSharePercentSum} / 100）。每项为 1–100 的整数。整除余数转入 Owner。
+              </p>
             </div>
             <p className="fine">
               发行规模、题目与目标处理器都在上方卡片里选定，本区块只汇总、不重复编辑。
@@ -1538,10 +1843,10 @@ export function OwnerCreate({
 
             <p className="fine">
               成本占募资总额 <b>{schemeRatioPct.toFixed(1)}%</b>，参考区间 {(COST_RATIO_MIN * 100).toFixed(0)}%–{(COST_RATIO_MAX * 100).toFixed(0)}%。
-              按当前报价，元件再涨 <b>{schemeRisePct.toFixed(0)}%</b> 后，募资总额刚好覆盖流片成本；超过这个幅度，执行时买不齐元件，本期失败并全额退款。
+              按当前报价，元件再涨 <b>{schemeRisePct.toFixed(0)}%</b> 后，募资总额刚好覆盖流片成本；超过这个幅度，执行时买不齐元件，判失败后可退款或降价重挂。
             </p>
             <p className="fine">
-              权重 H = {schemeWeight}。发布后锁定当前报价快照，持份人可在观察期内核对。
+              权重 H = {schemeWeight}。发布后锁定当前报价快照。
             </p>
             <p className="fine">
               Factory Owner：{shortAddress(factoryOwner || OWNER)}
@@ -1585,8 +1890,8 @@ export function OwnerHolders({ round, book, account = "", holders = null, chainM
       }))
     : buildHolders(book.sold, book.mine);
   const subtitle = chainMode
-    ? "从链上 Bought / Refunded / ListingTaken 事件重构的当前持有人。"
-    : "只记录通过购买记上的份数。直接转入的 BNB 不会出现在这里。";
+    ? "从链上 Subscribed / Refunded / ListingTaken 事件重构的当前持有人。"
+    : "只记录通过认筹记上的份数。直接转入的 BNB 不会出现在这里。";
   return (
     <section>
       {!embedded && (
@@ -1603,7 +1908,7 @@ export function OwnerHolders({ round, book, account = "", holders = null, chainM
           {loading ? (
             <p className="fine">正在从链上事件加载持有人…</p>
           ) : rows.length === 0 ? (
-            <p className="fine">这一期还没有人购买。</p>
+            <p className="fine">这一期还没有人认筹。</p>
           ) : (
             <table>
               <thead>

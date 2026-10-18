@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { readCall } from "./Calls.jsx";
 import { OwnerCreate, OwnerOverview } from "./Owner.jsx";
-import { IS_CONFIGURED as CHAIN_CONFIGURED, NETWORK, CHAIN_ID } from "./chain/config.js";
+import { IS_CONFIGURED as CHAIN_CONFIGURED, NETWORK, CHAIN_ID, explorerAddress, sourcifySource, BEM_MAINNET } from "./chain/config.js";
 import { useChain } from "./chain/useChain.js";
 import {
   send,
@@ -9,20 +9,23 @@ import {
   parseEther,
   parseBnb,
   readHolders,
-  readRecentBuys,
+  readRecentSubscriptions,
   hasInjected,
   setCampaignAddress,
   createCampaignOnChain,
   readFactoryOwner,
-  connectWallet,
 } from "./chain/client.js";
+import { discoverWallets, isMobile } from "./chain/wallets.js";
 import deployments from "./chain/deployments.json";
+import { OFFICIAL_PARTS } from "./tapeout.js";
+import { buildExecuteStartData } from "./podStart.js";
 import { keccak256, toUtf8Bytes } from "ethers";
 
 // 演示网表：execute 时传入原始字节，合约内 keccak 后须等于开期承诺的 netlistHash
 const RAW_NETLIST = toUtf8Bytes("netlist-v1");
 const RAW_NETLIST_HASH = keccak256(RAW_NETLIST);
-const START_DATA = "0x12345678";
+/** MockPoD 占位；接 OfficialPodAdapter 时必须换成打包后的官方 startData。 */
+const MOCK_START_DATA = "0x12345678";
 import {
   MARKET,
   OWNER,
@@ -33,14 +36,14 @@ import {
   SCENE_COPY,
   WALLET,
   recomputeSelf,
-  applyBuy,
+  applySubscribe,
+  applyOpenRefund,
   applyClaim,
   applyConfirmTransistors,
   applyCreate,
   applyExecute,
   applyHarvest,
   applyPlaceTransistorOrder,
-  applyAbortUnaffordable,
   applyCancelTransistorOrder,
   applyListShares,
   applyCancelListing,
@@ -68,8 +71,9 @@ import {
 
 /** 按生命周期收口导航（对照 contracts/FEATURES.md §6） */
 const LIFE_PAGES = [
-  { id: "round", label: "BEM挖矿认购", hint: "募集 → 待执行 → 挖矿" },
-  { id: "assets", label: "我的资产", hint: "持仓 / 领取 / 转让" },
+  { id: "round", label: "BEM挖矿认筹", hint: "募集 → 待执行 → 挖矿" },
+  { id: "assets", label: "我的资产", hint: "认筹 / 持仓 / 领取" },
+  { id: "transfer", label: "资产转让", hint: "挖矿份额转让" },
   { id: "rules", label: "规则", hint: "资金路径与退出" },
   { id: "owner", label: "Owner 工作台", hint: "开期 / 流片 / 调试" },
 ];
@@ -87,6 +91,8 @@ export default function App() {
   const [simBook, setSimBook] = useState(() => createScene("mining", ROUND, null));
   const [notice, setNotice] = useState("");
   const [pending, setPending] = useState("");
+  /** 正在移除的期次地址；列表里只有这一条显示「移除中」 */
+  const [pendingTarget, setPendingTarget] = useState("");
   const [now, setNow] = useState(Date.now());
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -143,7 +149,8 @@ export default function App() {
 
   // ── 数据源切换：已部署则只用链上；未部署才走本地模拟 ──
   const usingChain = chain.active && chain.book != null;
-  const chainBooting = chain.active && !chain.book;
+  const chainEmpty = chain.active && chain.empty && !chain.book;
+  const chainBooting = chain.active && chain.loading && !chain.book;
   /** 从链上 taskId + setPlan 算力反推题目与目标处理器，写入 round 供全页消费 */
   const design = useMemo(() => {
     const baseRound = usingChain ? chain.round : simRound;
@@ -195,22 +202,26 @@ export default function App() {
           : { role: "user", label: "未持份地址", shares: 0, address: account };
     })()
     : identify(account, book);
-  /** execute 观察期剩余毫秒 */
   const executeWait = executeUnlockIn(round, book, now);
 
   // 份额明细 / 历史：进入 Owner 工作台即拉链上数据
   const [chainHolders, setChainHolders] = useState(null);
+  const [holdersCampaign, setHoldersCampaign] = useState("");
   useEffect(() => {
     if (!(usingChain && page === "owner")) return undefined;
+    const addr = chain.campaignAddress;
+    if (!addr) return undefined;
     let alive = true;
+    setChainHolders(null);
+    setHoldersCampaign(addr);
     chain.refreshHistory?.();
-    readHolders()
+    readHolders(addr)
       .then((h) => alive && setChainHolders(h))
       .catch(() => alive && setChainHolders([]));
     return () => {
       alive = false;
     };
-  }, [usingChain, page, book.sold, chain.refreshHistory]);
+  }, [usingChain, page, chain.campaignAddress, chain.refreshHistory]);
 
   function switchScene(scene, expired = false, execFailed = false) {
     // 切换场景时保留当前 executePhase（如已确认到账的 ready），避免被重置回 buying；
@@ -225,6 +236,7 @@ export default function App() {
       });
     });
     setPending("");
+    setPendingTarget("");
     setNotice("");
   }
 
@@ -236,6 +248,7 @@ export default function App() {
 
   function run(label, action) {
     setPending(label);
+    setPendingTarget("");
     window.setTimeout(() => {
       action();
       setPending("");
@@ -248,29 +261,33 @@ export default function App() {
    */
   function invokeCall(method, args) {
     const WRITE_METHODS = [
-      "buy", "listShares", "cancelListing", "takeListing", "refund", "claim", "execute", "harvest",
+      "subscribe", "listShares", "cancelListing", "takeListing", "refund", "claim", "execute", "harvest",
       "placeTransistorOrder", "cancelTransistorOrder", "confirmTransistors", "setPlan", "updateNetworkWeight",
-      "createCampaign",
+      "createCampaign", "openRefund", "removeCampaign", "removeCampaignAt",
+      "setPod", "setBem", "setMinter", "setFeeShares", "recoverBnb", "recoverTransistors", "transferOwnership",
+      "setFactoryPod", "setFactoryBem", "setFactoryMinter", "setFactoryOwner",
     ];
     if (chain.active && WRITE_METHODS.includes(method)) return chainInvoke(method, args);
-    if (["status", "sold", "sharePriceBnb", "totalShares", "hashpower", "estHashpower", "dailyBem", "harvestCount", "feeBps", "totalDistributed", "sharesOf", "pendingBem"].includes(method)) {
+    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "hashpower", "estHashpower", "dailyBem", "harvestCount", "feeBps", "totalDistributed", "sharesOf", "pendingBem"].includes(method)) {
       return { ok: true, message: readCall(method, args, round, book, account, quote) };
     }
 
     let result;
-    if (method === "buy") result = applyBuy(round, book, args.shares);
+    if (method === "subscribe") result = applySubscribe(round, book, args.shares);
     else if (method === "listShares") result = applyListShares(round, book, args, actor);
     else if (method === "cancelListing") result = applyCancelListing(round, book, args.listingId, actor);
     else if (method === "takeListing") result = applyTakeListing(round, book, args.listingId, args.shares, actor);
     else if (method === "claim") result = applyClaim(round, book);
     else if (method === "execute") result = applyExecute(round, book, quote, actor, taskbook);
     else if (method === "harvest") result = applyHarvest(round, book);
-    else if (method === "placeTransistorOrder") result = applyPlaceTransistorOrder(round, book, actor);
-    else if (method === "abortUnaffordable") result = applyAbortUnaffordable(round, book, actor);
+    else if (method === "placeTransistorOrder") result = applyPlaceTransistorOrder(round, book, actor, args);
+    else if (method === "openRefund") result = applyOpenRefund(round, book, actor);
     else if (method === "cancelTransistorOrder") result = applyCancelTransistorOrder(round, book, actor);
     else if (method === "confirmTransistors") result = applyConfirmTransistors(round, book, actor);
     else if (method === "refund") result = applyRefund(round, book, actor);
     else if (method === "createCampaign") result = applyCreate(round, args, quote, taskbook);
+    else if (method === "recoverBnb") result = { ok: true, message: "模拟：BNB 已转给 Owner" };
+    else if (method === "recoverTransistors") result = { ok: true, message: "模拟：晶体管已转给 Owner" };
     else return { ok: false, message: "不能从管理页调用这个函数" };
 
     if (result.ok) {
@@ -284,48 +301,89 @@ export default function App() {
   /** 链上写操作：构造交易 → 发送并等待 → 刷新。自带 pending/notice，不走 run() 的 700ms。 */
   function chainInvoke(method, args) {
     setPending(method);
+    setPendingTarget(
+      method === "removeCampaign"
+        ? String(args?.campaign || args?.address || "").toLowerCase()
+        : ""
+    );
     (async () => {
       try {
         let signer = chain.signer;
         if (!signer) {
-          const w = await connectWallet();
+          const w = await chain.connect();
           signer = w.signer;
         }
         if (method === "createCampaign") {
           await chainCreateCampaign(args, signer);
           return;
         }
-        // 挂单前先 setPlan，写入预估算力 / capped / 晶体管数
+        if (method === "removeCampaign" || method === "removeCampaignAt") {
+          const removed = args?.campaign || args?.address;
+          if (method === "removeCampaignAt") {
+            const index = BigInt(Math.floor(Number(args?.index ?? -1)));
+            if (index < 0n) throw new Error("请填写工厂列表索引");
+            await send(chainTx.removeCampaignAt(signer, index));
+          } else {
+            if (!removed || !/^0x[0-9a-fA-F]{40}$/.test(String(removed))) {
+              throw new Error("请填写要移除的期次地址");
+            }
+            await send(chainTx.removeCampaign(signer, removed));
+          }
+          setNotice("已从工厂列表移除该期（链上合约仍在，可用原地址直连）");
+          const addrs = (await chain.refreshHistory?.()) || [];
+          const list = Array.isArray(addrs) ? addrs : [];
+          const current = String(book.address || "").toLowerCase();
+          if (current && !list.some((a) => String(a).toLowerCase() === current)) {
+            if (list.length) await chain.switchCampaign?.(list[0]);
+          }
+          await chain.refresh();
+          return;
+        }
         if (method === "placeTransistorOrder") {
-          const count = BigInt((chainEst && chainEst.usedParts) || book.transistorCount || 100);
+          if (book._chain && book.marketOrders === false) {
+            throw new Error("这期合约还是旧挂单接口，不会调用官方材料市场。重新部署并新开一期后才能 placeBid。");
+          }
+          const nandQty = BigInt(Math.floor(Number(args?.nandQty) || 0));
+          const latchQty = BigInt(Math.floor(Number(args?.latchQty) || 0));
+          if (nandQty === 0n && latchQty === 0n) throw new Error("NAND 与 LATCH 数量不能都为 0");
+          const nandPrice = nandQty > 0n ? parseEther(String(args?.nandPrice ?? "0").trim()) : 0n;
+          const latchPrice = latchQty > 0n ? parseEther(String(args?.latchPrice ?? "0").trim()) : 0n;
+          if ((nandQty > 0n && nandPrice <= 0n) || (latchQty > 0n && latchPrice <= 0n)) {
+            throw new Error("有数量的元件必须填写大于 0 的单价");
+          }
+          const transistors = args?.transistors || OFFICIAL_PARTS.TAPE_OUT_NAND.contract;
+          const count = nandQty + latchQty;
           const estHp = BigInt(Math.round((chainEst && chainEst.hashpower) || book.estimate?.hashpower || 0));
           const capped =
             Boolean(chainEst && chainEst.usedParts > MINE_GATE_LIMIT) || Boolean(book.capped);
           await send(chainTx.setPlan(signer, estHp, capped, count));
-          const unit = chain.transistorUnitPrice || parseEther("0.005");
-          await send(chainTx.placeTransistorOrder(signer, count, unit));
-        } else if (method === "abortUnaffordable") {
-          const est = chainEst || book.estimate || {};
-          if (est.capCoversFloor !== false) throw new Error("募资总额买得起晶体管，不能退款");
-          const count = BigInt(est.usedParts || 0);
-          if (count === 0n) throw new Error("没有元件数量，不能判断是否买得起");
-          const needWei = parseEther(Number(est.needBnb).toFixed(8));
-          let unit = needWei / count;
-          if (unit === 0n) unit = 1n;
-          if (unit * count <= needWei) unit += 1n;
-          await send(chainTx.abortUnaffordable(signer, count, unit));
+          await send(chainTx.placeTransistorOrder(signer, transistors, nandQty, nandPrice, latchQty, latchPrice));
+        } else if (method === "openRefund") {
+          await send(chainTx.openRefund(signer));
         } else {
           const promise = buildChainTx(method, args, signer);
           await send(promise);
         }
-        setNotice(`已确认：${method} ✓`);
+        setNotice(method === "openRefund"
+          ? "链上已退款。认筹 BNB 已按认筹地址原路退回。"
+          : `已确认：${method} ✓`);
         await chain.refresh();
-        if (method === "claim" || method === "refund") await chain.refreshPositions?.();
+        if (
+          method === "claim"
+          || method === "refund"
+          || method === "openRefund"
+          || method === "listShares"
+          || method === "takeListing"
+          || method === "cancelListing"
+          || method === "harvest"
+          || method === "subscribe"
+        ) await chain.refreshPositions?.();
         if (method === "createCampaign") await chain.refreshHistory?.();
       } catch (e) {
         setNotice(`失败：${e.message}`);
       } finally {
         setPending("");
+        setPendingTarget("");
       }
     })();
     return { ok: true, message: "交易已提交，等待链上确认…" };
@@ -346,15 +404,42 @@ export default function App() {
     }
     const fundingDays = BigInt(Math.round(Number(draft.fundingDays || 7)));
     if (fundingDays <= 0n) throw new Error("募集天数须为正整数");
-    const feeRecipient = String(draft.feeRecipient || chain.account || "").trim();
-    if (!/^0x[a-fA-F0-9]{40}$/.test(feeRecipient)) throw new Error("服务费收费地址格式不正确");
-    const taskId = BigInt(String(draft.taskId || 54));
-    let executeDelay = 0n;
-    if (draft.executeDelay != null && draft.executeDelay !== "") {
-      executeDelay = BigInt(String(draft.executeDelay));
-    } else if (draft.executeDelayHours != null && draft.executeDelayHours !== "") {
-      executeDelay = BigInt(Math.round(Number(draft.executeDelayHours) * 3600));
+    let feeShares = (Array.isArray(draft.feeShares) ? draft.feeShares : [])
+      .map((row) => ({
+        address: String(row.address || "").trim(),
+        shareBps: Math.round(Number(row.shareBps)),
+      }))
+      .filter((row) => row.address || row.shareBps);
+    if (feeShares.length === 0 && (draft.feeRecipients || draft.feeRecipient)) {
+      const recipients = String(draft.feeRecipients || draft.feeRecipient || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const bps = String(draft.feeShareBps || (recipients.length === 1 ? "10000" : ""))
+        .split(",")
+        .map((s) => Math.round(Number(s.trim())));
+      feeShares = recipients.map((address, i) => ({
+        address,
+        shareBps: bps[i] ?? 0,
+      }));
     }
+    if (feeShares.length === 0) {
+      const fallback = String(draft.feeRecipient || chain.account || "").trim();
+      feeShares.push({ address: fallback, shareBps: 10_000 });
+    }
+    for (const row of feeShares) {
+      if (!/^0x[a-fA-F0-9]{40}$/.test(row.address)) throw new Error("服务费收费地址格式不正确");
+      const percent = row.shareBps / 100;
+      if (!Number.isInteger(percent) || percent < 1 || percent > 100 || row.shareBps % 100 !== 0) {
+        throw new Error("服务费分成比例须为 1 到 100 的整数");
+      }
+    }
+    const feeShareSum = feeShares.reduce((sum, row) => sum + row.shareBps, 0);
+    if (feeShareSum !== 10_000) {
+      throw new Error(`所有分成地址比例之和必须等于 100，当前合计为 ${feeShareSum / 100}`);
+    }
+    const feeRecipient = feeShares[0].address;
+    const taskId = BigInt(String(draft.taskId || 54));
     const netlistHash =
       draft.netlistHash && String(draft.netlistHash).startsWith("0x")
         ? draft.netlistHash
@@ -363,7 +448,7 @@ export default function App() {
     // signer 可能被 accountsChanged 清掉，尽量补签
     let activeSigner = signer;
     if (!activeSigner) {
-      const w = await connectWallet();
+      const w = await chain.connect();
       activeSigner = w.signer;
     }
 
@@ -373,8 +458,8 @@ export default function App() {
       feePercent,
       fundingDays,
       feeRecipient,
+      feeShares,
       taskId,
-      executeDelay,
       netlistHash,
     });
 
@@ -403,7 +488,7 @@ export default function App() {
   function buildChainTx(method, args, signer) {
     const priceWei = book._sharePriceWei || 0n;
     switch (method) {
-      case "buy": return chainTx.buy(signer, BigInt(args.shares), BigInt(args.shares) * priceWei);
+      case "subscribe": return chainTx.subscribe(signer, BigInt(args.shares), BigInt(args.shares) * priceWei);
       case "claim": return chainTx.claim(signer, args?.campaign);
       case "harvest": return chainTx.harvest(signer);
       case "refund": return chainTx.refund(signer, args?.campaign);
@@ -415,17 +500,71 @@ export default function App() {
         return chainTx.takeListing(signer, Number(args.listingId), BigInt(args.shares), BigInt(args.shares) * wei);
       }
       case "cancelTransistorOrder": return chainTx.cancelTransistorOrder(signer);
-      case "confirmTransistors": return chainTx.confirmTransistors(signer);
+      case "confirmTransistors":
+        if (book._chain && book.marketOrders === false) {
+          throw new Error("这期合约不能读取官方订单簿。重新部署后，成交以 bids(id).remaining 为准。");
+        }
+        if (book._chain && !book.orderFilled) {
+          throw new Error("官方市场买单还没吃完（remaining > 0），不能进入待流片。");
+        }
+        return chainTx.confirmTransistors(signer);
       case "setPlan": {
-        const count = BigInt(args.count || (chainEst && chainEst.usedParts) || book.transistorCount || 0);
-        const estHp = BigInt(Math.round(args.hashpower ?? ((chainEst && chainEst.hashpower) || 0)));
-        return chainTx.setPlan(signer, estHp, Boolean(args.capped), count);
+        const src = args || {};
+        const count = BigInt(src.count || (chainEst && chainEst.usedParts) || book.transistorCount || 0);
+        const estHp = BigInt(Math.round(
+          src.hashpower ?? ((chainEst && chainEst.hashpower) || book.estimate?.hashpower || 0)
+        ));
+        if (count <= 0n) throw new Error("还没有元件数量，无法写入 setPlan");
+        return chainTx.setPlan(signer, estHp, Boolean(src.capped ?? book.capped), count);
       }
       case "updateNetworkWeight":
         return chainTx.updateNetworkWeight(signer, BigInt(args.verified), BigInt(args.unverified));
-      case "execute":
+      case "execute": {
         if (!netlistMatch) throw new Error("网表不匹配，无法 execute（检查 netlistHash）");
-        return chainTx.execute(signer, RAW_NETLIST, START_DATA);
+        if (book.executionFailed) throw new Error("本期已判流片失败，请先降价重挂或退款，不要直接再 execute");
+        if (!(Number(book.priceLock) > 0 && Number(book.transistorCount) > 0)) {
+          throw new Error("锁价或元件数无效，无法流片（禁止零成本 execute）");
+        }
+        const startData = buildExecuteStartData(args || {}) || MOCK_START_DATA;
+        if (deployments.podIsAdapter && startData === MOCK_START_DATA) {
+          throw new Error("当前 PoD 是官方适配器，请填写电路 ID 与证明，或粘贴打包好的 startData");
+        }
+        return chainTx.execute(signer, RAW_NETLIST, startData);
+      }
+      case "setPod": return chainTx.setPod(signer, args.pod);
+      case "setBem": return chainTx.setBem(signer, args.bem);
+      case "setMinter": return chainTx.setMinter(signer, args.minter);
+      case "setFeeShares": {
+        const recipients = String(args.feeRecipients || args.feeRecipient || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const shareBps = String(args.feeShareBps || "")
+          .split(",")
+          .map((s) => Math.round(Number(s.trim())));
+        if (!recipients.length || recipients.length !== shareBps.length) {
+          throw new Error("收费地址与分成基点数量须一致");
+        }
+        return chainTx.setFeeShares(signer, recipients, shareBps);
+      }
+      case "recoverBnb": {
+        const amount = BigInt(args?.amountWei ?? args?.amount ?? 0);
+        if (amount <= 0n) throw new Error("转出数量必须大于 0");
+        return chainTx.recoverBnb(signer, amount);
+      }
+      case "recoverTransistors": {
+        const token = String(args?.token || "").trim();
+        const id = BigInt(args?.id ?? 0);
+        const amount = BigInt(args?.amount ?? 0);
+        if (!/^0x[0-9a-fA-F]{40}$/.test(token)) throw new Error("晶体管合约地址无效");
+        if (amount <= 0n) throw new Error("转出数量必须大于 0");
+        return chainTx.recoverTransistors(signer, token, id, amount);
+      }
+      case "transferOwnership": return chainTx.transferOwnership(signer, args.newOwner);
+      case "setFactoryPod": return chainTx.setFactoryPod(signer, args.pod);
+      case "setFactoryBem": return chainTx.setFactoryBem(signer, args.bem);
+      case "setFactoryMinter": return chainTx.setFactoryMinter(signer, args.minter);
+      case "setFactoryOwner": return chainTx.setFactoryOwner(signer, args.newOwner);
       default: throw new Error("链上模式暂不支持：" + method);
     }
   }
@@ -436,13 +575,13 @@ export default function App() {
       invokeCall(method, args);
       return;
     }
-    run(method === "buy" ? "购买中" : "处理中", () => invokeCall(method, args));
+    run(method === "subscribe" ? "认筹中" : "处理中", () => invokeCall(method, args));
   }
 
   function approve() {
     if (chain.active) {
       // 原生 BNB，无需 ERC20 approve
-      act("buy", { shares: book.picked });
+      act("subscribe", { shares: book.picked });
       return;
     }
     run("授权中", () => {
@@ -451,20 +590,20 @@ export default function App() {
     });
   }
 
-  function buy() {
+  function subscribeShares() {
     if (!connected) {
       handleConnect();
       return;
     }
     if (chain.active) {
-      act("buy", { shares: book.picked });
+      act("subscribe", { shares: book.picked });
       return;
     }
     if (!book.approved) {
       approve();
       return;
     }
-    act("buy", { shares: book.picked });
+    act("subscribe", { shares: book.picked });
   }
 
   function handlePick(picked) {
@@ -475,14 +614,47 @@ export default function App() {
     setSimBook((current) => ({ ...current, picked }));
   }
 
-  /** 连接钱包：链上模式拉起注入式钱包并切到目标链；模拟模式直接置已连接。 */
-  function handleConnect() {
-    if (chain.active) {
-      chain.connect().catch((e) => setNotice(e.message || "连接失败"));
+  const [walletOpen, setWalletOpen] = useState(false);
+  const [walletChoices, setWalletChoices] = useState([]);
+  const [walletBusy, setWalletBusy] = useState(false);
+
+  /** 只有一个已注入钱包时直接连；手机或有多家钱包时先让用户选，TokenPocket 用深链唤起。 */
+  async function handleConnect() {
+    if (!chain.active) {
+      setSimConnected(true);
+      setNotice("已连接钱包");
       return;
     }
-    setSimConnected(true);
-    setNotice("已连接钱包");
+    try {
+      const choices = await discoverWallets();
+      const injected = choices.filter((item) => item.kind === "injected");
+      if (injected.length === 1 && choices.every((item) => item.kind === "injected")) {
+        await chain.connect(injected[0].provider);
+        setNotice(`已连接 ${injected[0].name}`);
+        return;
+      }
+      setWalletChoices(choices);
+      setWalletOpen(true);
+    } catch (e) {
+      setNotice(e.message || "连接失败");
+    }
+  }
+
+  async function pickWallet(choice) {
+    if (choice.kind === "deeplink" || choice.kind === "install") {
+      window.location.assign(choice.href);
+      return;
+    }
+    setWalletBusy(true);
+    try {
+      await chain.connect(choice.provider);
+      setWalletOpen(false);
+      setNotice(`已连接 ${choice.name}`);
+    } catch (e) {
+      setNotice(e.message || "连接失败");
+    } finally {
+      setWalletBusy(false);
+    }
   }
 
   function handleCreate(draft, review) {
@@ -609,23 +781,17 @@ export default function App() {
               <div className="topbar-wallet">
                 <div className="wallet-menu">
                   {usingChain && chain.account ? (
-                    <button className="wallet-chip" type="button">
-                      <span className="topbar-role">{actor.label}</span>
-                      {shortAddress(account)}
-                    </button>
-                  ) : (
-                    <button className="btn btn-primary" type="button" onClick={handleConnect} disabled={!hasInjected()}>
-                      连接钱包
-                    </button>
-                  )}
-                  <div className="wallet-pop" role="dialog" aria-label="钱包详情">
-                    <div className="wallet-pop-head">
-                      <span className="topbar-net">{NETWORK.name} · {CHAIN_ID}</span>
-                      <button className="wallet-refresh" type="button" onClick={chain.refresh}>刷新</button>
-                    </div>
-                    <div className="wallet-pop-body">
-                      {usingChain && chain.account ? (
-                        <>
+                    <>
+                      <button className="wallet-chip" type="button">
+                        <span className="topbar-role">{actor.label}</span>
+                        {shortAddress(account)}
+                      </button>
+                      <div className="wallet-pop" role="dialog" aria-label="钱包详情">
+                        <div className="wallet-pop-head">
+                          <span className="topbar-net">{NETWORK.name} · {CHAIN_ID}</span>
+                          <button className="wallet-refresh" type="button" onClick={chain.refresh}>刷新</button>
+                        </div>
+                        <div className="wallet-pop-body">
                           <div className="wallet-addr">
                             <div className="wallet-addr-top">
                               <div>
@@ -661,17 +827,50 @@ export default function App() {
                           >
                             断开连接
                           </button>
-                        </>
-                      ) : (
-                        <p className="wallet-pop-label">尚未连接。连接后可查看余额并签名。</p>
-                      )}
-                    </div>
-                  </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <button className="btn btn-primary" type="button" onClick={handleConnect}>
+                      连接钱包
+                    </button>
+                  )}
                 </div>
               </div>
             </header>
             {!hasInjected() && !chain.account && (
-              <p className="topbar-alert">未检测到钱包插件。请用安装了 MetaMask 的浏览器打开，并切换到 BSC 测试网。当前只能查看链上数据。</p>
+              <p className="topbar-alert">
+                {isMobile()
+                  ? "手机浏览器里点「连接钱包」，用 TokenPocket 打开本页后再签名。当前只能查看链上数据。"
+                  : "当前浏览器没有注入钱包。可安装 TokenPocket 或 MetaMask，手机也可直接用 TokenPocket 打开本页。当前只能查看链上数据。"}
+              </p>
+            )}
+            {walletOpen && (
+              <div className="wallet-sheet-mask" onClick={() => !walletBusy && setWalletOpen(false)}>
+                <div className="wallet-sheet" role="dialog" aria-label="选择钱包" onClick={(event) => event.stopPropagation()}>
+                  <div className="wallet-sheet-head">
+                    <strong>选择钱包</strong>
+                    <button type="button" onClick={() => setWalletOpen(false)} disabled={walletBusy}>关闭</button>
+                  </div>
+                  <p>连接后会切换到 {NETWORK.name}。手机上的 TokenPocket 会先打开本页，再在钱包里确认。</p>
+                  {walletChoices.length === 0 ? (
+                    <p className="wallet-sheet-empty">没有找到可用钱包，请用 TokenPocket 重新打开本页。</p>
+                  ) : (
+                    <ul className="wallet-choice-list">
+                      {walletChoices.map((choice) => (
+                        <li key={choice.id}>
+                          <button type="button" disabled={walletBusy} onClick={() => pickWallet(choice)}>
+                            <strong>{choice.name}</strong>
+                            <span>
+                              {choice.hint || (choice.kind === "injected" ? "已检测到，点击连接" : "打开")}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
             )}
             {chain.error && <p className="topbar-alert">{chain.error}</p>}
           </>
@@ -729,14 +928,22 @@ export default function App() {
         {chainBooting && (
           <section>
             <div className="empty">
-              <p>{chain.error ? `链上读取失败：${chain.error}` : "正在从 BSC 测试网读取 Campaign 状态…"}</p>
+              <p>{chain.error ? `链上读取失败：${chain.error}` : `正在从 ${NETWORK.name} 读取 Campaign 状态…`}</p>
               {chain.error && (
                 <button className="btn btn-primary" type="button" onClick={chain.refresh}>重试</button>
               )}
             </div>
           </section>
         )}
-        {!chainBooting && page === "round" && (
+        {!chainBooting && chainEmpty && page !== "owner" && page !== "rules" && (
+          <section>
+            <div className="empty">
+              <p>主网工厂已部署，还没有开期。认筹、资产和转让都会在开期后出现。</p>
+              <button className="btn btn-primary" type="button" onClick={() => openPage("owner", "create")}>去发布众筹挖矿</button>
+            </div>
+          </section>
+        )}
+        {!chainBooting && !(chainEmpty && page !== "owner" && page !== "rules") && page === "round" && (
           <RoundHub
             round={round}
             book={book}
@@ -752,24 +959,24 @@ export default function App() {
             actor={actor}
             onChain={usingChain}
             onPick={handlePick}
-            onBuy={buy}
-            onAbort={() => act("abortUnaffordable")}
+            onSubscribe={subscribeShares}
+            onRefund={() => act("refund")}
+            onAbort={() => act("openRefund")}
             onClaim={() => act("claim")}
             onHarvest={() => act("harvest")}
             onOpenOwner={() => openPage("owner", "overview")}
             onOpenAssets={() => openPage("assets")}
+            onOpenTransfer={() => openPage("transfer")}
             usingChain={usingChain}
             periods={usingChain ? chain.campaigns : []}
             onSwitchPeriod={usingChain ? chain.switchCampaign : null}
           />
         )}
-        {!chainBooting && page === "assets" && (
+        {!chainBooting && !chainEmpty && page === "assets" && (
           <AssetsHub
             round={round}
             book={book}
             copy={copy}
-            actor={actor}
-            account={account}
             pending={pending}
             connected={connected}
             usingChain={usingChain}
@@ -777,18 +984,41 @@ export default function App() {
             positionsLoading={usingChain ? chain.positionsLoading : false}
             onClaim={(address) => act("claim", { campaign: address })}
             onRefund={(address) => act("refund", { campaign: address })}
-            onBrowse={() => openPage("round")}
             onOpenPeriod={async (address) => {
               if (usingChain && address) await chain.switchCampaign(address);
               openPage("round");
             }}
             onConnect={handleConnect}
+          />
+        )}
+        {!chainBooting && !chainEmpty && page === "transfer" && (
+          <TransferPage
+            round={round}
+            book={book}
+            copy={copy}
+            actor={actor}
+            account={account}
+            pending={pending}
+            connected={connected}
             onList={(args) => act("listShares", args)}
             onCancel={(id) => act("cancelListing", { listingId: id })}
             onTake={(args) => act("takeListing", args)}
+            onBrowse={() => openPage("round")}
+            onConnect={handleConnect}
+            title="资产转让"
+            periods={usingChain ? chain.campaigns : []}
+            onSwitchPeriod={usingChain ? chain.switchCampaign : null}
           />
         )}
-        {!chainBooting && page === "owner" && (
+        {!chainBooting && page === "owner" && chainEmpty && ownerTab !== "create" && (
+          <section>
+            <div className="empty">
+              <p>工厂里还没有期次。发布后才会出现众筹列表。</p>
+              <button className="btn btn-primary" type="button" onClick={() => openPage("owner", "create")}>发布众筹挖矿</button>
+            </div>
+          </section>
+        )}
+        {!chainBooting && page === "owner" && (!chainEmpty || ownerTab === "create") && (
           <OwnerDesk
             tab={ownerTab}
             onTab={setOwnerTab}
@@ -799,6 +1029,7 @@ export default function App() {
             quote={quote}
             taskbook={taskbook}
             pending={pending}
+            pendingTarget={pendingTarget}
             actor={actor}
             account={account}
             executeWait={executeWait}
@@ -807,14 +1038,16 @@ export default function App() {
             chain={chain}
             factoryOwner={factoryOwner}
             chainHolders={chainHolders}
+            holdersCampaign={holdersCampaign}
             now={now}
-            onPlaceTransistorOrder={() => act("placeTransistorOrder")}
-            onAbortUnaffordable={() => act("abortUnaffordable")}
+            onPlaceTransistorOrder={(args) => act("placeTransistorOrder", args)}
+            onOpenRefund={() => act("openRefund")}
             onCancelTransistorOrder={() => act("cancelTransistorOrder")}
             onConfirmTransistors={() => act("confirmTransistors")}
-            onExecute={() => act("execute")}
+            onExecute={(args) => act("execute", args)}
             onHarvest={() => act("harvest")}
             onSetPlan={() => act("setPlan")}
+            onRemoveCampaign={(address) => act("removeCampaign", { campaign: address })}
             onOpenRound={() => openPage("round")}
             onOpenAssets={() => openPage("assets")}
             onCreate={handleCreate}
@@ -822,7 +1055,7 @@ export default function App() {
             onInvoke={invokeCall}
           />
         )}
-        {!chainBooting && page === "rules" && <RulesPage round={round} book={book} quote={quote} taskbook={taskbook} />}
+        {page === "rules" && <RulesPage campaigns={usingChain ? chain.campaigns : []} />}
       </main>
 
       {notice && <div className="toast">{notice}</div>}
@@ -928,16 +1161,22 @@ function RoundTitle({ id, lead, badge, tone, phase, periods, onSwitchPeriod, pro
   );
 }
 
-/** 生命周期进度条：募集 → 待执行 → 挖矿 */
-function LifecycleStrip({ scene, phase }) {
+/** 流片失败且认筹已全部退回：大状态结束，不再停在待执行。 */
+function refundSettled(row) {
+  return Boolean(row?.executionFailed) && Number(row?.sold) === 0;
+}
+
+/** 生命周期进度条：募集 → 待执行 → 挖矿。全部退款后，待执行改为已结束。 */
+function LifecycleStrip({ scene, phase, ended }) {
   const steps = [
     { id: "funding", label: "募集中" },
-    { id: "executing", label: "待执行" },
+    { id: "executing", label: ended ? "已结束" : "待执行" },
     { id: "mining", label: "挖矿中" },
   ];
   const idx = Math.max(0, steps.findIndex((s) => s.id === scene));
-  const phaseHint =
-    scene === "executing"
+  const phaseHint = ended
+    ? "已失败原路退款"
+    : scene === "executing"
       ? phase === "ready"
         ? "晶体管已到账 · 待流片"
         : phase === "listed"
@@ -948,7 +1187,7 @@ function LifecycleStrip({ scene, phase }) {
     <div className="life-strip" aria-label="本期生命周期">
       {steps.map((step, i) => (
         <div key={step.id} className="life-step-wrap">
-          <div className={`life-step${i < idx ? " is-done" : ""}${i === idx ? " is-active" : ""}`}>
+          <div className={`life-step${i < idx ? " is-done" : ""}${i === idx ? " is-active" : ""}${ended && step.id === "executing" ? " is-ended" : ""}`}>
             <span className="life-dot">{i + 1}</span>
             <span className="life-text">
               <span className="life-label">{step.label}</span>
@@ -965,19 +1204,19 @@ function LifecycleStrip({ scene, phase }) {
 /** 本期：随 funding / executing / mining 切换主内容 */
 function RoundHub({
   round, book, copy, quote, taskbook, remaining, pay, countdown, executeWait,
-  pending, connected, actor, onChain, onPick, onBuy, onAbort, onClaim, onHarvest, onOpenOwner, onOpenAssets,
+  pending, connected, actor, onChain, onPick, onSubscribe, onRefund, onAbort, onClaim, onHarvest, onOpenOwner, onOpenAssets, onOpenTransfer,
   usingChain = false, periods, onSwitchPeriod,
 }) {
   const netW = book.capped ? book.netWeightUnverified : book.netWeightVerified;
   const harvest = computeHarvest(round, book, book.selfAddress, Number.isFinite(netW) ? netW : null);
   const dailyBem = book._chain && book.dailyBem != null ? book.dailyBem : harvest.dailyBem;
-  const waitHours = Math.ceil((executeWait || 0) / 3600_000);
   const execEst = book.estimate || {};
   const isOwner = actor?.role === "owner";
+  const ended = refundSettled(book);
 
   return (
     <>
-      <LifecycleStrip scene={book.scene} phase={book.executePhase} />
+      <LifecycleStrip scene={book.scene} phase={book.executePhase} ended={ended} />
 
       {book.scene === "funding" && (
         <ProductPage
@@ -994,7 +1233,8 @@ function RoundHub({
           connected={connected}
             onChain={onChain}
             onPick={onPick}
-            onBuy={onBuy}
+            onSubscribe={onSubscribe}
+            onRefund={onRefund}
             usingChain={usingChain}
             periods={periods}
             onSwitchPeriod={onSwitchPeriod}
@@ -1005,10 +1245,12 @@ function RoundHub({
         <section>
           <RoundTitle
             id={round.id}
-            phase="待执行"
-            lead="份数已售罄。买得起晶体管就挂单；买不起时 Factory Owner 可发起退款，持份人再到「我的资产」原路退还。"
-            badge={copy.badge}
-            tone={copy.tone}
+            phase={ended ? "已结束" : "待执行"}
+            lead={ended
+              ? "本期已结束。流片失败，认筹 BNB 已按认筹地址原路退回。"
+              : "份数已售罄。晶体管到账后即可流片。Owner 也可以直接发起退款，认筹 BNB 会按认筹地址原路退回。"}
+            badge={ended ? "已结束" : copy.badge}
+            tone={ended ? "done" : copy.tone}
             periods={periods}
             onSwitchPeriod={onSwitchPeriod}
             processor={estimateHashpower(round, quote, round.totalShares, taskbook).processor || round.processorId}
@@ -1017,67 +1259,74 @@ function RoundHub({
           <article className="card progress-card">
             <div className="card-header">当前进度</div>
             <div className="card-body">
-              <Pipeline scene={book.scene} phase={book.executePhase} />
+              <Pipeline scene={book.scene} phase={book.executePhase} ended={ended} />
               <ul className="bill">
                 <li><span>已售</span><strong>{book.sold} / {round.totalShares} 份</strong></li>
                 <li><span>托管 BNB</span><strong>{round4(book.bnbPool || 0)} BNB</strong></li>
-                <li><span>晶体管子态</span><strong>{
-                  book.executePhase === "ready" ? "已到账 · 待流片"
+                <li><span>{ended ? "状态" : "晶体管子态"}</span><strong>{
+                  ended ? "已结束"
+                    : book.executePhase === "ready" ? "已到账 · 待流片"
                     : book.executePhase === "listed" ? "挂单中"
                       : "待挂单"
                 }</strong></li>
-                <li><span>退款</span><strong style={book.executionFailed || (execEst.usedParts > 0 && execEst.capCoversFloor === false) ? { color: "var(--color-danger)" } : undefined}>{
-                  book.executionFailed
-                    ? "已开放 · 持份人可原路退还"
-                    : book.executePhase !== "buying"
-                      ? "请先取消挂单"
-                      : execEst.usedParts > 0 && execEst.capCoversFloor === false
-                        ? "买不起晶体管 · Owner 可发起"
-                        : "买得起，不需要退款"
+                <li><span>{ended ? "结果" : "退款"}</span><strong style={!ended && book.executionFailed ? { color: "var(--color-danger)" } : undefined}>{
+                  ended
+                    ? "已失败原路退款"
+                    : book.executionFailed
+                      ? "持份人可原路退还"
+                      : book.executePhase !== "buying"
+                        ? "请先取消挂单"
+                        : "由 Owner 决定"
                 }</strong></li>
-                <li className="wait"><span>观察期</span><strong>{
-                  executeWait > 0 ? `还剩约 ${waitHours} 小时` : "已满，可流片"
-                }</strong></li>
-                {book.executionFailed && (
-                  <li className="due"><span>流片</span><strong style={{ color: "var(--color-danger)" }}>已失败 · 可原路退款</strong></li>
-                )}
               </ul>
               <p className="fine">
-                {book.executionFailed
-                  ? "退款已开放。持份人到「我的资产」原路退还 BNB。"
-                  : execEst.capCoversFloor === false && book.executePhase === "buying"
-                    ? "当前报价买不起晶体管。Factory Owner 可发起退款；买得起时只能挂单。"
-                    : "用户侧等待流片。失败后到「我的资产」退款。流片操作在 Owner 工作台。"}
+                {ended
+                  ? "本期已结束。流片失败，认筹 BNB 已按认筹地址原路退回，合约里不再留有募集款。"
+                  : book.executionFailed
+                    ? "流片失败，本金未支出。可到「我的资产」原路退还；Owner 也可降价重挂或批量退款剩余。"
+                    : "晶体管到账后即可流片。待挂单时 Owner 也可以直接发起退款。成功流片后未花完的募集款会按份退回。"}
               </p>
               <div className="actions">
-                {isOwner && book.executePhase === "buying" && !book.executionFailed && (
+                {isOwner && book.executePhase === "buying" && (
                   <>
                     <button
                       className="btn btn-primary"
                       type="button"
-                      disabled={Boolean(pending) || execEst.capCoversFloor === false}
+                      disabled={Boolean(pending)}
                       onClick={() => onOpenOwner()}
                     >
-                      去 Owner 工作台 · 挂单
+                      {book.executionFailed ? "去 Owner · 降价重挂" : "去 Owner 工作台 · 挂单"}
                     </button>
                     <button
                       className="btn btn-inline"
                       type="button"
-                      disabled={Boolean(pending) || execEst.capCoversFloor !== false}
+                      disabled={Boolean(pending)}
                       onClick={onAbort}
                     >
-                      {pending || "退款"}
+                      {pending || (book.executionFailed ? "退款剩余" : "退款")}
                     </button>
                   </>
                 )}
-                {isOwner && book.executePhase !== "buying" && (
+                {isOwner && book.executePhase !== "buying" && !book.executionFailed && (
                   <button className="btn btn-primary" type="button" onClick={onOpenOwner}>
                     去 Owner 工作台 · 流片
                   </button>
                 )}
-                <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
-                  我的资产
-                </button>
+                {isOwner && book.executePhase === "ready" && book.executionFailed && (
+                  <button className="btn btn-primary" type="button" onClick={onOpenOwner}>
+                    去 Owner · 撤回重挂
+                  </button>
+                )}
+                {(book.executionFailed || (book.scene === "funding" && book.endsAt && Date.now() > book.endsAt)) && (
+                  <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
+                    我的资产 · 退款
+                  </button>
+                )}
+                {!(book.executionFailed || (book.scene === "funding" && book.endsAt && Date.now() > book.endsAt)) && (
+                  <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
+                    我的资产
+                  </button>
+                )}
               </div>
             </div>
           </article>
@@ -1089,7 +1338,7 @@ function RoundHub({
           <RoundTitle
             id={round.id}
             phase="挖矿中"
-            lead="按份分发 BEM。主动退出请走「我的资产」份额转让；合约不提供本金赎回。"
+            lead="按份分发 BEM。主动退出请走「资产转让」；合约不提供本金赎回。"
             badge={copy.badge}
             tone={copy.tone}
             periods={periods}
@@ -1114,12 +1363,18 @@ function RoundHub({
               <div className="stat-value">{book.harvestCount || harvest.rounds || 0}</div>
             </article>
           </div>
-          <article className="card">
+          <article className="card claim-card">
             <div className="card-header">领取</div>
             <div className="card-body">
-              <div className="actions">
-                <button className="btn btn-primary" type="button" disabled={!connected || Boolean(pending)} onClick={onHarvest}>
-                  {pending === "harvest" ? "分发中…" : "全网分发 harvest"}
+              <div className="claim-actions">
+                <button
+                  className="btn btn-primary"
+                  type="button"
+                  disabled={!connected || (!book._chain && !(dailyBem > 0)) || Boolean(pending)}
+                  onClick={onHarvest}
+                  title={book._chain || dailyBem > 0 ? undefined : "当前没有可分发数量"}
+                >
+                  {pending === "harvest" ? "分发中…" : "全网分发"}
                 </button>
                 <button
                   className="btn btn-primary"
@@ -1129,12 +1384,12 @@ function RoundHub({
                 >
                   {pending === "claim" ? "领取中…" : `领取 ${formatBem(book.claimable)} BEM`}
                 </button>
-                <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
-                  份额转让
+                <button className="btn btn-inline" type="button" onClick={onOpenTransfer}>
+                  资产转让
                 </button>
               </div>
-              <p className="fine" style={{ marginTop: 10 }}>
-                harvest 累计全网一轮净产出；claim 只领本钱包 pending。次数不限，只要还在出矿。
+              <p className="fine claim-fine">
+                分发会先把当天的 BEM 打进本期合约，扣服务费后再按份记账。领取只转你自己已经入账、并且合约里拿得出来的部分。
               </p>
             </div>
           </article>
@@ -1144,11 +1399,48 @@ function RoundHub({
   );
 }
 
-/** 我的资产：工厂里每一期各读一次，不跟顶栏当前期走。 */
+/** 大状态下面的细分：募集超时、待挂单 / 挂单中 / 待流片、流片失败。 */
+function assetSubstatus(row, nowSec) {
+  if (row.scene === "funding") {
+    if (row.fundingDeadline > 0 && nowSec > row.fundingDeadline && row.sold < row.totalShares) return "超时未售罄";
+    return "认筹中";
+  }
+  if (row.scene === "executing") {
+    if (refundSettled(row)) return "已失败原路退款";
+    if (row.executionFailed) return "流片失败 · 可退款";
+    if (row.phase === "ready") return "已到账 · 待流片";
+    if (row.phase === "listed") return "挂单中";
+    return "待挂单";
+  }
+  if (row.scene === "mining") return "按份出矿";
+  return "";
+}
+
+/** 当前钱包买过、退过、领过，或仍有挂单锁定的期。 */
+function participated(row) {
+  return Number(row.shares) > 0
+    || Number(row.escrow) > 0
+    || Number(row.pendingBem) > 0
+    || Number(row.claimedBem) > 0
+    || Number(row.refundedBnb) > 0;
+}
+
+/** 与合约 refund() 对齐：募集超时未售罄，或待执行且已判流片失败；须有可用份额且无挂单锁定。 */
+function assetCanRefund(row, nowSec) {
+  const free = Number(row.shares || 0);
+  if (free <= 0 || Number(row.escrow || 0) > 0) return false;
+  if (row.scene === "funding") {
+    return row.fundingDeadline > 0
+      && nowSec > row.fundingDeadline
+      && Number(row.sold) < Number(row.totalShares);
+  }
+  return row.scene === "executing" && Boolean(row.executionFailed);
+}
+
 function AssetsHub({
-  round, book, copy, actor, account, pending, connected, usingChain,
+  round, book, copy, pending, connected, usingChain,
   positions, positionsLoading,
-  onClaim, onRefund, onBrowse, onOpenPeriod, onConnect, onList, onCancel, onTake,
+  onClaim, onRefund, onOpenPeriod, onConnect,
 }) {
   const rows = usingChain
     ? (positions || [])
@@ -1157,18 +1449,22 @@ function AssetsHub({
         address: round.contract,
         scene: book.scene,
         sceneLabel: copy.badge,
+        phase: book.executePhase || "",
         sold: book.sold,
         totalShares: round.totalShares,
         sharePriceBnb: round.sharePriceBnb,
         executionFailed: Boolean(book.executionFailed),
         fundingDeadline: book.endsAt ? Math.floor(book.endsAt / 1000) : 0,
         shares: connected ? book.mine : null,
+        escrow: connected ? book.listingShares || 0 : 0,
         pendingBem: book.claimable || 0,
+        claimedBem: book.claimed || 0,
         refundedBnb: book.refundedSelf || 0,
       }];
-  const held = rows.filter((row) => Number(row.shares) > 0);
-  const shareSum = held.reduce((sum, row) => sum + Number(row.shares || 0), 0);
-  const bemSum = rows.reduce((sum, row) => sum + Number(row.pendingBem || 0), 0);
+  const mineRows = rows.filter(participated);
+  const held = mineRows.filter((row) => Number(row.shares) + Number(row.escrow) > 0);
+  const shareSum = held.reduce((sum, row) => sum + Number(row.shares || 0) + Number(row.escrow || 0), 0);
+  const bemSum = mineRows.reduce((sum, row) => sum + Number(row.pendingBem || 0), 0);
   const nowSec = Date.now() / 1000;
 
   return (
@@ -1187,7 +1483,7 @@ function AssetsHub({
           </div>
         </div>
         <p className="round-hero-lead">
-          列出工厂中的每一期。连接钱包后显示你在各期的份数、可领和可退，不跟随当前选中的那一期。
+          只列出当前钱包参与过的期次。没买过、没退过、也没领过的期不显示。
         </p>
       </header>
 
@@ -1203,7 +1499,7 @@ function AssetsHub({
       <div className="holding-grid">
         <article className="stat-card accent">
           <div className="stat-label">期次</div>
-          <div className="stat-value">{rows.length} 期</div>
+          <div className="stat-value">{connected ? `${mineRows.length} 期` : "—"}</div>
         </article>
         <article className="stat-card">
           <div className="stat-label">我持有的期</div>
@@ -1220,12 +1516,14 @@ function AssetsHub({
       </div>
 
       <article className="card">
-        <div className="card-header">全部期次</div>
+        <div className="card-header">我参与的期次</div>
         <div className="card-body table-wrap">
-          {positionsLoading && rows.length === 0 ? (
-            <p className="fine">正在读取全部期次…</p>
-          ) : rows.length === 0 ? (
-            <p className="fine">工厂里还没有期次。</p>
+          {!connected ? (
+            <p className="fine">连接钱包后，这里只显示你参与过的期。</p>
+          ) : positionsLoading && mineRows.length === 0 ? (
+            <p className="fine">正在读取你参与的期次…</p>
+          ) : mineRows.length === 0 ? (
+            <p className="fine">当前钱包还没有参与过的期次。</p>
           ) : (
             <table>
               <thead>
@@ -1240,19 +1538,24 @@ function AssetsHub({
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row) => {
-                  const canRefund = connected && row.shares > 0 && (
-                    (row.scene === "funding" && row.fundingDeadline > 0 && nowSec > row.fundingDeadline && row.sold < row.totalShares)
-                    || (row.scene === "executing" && row.executionFailed)
-                  );
+                {mineRows.map((row) => {
                   const canClaim = connected && row.scene === "mining" && row.pendingBem > 0;
-                  const tone = row.scene === "mining" ? "mine" : row.scene === "executing" ? "wait" : "live";
+                  const canRefund = connected && assetCanRefund(row, nowSec);
+                  const refundBnb = round4(Number(row.shares || 0) * Number(row.sharePriceBnb || 0));
+                  const ended = refundSettled(row);
+                  const tone = ended ? "done" : row.executionFailed ? "back" : row.scene === "mining" ? "mine" : row.scene === "executing" ? "wait" : "live";
+                  const sub = assetSubstatus(row, nowSec);
                   return (
                     <tr key={row.address || row.id}>
                       <td>第 {row.id} 期</td>
-                      <td><span className={`badge tone-${tone}`}>{row.sceneLabel}</span></td>
+                      <td className="asset-status-cell">
+                        <div className={`asset-status tone-${tone}`}>
+                          <strong>{ended ? "已结束" : row.sceneLabel}</strong>
+                          {sub ? <span>{sub}</span> : null}
+                        </div>
+                      </td>
                       <td>{row.totalShares ? `${row.sold}/${row.totalShares}` : "—"}</td>
-                      <td>{row.shares == null ? "—" : `${row.shares} 份`}</td>
+                      <td>{`${Number(row.shares || 0) + Number(row.escrow || 0)} 份`}</td>
                       <td>{connected ? `${formatBem(row.pendingBem || 0)} BEM` : "—"}</td>
                       <td>{connected ? `${round4(row.refundedBnb || 0)} BNB` : "—"}</td>
                       <td>
@@ -1260,14 +1563,19 @@ function AssetsHub({
                           <button className="btn btn-inline" type="button" onClick={() => onOpenPeriod(row.address)}>
                             打开
                           </button>
+                          {canRefund && (
+                            <button
+                              className="btn btn-primary"
+                              type="button"
+                              disabled={Boolean(pending)}
+                              onClick={() => onRefund(row.address)}
+                            >
+                              {pending || `原路退还 ${refundBnb} BNB`}
+                            </button>
+                          )}
                           {canClaim && (
                             <button className="btn btn-primary" type="button" disabled={Boolean(pending)} onClick={() => onClaim(row.address)}>
                               {pending || "领取"}
-                            </button>
-                          )}
-                          {canRefund && (
-                            <button className="btn btn-inline" type="button" disabled={Boolean(pending)} onClick={() => onRefund(row.address)}>
-                              {pending || "退款"}
                             </button>
                           )}
                         </div>
@@ -1280,41 +1588,16 @@ function AssetsHub({
           )}
         </div>
       </article>
-
-      {book.scene === "mining" ? (
-        <TransferPage
-          round={round}
-          book={book}
-          copy={copy}
-          actor={actor}
-          account={account}
-          pending={pending}
-          connected={connected}
-          onList={onList}
-          onCancel={onCancel}
-          onTake={onTake}
-          onBrowse={onBrowse}
-          onConnect={onConnect}
-          embedded
-        />
-      ) : (
-        <article className="card">
-          <div className="card-header">份额转让</div>
-          <div className="card-body">
-            <p className="fine">份额转让只在挖矿中的期次开放。先在上表打开那一期，再回来挂牌。</p>
-          </div>
-        </article>
-      )}
     </section>
   );
 }
 
 /** Owner 工作台：开期 / 流片 / 持有人 / 调用 / 调试 */
 function OwnerDesk({
-  tab, onTab, tabs, round, book, copy, quote, taskbook, pending, actor, account,
-  executeWait, connected, usingChain, chain, factoryOwner, chainHolders, now,
-  onPlaceTransistorOrder, onAbortUnaffordable, onCancelTransistorOrder, onConfirmTransistors, onExecute, onHarvest, onSetPlan,
-  onOpenRound, onOpenAssets,
+  tab, onTab, tabs, round, book, copy, quote, taskbook, pending, pendingTarget, actor, account,
+  executeWait, connected, usingChain, chain, factoryOwner, chainHolders, holdersCampaign, now,
+  onPlaceTransistorOrder, onOpenRefund, onCancelTransistorOrder, onConfirmTransistors, onExecute, onHarvest, onSetPlan,
+  onRemoveCampaign, onOpenRound, onOpenAssets,
   onCreate, onConnect, onInvoke,
 }) {
   return (
@@ -1350,23 +1633,27 @@ function OwnerDesk({
           quote={quote}
           taskbook={taskbook}
           pending={pending}
+          pendingTarget={pendingTarget}
           actor={actor}
           executeWait={executeWait}
           history={usingChain ? chain.campaigns : null}
           onSwitchCampaign={usingChain ? chain.switchCampaign : null}
           onPlaceTransistorOrder={onPlaceTransistorOrder}
-          onAbortUnaffordable={onAbortUnaffordable}
+          onOpenRefund={onOpenRefund}
           onCancelTransistorOrder={onCancelTransistorOrder}
           onConfirmTransistors={onConfirmTransistors}
           onExecute={onExecute}
           onHarvest={onHarvest}
           onSetPlan={onSetPlan}
+          onRemoveCampaign={onRemoveCampaign}
           onOpenRound={onOpenRound}
           onOpenAssets={onOpenAssets}
           account={account}
           connected={connected}
           chainHolders={chainHolders}
+          holdersCampaign={holdersCampaign}
           onInvoke={onInvoke}
+          transistorUnitPrice={usingChain ? chain.transistorUnitPrice : null}
         />
       )}
       {tab === "create" && (
@@ -1494,12 +1781,17 @@ function RoundFacts({ round, book, quote, taskbook }) {
             <div className="stat-value">{est.affordableParts.toLocaleString("zh-CN")} 个</div>
           </article>
           <article className="stat-card">
-            <div className="stat-label">剩余 BNB</div>
-            <div className="stat-value" style={est.capCoversFloor ? undefined : { color: "var(--color-danger)" }}>
-              {est.capCoversFloor
-                ? `${(est.hardCapBnb - est.needBnb).toFixed(4)} BNB`
-                : `缺 ${(est.needBnb - est.hardCapBnb).toFixed(4)} BNB`}
+            <div className="stat-label">{book.executionFailed ? "合约剩余" : "报价余量"}</div>
+            <div className="stat-value" style={!book.executionFailed && !est.capCoversFloor ? { color: "var(--color-danger)" } : undefined}>
+              {book.executionFailed
+                ? `${round4(book.bnbPool || 0)} BNB`
+                : est.capCoversFloor
+                  ? `${(est.hardCapBnb - est.needBnb).toFixed(4)} BNB`
+                  : `缺 ${(est.needBnb - est.hardCapBnb).toFixed(4)} BNB`}
             </div>
+            {book.executionFailed ? (
+              <div className="stat-note">已退回 {round4(book.refundedTotal || 0)} BNB</div>
+            ) : null}
           </article>
           <article className="stat-card">
             <div className="stat-label">预估日产（已扣服务费）</div>
@@ -1508,12 +1800,16 @@ function RoundFacts({ round, book, quote, taskbook }) {
           <article className="stat-card wide-stat note-card">
             <div className="stat-label">预估随报价浮动，不是承诺</div>
             <p className="note-copy">
-              募资总额 {est.hardCapBnb.toFixed(4)} BNB，按 {est.processor} 当前报价（NAND {est.priceNand.toFixed(4)}{est.latch > 0 ? ` / LATCH ${est.priceLatch.toFixed(4)}` : ""} BNB，混合均价{" "}
-              {est.usedParts > 0 ? (est.needBnb / est.usedParts).toFixed(4) : "0.0000"} BNB/个）可买 {est.affordableParts} 个；本期题目 {est.usedParts} 个元件（
-              {est.nand} NAND + {est.latch} LATCH{est.latch === 0 ? "，纯组合逻辑" : ""}），权重 H ={" "}
-              {est.hashpower} = {est.usedParts} ×{est.processorScale}
-              {est.optimal ? ` + 溢价 ${est.refParts}×${est.q}` : "（非最优，无设计溢价）"}。
-              若执行时元件涨价导致募资总额买不够所需元件，本期全额退款。
+              {book.executionFailed
+                ? `本期已退款。合约里剩余 ${round4(book.bnbPool || 0)} BNB，累计已退回 ${round4(book.refundedTotal || 0)} BNB。上面的算力和元件个数仍按募资总额与当前报价估算，不是合约余额。`
+                : <>
+                  募资总额 {est.hardCapBnb.toFixed(4)} BNB，按 {est.processor} 当前报价（NAND {est.priceNand.toFixed(4)}{est.latch > 0 ? ` / LATCH ${est.priceLatch.toFixed(4)}` : ""} BNB，混合均价{" "}
+                  {est.usedParts > 0 ? (est.needBnb / est.usedParts).toFixed(4) : "0.0000"} BNB/个）可买 {est.affordableParts} 个；本期题目 {est.usedParts} 个元件（
+                  {est.nand} NAND + {est.latch} LATCH{est.latch === 0 ? "，纯组合逻辑" : ""}），权重 H ={" "}
+                  {est.hashpower} = {est.usedParts} ×{est.processorScale}
+                  {est.optimal ? ` + 溢价 ${est.refParts}×${est.q}` : "（非最优，无设计溢价）"}。
+                  报价余量是募资总额减去当前元件成本，不是合约里还剩多少 BNB。
+                </>}
             </p>
           </article>
         </div>
@@ -1522,10 +1818,12 @@ function RoundFacts({ round, book, quote, taskbook }) {
   );
 }
 
-function ProductPage({ round, book, copy, quote, taskbook, remaining, pay, countdown, executeWait, pending, connected, onPick, onBuy, onChain = false, usingChain = false, periods, onSwitchPeriod }) {
+function ProductPage({ round, book, copy, quote, taskbook, remaining, pay, countdown, executeWait, pending, connected, onPick, onSubscribe, onRefund, onChain = false, usingChain = false, periods, onSwitchPeriod }) {
   const progress = Math.round((book.sold / round.totalShares) * 100);
   const fundingOpen = book.scene === "funding" && (!book.endsAt || Date.now() <= book.endsAt);
-  const canBuy = fundingOpen && remaining > 0;
+  const fundingExpired = book.scene === "funding" && book.endsAt && Date.now() > book.endsAt;
+  const canSubscribe = fundingOpen && remaining > 0;
+  const refundBnb = round4((book.mine || 0) * round.sharePriceBnb);
   const maxPick = Math.max(remaining, 1);
   const harvest = computeHarvest(round, book);
   const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
@@ -1565,17 +1863,15 @@ function ProductPage({ round, book, copy, quote, taskbook, remaining, pay, count
             <div className="path">
               <h2>资金只走这条路径</h2>
               <ol>
-                <li>未售罄：本期不会流片，进入挖矿后才可在份额转让市场挂牌。</li>
+                <li>未售罄：到期后由认筹地址自己点退回，只退该钱包的本金。</li>
                 <li>售罄：按当前报价买入 NAND / LATCH 元件，流片成为矿机。</li>
                 <li>挖矿：BEM 按份分配，先扣 {round.feeBps / 100}% 服务费。</li>
               </ol>
               {book.scene === "executing" && (
                 <p className="fine">
                   {book.executePhase === "ready"
-                    ? executeWait > 0
-                      ? `观察期还剩 ${Math.ceil(executeWait / 3600_000)} 小时。这段时间内任何人都不能执行换币，你可以核对网表哈希与报价。`
-                      : "晶体管已到位。观察期已满后，持份用户 Factory Owner 均可触发 execute，一旦执行资金即转为 BNB 并烧掉晶体管。"
-                    : "本期份数已售完。Factory Owner 需手动调用 tapeout.net 挂单逻辑买入晶体管，到账后再确认成交并触发流片开矿——合约无法替人工操作 tapeout.net，需由 Owner 发起链上交易完成。"}
+                    ? "晶体管已到位，Owner 可以立即流片。流片不可逆。"
+                    : "本期份数已售完。Factory Owner 需手动调用 tapeout.net 挂单逻辑买入晶体管，到账后即可确认并流片。"}
                 </p>
               )}
               <p className="mono">{shortAddress(round.contract)} · {onChain ? "链上合约" : "预览地址"}</p>
@@ -1584,13 +1880,32 @@ function ProductPage({ round, book, copy, quote, taskbook, remaining, pay, count
         </article>
 
         <article className="card">
-          <div className="card-header">选择份数</div>
+          <div className="card-header">{fundingExpired ? "退回认筹" : "选择份数"}</div>
           <div className="card-body">
+            {fundingExpired ? (
+              <>
+                <p className="fine">
+                  募集已截止且未满额。请用当时认筹的钱包点退回，合约只把这一份本金打回该地址。
+                </p>
+                <ul className="bill">
+                  <li><span>我的份数</span><strong>{connected ? `${book.mine || 0} 份` : "—"}</strong></li>
+                  <li className="due"><span>可退</span><strong>{connected ? `${refundBnb} BNB` : "—"}</strong></li>
+                </ul>
+                {connected && book.mine > 0 ? (
+                  <button className="btn btn-primary" type="button" disabled={Boolean(pending)} onClick={onRefund}>
+                    {pending === "refund" ? "退回中…" : pending || `退回 ${refundBnb} BNB`}
+                  </button>
+                ) : (
+                  <p className="fine">{connected ? "当前钱包没有可退的份额。" : "连接认筹钱包后才能退回。"}</p>
+                )}
+              </>
+            ) : (
+              <>
             <Stepper
               value={book.picked}
               min={1}
-              max={canBuy ? maxPick : book.picked}
-              disabled={!canBuy}
+              max={canSubscribe ? maxPick : book.picked}
+              disabled={!canSubscribe}
               onChange={onPick}
             />
             <ul className="bill">
@@ -1611,12 +1926,20 @@ function ProductPage({ round, book, copy, quote, taskbook, remaining, pay, count
                 <strong>{round4(book.bnb || 0)} BNB</strong>
               </li>
             </ul>
-            <p className="remain">{canBuy ? `剩余 ${remaining} 份，不能自填金额` : "本期已停止认购"}</p>
-            <button className="btn btn-primary" type="button" disabled={!canBuy || Boolean(pending)} onClick={onBuy}>
-              {pending || buyLabel(book, connected, canBuy)}
+            <p className="remain">{canSubscribe ? `剩余 ${remaining} 份，不能自填金额` : "本期已停止认筹"}</p>
+            <button
+              className="btn btn-primary"
+              type="button"
+              disabled={!canSubscribe || Boolean(pending)}
+              onClick={onSubscribe}
+              title={canSubscribe && connected && book.approved ? "Confirm subscription" : undefined}
+            >
+              {pending || subscribeLabel(book, connected, canSubscribe)}
             </button>
             <p className="fine">合约按「份数 × {round.sharePriceBnb} BNB」记账。直接转账不会记份。</p>
             <RecentBuys round={round} book={book} usingChain={usingChain || onChain} account={book.selfAddress} />
+              </>
+            )}
           </div>
         </article>
       </div>
@@ -1656,7 +1979,7 @@ function PortfolioPage({ round, book, copy, actor, pending, connected, onClaim, 
         <div className="empty">
           <p>这一期还没有你的份数。</p>
           <button className="btn btn-primary" type="button" onClick={onBrowse}>
-            去认购
+            去认筹
           </button>
         </div>
       )}
@@ -1669,7 +1992,7 @@ function PortfolioPage({ round, book, copy, actor, pending, connected, onClaim, 
               <div className="stat-value">{book.mine} 份</div>
             </article>
             <article className="stat-card">
-              <div className="stat-label">认购金额</div>
+              <div className="stat-label">认筹金额</div>
               <div className="stat-value">{cost.toFixed(4)} BNB</div>
             </article>
             <article className="stat-card">
@@ -1685,7 +2008,7 @@ function PortfolioPage({ round, book, copy, actor, pending, connected, onClaim, 
             <article className="stat-card">
               <div className="stat-label">我的 BNB 余额</div>
               <div className="stat-value">{round4(book.bnb || 0)} BNB</div>
-              <div className="stat-note">认购/转让后剩余可用流动性</div>
+              <div className="stat-note">认筹/转让后剩余可用流动性</div>
             </article>
           </div>
           <article className="card">
@@ -1701,13 +2024,13 @@ function PortfolioPage({ round, book, copy, actor, pending, connected, onClaim, 
                   <strong>{round4(book.refundedSelf || 0)} BNB</strong>
                 </li>
                 <li className="due">
-                  <span>我的认购已付</span>
+                  <span>我的认筹已付</span>
                   <strong>{round4(book.mine * round.sharePriceBnb + (book.refundedSelf || 0))} BNB</strong>
                 </li>
               </ul>
               <p className="fine">
                 募集款与转让结算都走合约代持 BNB 池，与钱包余额隔离。
-                认购时扣你的 BNB 进池；转让接收时买方 BNB 实时付给卖方；
+                认筹时扣你的 BNB 进池；转让接收时买方 BNB 实时付给卖方；
                 退款/流片从池中支出，退回的 BNB 回到你的钱包余额。
               </p>
             </div>
@@ -1728,7 +2051,7 @@ function PortfolioPage({ round, book, copy, actor, pending, connected, onClaim, 
               )}
               {!showClaim && book.scene === "funding" && Date.now() > (book.endsAt || Infinity) && book.mine > 0 && (
                 <div>
-                  <p className="fine">募集已超过截止时间仍未售罄，可把认购的 BNB 原路退还。退款后份额清零，本期视为募集失败。</p>
+                  <p className="fine">募集已超过截止时间仍未售罄，可把认筹的 BNB 原路退还。退款后份额清零，本期视为募集失败。</p>
                   <button className="btn btn-primary" type="button" disabled={Boolean(pending)} onClick={onRefund}>
                     {pending || `原路退还 ${round4(book.mine * round.sharePriceBnb)} BNB`}
                   </button>
@@ -1742,7 +2065,7 @@ function PortfolioPage({ round, book, copy, actor, pending, connected, onClaim, 
               )}
               {!showClaim && book.scene === "executing" && book.executionFailed && book.mine > 0 && (
                 <div>
-                  <p className="fine">本期流片执行失败（元件报价超过募资总额，本金尚未支出）。可把认购的 BNB 原路退还，退款后份额清零。也可由 Owner 待元件降价后重试流片。</p>
+                  <p className="fine">本期流片执行失败（元件报价超过募资总额，本金尚未支出）。可把认筹的 BNB 原路退还，退款后份额清零。也可由 Owner 待元件降价后重试流片。</p>
                   <button className="btn btn-primary" type="button" disabled={Boolean(pending)} onClick={onRefund}>
                     {pending || `原路退还 ${round4(book.mine * round.sharePriceBnb)} BNB`}
                   </button>
@@ -1801,31 +2124,107 @@ function PortfolioPage({ round, book, copy, actor, pending, connected, onClaim, 
   );
 }
 
-function TransferPage({ round, book, copy, actor, account, pending, connected, onList, onCancel, onTake, onBrowse, onConnect, embedded = false }) {
+function TransferPage({ round, book, copy, actor, account, pending, connected, onList, onCancel, onTake, onBrowse, onConnect, embedded = false, title = "份额转让", periods, onSwitchPeriod }) {
   const [pickShares, setPickShares] = useState(1);
   const [price, setPrice] = useState(String(round.sharePriceBnb));
+  useEffect(() => {
+    setPrice(String(round.sharePriceBnb));
+    setPickShares(1);
+  }, [round.id, round.sharePriceBnb]);
   const available = book.mine;
   const canTransfer = book.scene === "mining";
   const canPublish = available > 0 && canTransfer;
-  const myListings = (book.listings || []).filter(
-    (l) => String(l.seller).toLowerCase() === String(account).toLowerCase(),
+  const shareCount = pickShares;
+  const shareOk = shareCount >= 1 && (!canPublish || shareCount <= available);
+  const marketRows = [...(book.listings || [])].sort((a, b) => {
+    const rank = { open: 0, done: 1, cancelled: 2 };
+    return (rank[a.status || "open"] ?? 0) - (rank[b.status || "open"] ?? 0);
+  });
+  const openCount = marketRows.filter((l) => (l.status || "open") === "open").length;
+  const doneCount = marketRows.filter((l) => l.status === "done").length;
+  const myListings = marketRows.filter(
+    (l) => (l.status || "open") === "open" && String(l.seller).toLowerCase() === String(account).toLowerCase(),
   );
+  const locked = Number(book.listingShares) || 0;
+  const held = Number(book.mine) || 0;
+  const principal = (held + locked) * round.sharePriceBnb;
+  const netW = book.capped ? book.netWeightUnverified : book.netWeightVerified;
+  const harvest = computeHarvest(round, book, book.selfAddress, Number.isFinite(netW) ? netW : null);
+  const dailyBem = book._chain && book.dailyBem != null ? book.dailyBem : harvest.dailyBem;
+  const mining = book.scene === "mining" && Number(book.hashpower) > 0;
 
   return (
     <section className={embedded ? "embedded-block" : undefined}>
       {!embedded && (
-      <header className="page-header">
-        <div>
-          <h1>份额转让</h1>
-          <p className="page-subtitle">
-            把份额挂到转让市场卖给其他持份人：发布出售时按每份 BNB 标价，挂出的份额立即锁定，
-            直到卖出或撤单。其他持份人可按发布价直接接收（份额过户、BNB 付给卖方）。
+        <header className="round-hero">
+          <div className="round-hero-row">
+            <div className="round-title">
+              <span className="round-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none">
+                  <path d="M7 8h11.5M15.5 5.5 18.5 8l-3 2.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M17 16H5.5M8.5 13.5 5.5 16l3 2.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+              <h1>{title}</h1>
+            </div>
+            {Array.isArray(periods) && periods.length > 0 && onSwitchPeriod ? (
+              <PeriodNav periods={periods} currentId={round.id} onSwitch={onSwitchPeriod} />
+            ) : (
+              <span className="round-period">第 {round.id} 期</span>
+            )}
+          </div>
+          <p className="round-hero-lead">
+            把挖矿份额挂到转让市场。挂出后立即锁定，卖出或撤单后才回到可用份数。
           </p>
-        </div>
-        <span className={`badge tone-${copy.tone}`}>{copy.badge}</span>
-      </header>
+        </header>
       )}
       {embedded && <h2 className="embedded-title">份额转让</h2>}
+
+      {!embedded && (
+        <>
+          <div className="holding-grid transfer-self">
+            <article className="stat-card accent">
+              <div className="stat-label">我的份数</div>
+              <div className="stat-value">{connected ? `${held} 份` : "—"}</div>
+              <div className="stat-note">第 {round.id} 期 · 可挂牌 {connected ? held : "—"} 份</div>
+            </article>
+            <article className="stat-card">
+              <div className="stat-label">挂单锁定</div>
+              <div className="stat-value">{connected ? `${locked} 份` : "—"}</div>
+            </article>
+            <article className="stat-card">
+              <div className="stat-label">认筹本金</div>
+              <div className="stat-value">{connected ? `${principal.toFixed(4)} BNB` : "—"}</div>
+              <div className="stat-note">每份 {round.sharePriceBnb.toFixed(4)} BNB</div>
+            </article>
+            <article className="stat-card">
+              <div className="stat-label">可领取</div>
+              <div className="stat-value">{connected ? `${formatBem(book.claimable)} BEM` : "—"}</div>
+              <div className="stat-note">已领取 {connected ? `${formatBem(book.claimed)} BEM` : "—"}</div>
+            </article>
+          </div>
+          <div className="holding-grid transfer-mine">
+            <article className="stat-card accent">
+              <div className="stat-label">实际算力</div>
+              <div className="stat-value">{mining ? `${Number(book.hashpower).toLocaleString("zh-CN")} H` : "—"}</div>
+              <div className="stat-note">{mining ? "挖矿中" : copy.badge}</div>
+            </article>
+            <article className="stat-card">
+              <div className="stat-label">日产{book._chain ? "（链上）" : ""}</div>
+              <div className="stat-value">{mining ? `${formatBem(dailyBem)} BEM` : "—"}</div>
+            </article>
+            <article className="stat-card">
+              <div className="stat-label">已分发轮数</div>
+              <div className="stat-value">{mining ? (book.harvestCount || harvest.rounds || 0) : "—"}</div>
+              <div className="stat-note">已分配 {mining ? `${formatBem(book.distributed || 0)} BEM` : "—"}</div>
+            </article>
+            <article className="stat-card">
+              <div className="stat-label">已售份数</div>
+              <div className="stat-value">{book.sold}/{round.totalShares}</div>
+            </article>
+          </div>
+        </>
+      )}
 
       {!connected && (
         <div className="empty">
@@ -1837,7 +2236,45 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
       )}
 
       {connected && (
-        <div className="layout">
+        <div className="layout transfer-desk">
+          <article className="card">
+            <div className="card-header">
+              <span>转让市场 · 接收发布的出售价额</span>
+              <span className="stat-label">开放 {openCount} · 完成 {doneCount}</span>
+            </div>
+            <div className="card-body">
+              {marketRows.length === 0 ? (
+                <p className="fine">还没有人挂单。发布出售后，挂单会显示在这里供其他持份人接收。</p>
+              ) : (
+                <div className="listing-board">
+                  <div className="listing-head">
+                    <span>卖方</span>
+                    <span>份数</span>
+                    <span>单价</span>
+                    <span>合计</span>
+                    <span>状态</span>
+                  </div>
+                  <ul>
+                    {marketRows.map((l) => (
+                      <ListingRow
+                        key={l.id}
+                        listing={l}
+                        account={account}
+                        pending={pending}
+                        disabled={!canTransfer}
+                        onTake={onTake}
+                        onCancel={onCancel}
+                      />
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {myListings.length > 0 && (
+                <p className="fine">撤单后锁定份额自动回到可用余额，可重新转让或领取。</p>
+              )}
+            </div>
+          </article>
+
           <article className="card">
             <div className="card-header">
               <span>发布出售</span>
@@ -1845,18 +2282,16 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
             </div>
             <div className="card-body">
               <p className="fine">挂单后这部分份额从可用余额扣出并锁定，不能领取或转让，直到成交或撤单。</p>
-              <div className="form-grid cols-2">
+              <div className="form-grid publish-fields">
                 <label className="field">
                   <span>出售份数</span>
-                  <div className="stepper-wrap">
-                    <Stepper
-                      value={pickShares}
-                      min={1}
-                      max={canPublish ? available : 1}
-                      disabled={!canPublish}
-                      onChange={setPickShares}
-                    />
-                  </div>
+                  <Stepper
+                    value={pickShares}
+                    min={1}
+                    max={canPublish ? available : 1}
+                    disabled={!canPublish}
+                    onChange={setPickShares}
+                  />
                 </label>
                 <label className="field">
                   <span>单价（BNB / 份）</span>
@@ -1872,19 +2307,19 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
                 <li>
                   <span>合计</span>
                   <strong>
-                    {round4(Number(pickShares) * Number(price) || 0).toFixed(4)} BNB
+                    {round4((shareOk ? shareCount : 0) * Number(price) || 0).toFixed(4)} BNB
                   </strong>
                 </li>
                 <li className="due">
                   <span>挂单后可用余额</span>
-                  <strong>{Math.max(0, available - (canPublish ? pickShares : 0))} 份</strong>
+                  <strong>{Math.max(0, available - (canPublish && shareOk ? shareCount : 0))} 份</strong>
                 </li>
               </ul>
               <button
                 className="btn btn-primary"
                 type="button"
-                disabled={!canPublish || !(Number(price) > 0) || Boolean(pending)}
-                onClick={() => onList({ shares: pickShares, priceBnbPerShare: Number(price) })}
+                disabled={!canPublish || !shareOk || !(Number(price) > 0) || Boolean(pending)}
+                onClick={() => onList({ shares: shareCount, priceBnbPerShare: Number(price) })}
               >
                 {pending || "发布出售挂单"}
               </button>
@@ -1899,59 +2334,6 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
             </div>
           </article>
 
-          <article className="card">
-            <div className="card-header">
-              <span>转让市场 · 接收发布的出售价额</span>
-              <span className="stat-label">{(book.listings || []).length} 个挂单</span>
-            </div>
-            <div className="card-body">
-              {(book.listings || []).length === 0 ? (
-                <p className="fine">还没有人挂单。发布出售后，挂单会显示在这里供其他持份人接收。</p>
-              ) : (
-                <ul className="listing-board">
-                  {book.listings.map((l) => (
-                    <ListingRow
-                      key={l.id}
-                      listing={l}
-                      account={account}
-                      pending={pending}
-                      disabled={!canTransfer}
-                      onTake={onTake}
-                      onCancel={onCancel}
-                    />
-                  ))}
-                </ul>
-              )}
-            </div>
-          </article>
-
-          {myListings.length > 0 && (
-            <article className="card">
-              <div className="card-header">我的挂单</div>
-              <div className="card-body">
-                <ul className="bill">
-                  {myListings.map((l) => (
-                    <li key={l.id}>
-                      <span>
-                        {l.shares} 份 @ {l.priceBnbPerShare.toFixed(4)} BNB · 合计 {l.totalBnb.toFixed(4)} BNB
-                      </span>
-                      <strong>
-                        <button
-                          className="btn btn-inline"
-                          type="button"
-                          disabled={!canTransfer || Boolean(pending)}
-                          onClick={() => onCancel(l.id)}
-                        >
-                          撤单
-                        </button>
-                      </strong>
-                    </li>
-                  ))}
-                </ul>
-                <p className="fine">撤单后锁定份额自动回到可用余额，可重新转让或领取。</p>
-              </div>
-            </article>
-          )}
         </div>
       )}
     </section>
@@ -1961,22 +2343,27 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
 function ListingRow({ listing, account, pending, disabled = false, onTake, onCancel }) {
   const [qty, setQty] = useState(1);
   const isMine = String(listing.seller).toLowerCase() === String(account).toLowerCase();
-  const maxQty = listing.shares;
+  const status = listing.status || (listing.open === false ? "cancelled" : "open");
+  const maxQty = Math.max(1, listing.shares || 1);
   const take = Math.min(Math.max(1, qty), maxQty);
   return (
-    <li className="listing-row">
-      <div className="listing-main">
-        <span className="listing-seller">{shortAddress(listing.seller)}{isMine ? "（我的）" : ""}</span>
-        <span className="listing-shares">{listing.shares} 份</span>
-        <span className="listing-price">{listing.priceBnbPerShare.toFixed(4)} BNB / 份</span>
-        <span className="listing-total">合计 {listing.totalBnb.toFixed(4)} BNB</span>
-      </div>
+    <li className={`listing-row is-${status}`}>
+      <span className="listing-seller">
+        {shortAddress(listing.seller)}
+        {isMine ? <em>我的</em> : null}
+      </span>
+      <span className="listing-shares">{listing.shares > 0 ? `${listing.shares} 份` : "—"}</span>
+      <span className="listing-price">{listing.priceBnbPerShare.toFixed(4)} BNB / 份</span>
+      <span className="listing-sum">{listing.totalBnb.toFixed(4)} BNB</span>
       <div className="listing-actions">
-        {isMine ? (
+        {status === "done" && <span className="listing-status is-done">完成</span>}
+        {status === "cancelled" && <span className="listing-status is-cancelled">已撤单</span>}
+        {status === "open" && isMine && (
           <button className="btn btn-inline" type="button" disabled={disabled || Boolean(pending)} onClick={() => onCancel(listing.id)}>
             撤单
           </button>
-        ) : (
+        )}
+        {status === "open" && !isMine && (
           <>
             <input
               className="qty-input"
@@ -1993,7 +2380,7 @@ function ListingRow({ listing, account, pending, disabled = false, onTake, onCan
               disabled={disabled || Boolean(pending)}
               onClick={() => onTake({ listingId: listing.id, shares: take })}
             >
-              接收（付 {round4(take * listing.priceBnbPerShare).toFixed(4)} BNB）
+              接收
             </button>
           </>
         )}
@@ -2010,7 +2397,7 @@ function RecentBuys({ round, book, usingChain = false, account = "" }) {
       return undefined;
     }
     let alive = true;
-    readRecentBuys(8)
+    readRecentSubscriptions(8)
       .then((list) => {
         if (!alive) return;
         const me = String(account || "").toLowerCase();
@@ -2029,11 +2416,11 @@ function RecentBuys({ round, book, usingChain = false, account = "" }) {
     };
   }, [usingChain, book.sold, account]);
 
-  if (rows == null) return <p className="fine">加载最近认购…</p>;
-  if (!rows.length) return <p className="fine">链上暂无认购记录。</p>;
+  if (rows == null) return <p className="fine">加载最近认筹…</p>;
+  if (!rows.length) return <p className="fine">链上暂无认筹记录。</p>;
   return (
     <div className="recent">
-      <p className="fine">最近认购{usingChain ? "（链上事件）" : ""}</p>
+      <p className="fine">最近认筹{usingChain ? "（链上事件 · Subscribed）" : ""}</p>
       <ul className="bill">
         {rows.map((row) => (
           <li key={`${row.address}-${row.shares}-${row.paid ?? row.shares}`}>
@@ -2048,157 +2435,237 @@ function RecentBuys({ round, book, usingChain = false, account = "" }) {
   );
 }
 
-function RulesPage({ round, book, quote, taskbook }) {
-  const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
-  const netW = book.capped ? book.netWeightUnverified : book.netWeightVerified;
-  const harvest = computeHarvest(round, book, book.selfAddress, Number.isFinite(netW) ? netW : null);
-  const dailyBem = book._chain && book.dailyBem != null ? book.dailyBem : harvest.dailyBem;
-  const weightVerified = Number.isFinite(book.netWeightVerified) ? book.netWeightVerified : NETWORK_WEIGHT.verified;
-  const weightUnverified = Number.isFinite(book.netWeightUnverified) ? book.netWeightUnverified : NETWORK_WEIGHT.unverified;
-  const est = estimateHashpower(round, quote, round.totalShares, taskbook);
-  const delayH = round.executeDelayHours ?? 48;
-  const sceneLabel = { funding: "募集中", executing: "待执行", mining: "挖矿中" }[book.scene] || book.scene;
-  const phaseLabel =
-    book.scene !== "executing"
-      ? "—"
-      : book.executePhase === "ready"
-        ? "已到账 · 待流片"
-        : book.executePhase === "listed"
-          ? "挂单中"
-          : "待挂单";
-
+function RulesPage({ campaigns = [] }) {
   const flow = [
-    { id: "funding", kicker: "01", title: "募集", body: "整数份认购，BNB 进托管池" },
-    { id: "executing", kicker: "02", title: "待执行", body: "晶体管到位并过观察期" },
-    { id: "mining", kicker: "03", title: "挖矿", body: "按份分发 BEM，可转让退出" },
+    { n: "1", title: "募集", body: "按份认筹，BNB 进托管池" },
+    { n: "2", title: "待执行", body: "晶体管到账后流片" },
+    { n: "3", title: "挖矿", body: "按份分发 BEM，可转让" },
   ];
-  const flowIdx = Math.max(0, flow.findIndex((s) => s.id === book.scene));
+  const exits = [
+    { title: "被动 · 退款", body: "募集超时未售罄，或流片失败且本金未支出。按认筹价原路退回，份额清零。" },
+    { title: "主动 · 资产转让", body: "仅挖矿中。挂单立刻锁定份额，成交时买方 BNB 直接付给卖方。" },
+  ];
+  const roles = [
+    ["任何人", "查看状态；挖矿中可分发并领取自己的收益"],
+    ["认筹用户", "募集中认筹；超时或流片失败时原路退款"],
+    ["持份用户", "挖矿中挂牌、接单、撤销自己的挂单"],
+    ["Factory Owner", "开期、晶体管三步、流片、更新全网权重"],
+  ];
+  const sameAddr = (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase();
+  const bemIsMainnet = sameAddr(deployments.bem, BEM_MAINNET);
+  const officialPod = "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46";
+  const podIsOfficial = sameAddr(deployments.pod, officialPod);
+  const podIsAdapter = Boolean(deployments.podIsAdapter);
+  const sharedContracts = [
+    {
+      name: "开期工厂",
+      address: deployments.factory,
+      verify: true,
+      use: "各期共用。开期时把 PoD、BEM、材料市场写入新期次。服务费分成表写在每一期里，不是共用合约。",
+    },
+    {
+      name: "BEM",
+      address: BEM_MAINNET,
+      href: `https://bscscan.com/address/${BEM_MAINNET}`,
+      use: bemIsMainnet
+        ? "主网奖励代币，各期共用。harvest 扣下的服务费按当期分成表从这里转出，整除余数进 Owner。"
+        : "主网奖励代币。当前网络还没有用这个地址。",
+    },
+    ...(!bemIsMainnet && deployments.bem
+      ? [{
+          name: "BEM（当前替身）",
+          address: deployments.bem,
+          use: "当前期次实际使用的代币。主网应改为上面的 BEM。",
+        }]
+      : []),
+    {
+      name: podIsAdapter ? "PoD 适配器" : podIsOfficial ? "PoD 挖矿合约" : "PoD（替身）",
+      address: deployments.pod,
+      verify: podIsAdapter,
+      use: podIsAdapter
+        ? `各期共用。对外仍是 IPoD，对内调官方 ${officialPod.slice(0, 10)}…。execute 前当期须持有电路 NFT，startData 须带官方证明。`
+        : podIsOfficial
+          ? "各期共用。流片调 start，harvest 调 claim，入账金额是实收。"
+          : "官方 PoD 认的是电路 NFT 持有人：调用 start 的地址必须是 ownerOf。手里还有晶体管不算。主网这一期仍接同接口替身。流片调 start，分发调 claim。",
+    },
+    {
+      name: "材料市场",
+      address: deployments.minter,
+      use: "各期共用的官方二级市场。晶体管不再铸造。NAND 的 tokenId 为 0，LATCH 为 1。挂单 placeBid，撤单 cancelBid，成交看 bids(id).remaining。",
+    },
+  ];
+  const periodContracts = (Array.isArray(campaigns) ? [...campaigns] : [])
+    .filter((item) => item?.address)
+    .sort((a, b) => Number(a.id) - Number(b.id))
+    .map((item) => ({
+      name: `第 ${item.id} 期`,
+      address: item.address,
+      verify: true,
+    }));
+  const fallbackPeriod = !periodContracts.length && deployments.campaign
+    ? [{
+        name: "当期",
+        address: deployments.campaign,
+        verify: true,
+      }]
+    : [];
+  const campaignRows = periodContracts.length ? periodContracts : fallbackPeriod;
+
+  function renderContractRows(items, { fullAddress = false } = {}) {
+    return items.filter((item) => item.address).map((item) => {
+      const href = item.href || explorerAddress(item.address);
+      const label = fullAddress ? item.address : shortAddress(item.address);
+      return (
+        <li key={`${item.name}-${item.address}`}>
+          <div className="rules-contract-main">
+            <strong>{item.name}</strong>
+            {item.use ? <p>{item.use}</p> : null}
+          </div>
+          <div className="rules-contract-side">
+            {href ? (
+              <a className={`mono${fullAddress ? " is-full" : ""}`} href={href} target="_blank" rel="noreferrer" title={item.address}>{label}</a>
+            ) : (
+              <code className={`mono${fullAddress ? " is-full" : ""}`} title={item.address}>{label}</code>
+            )}
+            {item.verify ? (
+              <a className="rules-verify" href={sourcifySource(item.address)} target="_blank" rel="noreferrer">开源验证</a>
+            ) : null}
+          </div>
+        </li>
+      );
+    });
+  }
 
   return (
     <section className="rules-page">
-      <header className="rules-hero">
-        <div>
-          <p className="rules-kicker">资金路径 · 退出规则</p>
-          <h1>这一期怎么走</h1>
-          <p>
-            认购款先托管。售罄后才流片。没有本金赎回，退出只有退款和挖矿中的份额转让。
-          </p>
+      <header className="round-hero">
+        <div className="round-hero-row">
+          <div className="round-title">
+            <span className="round-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none">
+                <path d="M7 5.5h10v13H7z" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M9.5 9h5M9.5 12.5h5M9.5 16h3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </span>
+            <h1>规则</h1>
+          </div>
         </div>
-        <div className="rules-hero-side">
-          <span className={`badge tone-${SCENE_COPY[book.scene]?.tone || "live"}`}>{sceneLabel}</span>
-          <span className="rules-contract mono">{shortAddress(round.contract)}</span>
-          {book.scene === "executing" && <span className="rules-phase">{phaseLabel}</span>}
-        </div>
+        <p className="round-hero-lead">
+          认筹款先托管，售罄后才流片。没有本金赎回，退出只有退款和挖矿中的资产转让。
+          {deployments.bemIsMock
+            ? " 当前为 BSC 测试网。主网晶体管只能在材料市场买卖，harvest 依赖 PoD 真实排放。"
+            : ""}
+        </p>
       </header>
 
-      <div className="rules-kpi">
-        {[
-          ["每份", `${round.sharePriceBnb.toFixed(4)} BNB`],
-          ["总份 / 已售", `${round.totalShares} / ${book.sold}`],
-          ["募资总额", `${hardCap.toFixed(4)} BNB`],
-          ["托管池", `${round4(book.bnbPool || 0)} BNB`],
-          ["服务费", `${round.feeBps / 100}%`],
-          ["募集 / 观察", `${round.fundingDays} 天 · ${delayH}h`],
-        ].map(([label, value]) => (
-          <div className="rules-kpi-item" key={label}>
-            <span>{label}</span>
-            <strong>{value}</strong>
-          </div>
-        ))}
-      </div>
-
-      <div className="rules-flow" aria-label="生命周期">
-        {flow.map((step, i) => (
-          <div
-            key={step.id}
-            className={`rules-flow-step${i < flowIdx ? " is-done" : ""}${i === flowIdx ? " is-active" : ""}`}
-          >
-            <span className="rules-flow-kicker">{step.kicker}</span>
-            <strong>{step.title}</strong>
-            <p>{step.body}</p>
-          </div>
-        ))}
-      </div>
-      <p className="rules-note">
-        题目 #{round.taskId}。直接转账不会记份，只能按份认购。售罄后进入待执行并开始观察期。
-      </p>
+      <section className="rules-block" aria-label="生命周期">
+        <div className="rules-block-head">
+          <h2>一期怎么走</h2>
+          <p>只能按份认筹。开期参数写死，直接转账不会记份。</p>
+        </div>
+        <ol className="rules-flow">
+          {flow.map((step) => (
+            <li key={step.n} className="rules-flow-step">
+              <span className="rules-flow-n">{step.n}</span>
+              <div>
+                <strong>{step.title}</strong>
+                <p>{step.body}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      </section>
 
       <div className="rules-grid">
-        <article className="rules-panel">
-          <header>
-            <span>退出</span>
-            <h2>两条路径，互不交叉</h2>
-          </header>
-          <div className="rules-path is-safe">
-            <em>被动 · 退款</em>
-            <p>募集超时未售罄，或流片失败且本金未支出。按认购价原路退回，份额清零。</p>
+        <section className="rules-block">
+          <div className="rules-block-head">
+            <h2>退出</h2>
+            <p>两条路径互不交叉。募集中和待执行不能挂牌。</p>
           </div>
-          <div className="rules-path is-exit">
-            <em>主动 · 份额转让</em>
-            <p>仅挖矿中。挂单立刻锁定份额，成交时买方 BNB 直接付给卖方，不进托管池。</p>
+          <div className="rules-exit-list">
+            {exits.map((item) => (
+              <article key={item.title} className="rules-exit">
+                <strong>{item.title}</strong>
+                <p>{item.body}</p>
+              </article>
+            ))}
           </div>
-          <p className="rules-note">募集中和待执行不能挂牌，也不能赎回本金或收益。</p>
-        </article>
+        </section>
 
-        <article className="rules-panel">
-          <header>
-            <span>待执行</span>
-            <h2>晶体管到位后才能流片</h2>
-          </header>
+        <section className="rules-block">
+          <div className="rules-block-head">
+            <h2>流片</h2>
+            <p>晶体管到位后才能流片，由 Owner 钱包发起。</p>
+          </div>
           <ol className="rules-steps">
-            <li className={book.scene === "executing" && book.executePhase === "buying" ? "is-on" : ""}>挂单并锁价</li>
-            <li className={book.scene === "executing" && book.executePhase === "listed" ? "is-on" : ""}>确认到账</li>
-            <li>观察 {delayH} 小时</li>
-            <li className={book.scene === "executing" && book.executePhase === "ready" ? "is-on" : ""}>Owner 流片开矿</li>
+            <li><span>1</span>挂单并锁价</li>
+            <li><span>2</span>确认到账</li>
+            <li><span>3</span>立即流片开矿</li>
           </ol>
-          <p>
-            流片不可逆，按锁定报价结算。买得起就开矿；买不起则判失败，本金不动，用户可退款，Owner 可降价重试。
-          </p>
-          <p className="rules-note">
-            二级市场无法由合约自动下单，须 Owner 钱包发起交易。
-            {book.scene === "executing" ? `当前：${phaseLabel}。` : ""}
-          </p>
-        </article>
-
-        <article className="rules-panel rules-panel-wide">
-          <header>
-            <span>挖矿与产出</span>
-            <h2>全网分发一轮，各领各的</h2>
-          </header>
-          <div className="rules-formula">
-            <span>个人可领</span>
-            <strong>
-              日产 × 已分发轮数 × (1 − {round.feeBps / 100}%) × 我的份数 / {round.totalShares} − 已领
-            </strong>
-          </div>
-          <div className="rules-metrics">
-            <div><span>权重 H</span><strong>{(book.hashpower || 0).toLocaleString("zh-CN")}</strong></div>
-            <div><span>当前日产</span><strong>{formatBem(dailyBem)} BEM</strong></div>
-            <div><span>全网权重</span><strong>{Number(weightVerified).toLocaleString()} / {Number(weightUnverified).toLocaleString()}</strong></div>
-            <div><span>池</span><strong>{book.capped ? "未验证 1%" : "已验证 99%"}</strong></div>
-            <div><span>我的占比</span><strong>{Math.round(harvest.share * 10000) / 100}%</strong></div>
-            <div><span>图纸预估</span><strong>{est.hashpower.toLocaleString("zh-CN")} H · {est.usedParts} 颗</strong></div>
-          </div>
-          <p className="rules-note">
-            全网日产 {NETWORK_DAILY_EMISSION.toLocaleString()} BEM，已验证池 99%、未验证池 1%。权重上涨则所有人日产下降。
-            分发次数不限，只要还在出矿。流片后以实际算力为准。
-          </p>
-        </article>
+          <p className="rules-note">买得起就开矿；买不起则判失败，本金不动，用户可退款，Owner 可降价重试。</p>
+        </section>
       </div>
 
-      <div className="rules-roles">
-        {[
-          ["任何人", "查看状态；挖矿中可触发全网分发并领取自己的收益"],
-          ["认购用户", "募集中买入；超时或流片失败时原路退款"],
-          ["持份用户", "挖矿中挂牌、接单、撤销自己的挂单"],
-          ["Factory Owner", "开期、晶体管三步、流片、设定计划、更新全网权重"],
-        ].map(([role, text]) => (
-          <article key={role}>
-            <strong>{role}</strong>
-            <p>{text}</p>
-          </article>
-        ))}
+      <section className="rules-block">
+        <div className="rules-block-head">
+          <h2>挖矿与领取</h2>
+          <p>全网分发一轮，各领各的。分发次数不限，入账按 PoD 实收，日产估算只作参考。</p>
+        </div>
+        <div className="rules-formula">
+          <span>个人可领</span>
+          <strong>日产 × 已分发轮数 × (1 − 服务费) × 我的份数 / 总份数 − 已领</strong>
+        </div>
+        <div className="rules-metrics">
+          <div><span>全网日产</span><strong>{NETWORK_DAILY_EMISSION.toLocaleString()} BEM</strong></div>
+          <div><span>已验证池</span><strong>99%</strong></div>
+          <div><span>未验证池</span><strong>1%</strong></div>
+          <div><span>权重基准</span><strong>{Number(NETWORK_WEIGHT.verified).toLocaleString()} / {Number(NETWORK_WEIGHT.unverified).toLocaleString()}</strong></div>
+        </div>
+        <p className="rules-note">日产按本期算力占全网权重折算。权重上涨则日产下降。流片后以实际算力为准。</p>
+      </section>
+
+      <div className="rules-contracts-split">
+        <section className="rules-block">
+          <div className="rules-block-head">
+            <h2>共用合约</h2>
+            <p>
+              {NETWORK.name}上工厂、BEM 与材料市场各期共用。
+              {podIsAdapter
+                ? "PoD 已接官方适配器：流片前把电路 NFT 转给当期，execute 带证明。"
+                : podIsOfficial
+                  ? "PoD 也各期共用。"
+                  : "PoD 仍是替身。官方挖矿不认当期合约持有的晶体管，只认电路 NFT 的主人。"}
+              服务费分成地址写在每一期里。
+            </p>
+          </div>
+          <ul className="rules-contracts">{renderContractRows(sharedContracts, { fullAddress: true })}</ul>
+        </section>
+        <section className="rules-block">
+          <div className="rules-block-head">
+            <h2>期次合约</h2>
+            <p>每一期有独立 Campaign，认筹、托管、退款、流片和领取都走它。</p>
+          </div>
+          {campaignRows.length ? (
+            <ul className="rules-contracts is-compact">{renderContractRows(campaignRows)}</ul>
+          ) : (
+            <p className="rules-note">尚未开期。工厂已部署，期次合约要等发布后才会出现。</p>
+          )}
+        </section>
       </div>
+
+      <section className="rules-block">
+        <div className="rules-block-head">
+          <h2>谁能做什么</h2>
+        </div>
+        <div className="rules-roles">
+          {roles.map(([role, text]) => (
+            <article key={role}>
+              <strong>{role}</strong>
+              <p>{text}</p>
+            </article>
+          ))}
+        </div>
+      </section>
     </section>
   );
 }
@@ -2209,7 +2676,7 @@ function Stepper({ value, min, max, disabled, onChange }) {
       <button type="button" disabled={disabled || value <= min} onClick={() => onChange(value - 1)} aria-label="减少一份">
         −
       </button>
-      <output>{String(value).padStart(2, "0")}</output>
+      <output>{String(value)}</output>
       <button type="button" disabled={disabled || value >= max} onClick={() => onChange(value + 1)} aria-label="增加一份">
         +
       </button>
@@ -2268,19 +2735,26 @@ function Countdown({ scene, countdown }) {
   );
 }
 
-function Pipeline({ scene, phase }) {
-  // 方案B：待执行拆为「买晶体管（手动）→ 流片开矿」；退出只通过份额转让实现
+function Pipeline({ scene, phase, ended }) {
   const steps = ["募集", "买晶体管", "流片开矿"];
-  const active = {
-    funding: 0,
-    // buying 高亮「买晶体管」；ready 高亮「流片开矿」（待执行）
-    executing: phase === "ready" ? 2 : 1,
-    mining: 2,
-  }[scene];
+  const active = ended
+    ? -1
+    : {
+        funding: 0,
+        executing: phase === "ready" ? 2 : 1,
+        mining: 2,
+      }[scene];
   return (
     <ol className="pipeline">
       {steps.map((label, index) => (
-        <li key={label} className={index === active ? "is-on" : index < active ? "is-done" : ""}>
+        <li
+          key={label}
+          className={
+            ended
+              ? index === 0 ? "is-done" : index === 1 ? "is-stop" : ""
+              : index === active ? "is-on" : index < active ? "is-done" : ""
+          }
+        >
           {label}
         </li>
       ))}
@@ -2288,11 +2762,11 @@ function Pipeline({ scene, phase }) {
   );
 }
 
-function buyLabel(book, connected, canBuy) {
-  if (!canBuy) return "已停止认购";
+function subscribeLabel(book, connected, canSubscribe) {
+  if (!canSubscribe) return "已停止认筹";
   if (!connected) return "连接钱包";
   if (!book.approved) return "授权 BNB";
-  return "确认购买";
+  return "确认认筹";
 }
 
 function splitCountdown(delta) {

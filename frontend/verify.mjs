@@ -442,23 +442,13 @@ ok(asStranger.role === "user", `名册外地址 -> ${asStranger.label}`);
 ok(identify(OWNER.toLowerCase(), holderBook).role === "owner", "Owner 大小写不敏感");
 ok(identify(WALLET, createScene("funding", ROUND, BOOK)).shares > 0, "funding 场景当前钱包有份");
 
-console.log("\n=== 24. execute 时间锁 ===");
-// 方案B：晶体管来自二级市场，execute 前必须先确认到账（executePhase=ready）。
-// 测试直接构造已过观察期且已到账的 book。
-const soldOut = { ...createScene("executing", ROUND, BOOK), sold: ROUND.totalShares, soldOutAt: Date.now() - 49 * 3600_000, executePhase: "ready" };
+console.log("\n=== 24. 到账后即可流片 ===");
+const soldOut = { ...createScene("executing", ROUND, BOOK), sold: ROUND.totalShares, soldOutAt: Date.now(), executePhase: "ready" };
 ok(soldOut.soldOutAt !== null, "executing 场景记录了售罄时刻");
-
-const early = { ...createScene("executing", ROUND, BOOK), sold: ROUND.totalShares, soldOutAt: Date.now() - 12 * 3600_000, executePhase: "ready" };
-ok(executeUnlockIn(ROUND, early, Date.now()) > 0, `售罄 12 小时（锁 48）时剩 ${Math.ceil(executeUnlockIn(ROUND, early, Date.now()) / 3600000)} 小时`);
-ok(!executeUnlocked(ROUND, early), "售罄 12 小时（锁 48）时不可执行");
-const future = Date.now() + 49 * 3600_000;
-ok(executeUnlocked(ROUND, soldOut, future), "49 小时后已解锁");
-ok(executeUnlockIn(ROUND, soldOut, future) === 0, "解锁后剩余为 0");
-
-const lockedExec = applyExecute(ROUND, early, QUOTE, { role: "owner", shares: 0 }, BOOK);
-ok(!lockedExec.ok, `时间锁内 Owner 也被拒: "${lockedExec.message.slice(0, 34)}..."`);
-const matured = soldOut;
-ok(applyExecute(ROUND, matured, QUOTE, { role: "owner", shares: 0 }, BOOK).ok, "期满后 Owner 可执行");
+ok(executeUnlockIn(ROUND, soldOut, Date.now()) === 0, "不再等待观察期");
+ok(executeUnlocked(ROUND, soldOut), "到账后即可执行");
+const early = soldOut;
+ok(applyExecute(ROUND, early, QUOTE, { role: "owner", shares: 0 }, BOOK).ok, "到账后 Owner 可立即执行");
 
 console.log("\n=== 25. execute 权限：仅 Factory Owner（不可逆） ===");
 const maturedBook = { ...createScene("executing", ROUND, BOOK), sold: ROUND.totalShares, soldOutAt: Date.now() - 49 * 3600_000, executePhase: "ready" };
@@ -468,8 +458,8 @@ const byOwner = applyExecute(ROUND, maturedBook, QUOTE, { role: "owner", shares:
 ok(byOwner.ok && byOwner.book.scene === "mining", "Owner 可触发 execute -> mining");
 const byStranger = applyExecute(ROUND, maturedBook, QUOTE, { role: "user", shares: 0 }, BOOK);
 ok(!byStranger.ok, `未持份地址被拒: "${byStranger.message}"`);
-const byOwnerLate = applyExecute(ROUND, early, QUOTE, { role: "owner", shares: 0 }, BOOK);
-ok(!byOwnerLate.ok, "Owner 无视时间锁也被拒（无特权）");
+const byOwnerLate = applyExecute(ROUND, { ...createScene("executing", ROUND, BOOK), sold: ROUND.totalShares, executePhase: "buying" }, QUOTE, { role: "owner", shares: 0 }, BOOK);
+ok(!byOwnerLate.ok, "晶体管未到账时 Owner 也不能流片");
 
 console.log("\n=== 26. 份额转让仅限挖矿中（无合约赎回/退款）===");
 // 份额转让仅在挖矿中允许：funding / executing 不可挂牌，mining 可挂牌
@@ -517,15 +507,15 @@ const mining3 = createScene("mining", ROUND, BOOK);
 ok(applyClaim(ROUND, mining3, { role: "holder", shares: 4 }).ok, "持份用户可领自己的 BEM");
 ok(!applyClaim(ROUND, createScene("funding", ROUND, BOOK), { role: "holder", shares: 3 }).ok, "募集中不可领取");
 
-console.log("\n=== 28. 售罄自动启动观察期 ===");
+console.log("\n=== 28. 售罄进入待执行 ===");
 const funding4 = createScene("funding", ROUND, BOOK);
 ok(funding4.soldOutAt === null, "募集中未记录售罄时刻");
 const partialBuy = applyBuy(ROUND, funding4, 1);
-ok(partialBuy.ok && partialBuy.book.soldOutAt === null, "未售罄时不启动观察期");
+ok(partialBuy.ok && partialBuy.book.soldOutAt === null, "未售罄时不记录售罄时刻");
 const finishing = applyBuy(ROUND, partialBuy.book, ROUND.totalShares - partialBuy.book.sold);
 ok(finishing.book.scene === "executing", "买到售罄 -> executing");
 ok(finishing.book.soldOutAt !== null, "售罄瞬间自动记录 soldOutAt");
-ok(executeUnlockIn(ROUND, finishing.book, Date.now()) > 0, "观察期立即开始计时");
+ok(executeUnlockIn(ROUND, finishing.book, Date.now()) === 0, "售罄后不再启动观察期");
 
 console.log("\n=== 29. 四种可挖矿元件 ===");
 ok(TRANSISTORS.length === 4, `4 种：${TRANSISTORS.map((t) => t.name).join("、")}`);

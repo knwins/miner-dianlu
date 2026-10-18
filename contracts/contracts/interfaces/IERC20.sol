@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @notice BEM 是 ERC20。Campaign 只需从 PoD 拉取日产、并把份额转给领取人。
+/// @notice BEM. Campaign pays the service fee on harvest and pays claimers on claim. Shares are not this token.
 interface IERC20 {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);

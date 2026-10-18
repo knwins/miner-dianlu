@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @title Ownable（最小自包含实现，避免引入外部依赖）
-/// @notice 仅两层权限：owner 可转让。Factory Owner 拥有 Campaign 的 execute / 晶体管挂单等特权。
+/// @title Ownable — minimal, no external dependency
+/// @notice Single owner, transferable. The factory owner holds Campaign execute and bid privileges.
 abstract contract Ownable {
     address public owner;
 
