@@ -276,7 +276,7 @@ export function findTask(round, book = null) {
   if (id) {
     const found = arr.find((t) => String(t.id) === id);
     if (found) return found;
-    // 题库未加载或不含这道题时，保留链上编号。不能换成兜底题 #17，否则发布选题和合约读回会对不上。
+    // 官方列表里没有这个编号时保留链上编号。不能换成兜底题，否则发布选题和合约读回会对不上。
     return {
       id,
       name: "题库未收录",
@@ -339,7 +339,13 @@ export function resolveCampaignDesign(round, book = null, taskbook = null) {
   return {
     task,
     taskId: String(round?.taskId ?? task?.id ?? ""),
-    taskName: task?.missing ? "题库未收录" : (task?.name || "—"),
+    taskName: taskbook?.source === "loading"
+      ? "读取题目中"
+      : taskbook?.source === "live"
+        ? (task?.missing ? "题库未收录" : (task?.name || "—"))
+        : taskbook?.source === "fallback" || taskbook?.source === "error"
+          ? "官方题库暂时没读到"
+          : (task?.missing ? "题库未收录" : (task?.name || "—")),
     taskTier: task?.tier || "—",
     taskKind: task?.kind || "",
     taskParts: Number(task?.g) || 0,

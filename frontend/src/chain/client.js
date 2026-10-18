@@ -1,6 +1,6 @@
 // 链上对接客户端（ethers v6）。读取 Campaign 实时状态、发送写交易。
 // 无钱包时用公共 RPC 只读；有钱包（window.ethereum）时签名发送。
-import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress, id } from "ethers";
+import { AbiCoder, BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress, getAddress, id, keccak256 } from "ethers";
 import { CAMPAIGN_ABI, ERC20_ABI, FACTORY_ABI } from "./abis.js";
 import {
   CAMPAIGN_ADDRESS,
@@ -439,23 +439,16 @@ async function readStateOn(runner, account, campaignAddr) {
   const order = await readMarketOrder(c);
 
   const n = Number(listingCount);
-  // 没有挂单时不必扫 ListingTaken。公共节点对大范围 eth_getLogs 会失败，扫下去会把整页读状态卡住。
   const rawListings = n > 0
     ? await Promise.all(Array.from({ length: n }, (_, i) => c.getListing(i)))
     : [];
-  const takenById = n > 0 ? await readTakenByListing(c) : new Map();
-  const listings = rawListings.map((l, i) => {
-    const fill = takenById.get(i);
-    return {
-      id: i,
-      seller: l.seller,
-      shares: l.shares,
-      priceBnbPerShare: l.priceBnbPerShare,
-      open: l.open,
-      takenShares: fill?.shares || 0n,
-      takenPaid: fill?.paid || 0n,
-    };
-  });
+  const listings = rawListings.map((l, i) => ({
+    id: i,
+    seller: l.seller,
+    shares: l.shares,
+    priceBnbPerShare: l.priceBnbPerShare,
+    open: l.open,
+  }));
 
   const state = {
     campaign: campaignAddr,
@@ -487,86 +480,7 @@ async function readStateOn(runner, account, campaignAddr) {
   return state;
 }
 
-/** 从链上事件重构当前持有人列表（合约无 holder 枚举）。 */
-const LOG_SPAN = 20000;
-const LOG_MAX_LOOKBACK = 250000;
-
-function logRangeTooWide(err) {
-  const text = String(err?.shortMessage || err?.message || err || "");
-  return /limit|range|too many|exceed|more than|query returned more|response size/i.test(text);
-}
-
-async function querySpan(contract, filter, start, end) {
-  try {
-    return await contract.queryFilter(filter, start, end);
-  } catch (err) {
-    // 节点拒绝大范围日志时才对半拆。额度、403、超时不能拆，否则会打出成千上万次请求，页面一直停在读取中。
-    if (!logRangeTooWide(err) || end <= start) return [];
-    const mid = start + Math.floor((end - start) / 2);
-    const left = await querySpan(contract, filter, start, mid);
-    const right = await querySpan(contract, filter, mid + 1, end);
-    return [...left, ...right];
-  }
-}
-
-/** 每笔挂单已接收的份数与金额。日志失败时返回空表，页面仍能显示未成交挂单。 */
-async function readTakenByListing(contract) {
-  const taken = new Map();
-  try {
-    const latest = await getReadProvider().getBlockNumber();
-    const from = Math.max(0, latest - LOG_MAX_LOOKBACK);
-    const events = await queryChunked(contract, contract.filters.ListingTaken(), from, latest);
-    for (const event of events) {
-      const id = Number(event.args?.id);
-      if (!Number.isInteger(id)) continue;
-      const prev = taken.get(id) || { shares: 0n, paid: 0n };
-      prev.shares += event.args.count;
-      prev.paid += event.args.paidBnb;
-      taken.set(id, prev);
-    }
-  } catch {
-    /* 公共节点限制日志范围时，完成状态退回「剩余份数为 0」 */
-  }
-  return taken;
-}
-
-async function queryChunked(contract, filter, from, to) {
-  const spans = [];
-  for (let start = from; start <= to; start += LOG_SPAN) {
-    spans.push([start, Math.min(start + LOG_SPAN - 1, to)]);
-  }
-  const out = [];
-  for (let i = 0; i < spans.length; i += 4) {
-    const parts = await Promise.all(
-      spans.slice(i, i + 4).map(([start, end]) => querySpan(contract, filter, start, end))
-    );
-    for (const part of parts) out.push(...part);
-  }
-  return out;
-}
-
-/** 最近认筹（Subscribed 事件），新→旧。 */
-export async function readRecentSubscriptions(limit = 8, campaignAddr = getCampaignAddress()) {
-  if (!isAddr(campaignAddr)) return [];
-  const runner = getReadProvider();
-  const c = campaignContract(runner, campaignAddr);
-  const latest = await runner.getBlockNumber();
-  const from = Math.max(0, latest - LOG_MAX_LOOKBACK);
-  const events = await queryChunked(c, c.filters.Subscribed(), from, latest);
-  const out = [];
-  for (let i = events.length - 1; i >= 0 && out.length < limit; i--) {
-    const e = events[i];
-    if (!e.args) continue;
-    out.push({
-      address: String(e.args.subscriber).toLowerCase(),
-      shares: Number(e.args.count),
-      paidBnb: Number(formatEther(e.args.paidBnb)),
-      blockNumber: e.blockNumber,
-      txHash: e.transactionHash,
-    });
-  }
-  return out;
-}
+/** 份额转让的成交份数留在挂单剩余字段里，不扫 ListingTaken。认筹名单走 holderCount / 存储槽，不扫 Subscribed。 */
 
 /** 链上只读某个视图（合约调用页用），返回人类可读字符串。 */
 export async function liveReadView(method, args = {}, account = null, campaignAddr = getCampaignAddress()) {
@@ -619,35 +533,46 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
   }
 }
 
+// 已部署的 Campaign 还没有 holderCount。_holders 在存储槽 30（链上长度读出来是 1，首个元素即认筹地址）。
+const HOLDERS_SLOT = 30n;
+
+async function readHolderAddresses(runner, c) {
+  try {
+    const n = Number(await c.holderCount());
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(await c.holderAt(i));
+    return out;
+  } catch (err) {
+    const text = String(err?.shortMessage || err?.message || "");
+    // 旧字节码没有这两个视图，调用会 revert。改读同一条 _holders 数组，不扫日志。
+    if (!/revert|CALL_EXCEPTION|could not decode/i.test(text)) throw err;
+  }
+  const len = BigInt(await runner.getStorage(c.target, HOLDERS_SLOT));
+  if (len === 0n || len > 10000n) return [];
+  const base = BigInt(keccak256(AbiCoder.defaultAbiCoder().encode(["uint256"], [HOLDERS_SLOT])));
+  const out = [];
+  for (let i = 0n; i < len; i++) {
+    const raw = await runner.getStorage(c.target, base + i);
+    if (BigInt(raw) === 0n) continue;
+    out.push(getAddress(`0x${raw.slice(-40)}`));
+  }
+  return out;
+}
+
 export async function readHolders(campaignAddr = getCampaignAddress()) {
   if (!isAddr(campaignAddr)) return [];
-  const runner = getReadProvider();
-  const c = campaignContract(runner, campaignAddr);
-  const latest = await runner.getBlockNumber();
-  const from = Math.max(0, latest - LOG_MAX_LOOKBACK);
-  const [subscribed, refunded, taken] = await Promise.all([
-    queryChunked(c, c.filters.Subscribed(), from, latest),
-    queryChunked(c, c.filters.Refunded(), from, latest),
-    queryChunked(c, c.filters.ListingTaken(), from, latest),
-  ]);
-  const addrs = new Set();
-  for (const e of subscribed) if (e.args?.subscriber) addrs.add(String(e.args.subscriber).toLowerCase());
-  for (const e of refunded) if (e.args?.holder) addrs.add(String(e.args.holder).toLowerCase());
-  for (const e of taken) {
-    if (e.args?.buyer) addrs.add(String(e.args.buyer).toLowerCase());
-    if (e.args?.seller) addrs.add(String(e.args.seller).toLowerCase());
-  }
-  const out = [];
-  for (const a of addrs) {
-    try {
-      const s = await c.sharesOf(a);
-      if (s > 0n) out.push({ address: a, shares: Number(s) });
-    } catch {
-      /* 单地址查询失败忽略 */
+  return withReadProvider(async (runner) => {
+    const c = campaignContract(runner, campaignAddr);
+    const addresses = await readHolderAddresses(runner, c);
+    const out = [];
+    for (const address of addresses) {
+      const [shares, escrow] = await Promise.all([c.sharesOf(address), c.escrowOf(address)]);
+      const total = shares + escrow;
+      if (total > 0n) out.push({ address: address.toLowerCase(), shares: Number(total) });
     }
-  }
-  out.sort((x, y) => y.shares - x.shares);
-  return out;
+    out.sort((x, y) => y.shares - x.shares);
+    return out;
+  });
 }
 
 const POSITION_SCENE = ["funding", "executing", "mining"];
@@ -994,7 +919,7 @@ async function createCampaignTx(signer, params) {
   return f.createCampaign(...createArgs(params, version));
 }
 
-export async function createCampaignOnChain(signer, params) {
+export async function createCampaignOnChain(signer, params, onSigned) {
   if (!signer) throw new Error("请先连接钱包");
   const caller = await signer.getAddress();
   const owner = await withReadProvider((provider) => factoryContract(provider).owner());
@@ -1030,6 +955,7 @@ export async function createCampaignOnChain(signer, params) {
 
   try {
     const t = await writer.createCampaign(...args, { gasLimit });
+    if (typeof onSigned === "function") onSigned(t.hash);
     const receipt = await waitForReceipt(t.hash);
     if (receipt.status === 0) throw new Error("交易上链失败（status=0）");
     let campaign = parseCreatedCampaign(receipt);
@@ -1173,9 +1099,10 @@ async function waitForReceipt(hash) {
   });
 }
 
-export async function send(promiseTx) {
+export async function send(promiseTx, onSigned) {
   try {
     const t = await promiseTx;
+    if (typeof onSigned === "function") onSigned(t.hash);
     const receipt = await waitForReceipt(t.hash);
     return { hash: t.hash, receipt };
   } catch (err) {

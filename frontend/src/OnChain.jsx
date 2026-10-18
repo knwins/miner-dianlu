@@ -24,6 +24,12 @@ export default function OnChainPage({ embedded = false }) {
   const [bnb, setBnb] = useState(null);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
+  const [hint, setHint] = useState("");
+  useEffect(() => {
+    if (!hint) return undefined;
+    const timer = setTimeout(() => setHint(""), 3000);
+    return () => clearTimeout(timer);
+  }, [hint]);
   const [logs, setLogs] = useState([]);
   const [form, setForm] = useState({ buyCount: 1, listCount: 1, listPrice: "0.02", takeId: 0, takeCount: 1, est: "408", capped: false, trCount: 100, trPrice: "0.005", tapeout: "netlist-v1" });
 
@@ -63,12 +69,18 @@ export default function OnChainPage({ embedded = false }) {
 
   async function run(label, fn) {
     if (!wallet) { setErr("请先连接钱包"); return; }
-    setBusy(label); setErr("");
+    setBusy(label);
+    setErr("");
+    setHint(`请在钱包中确认「${label}」。弹出窗口后点确认，不要关闭本页。`);
     try {
-      const { hash } = await send(fn(wallet.signer));
+      const { hash } = await send(fn(wallet.signer), () => {
+        setHint(`钱包已确认「${label}」，正在等待链上入块。`);
+      });
+      setHint("");
       setLogs((l) => [{ label, hash, ok: true }, ...l]);
       await refresh();
     } catch (e) {
+      setHint("");
       setErr(e.message || String(e));
       setLogs((l) => [{ label, hash: "", ok: false, msg: e.message }, ...l]);
     } finally { setBusy(""); }
@@ -110,6 +122,7 @@ export default function OnChainPage({ embedded = false }) {
             {!account && <button className="btn btn-primary" type="button" onClick={onConnect} disabled={!hasInjected()}>{hasInjected() ? "连接钱包" : "未检测到钱包"}</button>}
             <button className="btn btn-inline" type="button" onClick={refresh}>刷新</button>
           </div>
+          {hint && <p className="fine">{hint}</p>}
           {err && <div className="issues"><p>{err}</p></div>}
         </div>
       </article>

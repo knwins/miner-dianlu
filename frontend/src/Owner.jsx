@@ -126,12 +126,16 @@ export function OwnerOverview({
   }, [book.address]);
   useEffect(() => {
     if (book.executePhase !== "buying" || priceTouched.current) return;
+    if (taskbook?.source === "loading" || design.task?.missing) return;
+    const nand = Number(design.task?.nand) || 0;
+    const latch = Number(design.task?.latch) || 0;
+    if (nand + latch <= 0) return;
     const est = book.estimate || {};
-    setNandQty(String(est.nand || 0));
-    setLatchQty(String(est.latch || 0));
+    setNandQty(String(nand));
+    setLatchQty(String(latch));
     setNandPrice(String(round4(est.priceNand || suggestedUnit)));
     setLatchPrice(String(round4(est.priceLatch || est.priceNand || suggestedUnit)));
-  }, [book.address, book.executePhase, book.estimate, suggestedUnit]);
+  }, [book.address, book.executePhase, book.estimate, design.task, suggestedUnit, taskbook?.source]);
   const historyRows = (history != null ? history : PAST_ROUNDS).map((item) => {
     const onChainRow = history != null;
     const rowDesign = resolveCampaignDesign(
@@ -287,14 +291,17 @@ export function OwnerOverview({
 
                 {book.scene === "executing" && (() => {
                   const est = book.estimate || {};
-                  const need = est.usedParts || book.transistorCount || 0;
+                  const taskPending = taskbook?.source === "loading" || Boolean(design.task?.missing);
+                  const planNand = taskPending ? 0 : Number(design.task?.nand) || 0;
+                  const planLatch = taskPending ? 0 : Number(design.task?.latch) || 0;
+                  const need = taskPending ? 0 : planNand + planLatch;
                   const phaseLabel =
                     book.executePhase === "ready" ? "已到账 · 待流片"
                       : book.executePhase === "listed" ? "挂单中 · 待成交"
                         : "待挂单";
-                  // 图纸不需要的腿数量固定为 0，不展示、不挂单
-                  const showNand = Number(est.nand) > 0;
-                  const showLatch = Number(est.latch) > 0;
+                  // 图纸不需要的腿数量固定为 0，不展示、不挂单。取消订单只清掉订单数量，不改变题目。
+                  const showNand = planNand > 0;
+                  const showLatch = planLatch > 0;
                   const nandN = showNand ? Math.max(0, Math.floor(Number(nandQty) || 0)) : 0;
                   const latchN = showLatch ? Math.max(0, Math.floor(Number(latchQty) || 0)) : 0;
                   const nandP = Number(nandPrice) || 0;
@@ -302,10 +309,12 @@ export function OwnerOverview({
                   const orderCost = round4(nandN * nandP + latchN * latchP);
                   const canPlace = isOwner && (nandN > 0 || latchN > 0) && (!showNand || nandP > 0) && (!showLatch || latchP > 0);
                   const overBudget = orderCost > raised && raised > 0;
-                  const partLabel = [
-                    showNand ? `${est.nand || nandN} NAND` : null,
-                    showLatch ? `${est.latch || latchN} LATCH` : null,
-                  ].filter(Boolean).join(" + ") || "无需元件";
+                  const partLabel = taskPending
+                    ? "读取题目中"
+                    : [
+                        showNand ? `${planNand} NAND` : null,
+                        showLatch ? `${planLatch} LATCH` : null,
+                      ].filter(Boolean).join(" + ") || "无需元件";
                   const bidRows = [
                     Number(book.nandQty) > 0
                       ? { part: "NAND", id: book.nandBidId || "—", qty: book.nandQty, price: book.nandPrice, remaining: book.nandRemaining }
@@ -324,7 +333,7 @@ export function OwnerOverview({
                       <ul className="bill ops-bill">
                         <li><span>子状态</span><strong>{phaseLabel}</strong></li>
                         <li><span>目标处理器</span><strong>{design.processorId || round.processorId || "未记录"}</strong></li>
-                        <li><span>图纸建议</span><strong>{need} 颗 · {partLabel}</strong></li>
+                        <li><span>图纸建议</span><strong>{taskPending ? "读取题目中" : `${need} 颗 · ${partLabel}`}</strong></li>
                         {mixedUnit > 0 && (
                           <li><span>混合成本折合</span><strong>{round4(mixedUnit)} BNB/颗（need ÷ count）</strong></li>
                         )}
@@ -380,7 +389,7 @@ export function OwnerOverview({
                               </div>
                             </>
                           )}
-                          {!showNand && !showLatch && (
+                          {!taskPending && !showNand && !showLatch && (
                             <div className="field wide">
                               <span>挂单</span>
                               <strong className="fine">本期图纸不需要 NAND / LATCH，无需挂单</strong>
@@ -535,7 +544,9 @@ export function OwnerOverview({
                       <p className="fine ops-note">
                         {book.executePhase === "buying" && !book.executionFailed && (
                           <>
-                            {showNand || showLatch
+                            {taskPending
+                              ? "正在读取本期题目的元件数。取消挂单不会改变图纸，元件数以题目为准。"
+                              : showNand || showLatch
                               ? `只挂图纸需要的元件（${[showNand && "NAND", showLatch && "LATCH"].filter(Boolean).join(" / ")}）。单价框里的数字就是 placeBid 的价格，改完再挂单；报价刷新不会把改过的单价盖回去。保证金从本期募集款托管。`
                               : "本期图纸不需要 NAND / LATCH。"}
                             成交与否只看 bids(id).remaining，不需要到官网点确认。
@@ -1577,7 +1588,7 @@ export function OwnerCreate({
           <span>选题</span>
           <span className="stat-label">
             第三步 · 官方题库 {taskbook?.total || 0} 道
-            {taskbook?.source === "live" ? "（实时）" : taskbook?.source === "loading" ? "（加载中…）" : "（离线兜底）"}
+            {taskbook?.source === "live" ? "（公共题库）" : taskbook?.source === "loading" ? "（加载中…）" : "（离线兜底）"}
           </span>
         </div>
         <div className="card-body">
@@ -1965,13 +1976,13 @@ function LivePriceTag({ snapshot, intervalMs = 5000, now = Date.now() }) {
         ? "取价中…"
         : snapshot.error
           ? `取价失败：${snapshot.error}`
-          : `${snapshot.bnbUsdt ? `BNB ${snapshot.bnbUsdt.toFixed(4)} · ` : ""}实时价 · ${formatClock(snapshot.updatedAt || Date.now())} · ${secs}s 后刷新`}
+          : `${snapshot.source === "live" || snapshot.bnbLive ? "公共行情 · " : "本地报价 · "}${snapshot.bnbUsdt ? `BNB ${snapshot.bnbUsdt.toFixed(4)} · ` : ""}${formatClock(snapshot.updatedAt || Date.now())} · ${secs}s 后刷新`}
     </span>
   );
 }
 
 export function OwnerHolders({ round, book, account = "", holders = null, chainMode = false, embedded = false }) {
-  // 链上模式：用从事件重构的真实持有人；模拟模式：用 buildHolders 生成的演示名册
+  // 链上模式：读合约 _holders；模拟模式：用 buildHolders 生成的演示名册
   const loading = chainMode && holders == null;
   const rows = chainMode
     ? (holders || []).map((h) => ({
@@ -1982,7 +1993,7 @@ export function OwnerHolders({ round, book, account = "", holders = null, chainM
       }))
     : buildHolders(book.sold, book.mine);
   const subtitle = chainMode
-    ? "从链上 Subscribed / Refunded / ListingTaken 事件重构的当前持有人。"
+    ? "合约里记下的认筹地址。份数是当前仍持有的份额。"
     : "只记录通过认筹记上的份数。直接转入的 BNB 不会出现在这里。";
   return (
     <section>
@@ -1998,9 +2009,9 @@ export function OwnerHolders({ round, book, account = "", holders = null, chainM
         <div className="card-header">第 {round.id} 期 · {loading ? "…" : rows.length} 个地址 · 已售 {book.sold} 份</div>
         <div className="card-body table-wrap">
           {loading ? (
-            <p className="fine">正在从链上事件加载持有人…</p>
+            <p className="fine">正在从合约读取认筹地址…</p>
           ) : rows.length === 0 ? (
-            <p className="fine">这一期还没有人认筹。</p>
+            <p className="fine">{book.sold > 0 ? "链上已有认筹份数，地址列表暂时没有读到。请稍后再开一次份额明细。" : "这一期还没有人认筹。"}</p>
           ) : (
             <table>
               <thead>

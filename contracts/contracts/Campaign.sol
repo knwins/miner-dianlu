@@ -611,6 +611,15 @@ contract Campaign is Ownable, ReentrancyGuard {
         return _shares[account];
     }
 
+    /// @notice Subscribers and listing buyers, in first-seen order. Share counts stay on sharesOf.
+    function holderCount() external view returns (uint256) {
+        return _holders.length;
+    }
+
+    function holderAt(uint256 index) external view returns (address) {
+        return _holders[index];
+    }
+
     function escrowOf(address account) external view returns (uint256) {
         return _escrow[account];
     }

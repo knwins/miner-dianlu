@@ -76,11 +76,10 @@ export function bookFromState(state, account, extra = {}) {
   const bnb = bem(self.bnb);
   const listings = (state.listings || []).map((l) => {
     const remain = Number(l.shares);
-    const taken = Number(l.takenShares || 0);
-    // 关单后剩余份额仍写在 listing.shares：剩 0 且有成交 → 完成；否则是撤单（含部分成交后再撤）
-    const status = l.open ? "open" : (remain === 0 && taken > 0 ? "done" : "cancelled");
-    const shares = status === "done" ? (taken || remain) : remain;
-    const totalWei = status === "done" && l.takenPaid != null ? l.takenPaid : l.priceBnbPerShare * BigInt(shares);
+    // 成交会把剩余份数减到 0 并关单；撤单则留下未成交份数。用合约字段区分，不扫 ListingTaken 日志。
+    const status = l.open ? "open" : (remain === 0 ? "done" : "cancelled");
+    const shares = remain;
+    const totalWei = l.priceBnbPerShare * BigInt(shares);
     return {
       id: l.id,
       seller: l.seller,

@@ -178,6 +178,8 @@ describe("funding subscribe", () => {
     await expect(campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE - 1n })).to.be.revertedWithCustomError(campaign, "WrongPayment");
     await expect(campaign.connect(alice).subscribe(0n, { value: 0 })).to.be.revertedWithCustomError(campaign, "ZeroShares");
     await campaign.connect(alice).subscribe(10n, { value: SHARE_PRICE * 10n });
+    expect(await campaign.holderCount()).to.equal(1n);
+    expect(await campaign.holderAt(0)).to.equal(alice.address);
     await expect(campaign.connect(alice).subscribe(91n, { value: SHARE_PRICE * 91n })).to.be.revertedWithCustomError(campaign, "ExceedsRemaining");
   });
 

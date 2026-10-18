@@ -9,7 +9,6 @@ import {
   parseEther,
   parseBnb,
   readHolders,
-  readRecentSubscriptions,
   hasInjected,
   setCampaignAddress,
   createCampaignOnChain,
@@ -142,7 +141,7 @@ export default function App() {
 
   useEffect(() => {
     if (!notice) return undefined;
-    const timer = setTimeout(() => setNotice(""), 2800);
+    const timer = setTimeout(() => setNotice(""), 3000);
     return () => clearTimeout(timer);
   }, [notice]);
 
@@ -298,6 +297,47 @@ export default function App() {
     return { ok: result.ok, message: result.message };
   }
 
+  const WALLET_ACTION = {
+    subscribe: "认筹",
+    listShares: "发布转让",
+    cancelListing: "取消转让",
+    takeListing: "接收转让",
+    refund: "退款",
+    claim: "领取",
+    execute: "流片",
+    harvest: "分发",
+    placeTransistorOrder: "挂单",
+    cancelTransistorOrder: "取消挂单",
+    confirmTransistors: "确认成交",
+    setPlan: "写入计划",
+    updateNetworkWeight: "更新权重",
+    createCampaign: "发布期次",
+    openRefund: "退款",
+    removeCampaign: "移除期次",
+    removeCampaignAt: "移除期次",
+    setPod: "更换适配器",
+    setBem: "更换 BEM",
+    setMinter: "更换铸币",
+    setFeeShares: "更新分成",
+    recoverBnb: "取回 BNB",
+    recoverTransistors: "取回元件",
+    transferOwnership: "转移所有权",
+    setFactoryPod: "更换工厂适配器",
+    setFactoryBem: "更换工厂 BEM",
+    setFactoryMinter: "更换工厂铸币",
+    setFactoryOwner: "转移工厂所有权",
+  };
+
+  function walletAsk(method) {
+    const name = WALLET_ACTION[method] || "这笔操作";
+    setNotice(`请在钱包中确认「${name}」。弹出窗口后点确认，不要关闭本页。`);
+  }
+
+  function walletSigned(method) {
+    const name = WALLET_ACTION[method] || "这笔操作";
+    setNotice(`钱包已确认「${name}」，正在等待链上入块。`);
+  }
+
   /** 链上写操作：构造交易 → 发送并等待 → 刷新。自带 pending/notice，不走 run() 的 700ms。 */
   function chainInvoke(method, args) {
     setPending(method);
@@ -306,6 +346,8 @@ export default function App() {
         ? String(args?.campaign || args?.address || "").toLowerCase()
         : ""
     );
+    walletAsk(method);
+    const onSigned = () => walletSigned(method);
     (async () => {
       try {
         let signer = chain.signer;
@@ -314,7 +356,7 @@ export default function App() {
           signer = w.signer;
         }
         if (method === "createCampaign") {
-          await chainCreateCampaign(args, signer);
+          await chainCreateCampaign(args, signer, onSigned);
           return;
         }
         if (method === "removeCampaign" || method === "removeCampaignAt") {
@@ -322,12 +364,12 @@ export default function App() {
           if (method === "removeCampaignAt") {
             const index = BigInt(Math.floor(Number(args?.index ?? -1)));
             if (index < 0n) throw new Error("请填写工厂列表索引");
-            await send(chainTx.removeCampaignAt(signer, index));
+            await send(chainTx.removeCampaignAt(signer, index), onSigned);
           } else {
             if (!removed || !/^0x[0-9a-fA-F]{40}$/.test(String(removed))) {
               throw new Error("请填写要移除的期次地址");
             }
-            await send(chainTx.removeCampaign(signer, removed));
+            await send(chainTx.removeCampaign(signer, removed), onSigned);
           }
           setNotice("已从工厂列表移除该期（链上合约仍在，可用原地址直连）");
           const addrs = (await chain.refreshHistory?.()) || [];
@@ -355,12 +397,12 @@ export default function App() {
             || book.transistors
             || partsContractForProcessor(round.processorId)
             || OFFICIAL_PARTS.TAPE_OUT_NAND.contract;
-          await send(chainTx.placeTransistorOrder(signer, transistors, nandQty, nandPrice, latchQty, latchPrice));
+          await send(chainTx.placeTransistorOrder(signer, transistors, nandQty, nandPrice, latchQty, latchPrice), onSigned);
         } else if (method === "openRefund") {
-          await send(chainTx.openRefund(signer));
+          await send(chainTx.openRefund(signer), onSigned);
         } else {
           const promise = buildChainTx(method, args, signer);
-          await send(promise);
+          await send(promise, onSigned);
         }
         setNotice(method === "openRefund"
           ? "链上已退款。认筹 BNB 已按认筹地址原路退回。"
@@ -390,7 +432,7 @@ export default function App() {
   }
 
   /** 开期：开新一期页（完整 draft+_review）与合约调用页（表单字段）共用。 */
-  async function chainCreateCampaign(draft, signer) {
+  async function chainCreateCampaign(draft, signer, onSigned) {
     const review = draft._review;
     // 份额单价：优先用 toFixed(8) 去掉浮点尾巴，再 parseBnb
     const shareNum = Number(draft.sharePriceBnb);
@@ -464,18 +506,20 @@ export default function App() {
       taskId,
       netlistHash,
       transistors,
-    });
+    }, onSigned);
 
     setCampaignAddress(created);
     if (review) {
       try {
+        walletAsk("setPlan");
         await send(
           chainTx.setPlan(
             activeSigner,
             BigInt(Math.round(review.hashpower || 0)),
             Boolean(review.capped),
             BigInt(review.needParts || 0)
-          )
+          ),
+          () => walletSigned("setPlan")
         );
       } catch {
         /* setPlan 可稍后由 Owner 补 */
@@ -1706,11 +1750,16 @@ function RoundFacts({ round, book, quote, taskbook }) {
         <article className="stat-card">
           <div className="stat-label">题目</div>
           <div className="stat-value">
-            #{round.taskId ?? est.task?.id ?? "—"} {est.task?.missing ? "题库未收录" : (est.taskName || round.taskName || "—")}
+            #{round.taskId ?? "—"} {round.taskName || "—"}
           </div>
           <div className="stat-note">
-            {est.taskTier || ""}
-            {est.usedParts ? ` · ${est.usedParts} 元件` : ""}
+            {taskbook?.source === "live" && !est.task?.missing ? (
+              <>
+                {est.taskTier || ""}
+                {est.usedParts ? ` · ${est.usedParts} 元件` : ""}
+                {" · 公共题库"}
+              </>
+            ) : taskbook?.source === "loading" ? "正在读取官方题库" : "只显示官方题库里的题目名称"}
           </div>
         </article>
         <article className="stat-card">
@@ -2409,15 +2458,14 @@ function RecentBuys({ round, book, usingChain = false, account = "" }) {
       return undefined;
     }
     let alive = true;
-    readRecentSubscriptions(8)
+    readHolders()
       .then((list) => {
         if (!alive) return;
         const me = String(account || "").toLowerCase();
         setRows(
-          list.map((r) => ({
+          list.slice(0, 8).map((r) => ({
             address: r.address,
             shares: r.shares,
-            paid: r.paidBnb,
             self: me && r.address === me,
           }))
         );
@@ -2432,7 +2480,7 @@ function RecentBuys({ round, book, usingChain = false, account = "" }) {
   if (!rows.length) return <p className="fine">链上暂无认筹记录。</p>;
   return (
     <div className="recent">
-      <p className="fine">最近认筹{usingChain ? "（链上事件 · Subscribed）" : ""}</p>
+      <p className="fine">认筹地址（合约记录，不扫公共日志）</p>
       <ul className="bill">
         {rows.map((row) => (
           <li key={`${row.address}-${row.shares}-${row.paid ?? row.shares}`}>

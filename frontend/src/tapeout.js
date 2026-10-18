@@ -4,8 +4,11 @@
  * 官方没有 REST API，前端价格直接读链上合约；但站点提供两个聚合 JSON 快照，
  * 是我们自己后端（或本地预览）拉取价格与题库的最直接来源：
  *
- *   https://tapeout.net/tasks.json    官方题库，267 道题，含 g / d / K / C
- *   https://tapeout.net/market.json   市场订单簿，含成交价与买盘
+ * 仍走公共 HTTP、不能改成合约读取的只有这两处，页面上标为「公共题库」「公共行情」：
+ *   https://tapeout.net/tasks.json    官方题库
+ *   https://tapeout.net/market.json   元件订单簿快照
+ *   https://api.gateio.ws             BNB/USDT，market.json 里没有这个价格
+ * 认筹地址、挂单状态不再使用 eth_getLogs。
  *
  * 两者都是公开只读、无需鉴权。若不可用（离线、限流、站点改版），
  * 自动回落到本地兜底数据，保证 UI 不至于空白。
@@ -113,7 +116,6 @@ const FALLBACK_TASKS = [
   { id: 120, name: "移位寄存器", tier: "高级", group: "时序", kind: "seq", nIn: 1, nOut: 8, g: 210, d: 16, K: 210, C: 860160 },
 ];
 
-/** 规范化题目，补齐前端要用的派生字段 */
 function normalizeTask(t) {
   const ratio = LATCH_RATIO[t.kind] ?? LATCH_RATIO.comb;
   const latch = Math.round((t.g || 0) * ratio);

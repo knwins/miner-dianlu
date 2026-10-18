@@ -35,6 +35,8 @@ export const CAMPAIGN_ABI = [
   "function netWeightVerified() view returns (uint256)",
   "function netWeightUnverified() view returns (uint256)",
   "function sharesOf(address) view returns (uint256)",
+  "function holderCount() view returns (uint256)",
+  "function holderAt(uint256) view returns (address)",
   "function escrowOf(address) view returns (uint256)",
   "function claimedOf(address) view returns (uint256)",
   "function refundedOf(address) view returns (uint256)",
