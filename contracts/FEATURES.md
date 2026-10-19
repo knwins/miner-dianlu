@@ -38,7 +38,7 @@ mining 主动退出：份额转让；被动：仅超时/失败可 refund（挖�
 | `createCampaign(sharePriceBnb, totalShares, feePercent, fundingDays, feeRecipients, feeShareBps, taskId, pod_, netlistHash)` | 写 | 仅 Factory Owner | 创建一期；服务费多地址分成（比例之和 10000）；`pod_=0` 用工厂默认；服务费 1–20% |
 | `setPod` / `setBem` / `setMinter` | 写 | 仅 Factory Owner | 更换工厂默认外部依赖；**仅影响之后新开期** |
 | `removeCampaign(uint256 index)` | 写 | 仅 Factory Owner | 按索引从工厂列表移除；不销毁链上 Campaign；swap-and-pop |
-| `removeCampaign(address campaign)` | 写 | 仅 Factory Owner | 按地址从列表移除（重载）；找不到则 revert |
+| `indexOf(address campaign)` | 读 | 任何人 | 返回该期在列表中的索引；不在列表则返回 `campaigns.length`（再调 `removeCampaign` 会 revert `IndexOutOfBounds`） |
 | `campaignCount()` | 读 | 任何人 | 已开期次数 |
 | `campaigns(uint256 i)` | 读 | 任何人 | 第 i 期地址 |
 | `allCampaigns()` | 读 | 任何人 | 全部期次地址（已移除的不再出现） |
@@ -61,7 +61,8 @@ mining 主动退出：份额转让；被动：仅超时/失败可 refund（挖�
 |---|---|---|---|
 | `subscribe(uint256 count)` | 写 payable | `funding`；截止前；`msg.value == count × sharePriceBnb` | 认筹整数份；售罄 → `executing` + `buying`，记录 `soldOutAt` |
 | `refund()` | 写 | ① `funding` 且超时未售罄；或 ② `executing` 且 `executionFailed` | 本钱包本金原路退、份额清零；有 escrow 锁定时跳过 |
-| `openRefund()` | 写 | Owner；`executing` + `buying` | 批量原路退回各认筹地址；拒收地址跳过不阻断整笔 |
+| `openRefund()` | 写 | Owner；`executing` + `buying` | 批量原路退回各认筹地址；拒收地址跳过不阻断整笔。要求没有挂着的卖单、市场 `owed == 0` |
+| `abandonOrder()` | 写 | Owner；`executing`（`ready` 除外） | 放弃挂单一步到底：撤买单剩余 + 撤卖单 + 提取市场 `owed` + 按当前池子退款。已买入的元件留在合约里，不会自动卖 |
 
 ### 3.2 份额转让（仅 `mining`）
 

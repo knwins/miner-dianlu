@@ -42,7 +42,6 @@ contract CampaignFactory is Ownable {
     error ZeroCampaignParam();
     error BadFee();
     error IndexOutOfBounds();
-    error CampaignNotFound();
 
     constructor(address pod_, address bem_, address minter_) Ownable(msg.sender) {
         if (pod_ == address(0) || bem_ == address(0) || minter_ == address(0)) revert ZeroAddress();
@@ -137,6 +136,20 @@ contract CampaignFactory is Ownable {
         return campaigns;
     }
 
+    /// @notice True while `campaign` is in the registry. A retired Campaign lets anyone reclaim a stuck order.
+    function isRegistered(address campaign) external view returns (bool) {
+        return indexOf(campaign) != campaigns.length;
+    }
+
+    /// @notice Index of a campaign in `campaigns`, or campaigns.length when absent. Use it to call removeCampaign(index).
+    function indexOf(address campaign) public view returns (uint256) {
+        uint256 len = campaigns.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (campaigns[i] == campaign) return i;
+        }
+        return len;
+    }
+
     /// @notice Remove a round by index. Factory owner only.
     ///         Does not selfdestruct the Campaign. Holders can still use the original address.
     ///         Swap-and-pop: the last address may move into the removed index. Do not cache indexes.
@@ -150,23 +163,5 @@ contract CampaignFactory is Ownable {
         }
         campaigns.pop();
         emit CampaignRemoved(index, campaign);
-    }
-
-    /// @notice Remove a round by address (overload of removeCampaign(uint256)). Reverts if it is not in the list.
-    function removeCampaign(address campaign) external onlyOwner {
-        if (campaign == address(0)) revert ZeroAddress();
-        uint256 len = campaigns.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (campaigns[i] == campaign) {
-                uint256 last = len - 1;
-                if (i != last) {
-                    campaigns[i] = campaigns[last];
-                }
-                campaigns.pop();
-                emit CampaignRemoved(i, campaign);
-                return;
-            }
-        }
-        revert CampaignNotFound();
     }
 }

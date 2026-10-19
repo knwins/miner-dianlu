@@ -261,8 +261,9 @@ export default function App() {
   function invokeCall(method, args) {
     const WRITE_METHODS = [
       "subscribe", "listShares", "cancelListing", "takeListing", "refund", "claim", "execute", "harvest",
-      "placeTransistorOrder", "cancelTransistorOrder", "confirmTransistors", "setPlan", "updateNetworkWeight",
-      "createCampaign", "openRefund", "removeCampaign", "removeCampaignAt",
+      "placeTransistorOrder", "cancelTransistorOrder", "placeTransistorAsk", "cancelTransistorAsk",
+      "withdrawMarketProceeds", "confirmTransistors", "setPlan", "updateNetworkWeight",
+      "createCampaign", "openRefund", "abandonOrder", "removeCampaign", "removeCampaignAt",
       "setPod", "setBem", "setMinter", "setFeeShares", "recoverBnb", "recoverTransistors", "transferOwnership",
       "setFactoryPod", "setFactoryBem", "setFactoryMinter", "setFactoryOwner",
     ];
@@ -280,7 +281,7 @@ export default function App() {
     else if (method === "execute") result = applyExecute(round, book, quote, actor, taskbook);
     else if (method === "harvest") result = applyHarvest(round, book);
     else if (method === "placeTransistorOrder") result = applyPlaceTransistorOrder(round, book, actor, args);
-    else if (method === "openRefund") result = applyOpenRefund(round, book, actor);
+    else if (method === "openRefund" || method === "abandonOrder") result = applyOpenRefund(round, book, actor);
     else if (method === "cancelTransistorOrder") result = applyCancelTransistorOrder(round, book, actor);
     else if (method === "confirmTransistors") result = applyConfirmTransistors(round, book, actor);
     else if (method === "refund") result = applyRefund(round, book, actor);
@@ -306,13 +307,17 @@ export default function App() {
     claim: "领取",
     execute: "流片",
     harvest: "分发",
-    placeTransistorOrder: "挂单",
-    cancelTransistorOrder: "取消挂单",
+    placeTransistorOrder: "挂买单",
+    cancelTransistorOrder: "取消买单",
+    placeTransistorAsk: "挂卖单",
+    cancelTransistorAsk: "取消卖单",
+    withdrawMarketProceeds: "提取卖出款",
     confirmTransistors: "确认成交",
     setPlan: "写入计划",
     updateNetworkWeight: "更新权重",
     createCampaign: "发布期次",
     openRefund: "退款",
+    abandonOrder: "撤单退款",
     removeCampaign: "移除期次",
     removeCampaignAt: "移除期次",
     setPod: "更换适配器",
@@ -393,27 +398,54 @@ export default function App() {
           if ((nandQty > 0n && nandPrice <= 0n) || (latchQty > 0n && latchPrice <= 0n)) {
             throw new Error("有数量的元件必须填写大于 0 的单价");
           }
+          const cost = nandQty * nandPrice + latchQty * latchPrice;
+          const pool = parseEther(String(book.bnbPool ?? 0));
+          if (cost > pool) {
+            throw new Error("托管金额超过募集余额，不会挂出。请降低数量或单价后再提交。");
+          }
           const transistors = args?.transistors
             || book.transistors
             || partsContractForProcessor(round.processorId)
             || OFFICIAL_PARTS.TAPE_OUT_NAND.contract;
           await send(chainTx.placeTransistorOrder(signer, transistors, nandQty, nandPrice, latchQty, latchPrice), onSigned);
+        } else if (method === "placeTransistorAsk") {
+          if (book._chain && book.marketAsks === false) {
+            throw new Error("这期合约还没有卖单接口。重新部署并新开一期后才能 placeAsk。");
+          }
+          const nandQty = BigInt(Math.floor(Number(args?.nandQty) || 0));
+          const latchQty = BigInt(Math.floor(Number(args?.latchQty) || 0));
+          if (nandQty === 0n && latchQty === 0n) throw new Error("NAND 与 LATCH 数量不能都为 0");
+          const nandPrice = nandQty > 0n ? parseEther(String(args?.nandPrice ?? "0").trim()) : 0n;
+          const latchPrice = latchQty > 0n ? parseEther(String(args?.latchPrice ?? "0").trim()) : 0n;
+          if ((nandQty > 0n && nandPrice <= 0n) || (latchQty > 0n && latchPrice <= 0n)) {
+            throw new Error("有数量的元件必须填写大于 0 的单价");
+          }
+          await send(chainTx.placeTransistorAsk(signer, nandQty, nandPrice, latchQty, latchPrice), onSigned);
         } else if (method === "openRefund") {
           await send(chainTx.openRefund(signer), onSigned);
+        } else if (method === "abandonOrder") {
+          await send(chainTx.abandonOrder(signer), onSigned);
         } else {
           const promise = buildChainTx(method, args, signer);
           await send(promise, onSigned);
         }
         setNotice(method === "openRefund"
           ? "链上已退款。认筹 BNB 已按认筹地址原路退回。"
+          : method === "abandonOrder"
+            ? "已撤单并退款：未成交保证金已收回，卖出款已提取，持份人按剩余池子原路退回。"
           : method === "placeTransistorOrder"
-            ? "已向材料市场挂单。保证金从本期募集款托管。"
-            : `已确认：${method} ✓`);
+            ? "已向材料市场挂买单。保证金从本期募集款托管。"
+            : method === "placeTransistorAsk"
+              ? "已向材料市场挂卖单。成交后点「提取卖出款」再退款。"
+              : method === "withdrawMarketProceeds"
+                ? "卖出款已转入本期募集余额。"
+                : `已确认：${method} ✓`);
         await chain.refresh();
         if (
           method === "claim"
           || method === "refund"
           || method === "openRefund"
+          || method === "abandonOrder"
           || method === "listShares"
           || method === "takeListing"
           || method === "cancelListing"
@@ -547,6 +579,8 @@ export default function App() {
         return chainTx.takeListing(signer, Number(args.listingId), BigInt(args.shares), BigInt(args.shares) * wei);
       }
       case "cancelTransistorOrder": return chainTx.cancelTransistorOrder(signer);
+      case "cancelTransistorAsk": return chainTx.cancelTransistorAsk(signer);
+      case "withdrawMarketProceeds": return chainTx.withdrawMarketProceeds(signer);
       case "confirmTransistors":
         if (book._chain && book.marketOrders === false) {
           throw new Error("这期合约不能读取官方订单簿。重新部署后，成交以 bids(id).remaining 为准。");
@@ -1093,7 +1127,11 @@ export default function App() {
             now={now}
             onPlaceTransistorOrder={(args) => act("placeTransistorOrder", args)}
             onOpenRefund={() => act("openRefund")}
+            onAbandonOrder={() => act("abandonOrder")}
             onCancelTransistorOrder={() => act("cancelTransistorOrder")}
+            onPlaceTransistorAsk={(args) => act("placeTransistorAsk", args)}
+            onCancelTransistorAsk={() => act("cancelTransistorAsk")}
+            onWithdrawMarketProceeds={() => act("withdrawMarketProceeds")}
             onConfirmTransistors={() => act("confirmTransistors")}
             onExecute={(args) => act("execute", args)}
             onHarvest={() => act("harvest")}
@@ -1459,6 +1497,7 @@ function assetSubstatus(row, nowSec) {
   if (row.scene === "executing") {
     if (refundSettled(row)) return "已失败原路退款";
     if (row.executionFailed) return "流片失败 · 可退款";
+    if (refundShortfall(row) > 0) return "池子不足 · 按比例退";
     if (row.phase === "ready") return "已到账 · 待流片";
     if (row.phase === "listed") return "挂单中";
     return "待挂单";
@@ -1485,7 +1524,16 @@ function assetCanRefund(row, nowSec) {
       && nowSec > row.fundingDeadline
       && Number(row.sold) < Number(row.totalShares);
   }
-  return row.scene === "executing" && Boolean(row.executionFailed);
+  if (row.scene !== "executing") return false;
+  if (row.executionFailed) return true;
+  // 买单部分成交后撤单/卖单，池子可能已不够按份全退：合约允许持份人按比例自取。
+  return row.phase === "buying" && refundShortfall(row) > 0;
+}
+
+/** 合约口径：raisedBnb < sold × sharePriceBnb 时持份人可按比例退款。 */
+function refundShortfall(row) {
+  const need = Number(row.sold || 0) * Number(row.sharePriceBnb || 0);
+  return Math.max(0, need - Number(row.raisedBnb || 0));
 }
 
 function AssetsHub({
@@ -1511,6 +1559,7 @@ function AssetsHub({
         pendingBem: book.claimable || 0,
         claimedBem: book.claimed || 0,
         refundedBnb: book.refundedSelf || 0,
+        raisedBnb: book.bnbPool || 0,
       }];
   const mineRows = rows.filter(participated);
   const held = mineRows.filter((row) => Number(row.shares) + Number(row.escrow) > 0);
@@ -1592,7 +1641,13 @@ function AssetsHub({
                 {mineRows.map((row) => {
                   const canClaim = connected && row.scene === "mining" && row.pendingBem > 0;
                   const canRefund = connected && assetCanRefund(row, nowSec);
-                  const refundBnb = round4(Number(row.shares || 0) * Number(row.sharePriceBnb || 0));
+                  // 池子不足时合约按比例退，按钮金额必须与实际到账一致。
+                  const need = Number(row.sold || 0) * Number(row.sharePriceBnb || 0);
+                  const raised = Number(row.raisedBnb || 0);
+                  const short = need > 0 && raised < need;
+                  const refundBnb = short
+                    ? round4((raised * Number(row.shares || 0)) / Math.max(1, Number(row.sold || 0)))
+                    : round4(Number(row.shares || 0) * Number(row.sharePriceBnb || 0));
                   const ended = refundSettled(row);
                   const tone = ended ? "done" : row.executionFailed ? "back" : row.scene === "mining" ? "mine" : row.scene === "executing" ? "wait" : "live";
                   const sub = assetSubstatus(row, nowSec);
@@ -1647,7 +1702,9 @@ function AssetsHub({
 function OwnerDesk({
   tab, onTab, tabs, round, book, copy, quote, taskbook, pending, pendingTarget, actor, account,
   executeWait, connected, usingChain, chain, factoryOwner, chainHolders, holdersCampaign, now,
-  onPlaceTransistorOrder, onOpenRefund, onCancelTransistorOrder, onConfirmTransistors, onExecute, onHarvest, onSetPlan,
+  onPlaceTransistorOrder, onOpenRefund, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
+  onPlaceTransistorAsk, onCancelTransistorAsk, onWithdrawMarketProceeds,
+  onExecute, onHarvest, onSetPlan,
   onRemoveCampaign, onOpenRound, onOpenAssets,
   onCreate, onConnect, onInvoke,
 }) {
@@ -1691,7 +1748,11 @@ function OwnerDesk({
           onSwitchCampaign={usingChain ? chain.switchCampaign : null}
           onPlaceTransistorOrder={onPlaceTransistorOrder}
           onOpenRefund={onOpenRefund}
+          onAbandonOrder={onAbandonOrder}
           onCancelTransistorOrder={onCancelTransistorOrder}
+          onPlaceTransistorAsk={onPlaceTransistorAsk}
+          onCancelTransistorAsk={onCancelTransistorAsk}
+          onWithdrawMarketProceeds={onWithdrawMarketProceeds}
           onConfirmTransistors={onConfirmTransistors}
           onExecute={onExecute}
           onHarvest={onHarvest}

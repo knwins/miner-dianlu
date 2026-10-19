@@ -239,6 +239,28 @@ export function round4(value) {
 }
 
 /**
+ * 五位小数：元件挂单价。挂单允许填 0.00001 BNB 级别，
+ * 用四位会把用户输入静默改小，所以输入框与挂单价展示统一走这里。
+ */
+export function round5(value) {
+  return Math.round((Number(value) || 0) * 100000) / 100000;
+}
+
+/** 价格输入框的展示值：最多五位小数，去掉浮点尾巴。 */
+export function priceText(value) {
+  const n = Number(value) || 0;
+  return Number.isFinite(n) ? String(Math.round(n * 100000) / 100000) : "";
+}
+
+/** 输入过程中限制为最多五位小数（允许空串与末尾小数点）。 */
+export function clampPriceInput(raw) {
+  const text = String(raw ?? "").replace(/[^\d.]/g, "");
+  const dot = text.indexOf(".");
+  if (dot < 0) return text;
+  return `${text.slice(0, dot + 1)}${text.slice(dot + 1).replace(/\./g, "").slice(0, 5)}`;
+}
+
+/**
  * 兜底题目：题库未加载时用，避免权重与成本算成 0。
  * 与官方题库 #17 参数对齐。
  *

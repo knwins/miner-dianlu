@@ -22,7 +22,14 @@ import {Emission} from "./libraries/Emission.sol";
 ///    hash and fills, returns leftover BNB, then calls pod.start.
 ///  - Share transfer is Mining-only. Buyer BNB is paid straight to the seller, not into raisedBnb.
 ///  - pendingBem uses available _shares only. Escrowed shares do not accrue.
+interface IFactory {
+    function isRegistered(address campaign) external view returns (bool);
+}
+
 contract Campaign is Ownable, ReentrancyGuard {
+    /// @notice Factory that created this round. Read for registry membership (see receive / cancelTransistorOrder).
+    address public immutable factory;
+
     // ─────────────────────────── state machine ───────────────────────────
     enum Scene {
         Funding,
@@ -91,6 +98,13 @@ contract Campaign is Ownable, ReentrancyGuard {
     uint256 public latchQty;
     uint96 public nandPrice;
     uint96 public latchPrice;
+    /// @notice Sell-side ask ids after a partial buy. Used to cash out parts already on hand before refund.
+    uint256 public nandAskId;
+    uint256 public latchAskId;
+    uint256 public nandAskQty;
+    uint256 public latchAskQty;
+    uint96 public nandAskPrice;
+    uint96 public latchAskPrice;
 
     // network weights (oracle). Defaults are the on-chain snapshot at deploy.
     uint256 public netWeightVerified;
@@ -116,6 +130,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice The second argument is total escrowed BNB, not a unit price. The name is kept for the old ABI.
     event TransistorOrderPlaced(uint256 count, uint256 unitPriceBnb);
     event TransistorOrderCancelled();
+    event TransistorAskPlaced(uint256 nandQty, uint256 latchQty, uint256 nandAskId, uint256 latchAskId);
+    event TransistorAskCancelled();
     event TransistorsConfirmed();
     /// @notice needBnb is the bid escrow that could not be paid. openRefund emits 0. The tx does not revert.
     event ExecutionFailed(uint256 needBnb, uint256 raisedBnb);
@@ -163,6 +179,10 @@ contract Campaign is Ownable, ReentrancyGuard {
     error TransferFailed();
     error OrderFilled();
     error BadBidId();
+    error BadAskId();
+    error AlreadyAsked();
+    error NotAsked();
+    error InsufficientParts();
     error BadFeeShares();
     error PodCallFailed();
 
@@ -190,6 +210,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (pod_ == address(0) || bem_ == address(0) || minter_ == address(0) || transistors_ == address(0)) {
             revert ZeroAddress();
         }
+        factory = msg.sender;
         if (totalShares_ == 0 || sharePriceBnb_ == 0) revert ZeroShares();
         sharePriceBnb = sharePriceBnb_;
         totalShares = totalShares_;
@@ -208,10 +229,24 @@ contract Campaign is Ownable, ReentrancyGuard {
         _writeFeeShares(feeRecipients_, feeShareBps_);
     }
 
-    /// @dev Subscribe and share sales do not use receive. Only unfilled bid escrow from the market is accepted and credited to raisedBnb.
+    /// @dev Subscribe and share sales do not use receive. Only market payouts are accepted and credited to raisedBnb
+    ///      (unfilled bid escrow, ask proceeds after withdraw).
+    ///      Once the factory drops this round, the owner may be gone with a live bid. Anyone can then reclaim it via
+    ///      cancelTransistorOrder, whose cancelBid refund arrives here exactly like a normal cancel.
     receive() external payable {
-        if (msg.sender != address(market)) revert DirectTransferNotAllowed();
+        if (msg.sender != address(market) && !(scene == Scene.Executing && msg.sender != owner && _retired())) {
+            revert DirectTransferNotAllowed();
+        }
         raisedBnb += msg.value;
+    }
+
+    /// @dev The factory registry is this round's only source of writes. A reverting call counts as retired.
+    function _retired() internal view returns (bool) {
+        try IFactory(factory).isRegistered(address(this)) returns (bool live) {
+            return !live;
+        } catch {
+            return true;
+        }
     }
 
     /// @notice Legacy reader. Returns the material-market address.
@@ -330,12 +365,14 @@ contract Campaign is Ownable, ReentrancyGuard {
     // ─────────────────────────── refund (pull) ───────────────────────────
 
     /// @notice The subscriber pulls their principal. Nothing runs automatically at the deadline.
-    ///         Allowed when Funding and timestamp > fundingDeadline, Executing and executionFailed,
-    ///         or Executing/Buying when raisedBnb can no longer cover every share (a partial fill was settled).
+    ///         Allowed when the round never sold out and Funding is past its deadline, when Executing and
+    ///         executionFailed, or when Executing/Buying and raisedBnb can no longer cover every share
+    ///         (a partial fill was settled, with or without asking the leftover parts).
     ///         A full pool pays count × sharePriceBnb. A short pool pays pro-rata of raisedBnb.
+    ///         A sold-out round cannot use the deadline path: buyers paid to tape out, not to sit in Funding.
     ///         Reverts if this wallet still has escrowed shares.
     function refund() external nonReentrant {
-        bool fundingExpired = scene == Scene.Funding && block.timestamp > fundingDeadline;
+        bool fundingExpired = scene == Scene.Funding && sold < totalShares && block.timestamp > fundingDeadline;
         bool execFailed = scene == Scene.Executing && executionFailed;
         bool short = scene == Scene.Executing && phase == Phase.Buying && _shortfall();
         if (!fundingExpired && !execFailed && !short) revert RefundNotAvailable();
@@ -357,9 +394,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     function _refundHolder(address who, bool soft) internal returns (uint256 amount) {
         uint256 s = _shares[who];
         if (s == 0 || _escrow[who] != 0 || sold == 0) return 0;
-        uint256 owed = s * sharePriceBnb;
-        uint256 poolOwed = sold * sharePriceBnb;
-        amount = raisedBnb >= poolOwed ? owed : (raisedBnb * s) / sold;
+        // A full pool pays count × price. A short pool pays raise × shares / sold pro-rata.
+        amount = raisedBnb >= sold * sharePriceBnb ? s * sharePriceBnb : (raisedBnb * s) / sold;
         if (amount == 0) return 0;
         _shares[who] = 0;
         sold -= s;
@@ -444,7 +480,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Uses the transistors address locked at create. `transistors_` must be address(0) or equal that address.
     ///         Escrow is debited from raisedBnb and sent with placeBid. A zero-qty leg is skipped and its bid id stays 0.
     ///         If cost > raisedBnb, sets executionFailed and returns. The tx does not revert and no bid is placed.
-    ///         Reverts if already failed and (not sold out or raisedBnb is 0). A sold-out round with BNB left clears the flag and places.
+    ///         Only one market order at a time: an open ask must be cancelled first. A fully filled ask slot is cleared here.
     function placeTransistorOrder(
         address transistors_,
         uint256 nandQty_,
@@ -452,13 +488,13 @@ contract Campaign is Ownable, ReentrancyGuard {
         uint256 latchQty_,
         uint96 latchPrice_
     ) external onlyOwner nonReentrant {
-        if (scene != Scene.Executing) revert WrongScene();
+        _requireExecuting();
         if (phase == Phase.Ready) revert AlreadyReady();
         if (phase == Phase.Listed) revert AlreadyListed();
-        if (transistors == address(0)) revert ZeroAddress();
+        _purgeFilledAsk();
+        if (_askOpen()) revert AlreadyAsked();
         if (transistors_ != address(0) && transistors_ != transistors) revert ZeroAddress();
-        if (nandQty_ == 0 && latchQty_ == 0) revert ZeroShares();
-        if ((nandQty_ > 0 && nandPrice_ == 0) || (latchQty_ > 0 && latchPrice_ == 0)) revert ZeroPrice();
+        _requireLegParams(nandQty_, nandPrice_, latchQty_, latchPrice_);
         if (executionFailed && (sold < totalShares || raisedBnb == 0)) revert RefundNotAvailable();
 
         uint256 nandCost = nandQty_ * uint256(nandPrice_);
@@ -478,27 +514,46 @@ contract Campaign is Ownable, ReentrancyGuard {
         latchPrice = latchPrice_;
         transistorCount = nandQty_ + latchQty_;
         priceLock = cost;
-        if (nandQty_ > 0) {
-            nandBidId = market.placeBid{value: nandCost}(transistors, 0, nandPrice_, nandQty_);
-            if (nandBidId == 0) revert BadBidId();
-        }
-        if (latchQty_ > 0) {
-            latchBidId = market.placeBid{value: latchCost}(transistors, 1, latchPrice_, latchQty_);
-            if (latchBidId == 0) revert BadBidId();
-        }
+        nandBidId = _placeBidLeg(0, nandQty_, nandPrice_, nandCost);
+        latchBidId = _placeBidLeg(1, latchQty_, latchPrice_, latchCost);
         phase = Phase.Listed;
         emit TransistorOrderPlaced(transistorCount, cost);
     }
 
     /// @notice Buying only. The owner sets executionFailed if needed, then refunds each holder.
     ///         Quotes are ignored. A rejecting address is skipped. Already Listed must be cancelled first.
+    ///         Open asks must be cancelled first; ask proceeds must be withdrawn (owed == 0) first.
+    ///         Use abandonOrder to do all of that in one call.
     function openRefund() external onlyOwner nonReentrant {
-        if (scene != Scene.Executing) revert WrongScene();
+        _requireExecuting();
         if (phase != Phase.Buying) revert AlreadyListed();
-        if (!executionFailed) {
-            executionFailed = true;
-            emit ExecutionFailed(0, raisedBnb);
+        _purgeFilledAsk();
+        if (_askOpen() || market.owed(address(this)) > 0) revert AlreadyAsked();
+        markFailed();
+        _refundAll();
+    }
+
+    /// @notice Owner only. Give up on this round: cancel the rest of the bid, return the parts still held
+    ///         here to the owner, cancel open asks, withdraw what the market owes, and refund every holder.
+    ///         Unsold parts have no value to the pool and would otherwise be stranded in this contract
+    ///         (openRefund and abandonOrder both lock the round out of any further ask), so the owner recovers them.
+    function abandonOrder() external onlyOwner nonReentrant {
+        _requireExecuting();
+        if (phase == Phase.Ready) revert AlreadyReady();
+        if (phase == Phase.Listed) {
+            _cancelOpenLeg(nandBidId, nandQty);
+            _cancelOpenLeg(latchBidId, latchQty);
+            _clearOrder();
         }
+        phase = Phase.Buying;
+        _cancelOpenAsk();
+        _returnHeldParts();
+        if (market.owed(address(this)) > 0) market.withdraw();
+        markFailed();
+        _refundAll();
+    }
+
+    function _refundAll() internal {
         uint256 n = _holders.length;
         for (uint256 i = 0; i < n; i++) {
             _refundHolder(_holders[i], true);
@@ -506,16 +561,16 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     /// @notice Cancel whatever is still open on the market, then return to Buying.
-    ///         An untouched order can be cancelled by the owner only.
-    ///         Once any quantity has filled, anyone may cancel the remainder so the escrow comes back.
-    ///         A fully filled order whose parts are already in this contract cannot be cancelled.
+    ///         Owner only while nothing filled. Once any quantity filled, anyone may cancel the rest.
+    ///         A fully filled order whose parts are already here cannot be cancelled.
     ///         cancelBid refunds the unfilled escrow into receive. Filled quantity stays spent.
+    ///         Escrow must never be stranded, so anyone may also cancel a round removed from the factory registry
+    ///         (its owner may no longer be around).
     function cancelTransistorOrder() external nonReentrant {
-        if (scene != Scene.Executing) revert WrongScene();
         if (phase != Phase.Listed) revert NotListed();
         bool touched = _filledSome(nandBidId, nandQty) || _filledSome(latchBidId, latchQty);
         if (orderFilled() && _partsOnHand()) revert OrderFilled();
-        if (!touched && msg.sender != owner) revert NotOwner(msg.sender);
+        if (!touched && msg.sender != owner && !_retired()) revert NotOwner(msg.sender);
         _cancelOpenLeg(nandBidId, nandQty);
         _cancelOpenLeg(latchBidId, latchQty);
         _clearOrder();
@@ -523,11 +578,65 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit TransistorOrderCancelled();
     }
 
+    /// @notice Anyone may call. Lets holders refund even when no owner is around: a live bid can be cancelled by
+    ///         anyone (see cancelTransistorOrder), and this opens refund() / openRefund() in one tx.
+    function markFailed() public {
+        if (scene != Scene.Executing || executionFailed) return;
+        executionFailed = true;
+        emit ExecutionFailed(0, raisedBnb);
+    }
+
+    /// @notice List parts already held by this campaign on the official ask book.
+    ///         Buying only (no live bid). Only one market order at a time: cancel the bid first if Listed.
+    ///         Reverts if any ask leg is still open. Approves the market once, then placeAsk for each non-zero leg.
+    function placeTransistorAsk(
+        uint256 nandQty_,
+        uint96 nandPrice_,
+        uint256 latchQty_,
+        uint96 latchPrice_
+    ) external onlyOwner nonReentrant {
+        _requireExecuting();
+        if (phase != Phase.Buying) revert AlreadyListed();
+        _requireLegParams(nandQty_, nandPrice_, latchQty_, latchPrice_);
+        _purgeFilledAsk();
+        if (_askOpen()) revert AlreadyAsked();
+
+        IERC1155 token = IERC1155(transistors);
+        if (nandQty_ > 0 && token.balanceOf(address(this), 0) < nandQty_) revert InsufficientParts();
+        if (latchQty_ > 0 && token.balanceOf(address(this), 1) < latchQty_) revert InsufficientParts();
+        // Idempotent; skips the extra isApprovedForAll SLOAD/external call.
+        token.setApprovalForAll(address(market), true);
+
+        nandAskQty = nandQty_;
+        latchAskQty = latchQty_;
+        nandAskPrice = nandPrice_;
+        latchAskPrice = latchPrice_;
+        nandAskId = _placeAskLeg(0, nandQty_, nandPrice_);
+        latchAskId = _placeAskLeg(1, latchQty_, latchPrice_);
+        emit TransistorAskPlaced(nandQty_, latchQty_, nandAskId, latchAskId);
+    }
+
+    /// @notice Owner only. Cancel unsold ask remainder so parts return to this campaign.
+    ///         Fully filled legs (remaining == 0) are skipped. Call withdrawMarketProceeds after fills.
+    ///         A fully filled ask (remaining == 0) can be cleared here without touching the market.
+    function cancelTransistorAsk() external onlyOwner nonReentrant {
+        if (!_askRecorded()) revert NotAsked();
+        _cancelOpenAsk();
+        emit TransistorAskCancelled();
+    }
+
+    /// @notice Pull ask / bid proceeds owed by the material market into raisedBnb (via receive).
+    ///         Anyone may call. No-op when owed is 0.
+    function withdrawMarketProceeds() external nonReentrant {
+        if (market.owed(address(this)) == 0) return;
+        market.withdraw();
+    }
+
     /// @notice Anyone may call. Does not move tokens.
     ///         Moves Listed → Ready only when both legs have remaining == 0 and this contract holds the parts.
     ///         A zero-qty leg counts as filled.
     function confirmTransistors() external {
-        if (scene != Scene.Executing) revert WrongScene();
+        _requireExecuting();
         if (phase == Phase.Ready) revert AlreadyReady();
         if (phase != Phase.Listed) revert NotListed();
         if (!orderFilled() || !_partsOnHand()) revert TransistorsNotReady();
@@ -546,7 +655,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Does not pay the market. Returns leftover raisedBnb pro-rata, then pod.start(startData), and enters Mining.
     ///         Rejected surplus stays in raisedBnb.
     function execute(bytes calldata tapeoutData, bytes calldata startData) external onlyOwner nonReentrant {
-        if (scene != Scene.Executing) revert WrongScene();
+        _requireExecuting();
         if (sold < totalShares) revert NotSoldOut();
         if (phase != Phase.Ready) revert TransistorsNotReady();
         if (keccak256(tapeoutData) != netlistHash) revert NetlistMismatch();
@@ -590,18 +699,21 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Claim msg.sender's pending. If the contract's BEM is short, only the balance is sent and claimed is increased by that amount.
     function claim() external nonReentrant returns (uint256) {
-        if (scene != Scene.Mining) revert WrongScene();
         uint256 pending = pendingBem(msg.sender);
-        if (pending == 0) revert NothingToClaim();
         uint256 bal = bem.balanceOf(address(this));
         uint256 amount = pending <= bal ? pending : bal;
-        if (amount == 0) revert NothingToClaim();
-
+        if (scene != Scene.Mining || amount == 0) revert NothingToClaim();
         _claimed[msg.sender] += amount;
         totalClaimed += amount;
         if (!bem.transfer(msg.sender, amount)) revert TransferFailed();
         emit Claimed(msg.sender, amount);
         return amount;
+    }
+
+    /// @dev True return is not enough for a non-standard BEM: the balance must actually drop.
+    ///      A fee-on-transfer BEM sends less; do not credit the wallet the full `amount` then.
+    function _payBem(address to, uint256 amount) internal {
+        if (!bem.transfer(to, amount)) revert TransferFailed();
     }
 
     // ─────────────────────────── views ───────────────────────────
@@ -634,11 +746,6 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     function listingCount() external view returns (uint256) {
         return _listings.length;
-    }
-
-    function getListing(uint256 id) external view returns (Listing memory) {
-        if (id >= _listings.length) revert NoListing();
-        return _listings[id];
     }
 
     // ─────────────────────────── internal ───────────────────────────
@@ -723,71 +830,92 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (phase == Phase.Listed) revert AlreadyListed();
         if (phase == Phase.Ready) revert AlreadyReady();
         if (token == address(0)) revert ZeroAddress();
-        if (amount == 0) revert ZeroShares();
         IERC1155(token).safeTransferFrom(address(this), owner, id, amount, "");
-        emit TransistorsRecovered(token, id, amount, owner);
     }
 
-    /// @notice Test rescue. Sends BNB stuck in this campaign to the current owner and emits BnbRecovered.
-    ///         Funding / Executing: only the excess over raisedBnb, so subscription escrow stays put.
-    ///         Mining: can also take remaining raisedBnb left after a rejected surplus transfer.
-    ///         Recipient is always `owner`.
+    /// @notice Owner sweep of BNB that no share is entitled to. Recipient is always `owner`.
+    ///         Only the excess over raisedBnb can leave, so subscription escrow stays put.
+    ///         Mining may also take remaining raisedBnb left by a rejected surplus transfer.
     function recoverBnb(uint256 amount) external onlyOwner nonReentrant {
-        if (amount == 0) revert ZeroShares();
         uint256 bal = address(this).balance;
+        if (amount == 0) revert ZeroShares();
         if (amount > bal) revert ExceedsRemaining();
-
         uint256 reserved = raisedBnb;
-        uint256 excess = bal > reserved ? bal - reserved : 0;
-        if (amount > excess) {
-            if (scene != Scene.Mining) revert WrongScene();
-            raisedBnb = reserved - (amount - excess);
+        if (amount > bal - reserved) {
+            // Beyond the excess is only reachable in Mining (rejected surplus) or once every share left sold.
+            if (scene != Scene.Mining && sold != 0) revert WrongScene();
+            raisedBnb = bal - amount;
         }
         _send(owner, amount);
         emit BnbRecovered(amount, owner);
     }
 
+    /// @dev cancelOrder/abandonOrder have both finished before this runs, so the campaign owns no live order.
+    ///      A caller that cannot receive ERC1155 must not block the refund: skip it and leave the parts here.
+    function _returnHeldParts() internal {
+        IERC1155 token = IERC1155(transistors);
+        for (uint256 id = 0; id < 2; id++) {
+            uint256 amount = token.balanceOf(address(this), id);
+            if (amount == 0) continue;
+            try token.safeTransferFrom(address(this), owner, id, amount, "") {} catch {}
+        }
+    }
+
     /// @notice Test rescue. Mining only. Sends the remaining raisedBnb to `to` when a holder rejected the surplus
     ///         and the BNB would otherwise sit in this campaign. `to` may be the rejected address or the owner.
     function rescueUnsentBnb(address to) external onlyOwner nonReentrant {
-        if (scene != Scene.Mining) revert WrongScene();
-        if (to == address(0)) revert ZeroAddress();
         uint256 amt = raisedBnb;
-        if (amt == 0) revert ZeroShares();
+        if (scene != Scene.Mining || to == address(0) || amt == 0) revert WrongScene();
         raisedBnb = 0;
         _send(to, amt);
     }
 
+    function _requireExecuting() internal view {
+        if (scene != Scene.Executing) revert WrongScene();
+    }
+
+    function _requireLegParams(uint256 nandQty_, uint96 nandPrice_, uint256 latchQty_, uint96 latchPrice_) internal pure {
+        if (nandQty_ == 0 && latchQty_ == 0) revert ZeroShares();
+        if ((nandQty_ > 0 && nandPrice_ == 0) || (latchQty_ > 0 && latchPrice_ == 0)) revert ZeroPrice();
+    }
+
+    function _placeBidLeg(uint8 tokenId, uint256 qty, uint96 price, uint256 cost) internal returns (uint256 id) {
+        if (qty == 0) return 0;
+        id = market.placeBid{value: cost}(transistors, tokenId, price, qty);
+        if (id == 0) revert BadBidId();
+    }
+
+    /// @dev A zero id would make _askOpen() read remaining 0 and silently unlock a second order.
+    function _placeAskLeg(uint8 tokenId, uint256 qty, uint96 price) internal returns (uint256 id) {
+        if (qty == 0) return 0;
+        id = market.placeAsk(transistors, tokenId, price, qty);
+        if (id == 0) revert BadAskId();
+    }
+
     function _legFilled(uint256 id, uint256 qty) internal view returns (bool) {
-        if (qty == 0) return true;
-        return _remaining(id) == 0;
+        return qty == 0 || _remaining(id) == 0;
     }
 
     /// @dev True when the seller has taken at least one unit, including a leg whose remaining is already 0.
     function _filledSome(uint256 id, uint256 qty) internal view returns (bool) {
-        if (qty == 0) return false;
-        return _remaining(id) < qty;
+        return qty != 0 && _remaining(id) < qty;
     }
 
     /// @dev Cancel the unfilled remainder. A filled leg (remaining == 0) is left alone; cancelBid would revert.
     function _cancelOpenLeg(uint256 id, uint256 qty) internal {
-        if (qty == 0 || id == 0) return;
-        if (_remaining(id) == 0) return;
-        market.cancelBid(id);
+        if (qty != 0 && id != 0 && _remaining(id) != 0) market.cancelBid(id);
     }
 
     /// @dev True when raised BNB can no longer repay every outstanding share at the subscription price.
     function _shortfall() internal view returns (bool) {
-        if (sold == 0) return false;
+        // sold == 0 is the settled state: refund() must still go through to tell the caller it already left.
         return raisedBnb < sold * sharePriceBnb;
     }
 
     /// @dev Parts for the live order are in this contract. Token id 0 is NAND, 1 is LATCH.
     function _partsOnHand() internal view returns (bool) {
         IERC1155 token = IERC1155(transistors);
-        if (nandQty > 0 && token.balanceOf(address(this), 0) < nandQty) return false;
-        if (latchQty > 0 && token.balanceOf(address(this), 1) < latchQty) return false;
-        return true;
+        return (nandQty <= token.balanceOf(address(this), 0)) && (latchQty <= token.balanceOf(address(this), 1));
     }
 
     function _remaining(uint256 id) internal view returns (uint256 remaining) {
@@ -796,15 +924,43 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     function _clearOrder() internal {
-        nandBidId = 0;
-        latchBidId = 0;
-        nandQty = 0;
-        latchQty = 0;
-        nandPrice = 0;
-        latchPrice = 0;
-        // transistors stays: locked at create for this round's TapeOut / Behemoth parts contract
-        transistorCount = 0;
-        priceLock = 0;
+        // transistors stays: locked at create for this round's TapeOut / Behemoth parts contract.
+        // No public read uses the bid ids / unit prices / quantities after a cancel: every view goes through the book.
+        nandBidId = latchBidId = nandQty = latchQty = transistorCount = priceLock = 0;
+    }
+
+    function _askRecorded() internal view returns (bool) {
+        return nandAskQty | latchAskQty != 0;
+    }
+
+    /// @dev Drop ask storage once every leg has filled, so no ghost order shows up in the UI.
+    function _purgeFilledAsk() internal {
+        if (!_askOpen()) _clearAsk();
+    }
+
+    function _askOpen() internal view returns (bool) {
+        return (nandAskQty > 0 && _askRemaining(nandAskId) > 0)
+            || (latchAskQty > 0 && _askRemaining(latchAskId) > 0);
+    }
+
+    function _askRemaining(uint256 id) internal view returns (uint256 remaining) {
+        if (id == 0) return 0;
+        (,,,, remaining) = market.asks(id);
+    }
+
+    /// @dev Cancel both open ask legs and drop the record. Fully filled legs are skipped.
+    function _cancelOpenAsk() internal {
+        uint256 a = nandAskId;
+        uint256 b = latchAskId;
+        _clearAsk();
+        if (_askRemaining(a) != 0) market.cancelAsk(a);
+        if (_askRemaining(b) != 0) market.cancelAsk(b);
+    }
+
+    function _clearAsk() internal {
+        nandAskId = latchAskId = nandAskQty = latchAskQty = 0;
+        nandAskPrice = 0;
+        latchAskPrice = 0;
     }
 
     /// @dev Official fillBid uses ERC1155 safeTransfer. The caller is not checked; the hook only returns the receiver selector.
@@ -831,21 +987,19 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///      A normal IPoD (the test mock) is called directly. A malicious pod can be delegatecalled
     ///      only after the owner points setPod at it.
     function _podStart(bytes calldata startData) internal returns (uint256) {
-        if (_podDelegatecall()) {
-            (bool ok, bytes memory ret) = address(pod).delegatecall(abi.encodeCall(IPoD.start, (startData)));
-            if (!ok) _bubble(ret);
-            return abi.decode(ret, (uint256));
-        }
-        return IPoD(pod).start(startData);
+        return _podInvoke(abi.encodeCall(IPoD.start, (startData)));
     }
 
     function _podClaim() internal returns (uint256) {
-        if (_podDelegatecall()) {
-            (bool ok, bytes memory ret) = address(pod).delegatecall(abi.encodeCall(IPoD.claim, ()));
-            if (!ok) _bubble(ret);
-            return abi.decode(ret, (uint256));
-        }
-        return IPoD(pod).claim();
+        return _podInvoke(abi.encodeCall(IPoD.claim, ()));
+    }
+
+    function _podInvoke(bytes memory data) internal returns (uint256) {
+        (bool ok, bytes memory ret) = _podDelegatecall()
+            ? address(pod).delegatecall(data)
+            : address(pod).call(data);
+        if (!ok) _bubble(ret);
+        return abi.decode(ret, (uint256));
     }
 
     function _podDelegatecall() internal view returns (bool) {

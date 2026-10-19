@@ -25,7 +25,8 @@ const accounts = PK ? [PK] : [];
 module.exports = {
   solidity: {
     version: "0.8.24",
-    settings: { optimizer: { enabled: true, runs: 200 }, viaIR: true },
+    // runs 偏低优先压体积：工厂合约内嵌 Campaign 创建码，主网 24KB 上限。
+    settings: { optimizer: { enabled: true, runs: 1 }, viaIR: true, evmVersion: "paris" },
   },
   sourcify: {
     enabled: true,
@@ -35,7 +36,7 @@ module.exports = {
     enabled: Boolean(process.env.BSCSCAN_API_KEY),
   },
   networks: {
-    hardhat: { chainId: 31337 },
+    hardhat: { chainId: 31337, allowUnlimitedContractSize: true },
     bscTestnet: {
       url: process.env.BSC_TESTNET_RPC || "https://bsc-testnet-rpc.publicnode.com",
       chainId: 97,

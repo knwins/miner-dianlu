@@ -66,6 +66,57 @@ async function deployFixture() {
   return { bem, pod, minter, parts, factory, campaign, owner, alice, bob, carol, feeRecipient };
 }
 
+describe("escrow can never be stranded", () => {
+  it("abandonOrder pays the refund and hands the leftover parts to the owner", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+
+    await campaign.connect(owner).abandonOrder();
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(1n);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
+    // Sale 99/100 pro-rata: the holder gets 0.99 back and keeps nothing on the book.
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+    expect(await campaign.sold()).to.equal(0n);
+    expect(await campaign.raisedBnb()).to.equal(0n);
+  });
+
+  it("markFailed opens refund() when a short pool has no owner around", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await campaign.connect(alice).cancelTransistorOrder();
+
+    await campaign.connect(alice).markFailed();
+    await expect(campaign.connect(alice).refund()).to.emit(campaign, "Refunded");
+    expect(await campaign.raisedBnb()).to.equal(0n);
+  });
+
+  it("anyone may cancel an untouched bid once the factory drops the round", async () => {
+    const { campaign, factory, owner, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, UNIT);
+
+    await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(
+      campaign,
+      "NotOwner",
+    );
+    expect(await factory.isRegistered(await campaign.getAddress())).to.equal(true);
+    await factory.connect(owner).removeCampaign(0);
+    expect(await factory.isRegistered(await campaign.getAddress())).to.equal(false);
+
+    await campaign.connect(alice).cancelTransistorOrder();
+    expect(await campaign.raisedBnb()).to.equal(100n * SHARE_PRICE);
+    expect(await campaign.phase()).to.equal(1n); // Buying
+  });
+});
+
 async function miningFixture() {
   const ctx = await loadFixture(deployFixture);
   const { campaign, alice, bob, owner, pod, bem } = ctx;
@@ -154,10 +205,11 @@ describe("CampaignFactory", () => {
     const second = await factory.campaigns(1);
     expect(await factory.campaignCount()).to.equal(2n);
 
-    await expect(factory.connect(alice)["removeCampaign(uint256)"](0)).to.be.revertedWithCustomError(factory, "NotOwner");
-    await expect(factory.connect(owner)["removeCampaign(uint256)"](9)).to.be.revertedWithCustomError(factory, "IndexOutOfBounds");
+    await expect(factory.connect(alice).removeCampaign(0)).to.be.revertedWithCustomError(factory, "NotOwner");
+    await expect(factory.connect(owner).removeCampaign(9)).to.be.revertedWithCustomError(factory, "IndexOutOfBounds");
 
-    await expect(factory.connect(owner)["removeCampaign(address)"](first))
+    expect(await factory.indexOf(second)).to.equal(1n);
+    await expect(factory.connect(owner).removeCampaign(0))
       .to.emit(factory, "CampaignRemoved");
     expect(await factory.campaignCount()).to.equal(1n);
     expect(await factory.campaigns(0)).to.equal(second);
@@ -166,9 +218,8 @@ describe("CampaignFactory", () => {
     expect(await ethers.provider.getCode(first)).to.not.equal("0x");
     expect(await campaign.getAddress()).to.equal(first);
     expect(await campaign.scene()).to.equal(0); // Funding
-
-    await expect(factory.connect(owner)["removeCampaign(address)"](first))
-      .to.be.revertedWithCustomError(factory, "CampaignNotFound");
+    // Absent address reports length, so callers get IndexOutOfBounds from removeCampaign.
+    expect(await factory.indexOf(first)).to.equal(1n);
   });
 });
 
@@ -329,6 +380,203 @@ describe("transistor order + execute", () => {
     await campaign.connect(bob).refund();
     expect(await campaign.raisedBnb()).to.equal(0n);
     expect(await campaign.sharesOf(bob.address)).to.equal(0n);
+  });
+
+  it("partial fill: cancel bid first, then placeAsk, sell and refund", async () => {
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
+    await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+
+    const askPrice = ethers.parseEther("0.03");
+    // One order at a time: ask while bid is Listed must revert.
+    await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0))
+      .to.be.revertedWithCustomError(campaign, "AlreadyListed");
+
+    await campaign.connect(alice).cancelTransistorOrder();
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0))
+      .to.emit(campaign, "TransistorAskPlaced");
+    expect(await campaign.nandAskId()).to.be.gt(0n);
+
+    await expect(campaign.connect(owner).placeTransistorOrder(ethers.ZeroAddress, 1n, UNIT, 0n, 0))
+      .to.be.revertedWithCustomError(campaign, "AlreadyAsked");
+    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "AlreadyAsked");
+
+    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
+    // Sell proceeds still in market.owed ? refund must wait for withdraw.
+    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "AlreadyAsked");
+    await campaign.withdrawMarketProceeds();
+    await campaign.connect(owner).cancelTransistorAsk();
+    const after = SHARE_PRICE * 100n - UNIT + askPrice;
+    expect(await campaign.raisedBnb()).to.equal(after);
+    await campaign.connect(owner).openRefund();
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+    expect(await campaign.sharesOf(bob.address)).to.equal(0n);
+  });
+
+  it("buy can be placed again after a prior ask fully sold", async () => {
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 10n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+    await campaign.connect(owner).cancelTransistorOrder();
+    const askPrice = ethers.parseEther("0.02");
+    await campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0);
+    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
+    await campaign.withdrawMarketProceeds();
+    await campaign.connect(owner).cancelTransistorAsk();
+    await place(campaign, owner, 1n, UNIT);
+    expect(await campaign.phase()).to.equal(PHASE.Listed);
+  });
+
+  it("placeAsk returning id 0 reverts instead of unlocking a second order", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 10n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+    await campaign.connect(owner).cancelTransistorOrder();
+    await minter.setReturnZeroAsk(true);
+    await expect(campaign.connect(owner).placeTransistorAsk(1n, UNIT, 0n, 0))
+      .to.be.revertedWithCustomError(campaign, "BadAskId");
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+  });
+
+  it("fully filled ask can be cleared without touching the market", async () => {
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 10n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+    await campaign.connect(owner).cancelTransistorOrder();
+    const askPrice = ethers.parseEther("0.02");
+    await campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0);
+    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
+    await campaign.withdrawMarketProceeds();
+    await campaign.connect(owner).cancelTransistorAsk();
+    expect(await campaign.nandAskQty()).to.equal(0n);
+    expect(await campaign.nandAskId()).to.equal(0n);
+  });
+
+  it("leftover parts plus short raise refund pro-rata and leave no stranded BNB", async () => {
+    // Bid 100 @ UNIT buy only 1 unit; sell 1 unit but raise is short of 100 × 0.01.
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
+    await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+    await campaign.connect(alice).cancelTransistorOrder();
+    // Raise is 0.995 but principal is 1.0. Selling the 1 leftover part is not enough to close the gap.
+    const askPrice = SHARE_PRICE * 25n / 100n;
+    await campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0);
+    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
+    await campaign.withdrawMarketProceeds();
+    await campaign.connect(owner).cancelTransistorAsk();
+
+    const pool = SHARE_PRICE * 100n - UNIT + askPrice;
+    expect(await campaign.raisedBnb()).to.equal(pool);
+    expect(await campaign.totalRefunded()).to.equal(0n);
+    // Short pool: no owner switch needed, each holder pulls pro-rata.
+    const aliceBefore = await ethers.provider.getBalance(alice.address);
+    const tx = await campaign.connect(alice).refund();
+    const r = await tx.wait();
+    expect(await ethers.provider.getBalance(alice.address) + r.gasUsed * r.gasPrice - aliceBefore).to.equal((pool * 60n) / 100n);
+    await campaign.connect(bob).refund();
+    // Pool fully drained: no stranded BNB behind zeroed shares.
+    expect(await campaign.raisedBnb()).to.equal(0n);
+    expect(await campaign.sold()).to.equal(0n);
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+  });
+
+  it("refund after fundingDeadline can still drain a sold-out pool", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, ethers.parseEther("0.02")); // over budget: soft-fail, no order
+    await time.increase(FUNDING_DAYS * 24 * 3600 + 1);
+    await campaign.connect(owner).openRefund();
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+    expect(await campaign.raisedBnb()).to.equal(0n);
+  });
+
+  it("openRefund pays principal, leaves the excess sweepable, and burns any residual", async () => {
+    // 100 shares, bid 10 × UNIT, fill 2, cancel the bid, sell the 2 filled parts at 0.02 each.
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 10n);
+    await place(campaign, owner, 10n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 2n); // partial fill leaves a cancellable remainder
+    await parts.mint(await campaign.getAddress(), 0, 2n);
+    await campaign.connect(alice).cancelTransistorOrder();
+    const askPrice = ethers.parseEther("0.02");
+    await campaign.connect(owner).placeTransistorAsk(2n, askPrice, 0n, 0);
+    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 2n, { value: askPrice * 2n });
+    await campaign.withdrawMarketProceeds();
+    await campaign.connect(owner).cancelTransistorAsk();
+
+    const pool = SHARE_PRICE * 100n - UNIT * 2n + askPrice * 2n;
+    const needed = SHARE_PRICE * 100n;
+    expect(pool).to.be.gt(needed);
+
+    await campaign.connect(owner).openRefund();
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+    // Holders only get principal back; the sale premium stays for the owner as excess over raisedBnb.
+    expect(await campaign.raisedBnb()).to.equal(pool - needed);
+    // After a full refund sold == 0, so the whole balance is entitled to nobody and the premium can be swept.
+    await campaign.connect(owner).recoverBnb(pool - needed);
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+    // openRefund is idempotent: every share is already refunded, so nothing moves.
+    await campaign.connect(owner).openRefund();
+    expect(await campaign.raisedBnb()).to.equal(0n);
+  });
+
+  it("abandonOrder reclaims a cancelable bid and refunds every holder in one call", async () => {
+    // Bid 100 @ UNIT, fill 1, then abandon: cancelBid returns 99 × UNIT, the holder gets principal back,
+    // and the spent 1 × UNIT is a realised loss for the holders (short pool, pro-rata).
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
+    await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+
+    await expect(campaign.connect(alice).abandonOrder()).to.be.revertedWithCustomError(campaign, "NotOwner");
+    await expect(campaign.connect(owner).abandonOrder()).to.emit(campaign, "ExecutionFailed");
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+    expect(await campaign.sharesOf(bob.address)).to.equal(0n);
+    expect(await campaign.executionFailed()).to.equal(true);
+    expect(await campaign.nandBidId()).to.equal(0n);
+    expect(await campaign.raisedBnb()).to.equal(0n);
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+    // 1 × UNIT spent on a part nobody needs is not recoverable.
+    expect(await campaign.totalRefunded()).to.equal(SHARE_PRICE * 100n - UNIT);
+  });
+
+  it("abandonOrder also works straight from a live bid and blocks once Ready", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await place(campaign, owner, 10n, UNIT);
+    expect(await campaign.phase()).to.equal(PHASE.Listed);
+    await campaign.connect(owner).abandonOrder();
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    expect(await campaign.nandQty()).to.equal(0n);
+    expect(await campaign.raisedBnb()).to.equal(0n);
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+
+    // Nothing was spent, so the full pool came back to the holder.
+    expect(await campaign.totalRefunded()).to.equal(SHARE_PRICE * 100n);
   });
 
   it("a filled order with parts on hand cannot be cancelled", async () => {
@@ -593,12 +841,10 @@ describe("harvest / claim", () => {
     await expect(campaign.connect(owner).recoverTransistors(ethers.ZeroAddress, 0, 1n))
       .to.be.revertedWithCustomError(campaign, "ZeroAddress");
     await expect(campaign.connect(owner).recoverTransistors(await held.getAddress(), 0, 0))
-      .to.be.revertedWithCustomError(campaign, "ZeroShares");
+      .to.be.revertedWithCustomError(held, "Insufficient");
 
     const scene = await campaign.scene();
-    await expect(campaign.connect(owner).recoverTransistors(await held.getAddress(), 0, 7n))
-      .to.emit(campaign, "TransistorsRecovered")
-      .withArgs(await held.getAddress(), 0, 7n, owner.address);
+    await campaign.connect(owner).recoverTransistors(await held.getAddress(), 0, 7n);
     await campaign.connect(owner).recoverTransistors(await held.getAddress(), 1, 2n);
 
     expect(await held.balanceOf(owner.address, 0)).to.equal(7n);

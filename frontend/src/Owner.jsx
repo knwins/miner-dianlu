@@ -12,6 +12,7 @@ import {
   QUOTE,
   TRANSISTORS,
   buildHolders,
+  clampPriceInput,
   computeHarvest,
   findTask,
   designOffering,
@@ -38,6 +39,8 @@ import {
   reviewRound,
   shortAddress,
   round4,
+  round5,
+  priceText,
 } from "./fixtures.js";
 
 const EMPTY_FORM = {
@@ -71,13 +74,16 @@ const EMPTY_FORM = {
 
 export function OwnerOverview({
   round, book, copy, pending, pendingTarget = "", actor, executeWait, history, taskbook,
-  onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onCancelTransistorOrder, onConfirmTransistors,
+  onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
+  onPlaceTransistorAsk, onCancelTransistorAsk, onWithdrawMarketProceeds,
   onExecute, onHarvest, onSetPlan, onRemoveCampaign, onOpenRound, onOpenAssets,
   account = "", connected = false, chainHolders = null, holdersCampaign = "", quote, onInvoke,
   transistorUnitPrice = null,
 }) {
   // 链上：托管池 raisedBnb 为权威；模拟：份数×单价
   const raised = book._chain ? Number(book.bnbPool || 0) : book.sold * round.sharePriceBnb;
+  // 池子够不够按份全额退款。缺额时持份人仍可按比例自取，但卖单成交款要先进池子才有机会补上。
+  const refundGap = Math.max(0, Number(book.sold || 0) * Number(round.sharePriceBnb || 0) - raised);
   const netW = book.capped ? book.netWeightUnverified : book.netWeightVerified;
   const harvest = computeHarvest(
     round,
@@ -120,9 +126,17 @@ export function OwnerOverview({
   const [latchQty, setLatchQty] = useState("0");
   const [nandPrice, setNandPrice] = useState("0");
   const [latchPrice, setLatchPrice] = useState("0");
+  const [sellNandQty, setSellNandQty] = useState("0");
+  const [sellLatchQty, setSellLatchQty] = useState("0");
+  const [sellNandPrice, setSellNandPrice] = useState("0");
+  const [sellLatchPrice, setSellLatchPrice] = useState("0");
+  /** 空闲时选挂买单还是卖单；有活单时由链上状态决定，不并存。 */
+  const [orderSide, setOrderSide] = useState("buy");
   const priceTouched = useRef(false);
+  const sellPriceTouched = useRef(false);
   useEffect(() => {
     priceTouched.current = false;
+    sellPriceTouched.current = false;
   }, [book.address]);
   useEffect(() => {
     if (book.executePhase !== "buying" || priceTouched.current) return;
@@ -133,9 +147,19 @@ export function OwnerOverview({
     const est = book.estimate || {};
     setNandQty(String(nand));
     setLatchQty(String(latch));
-    setNandPrice(String(round4(est.priceNand || suggestedUnit)));
-    setLatchPrice(String(round4(est.priceLatch || est.priceNand || suggestedUnit)));
+    setNandPrice(priceText(round5(est.priceNand || suggestedUnit)));
+    setLatchPrice(priceText(round5(est.priceLatch || est.priceNand || suggestedUnit)));
   }, [book.address, book.executePhase, book.estimate, design.task, suggestedUnit, taskbook?.source]);
+  useEffect(() => {
+    const heldNand = Number(book.partsNand) || 0;
+    const heldLatch = Number(book.partsLatch) || 0;
+    setSellNandQty(String(heldNand));
+    setSellLatchQty(String(heldLatch));
+    if (sellPriceTouched.current) return;
+    const est = book.estimate || {};
+    if (heldNand > 0) setSellNandPrice(priceText(round5(est.priceNand || suggestedUnit)));
+    if (heldLatch > 0) setSellLatchPrice(priceText(round5(est.priceLatch || est.priceNand || suggestedUnit)));
+  }, [book.address, book.partsNand, book.partsLatch, book.estimate, suggestedUnit]);
   const historyRows = (history != null ? history : PAST_ROUNDS).map((item) => {
     const onChainRow = history != null;
     const rowDesign = resolveCampaignDesign(
@@ -306,9 +330,33 @@ export function OwnerOverview({
                   const latchN = showLatch ? Math.max(0, Math.floor(Number(latchQty) || 0)) : 0;
                   const nandP = Number(nandPrice) || 0;
                   const latchP = Number(latchPrice) || 0;
-                  const orderCost = round4(nandN * nandP + latchN * latchP);
-                  const canPlace = isOwner && (nandN > 0 || latchN > 0) && (!showNand || nandP > 0) && (!showLatch || latchP > 0);
-                  const overBudget = orderCost > raised && raised > 0;
+                  const orderCostRaw = nandN * nandP + latchN * latchP;
+                  const orderCost = round5(orderCostRaw);
+                  const heldNand = Number(book.partsNand) || 0;
+                  const heldLatch = Number(book.partsLatch) || 0;
+                  const sellNandN = Math.min(heldNand, Math.max(0, Math.floor(Number(sellNandQty) || 0)));
+                  const sellLatchN = Math.min(heldLatch, Math.max(0, Math.floor(Number(sellLatchQty) || 0)));
+                  const sellNandP = Number(sellNandPrice) || 0;
+                  const sellLatchP = Number(sellLatchPrice) || 0;
+                  const sellProceeds = round5(sellNandN * sellNandP + sellLatchN * sellLatchP);
+                  const buyOpen = book.executePhase === "listed";
+                  const askOpen = Boolean(book.askOpen);
+                  const idle = !buyOpen && !askOpen;
+                  const canBuy = raised > 0 && idle && book.executePhase === "buying";
+                  const canSell = Boolean(book.marketAsks) && (heldNand > 0 || heldLatch > 0) && idle && book.executePhase === "buying";
+                  // 主路径默认买单；仅用户显式切卖，或只能卖时走卖单。
+                  const side = buyOpen ? "buy" : askOpen ? "sell"
+                    : (orderSide === "sell" && canSell) ? "sell"
+                      : canBuy ? "buy"
+                        : canSell ? "sell" : "buy";
+                  // 托管额超过 raisedBnb 时不允许点提交（链上也不会真正挂出）。
+                  const overBudget = orderCostRaw > raised;
+                  const canPlaceBuy = isOwner && canBuy && side === "buy" && !overBudget
+                    && (nandN > 0 || latchN > 0)
+                    && (!showNand || nandN === 0 || nandP > 0)
+                    && (!showLatch || latchN === 0 || latchP > 0);
+                  const canPlaceSell = isOwner && canSell && side === "sell" && (sellNandN > 0 || sellLatchN > 0)
+                    && (sellNandN === 0 || sellNandP > 0) && (sellLatchN === 0 || sellLatchP > 0);
                   const partLabel = taskPending
                     ? "读取题目中"
                     : [
@@ -317,179 +365,395 @@ export function OwnerOverview({
                       ].filter(Boolean).join(" + ") || "无需元件";
                   const bidRows = [
                     Number(book.nandQty) > 0
-                      ? { part: "NAND", id: book.nandBidId || "—", qty: book.nandQty, price: book.nandPrice, remaining: book.nandRemaining }
+                      ? { side: "buy", part: "NAND", id: book.nandBidId || "—", qty: book.nandQty, price: book.nandPrice, remaining: book.nandRemaining }
                       : null,
                     Number(book.latchQty) > 0
-                      ? { part: "LATCH", id: book.latchBidId || "—", qty: book.latchQty, price: book.latchPrice, remaining: book.latchRemaining }
+                      ? { side: "buy", part: "LATCH", id: book.latchBidId || "—", qty: book.latchQty, price: book.latchPrice, remaining: book.latchRemaining }
                       : null,
                   ].filter(Boolean);
-                  const legOpen = (remaining) => {
-                    if (book.executePhase !== "listed") return false;
-                    if (remaining == null) return !book.orderFilled;
-                    return Number(remaining) > 0;
+                  const askRows = book.marketAsks ? [
+                    Number(book.nandAskQty) > 0
+                      ? { side: "sell", part: "NAND", id: book.nandAskId || "—", qty: book.nandAskQty, price: book.nandAskPrice, remaining: book.nandAskRemaining }
+                      : null,
+                    Number(book.latchAskQty) > 0
+                      ? { side: "sell", part: "LATCH", id: book.latchAskId || "—", qty: book.latchAskQty, price: book.latchAskPrice, remaining: book.latchAskRemaining }
+                      : null,
+                  ].filter(Boolean) : [];
+                  const legOpen = (row) => {
+                    if (row.side === "buy") {
+                      if (book.executePhase !== "listed") return false;
+                      if (row.remaining == null) return !book.orderFilled;
+                      return Number(row.remaining) > 0;
+                    }
+                    if (row.remaining == null) return askOpen;
+                    return Number(row.remaining) > 0;
                   };
+                  const liveRows = buyOpen ? bidRows : askOpen ? askRows : [];
+                  const partsOnHand = [
+                    heldNand > 0 ? `${heldNand} NAND` : null,
+                    heldLatch > 0 ? `${heldLatch} LATCH` : null,
+                  ].filter(Boolean);
+                  const flowStep = book.executePhase === "ready" ? 3 : buyOpen ? 2 : 1;
+                  // 卖单成交款留在市场 owed 里，未提取时 openRefund 会被合约拒绝。
+                  const marketOwed = Number(book.marketOwed) || 0;
+                  const canWithdraw = isOwner && book.marketAsks && (askOpen || marketOwed > 0);
+                  const canRefund = isOwner && book.executePhase === "buying" && !askOpen && marketOwed <= 0;
+                  const refundHint = askOpen
+                    ? "有挂单时不能退款，请先取消"
+                    : marketOwed > 0
+                      ? "市场里还有卖出款未提取，请先点「提取卖出款」"
+                      : undefined;
+                  // 放弃挂单：一次撤销买单剩余 + 撤卖单 + 提取卖出款 + 按池子退款，不需要逐项操作。
+                  const canAbandon = isOwner && (buyOpen || askOpen || marketOwed > 0);
+                  const nextHint = book.executePhase === "ready"
+                    ? (refundGap > 0
+                      ? "元件已到账，可继续流片；若不流片，池子只够按比例退款。"
+                      : "元件已到账，确认参数后流片开矿。")
+                    : marketOwed > 0 && !buyOpen
+                      ? "卖单已全部成交，先「提取卖出款」把 BNB 取回，再退款或重挂买单。"
+                      : askOpen
+                        ? "卖单挂着：成交后提取卖出款，撤清后再退款或重挂买单。"
+                      : Number(book.sold || 0) === 0
+                        ? "已全部退款（份数归零），池子里若还有卖单溢价，Owner 可用「取回 BNB」扫出。"
+                      : buyOpen
+                        ? (book.orderFilled
+                          ? "买单已成交齐，点「确认到账」进入待流片。"
+                          : "等待市场成交。要改价或转卖元件，先取消买单。")
+                        : canBuy
+                          ? "主路径：按图纸挂买单买入元件。"
+                          : canSell
+                            ? "无可用买单资金。有库存时可挂卖单回笼，再退款。"
+                            : book.executionFailed
+                              ? "上次挂单超余额未挂出，改低单价重试或退款。"
+                              : "当前不能挂单。";
+                  const canConfirm = isOwner && buyOpen && (!book.marketOrders || book.orderFilled);
+
+                  const renderLegForm = (kind) => {
+                    const isBuy = kind === "buy";
+                    const legs = isBuy
+                      ? [
+                          showNand && { key: "nand", label: "NAND", qty: nandQty, setQty: setNandQty, price: nandPrice, setPrice: setNandPrice, touch: priceTouched, quote: Number(est.priceNand) || 0 },
+                          showLatch && { key: "latch", label: "LATCH", qty: latchQty, setQty: setLatchQty, price: latchPrice, setPrice: setLatchPrice, touch: priceTouched, quote: Number(est.priceLatch || est.priceNand) || 0 },
+                        ].filter(Boolean)
+                      : [
+                          heldNand > 0 && { key: "nand", label: "NAND", qty: sellNandQty, setQty: setSellNandQty, price: sellNandPrice, setPrice: setSellNandPrice, touch: sellPriceTouched, quote: Number(est.priceNand) || 0, max: heldNand },
+                          heldLatch > 0 && { key: "latch", label: "LATCH", qty: sellLatchQty, setQty: setSellLatchQty, price: sellLatchPrice, setPrice: setSellLatchPrice, touch: sellPriceTouched, quote: Number(est.priceLatch || est.priceNand) || 0, max: heldLatch },
+                        ].filter(Boolean);
+                    if (legs.length === 0) {
+                      return <p className="flow-empty">{isBuy ? "本期图纸不需要 NAND / LATCH。" : "暂无库存可卖。"}</p>;
+                    }
+                    return (
+                      <div className="flow-form">
+                        <table className="flow-table">
+                          <thead>
+                            <tr>
+                              <th>元件</th>
+                              <th>{isBuy ? "数量" : "数量"}</th>
+                              <th>{isBuy ? "买价 BNB" : "卖价 BNB"}</th>
+                              <th>市价</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {legs.map((leg) => (
+                              <tr key={leg.key}>
+                                <td>
+                                  <strong>{leg.label}</strong>
+                                  {leg.max != null && <span className="flow-max">持有 {leg.max}</span>}
+                                </td>
+                                <td>
+                                  <input inputMode="numeric" value={leg.qty} disabled={!isOwner || Boolean(pending)} onChange={(e) => leg.setQty(e.target.value)} />
+                                </td>
+                                <td>
+                                  <input
+                                    inputMode="decimal"
+                                    step="0.00001"
+                                    placeholder="0.00000"
+                                    title="单价最多五位小数（0.00001 BNB/颗）"
+                                    value={leg.price}
+                                    disabled={!isOwner || Boolean(pending)}
+                                    onChange={(e) => { leg.touch.current = true; leg.setPrice(clampPriceInput(e.target.value)); }}
+                                  />
+                                </td>
+                                <td>
+                                  {leg.quote > 0 ? (
+                                    <button
+                                      type="button"
+                                      className="flow-quote"
+                                      onClick={() => { leg.touch.current = true; leg.setPrice(priceText(round5(leg.quote))); }}
+                                    >
+                                      {round5(leg.quote).toFixed(5)}
+                                    </button>
+                                  ) : "—"}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        <div className="flow-form-bar">
+                          <span className={overBudget && isBuy ? "is-warn" : undefined}>
+                            {isBuy
+                              ? `托管 ${orderCost} BNB · 可用 ${round4(raised)}${overBudget ? " · 超余额不会挂出" : ""}`
+                              : `预估收入 ${sellProceeds} BNB`}
+                          </span>
+                          {isBuy ? (
+                            <button
+                              className="btn btn-primary"
+                              type="button"
+                              disabled={!canPlaceBuy || Boolean(pending)}
+                              onClick={() => onPlaceTransistorOrder?.({
+                                nandQty: nandN,
+                                latchQty: latchN,
+                                nandPrice: nandN > 0 ? String(nandP) : "0",
+                                latchPrice: latchN > 0 ? String(latchP) : "0",
+                              })}
+                            >
+                              {pending === "placeTransistorOrder" ? "提交中…" : "提交买单"}
+                            </button>
+                          ) : (
+                            <button
+                              className="btn btn-primary"
+                              type="button"
+                              disabled={!canPlaceSell || Boolean(pending)}
+                              onClick={() => onPlaceTransistorAsk?.({
+                                nandQty: sellNandN,
+                                latchQty: sellLatchN,
+                                nandPrice: sellNandN > 0 ? String(sellNandP) : "0",
+                                latchPrice: sellLatchN > 0 ? String(sellLatchP) : "0",
+                              })}
+                            >
+                              {pending === "placeTransistorAsk" ? "提交中…" : "提交卖单"}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  };
+
                   return (
                     <>
                       <ul className="bill ops-bill">
                         <li><span>子状态</span><strong>{phaseLabel}</strong></li>
                         <li><span>目标处理器</span><strong>{design.processorId || round.processorId || "未记录"}</strong></li>
-                        <li><span>图纸建议</span><strong>{taskPending ? "读取题目中" : `${need} 颗 · ${partLabel}`}</strong></li>
+                        <li><span>图纸</span><strong>{taskPending ? "读取中" : `${need} 颗 · ${partLabel}`}</strong></li>
+                        <li><span>资金 / 库存</span><strong>{round4(raised)} BNB · {partsOnHand.length ? partsOnHand.join(" / ") : "无元件"}</strong></li>
                         {mixedUnit > 0 && (
-                          <li><span>混合成本折合</span><strong>{round4(mixedUnit)} BNB/颗（need ÷ count）</strong></li>
+                          <li><span>混合成本</span><strong>{round4(mixedUnit)} BNB/颗</strong></li>
                         )}
-                        <li className="due"><span>本阶段 Owner 可做</span><strong>调用官方市场 placeBid，或直接退款</strong></li>
                       </ul>
-                      {book.executePhase === "buying" && (
-                        <div className="form-grid publish-fields bid-form">
-                          {showNand && (
-                            <>
-                              <label className="field">
-                                <span>NAND 数量（tokenId 0）</span>
-                                <input inputMode="numeric" value={nandQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setNandQty(e.target.value)} />
-                              </label>
-                              <div className="field">
-                                <span>NAND 单价（BNB）</span>
-                                <input inputMode="decimal" value={nandPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => { priceTouched.current = true; setNandPrice(e.target.value); }} />
-                                {Number(est.priceNand) > 0 && (
-                                  <button
-                                    className="price-latest"
-                                    type="button"
-                                    onClick={() => {
-                                      priceTouched.current = true;
-                                      setNandPrice(String(round4(est.priceNand)));
-                                    }}
-                                  >
-                                    最新价 {round4(est.priceNand)}
-                                  </button>
-                                )}
-                              </div>
-                            </>
-                          )}
-                          {showLatch && (
-                            <>
-                              <label className="field">
-                                <span>LATCH 数量（tokenId 1）</span>
-                                <input inputMode="numeric" value={latchQty} disabled={!isOwner || Boolean(pending)} onChange={(e) => setLatchQty(e.target.value)} />
-                              </label>
-                              <div className="field">
-                                <span>LATCH 单价（BNB）</span>
-                                <input inputMode="decimal" value={latchPrice} disabled={!isOwner || Boolean(pending)} onChange={(e) => { priceTouched.current = true; setLatchPrice(e.target.value); }} />
-                                {Number(est.priceLatch || est.priceNand) > 0 && (
-                                  <button
-                                    className="price-latest"
-                                    type="button"
-                                    onClick={() => {
-                                      priceTouched.current = true;
-                                      setLatchPrice(String(round4(est.priceLatch || est.priceNand)));
-                                    }}
-                                  >
-                                    最新价 {round4(est.priceLatch || est.priceNand)}
-                                  </button>
-                                )}
-                              </div>
-                            </>
-                          )}
-                          {!taskPending && !showNand && !showLatch && (
-                            <div className="field wide">
-                              <span>挂单</span>
-                              <strong className="fine">本期图纸不需要 NAND / LATCH，无需挂单</strong>
+
+                      <ol className="flow-steps" aria-label="待执行流程">
+                        <li className={flowStep === 1 ? "is-current" : flowStep > 1 ? "is-done" : ""}>
+                          <span>1</span>挂单
+                        </li>
+                        <li className={flowStep === 2 ? "is-current" : flowStep > 2 ? "is-done" : ""}>
+                          <span>2</span>确认到账
+                        </li>
+                        <li className={flowStep === 3 ? "is-current" : ""}>
+                          <span>3</span>流片
+                        </li>
+                      </ol>
+
+                      <p className="flow-next"><strong>下一步</strong>{nextHint}</p>
+
+                      {/* 上：当前挂单；下：操作表单 / 主按钮 */}
+                      {(book.executePhase === "buying" || book.executePhase === "listed" || askOpen || marketOwed > 0) && (
+                        <div className="flow-panel">
+                          <div className="flow-panel-head">
+                            <div>
+                              <h3>
+                                {buyOpen ? "当前买单"
+                                  : askOpen ? "当前卖单"
+                                    : marketOwed > 0 ? "卖出款待提取"
+                                      : side === "sell" ? "挂卖单（支线）" : "挂买单（主路径）"}
+                              </h3>
+                              <p>
+                                {buyOpen || askOpen
+                                  ? "同时只能有一单。换方向前先取消当前剩余。"
+                                  : side === "sell"
+                                    ? "卖出库存回笼 BNB，撤清后可退款或再挂买单。"
+                                    : "用募集款托管买入图纸元件。"}
+                              </p>
                             </div>
-                          )}
-                          {(showNand || showLatch) && (
-                            <div className="field wide">
-                              <span>托管保证金（{[showNand && "NAND", showLatch && "LATCH"].filter(Boolean).join(" + ")}）</span>
-                              <strong style={overBudget ? { color: "var(--color-danger)" } : undefined}>
-                                {orderCost} BNB
-                                {raised > 0 ? ` · 募集 ${round4(raised)} BNB` : ""}
-                                {overBudget ? " · 超过募集，不会挂出" : ""}
-                              </strong>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      <div className="bid-records">
-                        <h3>已挂单</h3>
-                        {bidRows.length === 0 ? (
-                          <p className="bid-empty">还没有挂单。</p>
-                        ) : (
-                          <ul className="bid-record-list">
-                            {bidRows.map((row) => {
-                              const open = legOpen(row.remaining);
-                              const bidStatus = open ? "挂单中" : "已成交";
-                              return (
-                                <li key={row.part}>
-                                  <span>{row.part} · 单号 {row.id}</span>
-                                  <strong>{row.qty} 颗 × {round4(row.price || 0)} BNB · {bidStatus}</strong>
-                                  {open && (
+                            {idle && (canBuy || canSell) && (
+                              <div className="flow-mode">
+                                <button type="button" className={side === "buy" ? "is-on" : ""} disabled={!canBuy} onClick={() => setOrderSide("buy")}>买单</button>
+                                <button type="button" className={side === "sell" ? "is-on" : ""} disabled={!canSell} onClick={() => setOrderSide("sell")}>卖单</button>
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flow-panel-body">
+                            {(buyOpen || askOpen) ? (
+                              <>
+                                <table className="flow-table">
+                                  <thead>
+                                    <tr>
+                                      <th>元件</th>
+                                      <th>挂出</th>
+                                      <th>进度</th>
+                                      <th>单号</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {liveRows.map((row) => {
+                                      const filled = Number(row.qty) - (row.remaining == null ? 0 : Number(row.remaining));
+                                      const open = legOpen(row);
+                                      return (
+                                        <tr key={`${row.side}-${row.part}`}>
+                                          <td><strong>{row.part}</strong></td>
+                                          <td>{row.qty} × {round5(row.price || 0).toFixed(5)} BNB</td>
+                                          <td className={open ? "is-open" : "is-done"}>
+                                            {open
+                                              ? (row.remaining == null ? "挂单中" : `剩 ${Number(row.remaining)} · 成 ${Math.max(0, filled)}`)
+                                              : "已成交"}
+                                          </td>
+                                          <td className="mono">#{String(row.id)}</td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                                <div className="flow-panel-actions">
+                                  {buyOpen && (
+                                    <>
+                                      <button
+                                        className="btn btn-primary"
+                                        type="button"
+                                        disabled={!canConfirm || Boolean(pending)}
+                                        onClick={onConfirmTransistors}
+                                      >
+                                        {pending === "confirmTransistors"
+                                          ? "确认中…"
+                                          : book.orderFilled ? "确认到账" : "等待成交…"}
+                                      </button>
+                                      <button
+                                        className="btn btn-inline"
+                                        type="button"
+                                        disabled={!isOwner || Boolean(pending)}
+                                        onClick={onCancelTransistorOrder}
+                                      >
+                                        {pending === "cancelTransistorOrder" ? "取消中…" : "取消买单"}
+                                      </button>
+                                    </>
+                                  )}
+                                  {canWithdraw && (
+                                    <button
+                                      className="btn btn-primary"
+                                      type="button"
+                                      disabled={!isOwner || Boolean(pending)}
+                                      onClick={onWithdrawMarketProceeds}
+                                    >
+                                      {pending === "withdrawMarketProceeds" ? "提取中…" : "提取卖出款"}
+                                    </button>
+                                  )}
+                                  {askOpen && (
                                     <button
                                       className="btn btn-inline"
                                       type="button"
                                       disabled={!isOwner || Boolean(pending)}
-                                      onClick={onCancelTransistorOrder}
+                                      onClick={onCancelTransistorAsk}
                                     >
-                                      {pending === "cancelTransistorOrder" ? "取消中…" : "取消挂单"}
+                                      {pending === "cancelTransistorAsk" ? "取消中…" : "取消卖单"}
                                     </button>
                                   )}
-                                </li>
-                              );
-                            })}
-                          </ul>
-                        )}
-                      </div>
-                      <div className="actions">
-                        {book.executePhase === "buying" && (
-                          <>
-                            {(showNand || showLatch) && (
-                              <button
-                                className="btn btn-primary"
-                                type="button"
-                                disabled={!canPlace || Boolean(pending)}
-                                onClick={() => onPlaceTransistorOrder?.({
-                                  nandQty: nandN,
-                                  latchQty: latchN,
-                                  nandPrice: nandN > 0 ? String(nandP) : "0",
-                                  latchPrice: latchN > 0 ? String(latchP) : "0",
-                                })}
-                              >
-                                {pending || (book.executionFailed ? "降价后重新 placeBid" : "向官方市场挂单")}
-                              </button>
+                                  {!askOpen && marketOwed > 0 && (
+                                    <span className="flow-note">卖单已全部成交，这笔 {round4(marketOwed)} BNB 仍留在材料市场，提取后才能退款。</span>
+                                  )}
+                                </div>
+                              </>
+                            ) : marketOwed > 0 && !canBuy ? (
+                              <div className="flow-panel-actions">
+                                <button
+                                  className="btn btn-primary"
+                                  type="button"
+                                  disabled={!isOwner || Boolean(pending)}
+                                  onClick={onWithdrawMarketProceeds}
+                                >
+                                  {pending === "withdrawMarketProceeds" ? "提取中…" : "提取卖出款"}
+                                </button>
+                                <span className="flow-note">从材料市场取回 BNB，之后可退款或重挂买单。</span>
+                              </div>
+                            ) : (
+                              <>
+                                {side === "buy" && (canBuy ? renderLegForm("buy") : (
+                                  <p className="flow-empty">
+                                    {raised <= 0 ? "募集余额为 0，无法挂买单。" : "当前不能挂买单。"}
+                                  </p>
+                                ))}
+                                {side === "sell" && (canSell ? renderLegForm("sell") : (
+                                  <p className="flow-empty">
+                                    {!book.marketAsks
+                                      ? "这期合约无卖单接口，需重新部署后开新期。"
+                                      : "暂无库存。买单部分成交并取消后，才能挂卖单。"}
+                                  </p>
+                                ))}
+                              </>
                             )}
+                          </div>
+                        </div>
+                      )}
+
+                      {(book.executePhase === "buying" || book.executePhase === "listed" || askOpen) && (
+                        <div className="flow-tools">
+                          <button
+                            className="btn btn-inline"
+                            type="button"
+                            disabled={!canRefund || Boolean(pending)}
+                            onClick={onOpenRefund}
+                            title={refundHint}
+                          >
+                            {pending === "openRefund" ? "退款中…" : (book.executionFailed ? "退款剩余" : "原路退款")}
+                          </button>
+                          {canAbandon && (
                             <button
                               className="btn btn-inline"
                               type="button"
-                              disabled={!isOwner || Boolean(pending)}
-                              onClick={onOpenRefund}
+                              disabled={Boolean(pending)}
+                              onClick={onAbandonOrder}
+                              title="撤销未成交买单、撤卖单、提取卖出款，然后按当前池子给持份人退款"
                             >
-                              {pending || (book.executionFailed ? "退款剩余" : "退款")}
+                              {pending === "abandonOrder" ? "撤回中…" : "放弃挂单并退款"}
                             </button>
-                            <a
-                              className="btn btn-inline"
-                              href="https://tapeout.net/"
-                              target="_blank"
-                              rel="noreferrer"
-                            >
-                              打开 tapeout.net
-                            </a>
-                          </>
-                        )}
-                        {book.executePhase === "listed" && (
-                          <>
-                            <button className="btn btn-primary" type="button" disabled={!isOwner || Boolean(pending) || (book.marketOrders && !book.orderFilled)} onClick={onConfirmTransistors}>
-                              {pending || (book.orderFilled ? "成交已齐，进入待流片" : "同步官方成交")}
+                          )}
+                          <a className="btn btn-inline" href="https://tapeout.net/" target="_blank" rel="noreferrer">
+                            tapeout.net
+                          </a>
+                          {askOpen === false && idle && canSell && side === "buy" && (
+                            <button type="button" className="flow-link" onClick={() => setOrderSide("sell")}>
+                              改挂卖单回笼 →
                             </button>
-                          </>
-                        )}
-                        {book.executePhase === "ready" && !book.executionFailed && (
-                          <button
-                            className="btn btn-primary"
-                            type="button"
-                            disabled={!canExecute || Boolean(pending)}
-                            onClick={() => onExecute?.(startForm)}
-                          >
-                            {pending === "execute" ? "流片中…" : "流片并开户挖矿"}
-                          </button>
-                        )}
-                      </div>
+                          )}
+                          {idle && canBuy && side === "sell" && (
+                            <button type="button" className="flow-link" onClick={() => setOrderSide("buy")}>
+                              ← 回到买单
+                            </button>
+                          )}
+                        </div>
+                      )}
+
+                      {book.executePhase === "ready" && !book.executionFailed && (
+                        <div className="flow-panel">
+                          <div className="flow-panel-head">
+                            <div>
+                              <h3>流片开矿</h3>
+                              <p>确认到账完成。执行后进入挖矿，剩余募集款按份退回。</p>
+                            </div>
+                          </div>
+                          <div className="flow-panel-body">
+                            <div className="flow-panel-actions">
+                              <button
+                                className="btn btn-primary"
+                                type="button"
+                                disabled={!canExecute || Boolean(pending)}
+                                onClick={() => onExecute?.(startForm)}
+                              >
+                                {pending === "execute" ? "流片中…" : "流片并开户挖矿"}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
                       {book.executePhase === "ready" && needsOfficialStart ? (
                         <div className="fee-share-block" style={{ marginTop: 12 }}>
                           <p className="fine">
@@ -541,27 +805,11 @@ export function OwnerOverview({
                           </label>
                         </div>
                       ) : null}
+
                       <p className="fine ops-note">
-                        {book.executePhase === "buying" && !book.executionFailed && (
-                          <>
-                            {taskPending
-                              ? "正在读取本期题目的元件数。取消挂单不会改变图纸，元件数以题目为准。"
-                              : showNand || showLatch
-                              ? `只挂图纸需要的元件（${[showNand && "NAND", showLatch && "LATCH"].filter(Boolean).join(" / ")}）。单价框里的数字就是 placeBid 的价格，改完再挂单；报价刷新不会把改过的单价盖回去。保证金从本期募集款托管。`
-                              : "本期图纸不需要 NAND / LATCH。"}
-                            成交与否只看 bids(id).remaining，不需要到官网点确认。
-                            {book._chain && book.marketOrders === false ? " 当前这期仍是旧合约，需要重新部署后新开一期才会真正调用市场。" : ""}
-                          </>
-                        )}
-                        {book.executePhase === "buying" && book.executionFailed && "保证金超过募集余额，没有挂出。可改低单价后重试，或退款。"}
-                        {book.executePhase === "listed" && (
-                          book.orderFilled
-                            ? "官方订单簿已全部成交。"
-                            : "还有未成交数量。取消挂单会调用 cancelBid，把没成交的保证金退回本期。"
-                        )}
-                        {book.executePhase === "ready" && !needsOfficialStart && "官方买单已成交，可以流片。元件款已在挂单时托管，流片只退还剩余募集款。"}
-                        {book.executePhase === "ready" && needsOfficialStart && "官方买单已成交。适配器路径还要把电路 NFT 转给当期，并带上证明再 execute。"}
-                        {!isOwner && " 当前钱包不是 Factory Owner，无法执行本阶段写操作。"}
+                        {book._chain && book.marketOrders === false && "当前这期仍是旧合约，重新部署并开新期后才会真正调用市场。"}
+                        {book.executionFailed && idle && " 上次买单托管额超过募集余额，交易虽上链但未真正挂出（未扣款）。请降低数量/单价重挂，或直接退款。"}
+                        {!isOwner && " 当前钱包不是 Factory Owner，无法执行写操作。"}
                       </p>
                     </>
                   );
@@ -638,7 +886,13 @@ export function OwnerOverview({
                       </dd>
                     </div>
                     <div><dt>题目元件</dt><dd>{design.taskParts || "—"} 颗</dd></div>
-                    <div><dt>托管 BNB</dt><dd>{round4(book.bnbPool || 0)} BNB</dd></div>
+                    <div>
+                      <dt>托管 BNB</dt>
+                      <dd>
+                        {round4(book.bnbPool || 0)} BNB
+                        {refundGap > 0 && <span className="flow-gap"> · 距按份全退还差 {round4(refundGap)} BNB</span>}
+                      </dd>
+                    </div>
                     <div><dt>已验证权重</dt><dd>{Number(book.netWeightVerified || 0).toLocaleString()}</dd></div>
                     <div><dt>未验证权重</dt><dd>{Number(book.netWeightUnverified || 0).toLocaleString()}</dd></div>
                     <div><dt>锁价</dt><dd>{book.priceLock ? `${round4(book.priceLock)} BNB` : "未锁"}</dd></div>

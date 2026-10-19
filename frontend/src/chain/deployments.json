@@ -1,14 +1,15 @@
 {
   "network": "bsc",
   "chainId": 56,
-  "deployedAt": "2026-10-18T15:55:00.000Z",
+  "deployedAt": "2026-10-19T04:53:50.387Z",
   "bem": "0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a",
   "bemConfigured": "0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a",
   "bemIsMock": false,
   "pod": "0x3647c71F0B947fd3CFAcF480Ab5a723dF18Bb3c4",
   "minter": "0xA6a80C1919a8326022d7c601a488888C13aA16E4",
-  "factory": "0x19a47311FC280f146D1992dD99DC7Fa5735e10BA",
+  "factory": "0x29f4A37509ac1CB556562398240446D7168Fdc2f",
   "legacyFactories": [
+    "0x19a47311FC280f146D1992dD99DC7Fa5735e10BA",
     "0x638744e7308D8dCe3444d6991137f7405f5Ab2ED",
     "0xB4315F55CD614d09092f0Fcf75ef34C5ee252c3b"
   ],
@@ -17,5 +18,5 @@
   "deployer": "0xebA1B24d36487a75C533233A07D6899a268Bb9AA",
   "podIsAdapter": true,
   "officialPod": "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46",
-  "notes": "新工厂已部署，尚未开期。createCampaign 会把目标处理器的晶体管合约地址写入期次。PoD 仍是 OfficialPodAdapter，材料市场与 BEM 为官方合约。上一台工厂 0x638744e7308D8dCe3444d6991137f7405f5Ab2ED 的期次不会出现在新列表里。部署交易 0xa92ae2c3c341ea8376123f46acf8520a937aad0a3e12e9553222283a706c498b。"
+  "notes": "新工厂（第 39 笔，交易 0xc1099ffef7e69f5f8e6608619685018d0e55021aa5111c954d39ee808193b359，块 128492928）已部署，尚未开期。运行时代码 24566 字节。pod/bem/minter 均为线上真实合约。旧工厂的期次仍可调用，但不出现在新列表里。"
 }

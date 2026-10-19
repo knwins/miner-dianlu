@@ -596,6 +596,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         c.executionFailed(),
         c.fundingDeadline(),
         c.phase(),
+        c.raisedBnb(),
       ];
       if (account) {
         base.push(c.sharesOf(account), c.escrowOf(account), c.pendingBem(account), c.claimedOf(account), c.refundedOf(account));
@@ -614,11 +615,12 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         sharePriceBnb: Number(formatEther(res[3])),
         executionFailed: Boolean(res[4]),
         fundingDeadline: Number(res[5]),
-        shares: account ? Number(res[7]) : null,
-        escrow: account ? Number(res[8]) : 0,
-        pendingBem: account ? Number(formatEther(res[9])) : 0,
-        claimedBem: account ? Number(formatEther(res[10])) : 0,
-        refundedBnb: account ? Number(formatEther(res[11])) : 0,
+        raisedBnb: Number(formatEther(res[7])),
+        shares: account ? Number(res[8]) : null,
+        escrow: account ? Number(res[9]) : 0,
+        pendingBem: account ? Number(formatEther(res[10])) : 0,
+        claimedBem: account ? Number(formatEther(res[11])) : 0,
+        refundedBnb: account ? Number(formatEther(res[12])) : 0,
       });
     } catch {
       rows.push({
@@ -637,6 +639,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         pendingBem: 0,
         claimedBem: 0,
         refundedBnb: 0,
+        raisedBnb: 0,
         error: true,
       });
     }
@@ -649,6 +652,10 @@ async function readMarketOrder(c) {
   const empty = {
     nandBidId: 0n, latchBidId: 0n, nandQty: 0n, latchQty: 0n,
     nandPrice: 0n, latchPrice: 0n, transistors: ZeroAddress, orderFilled: false, marketOrders: false,
+    nandAskId: 0n, latchAskId: 0n, nandAskQty: 0n, latchAskQty: 0n,
+    nandAskPrice: 0n, latchAskPrice: 0n, askOpen: false,
+    nandAskRemaining: null, latchAskRemaining: null,
+    partsNand: 0n, partsLatch: 0n, marketAsks: false,
   };
   try {
     const [nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled] = await Promise.all([
@@ -660,9 +667,55 @@ async function readMarketOrder(c) {
       readLegRemaining(c.runner, marketAddr, nandBidId, nandQty),
       readLegRemaining(c.runner, marketAddr, latchBidId, latchQty),
     ]);
-    return { nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled, marketOrders: true, nandRemaining, latchRemaining };
+    const asks = await readMarketAsk(c, marketAddr, transistors);
+    return {
+      nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled,
+      marketOrders: true, nandRemaining, latchRemaining, ...asks,
+    };
   } catch {
     return empty;
+  }
+}
+
+async function readMarketAsk(c, marketAddr, transistors) {
+  const blank = {
+    nandAskId: 0n, latchAskId: 0n, nandAskQty: 0n, latchAskQty: 0n,
+    nandAskPrice: 0n, latchAskPrice: 0n, askOpen: false,
+    nandAskRemaining: null, latchAskRemaining: null,
+    partsNand: 0n, partsLatch: 0n, marketAsks: false, marketOwed: 0n,
+  };
+  try {
+    const [nandAskId, latchAskId, nandAskQty, latchAskQty, nandAskPrice, latchAskPrice] = await Promise.all([
+      c.nandAskId(), c.latchAskId(), c.nandAskQty(), c.latchAskQty(),
+      c.nandAskPrice(), c.latchAskPrice(),
+    ]);
+    const holder = c.target;
+    const [nandAskRemaining, latchAskRemaining, partsNand, partsLatch, marketOwed] = await Promise.all([
+      readAskRemaining(c.runner, marketAddr, nandAskId, nandAskQty),
+      readAskRemaining(c.runner, marketAddr, latchAskId, latchAskQty),
+      readPartBalance(c.runner, transistors, holder, 0),
+      readPartBalance(c.runner, transistors, holder, 1),
+      readMarketOwed(c.runner, marketAddr, holder),
+    ]);
+    const askOpen = (nandAskRemaining != null && nandAskRemaining > 0n)
+      || (latchAskRemaining != null && latchAskRemaining > 0n)
+      || ((nandAskQty > 0n || latchAskQty > 0n) && nandAskRemaining == null && latchAskRemaining == null);
+    return {
+      nandAskId, latchAskId, nandAskQty, latchAskQty, nandAskPrice, latchAskPrice, askOpen,
+      nandAskRemaining, latchAskRemaining, partsNand, partsLatch, marketAsks: true, marketOwed,
+    };
+  } catch {
+    return blank;
+  }
+}
+
+async function readPartBalance(runner, transistors, holder, tokenId) {
+  if (!transistors || transistors === ZeroAddress || !holder) return 0n;
+  try {
+    const token = new Contract(transistors, ["function balanceOf(address,uint256) view returns (uint256)"], runner);
+    return await token.balanceOf(holder, tokenId);
+  } catch {
+    return 0n;
   }
 }
 
@@ -675,6 +728,31 @@ async function readLegRemaining(runner, marketAddr, id, qty) {
     ], runner);
     const bid = await market.bids(id);
     return bid.remaining;
+  } catch {
+    return null;
+  }
+}
+
+/** 卖单成交款先落在市场 owed，不提取的话 openRefund 会被合约拒绝。 */
+async function readMarketOwed(runner, marketAddr, account) {
+  if (!marketAddr || marketAddr === ZeroAddress || !account) return 0n;
+  try {
+    const market = new Contract(marketAddr, ["function owed(address) view returns (uint256)"], runner);
+    return await market.owed(account);
+  } catch {
+    return 0n;
+  }
+}
+
+async function readAskRemaining(runner, marketAddr, id, qty) {
+  if (marketAddr == null) return null;
+  if (marketAddr === ZeroAddress || id === 0n || qty === 0n) return 0n;
+  try {
+    const market = new Contract(marketAddr, [
+      "function asks(uint256) view returns (address seller, uint96 price, address transistors, uint8 tokenId, uint256 remaining)",
+    ], runner);
+    const ask = await market.asks(id);
+    return ask.remaining;
   } catch {
     return null;
   }
@@ -774,11 +852,21 @@ export const tx = {
   takeListing: (signer, id, count, valueWei) => signerOrThrow(signer).takeListing(id, count, { value: valueWei }),
   placeTransistorOrder: (signer, transistors, nandQty, nandPrice, latchQty, latchPrice) =>
     signerOrThrow(signer).placeTransistorOrder(transistors, nandQty, nandPrice, latchQty, latchPrice),
+  placeTransistorAsk: (signer, nandQty, nandPrice, latchQty, latchPrice) =>
+    signerOrThrow(signer).placeTransistorAsk(nandQty, nandPrice, latchQty, latchPrice),
+  cancelTransistorAsk: (signer) => signerOrThrow(signer).cancelTransistorAsk(),
+  withdrawMarketProceeds: (signer) => signerOrThrow(signer).withdrawMarketProceeds(),
   openRefund: async (signer) => {
     const c = signerOrThrow(signer);
     const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
     if (code.includes(id("openRefund()").slice(2, 10))) return c.openRefund();
     throw new Error("这期是旧合约，链上没有 Owner 直接退款。重新部署工厂后，新开的期才能退款。");
+  },
+  abandonOrder: async (signer) => {
+    const c = signerOrThrow(signer);
+    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
+    if (code.includes(id("abandonOrder()").slice(2, 10))) return c.abandonOrder();
+    throw new Error("这期是旧合约，链上没有 abandonOrder。重新部署工厂后，新开的期才有这个入口。");
   },
   cancelTransistorOrder: (signer) => signerOrThrow(signer).cancelTransistorOrder(),
   confirmTransistors: (signer) => signerOrThrow(signer).confirmTransistors(),
@@ -786,8 +874,14 @@ export const tx = {
   setPlan: (signer, est, capped, count) => signerOrThrow(signer).setPlan(est, capped, count),
   updateNetworkWeight: (signer, ver, unver) => signerOrThrow(signer).updateNetworkWeight(ver, unver),
   createCampaign: (signer, params) => createCampaignTx(signer, params),
-  removeCampaignAt: (signer, index) => factoryContract(signer).getFunction("removeCampaign(uint256)")(index),
-  removeCampaign: (signer, campaign) => factoryContract(signer).getFunction("removeCampaign(address)")(campaign),
+  removeCampaignAt: (signer, index) => factoryContract(signer).removeCampaign(index),
+  // 链上只保留按索引移除；先查索引，查不到（返回 count）就报错。
+  removeCampaign: async (signer, campaign) => {
+    const factory = factoryContract(signer);
+    const index = await factory.indexOf(campaign);
+    if (index >= await factory.campaignCount()) throw new Error("该期不在工厂列表中");
+    return factory.removeCampaign(index);
+  },
   setFactoryPod: (signer, pod) => factoryContract(signer).setPod(pod),
   setFactoryBem: (signer, bem) => factoryContract(signer).setBem(bem),
   setFactoryMinter: (signer, minter) => factoryContract(signer).setMinter(minter),

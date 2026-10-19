@@ -14,6 +14,7 @@ import {
   reviewRound,
   seedCalls,
   shortAddress,
+  clampPriceInput,
 } from "./fixtures.js";
 import { FACTORY_ADDRESS, POD_ADDRESS, CAMPAIGN_ADDRESS } from "./chain/config.js";
 import { getCampaignAddress, liveReadView } from "./chain/client.js";
@@ -48,8 +49,8 @@ export function contractCatalog(round) {
           name: "removeCampaign",
           kind: "write",
           caller: "Factory Owner",
-          signature: "removeCampaign(address campaign)",
-          summary: "按地址从工厂列表移除一期。不销毁链上 Campaign；有份额仍可用原地址直连。swap-and-pop 后序号可能变化。",
+          signature: "removeCampaign(address campaign) → indexOf → removeCampaign(uint256)",
+          summary: "按地址移除一期：前端先查 indexOf，再调用 removeCampaign(index)。不销毁链上 Campaign。",
           fields: [["campaign", "期次地址", campaignAddr || "0x"]],
         },
         {
@@ -180,8 +181,10 @@ export function contractCatalog(round) {
           signature: "placeTransistorOrder(address transistors, uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
           summary: "调用材料市场 placeBid。NAND tokenId 0、LATCH tokenId 1，保证金从募集款托管。买不起则标失败且不挂单。",
           fields: [
-            ["count", "挂单数量（颗）", "100"],
-            ["unitPriceBnb", "挂单单价（BNB/颗）", "0.005"],
+            ["nandQty", "NAND 数量（颗，可留空）", "100"],
+            ["nandPrice", "NAND 买价 BNB（最多 5 位小数）", "0.05610"],
+            ["latchQty", "LATCH 数量（颗，可留空）", "0"],
+            ["latchPrice", "LATCH 买价 BNB（最多 5 位小数）", "0"],
           ],
         },
         {
@@ -190,6 +193,35 @@ export function contractCatalog(round) {
           caller: "未成交仅 Factory Owner；已有成交时任何人",
           signature: "cancelTransistorOrder()",
           summary: "撤销市场上还没成交的部分，保证金退回本期并回到待挂单。全部成交且元件已到账时不能取消。",
+          fields: [],
+        },
+        {
+          name: "placeTransistorAsk",
+          kind: "write",
+          caller: "仅 Factory Owner",
+          signature: "placeTransistorAsk(uint256,uint96,uint256,uint96)",
+          summary: "部分买单成交后，把合约里已到账的 NAND/LATCH 挂到官方卖单。成交款进 owed，再 withdrawMarketProceeds 后用于退款。",
+          fields: [
+            ["nandQty", "NAND 数量", "1"],
+            ["nandPrice", "NAND 卖价 BNB（最多 5 位小数）", "0.05000"],
+            ["latchQty", "LATCH 数量", "0"],
+            ["latchPrice", "LATCH 卖价 BNB（最多 5 位小数）", "0"],
+          ],
+        },
+        {
+          name: "cancelTransistorAsk",
+          kind: "write",
+          caller: "仅 Factory Owner",
+          signature: "cancelTransistorAsk()",
+          summary: "取消未成交卖单，元件退回本期合约。",
+          fields: [],
+        },
+        {
+          name: "withdrawMarketProceeds",
+          kind: "write",
+          caller: "任何人",
+          signature: "withdrawMarketProceeds()",
+          summary: "把材料市场 owed 里的卖出款提到本期 raisedBnb。",
           fields: [],
         },
         {
@@ -291,11 +323,11 @@ export function contractCatalog(round) {
       address: "由本期合约调用",
       methods: [
         {
-          name: "placeBid / cancelBid",
+          name: "placeBid / placeAsk",
           kind: "internal",
           caller: "仅本期合约",
-          signature: "placeBid(address,uint8,uint96,uint256) payable / cancelBid(uint256)",
-          summary: "晶体管铸造已结束。placeTransistorOrder 向材料市场挂买单并托管 BNB；cancelTransistorOrder 撤销未成交买单。成交由卖方 fillBid，不经过 mint。",
+          signature: "placeBid / cancelBid / placeAsk / cancelAsk / withdraw",
+          summary: "placeTransistorOrder 挂买单；部分成交后 placeTransistorAsk 挂卖单。成交款经 withdrawMarketProceeds 回到募集余额，便于退款。",
           fields: [],
         },
         {
@@ -321,6 +353,8 @@ export function ContractCalls({ round, book, connected, wallet, pending, onInvok
   const method = findMethod(catalog, selected);
   const gate = method ? callGate(method, book, round, connected, actor) : { ok: false, reason: "未选择函数" };
   const fields = method ? method.fields.map(([key, label, fallback]) => [key, label, args[key] ?? String(fallback)]) : [];
+  // 元件挂单价按五位小数限制输入，避免用户填的 0.00456 被静默截成 0.0045
+  const isPriceField = (key) => /price/i.test(key);
 
   function choose(id) {
     setSelected(id);
@@ -410,7 +444,15 @@ export function ContractCalls({ round, book, connected, wallet, pending, onInvok
               {fields.map(([key, label, value]) => (
                 <label key={key} className="field wide">
                   <span>{label}</span>
-                  <input value={value} onChange={(event) => setArgs((current) => ({ ...current, [key]: event.target.value }))} />
+                  <input
+                    value={value}
+                    inputMode={isPriceField(key) ? "decimal" : undefined}
+                    step={isPriceField(key) ? "0.00001" : undefined}
+                    onChange={(event) => {
+                      const next = isPriceField(key) ? clampPriceInput(event.target.value) : event.target.value;
+                      setArgs((current) => ({ ...current, [key]: next }));
+                    }}
+                  />
                 </label>
               ))}
             </div>

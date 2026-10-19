@@ -1989,66 +1989,273 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 }
 .bid-form .field { gap: 10px; }
 .bid-form .field span { min-height: 0; line-height: 22px; }
-.bid-records { margin-top: 22px; }
-.bid-records h3 {
-  margin: 0 0 12px;
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 22px;
-}
-.bid-empty {
-  margin: 0;
-  color: var(--color-text-tertiary);
-  font-size: 13px;
-  line-height: 1.7;
-}
-.bid-record-list {
-  margin: 0;
+
+/* 待执行：按流程组织的挂单 UI */
+.flow-steps {
+  display: flex;
+  gap: 0;
+  margin: 14px 0 10px;
   padding: 0;
   list-style: none;
-  border-top: 1px solid var(--color-border);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--color-bg-container);
 }
-.bid-record-list li {
+.flow-steps li {
+  flex: 1;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px 0;
-  border-bottom: 1px solid var(--color-border);
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 8px;
+  border-right: 1px solid var(--color-border);
+  color: var(--color-text-quaternary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.flow-steps li:last-child { border-right: 0; }
+.flow-steps li span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--color-bg-spotlight);
+  font-size: 11px;
+}
+.flow-steps li.is-done {
+  color: var(--color-success);
+  background: var(--color-success-light);
+}
+.flow-steps li.is-done span {
+  background: var(--color-success);
+  color: #fff;
+}
+.flow-steps li.is-current {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+.flow-steps li.is-current span {
+  background: var(--color-primary);
+  color: #fff;
+}
+.flow-next {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--color-primary);
+  background: var(--color-primary-light);
   color: var(--color-text-secondary);
   font-size: 13px;
-  line-height: 1.6;
+  line-height: 1.5;
 }
-.bid-record-list strong {
-  margin-left: auto;
-  color: var(--color-text);
-  font-weight: 600;
-  text-align: right;
+.flow-next strong {
+  margin-right: 8px;
+  color: var(--color-primary);
+  font-weight: 700;
 }
-.bid-record-list .btn-inline {
-  flex: 0 0 auto;
-  min-height: 32px;
-  padding: 0 14px;
-  border: 1px solid var(--color-primary);
+.flow-panel {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-container);
+  overflow: hidden;
+}
+.flow-panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-elevated);
+}
+.flow-panel-head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.flow-panel-head p {
+  margin: 4px 0 0;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.flow-mode {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--color-border);
   border-radius: var(--radius);
   background: #fff;
+}
+.flow-mode button {
+  min-height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.flow-mode button.is-on {
+  background: var(--color-primary);
+  color: #fff;
+}
+.flow-mode button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.flow-panel-body {
+  padding: 12px 14px 14px;
+}
+.flow-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.flow-table th {
+  padding: 0 8px 8px 0;
+  color: var(--color-text-quaternary);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+.flow-table td {
+  padding: 6px 8px 6px 0;
+  vertical-align: middle;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+}
+.flow-table tr:first-child td { border-top: 0; }
+.flow-table strong { color: var(--color-text); font-weight: 650; }
+.flow-table .flow-max {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-text-quaternary);
+  font-size: 11px;
+  font-weight: 400;
+}
+.flow-table input {
+  width: 100%;
+  min-width: 92px;
+  max-width: 150px;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: #fff;
+}
+/* 元件挂单价要容纳 5 位小数（如 0.05610），右对齐更易逐位比对 */
+.flow-table input[step="0.00001"] {
+  min-width: 96px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.flow-table .is-open { color: var(--color-primary); font-weight: 650; }
+.flow-table .is-done { color: var(--color-success); font-weight: 650; }
+.flow-table .mono {
+  color: var(--color-text-quaternary);
+  font-size: 12px;
+}
+.flow-quote {
+  border: 0;
+  padding: 0;
+  background: transparent;
   color: var(--color-primary);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.flow-form-bar,
+.flow-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+.flow-form-bar span,
+.flow-form-bar .is-warn {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.flow-form-bar .is-warn { color: var(--color-danger); font-weight: 600; }
+.flow-panel-actions {
+  justify-content: flex-start;
+}
+.flow-panel-actions .btn,
+.flow-form-bar .btn,
+.flow-tools .btn {
+  width: auto;
+  min-width: 96px;
+  min-height: 36px;
+  margin-top: 0;
+  padding: 0 14px;
+  border-radius: 8px;
   font-size: 13px;
   font-weight: 600;
   line-height: 1;
-  cursor: pointer;
 }
-.bid-record-list .btn-inline:hover:not(:disabled) {
+.flow-panel-actions .btn-inline,
+.flow-form-bar .btn-inline,
+.flow-tools .btn-inline {
+  border: 1px solid var(--color-primary);
+  background: #fff;
+  color: var(--color-primary);
+}
+.flow-panel-actions .btn-inline:hover:not(:disabled),
+.flow-form-bar .btn-inline:hover:not(:disabled),
+.flow-tools .btn-inline:hover:not(:disabled) {
   background: var(--color-primary-light);
 }
-.bid-record-list .btn-inline:disabled {
-  opacity: 1;
-  border-color: #b7e4e6;
-  background: #f7fbfb;
-  color: #7aaeb0;
-  cursor: default;
+.flow-empty {
+  margin: 0;
+  color: var(--color-text-tertiary);
+  font-size: 13px;
+  line-height: 1.55;
 }
-.ops-note { margin-top: 18px; line-height: 1.75; }
+.flow-note {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.flow-gap {
+  color: var(--color-danger);
+}
+.flow-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.flow-link {
+  border: 0;
+  padding: 0 4px;
+  background: transparent;
+  color: var(--color-primary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ops-note { margin-top: 10px; line-height: 1.55; font-size: 12px; color: var(--color-text-tertiary); }
+@media (max-width: 640px) {
+  .flow-steps { flex-direction: column; }
+  .flow-steps li { justify-content: flex-start; border-right: 0; border-bottom: 1px solid var(--color-border); }
+  .flow-steps li:last-child { border-bottom: 0; }
+  .flow-table input { max-width: none; }
+  .flow-table input[step="0.00001"] { min-width: 88px; }
+}
 .price-latest {
   align-self: flex-start;
   border: 0;

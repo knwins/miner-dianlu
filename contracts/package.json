@@ -6,6 +6,9 @@
   "scripts": {
     "compile": "node ./node_modules/hardhat/internal/cli/bootstrap.js compile",
     "test": "node ./node_modules/hardhat/internal/cli/bootstrap.js test",
+    "size": "node ./scripts/check-size.mjs",
+    "deploy:factory": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-factory.js --network bsc",
+    "predeploy": "npm run size",
     "verify:published": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-published.js --network bscTestnet",
     "node": "node ./node_modules/hardhat/internal/cli/bootstrap.js node"
   },
