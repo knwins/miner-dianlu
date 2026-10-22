@@ -30,3 +30,7 @@ Thumbs.db
 
 # ── WorkBuddy 内部数据（记忆/日志，不入库）──
 .workbuddy/
+MEMORY.md
+
+# ── 探针调试截图（可随时重新生成）──
+frontend/.shots/

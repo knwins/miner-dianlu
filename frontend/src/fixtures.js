@@ -1,37 +1,20 @@
 import {
-  MINE_GATE_LIMIT,
-  NETWORK_DAILY_EMISSION,
   NETWORK_WEIGHT,
-  POOL,
-  currentRate,
-  cumulativeEmission,
-  eraDaily,
   poolDailyYield,
-  roiOf,
 } from "./emission.js";
 
 import {
   DEFAULT_TRANSISTOR,
   TRANSISTORS,
+  NOMINAL_QUOTE,
+  NOMINAL_BNB_USDT,
   findTransistor,
   processorScale,
-  computeHashpower,
-  designMetrics,
-  qualityFactor,
   isMineable,
-  PROCESSORS,
-  PARTS,
   planTask,
-  rankTransistors,
   transistorIdFor,
-  compareProcessors,
-  adviseProcessor,
   PROCESSOR_IDS,
-  suggestTaskRange,
-  suggestHardCap,
-  designOffering,
-  listTasks,
-  taskTiers,
+  suggestPartRange,
 } from "./prices.js";
 
 export const WALLET = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F";
@@ -75,7 +58,14 @@ export const ROUND = {
    * 这里显式存一份，避免下游再用 sharePriceBnb × totalShares 重算（新模型下每份由募资总额派生）。
    */
   hardCapBnb: 68.5,
-  feeBps: 500,
+  /**
+   * 服务费百分比（1–20）。演示期次的样本值；真实期次一律由开期表单填入，
+   * 不设任何代码级默认值——feePercentOf/feeBpsOf 是唯一读取口径。
+   *
+   * ⚠️ 口径：这是**挖矿产出奖励**的服务费（从挖矿收益里计提），
+   * **与认筹款无关** —— 认购人付的 BNB 全额进认购托管池，不收任何服务费。
+   */
+  feePercent: 5,
   fundingDays: 15,
   /** 挖矿期天数，取自协议常量，不可通过开期参数修改 */
   miningDays: MINING_DAYS,
@@ -88,40 +78,35 @@ export const ROUND = {
   /** 挖矿用元件组合（处理器 × 元件），见 prices.js 的 TRANSISTORS */
   transistorId: DEFAULT_TRANSISTOR,
   /**
-   * 本期选题（官方题库 ID）。题目决定元件数与深度，进而决定流片成本与权重。
+   * 本期要烧的元件总数（NAND + LATCH），即链上 placeTransistorOrder 的数量。
    *
-   * 原按 USDT 计为 50,000。按 BNB 实时价 730 USDT ≈ 68 BNB，
-   * 选 #54「8位桶形左移」：g=68、d=7（深度浅，成本惩罚小），
-   * 按 Behemoth NAND 实时价约 29 BNB，占募资总额约 43%。
-   *
-   * **选题必须随BNB 价与元件价一起校准**——
-   * BNB 涨价同样会压缩募资总额的 BNB 购买力，成本占比随之上升、
-   * 触发退款的阈值下降。BNB 600 时 #96 合适，730 时就该换成更轻的题。
-   * 权重 H = 68 × 6 = 408（非最优，只有工本无设计溢价）。
+   * 元件数由本期募资总额按理想成本占比派生，不由人工填写，
+   * 权重 H = 元件数 × 处理器每颗算力（默认 Behemoth P=6 → 68 × 6 = 408）。
+   * 68 是基准期次规模下的示例值，实际开期一律由当期募资总额反推。
    */
-  taskId: "54",
-  /** 图纸是否该题最优首创。项目方统一图纸默认复制参考，故为 false（无设计溢价）*/
-  optimal: false,
+  partCount: 68,
   contract: "0xA11cE9010000000000000000000000000000E901",
   feeRecipient: "0x0000000000000000000000000000000000000fee",
-  feeShares: [{ address: "0x0000000000000000000000000000000000000fee", shareBps: 10_000 }],
+  /** 演示期次的分成样本；比例以百分比整数存，合计须 100 */
+  feeShares: [{ address: "0x0000000000000000000000000000000000000fee", sharePercent: 100 }],
 };
 
 /**
- * 价格源。募集期只能读到「当前」价格，所以权重只能是预估；
- * 真正决定权重的是 execute 那一刻的报价。
- * 元件目录与实时取价逻辑见 `prices.js`。
+ * 价格口径。前端不读行情，链上单价是权威来源；
+ * 拿不到链上单价时才用 `prices.js` 的静态基准价做测算。
  */
+
+/** BNB → USDT 的固定折算口径，仅用于等值展示，不参与链上计算。 */
 export const MARKET = {
-  bnbUsdt: 600,
+  bnbUsdt: NOMINAL_BNB_USDT,
 };
 
-/** 开期时锁定的报价快照，作为预估基准；execute 时会被实际报价覆盖。 */
-export const QUOTE = {
-  bnbUsdt: MARKET.bnbUsdt,
-  /** 各元件组合的 BNB 单价，与 prices.js 的 TRANSISTORS 对应 */
-  prices: Object.fromEntries(TRANSISTORS.map((t) => [t.id, t.priceBnb])),
-};
+/**
+ * 静态基准报价。与 `NOMINAL_QUOTE` 是同一个对象——
+ * 早期代码把它当成「开期锁定的实时快照」，现在它只是固定常量：
+ * 不联网、不轮询、不会自己变。
+ */
+export const QUOTE = NOMINAL_QUOTE;
 
 export const OWNER = "0x0a11eE0000000000000000000000000000000A11";
 
@@ -200,22 +185,56 @@ export const SCENE_COPY = {
   funding: {
     badge: "募集中",
     tone: "live",
-    lead: "本期开放认筹，份额售罄后进入换币流片。募集到期仍未满时，由认筹地址自己点退回，只退该钱包的本金。",
+    lead: "本期开放认筹，份额售罄后由 Owner 买入元件并投入矿池。募集到期仍未满时，由认筹地址自己点退回，只退该钱包的本金。",
   },
   executing: {
     badge: "待执行",
     tone: "wait",
-    lead: "本期份数已售完。晶体管须由 Owner 调用 tapeout.net 挂单并确认到账后才能流片；买不起则判失败、本金不动，持份人可原路退还，Owner 也可降价重挂。成功流片后未花完的募集款按份退回。",
+    lead: "本期份数已售完。Owner 在材料市场挂单买入元件、确认到账后投入矿池；入池前本金不动，持份人可原路退还，Owner 也可改价重挂。",
   },
   mining: {
     badge: "挖矿中",
     tone: "done",
-    lead: "矿机已开矿，按权重占比分得全网日产。产出随全网算力变化，不是固定值。",
+    lead: "元件已投入矿池，本期进入挖矿（不可逆）。BEM 分配合约接入前不产出发放；退出只能把份额挂到转让市场。",
   },
 };
 
+/**
+ * 服务费百分比的唯一读取口径：优先 feePercent，兼容只给了 bps 的老数据。
+ * 全程不回落到任何写死的默认值——没有数据就是 0。
+ *
+ * 口径：服务费**真正上链**（Campaign.serviceFeeBps）。
+ * 链上模式由 adapter.roundFromState 从合约读出 feePercent / serviceFeeBps，
+ * 这里只做单位换算，不再负责「取值来源」。
+ *
+ * ⚠️ 这是**挖矿产出奖励**的服务费（depositRevenue 从挖矿收益里计提），
+ * **与认筹款无关** —— 认筹款不收服务费。
+ */
+export function feePercentOf(round) {
+  const p = Number(round?.feePercent);
+  if (Number.isFinite(p) && p >= 0) return p;
+  const bps = Number(round?.feeBps);
+  return Number.isFinite(bps) ? bps / 100 : 0;
+}
+
+/** 基点口径，供需要 bps 的地方使用（同样由 feePercent 派生） */
+export function feeBpsOf(round) {
+  return Math.round(feePercentOf(round) * 100);
+}
+
 export function feeRate(round) {
-  return round.feeBps / 10000;
+  return feePercentOf(round) / 100;
+}
+
+/**
+ * 元件数派生：按募资总额的理想成本占比反推能买多少颗元件。
+ * 元件数不再是开期参数，只由规模决定（权重 H = 元件数 × P 仍成立）。
+ */
+export function derivePartCount({ hardCapBnb, transistorId, snapshot }) {
+  const cap = Number(hardCapBnb);
+  if (!(Number.isFinite(cap) && cap > 0)) return 1;
+  const ideal = suggestPartRange({ hardCapBnb: cap, snapshot, transistorId }).idealParts;
+  return Math.max(1, Math.round(Number(ideal)) || 1);
 }
 
 /**
@@ -235,7 +254,11 @@ export function round2(value) {
 
 /** 四位小数：单价与每权重日产口径（0.0045 这类系数必须保留精度） */
 export function round4(value) {
-  return Math.round((Number(value) || 0) * 10000) / 10000;
+  // 守卫非有限数：Number(Infinity) || 0 仍是 Infinity（Infinity 是 truthy），
+  // 之前 hardCapBnb=0 时 costRatio 会算出 Infinity 并显示成 "Infinity%"。
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 10000) / 10000;
 }
 
 /**
@@ -261,73 +284,11 @@ export function clampPriceInput(raw) {
 }
 
 /**
- * 兜底题目：题库未加载时用，避免权重与成本算成 0。
- * 与官方题库 #17 参数对齐。
- *
- * nand / latch 必须一并带上：官方 tasks.json 没有这两个字段，
- * 它们是 normalizeTask 按题型比例推导的。兜底数据绕过这个环节，
- * 漏掉会导致 hasExact 判定为false，配比与成本在离线状态下算成另一套数。
- */
-const FALLBACK_TASK = {
-  id: "17",
-  name: "八位全零检测",
-  tier: "初级",
-  group: "组合逻辑",
-  kind: "comb",
-  nIn: 8,
-  nOut: 1,
-  g: 22,
-  /** 组合逻辑 LATCH 占 20% -> 4 个 LATCH + 18 个 NAND */
-  latch: 4,
-  nand: 18,
-  d: 7,
-  K: 22,
-  C: 7546,
-};
-
-/**
- * 按 ID 取官方题目。
- * 找不到时回落到 FALLBACK_TASK，保证权重与成本始终有值——
- * 否则会出现「权重 0 -> 校验永远失败」的静默错误。
- */
-export function findTask(round, book = null) {
-  const raw = round?.taskId;
-  const id = raw != null && String(raw) !== "" ? String(raw) : "";
-  const list = book?.tasks || book;
-  const arr = Array.isArray(list) ? list : [];
-  if (id) {
-    const found = arr.find((t) => String(t.id) === id);
-    if (found) return found;
-    // 官方列表里没有这个编号时保留链上编号。不能换成兜底题，否则发布选题和合约读回会对不上。
-    return {
-      id,
-      name: "题库未收录",
-      missing: true,
-      tier: "—",
-      group: "",
-      kind: "comb",
-      nIn: 0,
-      nOut: 0,
-      g: 0,
-      latch: 0,
-      nand: 0,
-      d: 0,
-      K: 0,
-      C: 0,
-      weight: 0,
-    };
-  }
-  return FALLBACK_TASK;
-}
-
-/**
- * 从链上 / 本地期次字段解析「题目 + 目标处理器」。
- * - 题目：权威来源是 Campaign.taskId（不可变）
+ * 从链上 / 本地期次字段解析「目标处理器」。
  * - 处理器：新工厂开期写入 transistors（元件合约地址）；旧期次可用 setPlan 的
  *   estHashpower / transistorCount（或执行后 hashpower）反推 P≈H/元件数
  */
-export function resolveCampaignDesign(round, book = null, taskbook = null) {
-  const task = findTask(round, taskbook);
+export function resolveCampaignDesign(round, book = null) {
   const chain = Boolean(book?._chain);
   // 链上只认合约字段。报价引擎的 estimate、以及 fixtures 里的默认 Behemoth，都不能当成本期处理器。
   const parts = chain
@@ -345,10 +306,15 @@ export function resolveCampaignDesign(round, book = null, taskbook = null) {
     if (fromTr && PROCESSOR_IDS.includes(fromTr)) processorId = fromTr;
   }
   if (!processorId && hp > 0) {
-    const denom = parts > 0 ? parts : Number(task?.g) || 0;
-    if (denom > 0) {
-      const scale = hp / denom;
-      processorId = scale >= 3.5 ? "Behemoth" : "TapeOut";
+    // 旧期次没记处理器地址：用 H ÷ 元件数反推规模（P≈H/元件数），取标度最接近的处理器。
+    // 数据驱动：按标度查表匹配，不会把某个处理器误认成 Behemoth 或 TapeOut。
+    if (parts > 0) {
+      const scale = hp / parts;
+      processorId =
+        PROCESSOR_IDS.find((id) => processorScale(id) === scale) ||
+        PROCESSOR_IDS.reduce((best, id) =>
+          Math.abs(processorScale(id) - scale) < Math.abs(processorScale(best) - scale) ? id : best,
+        PROCESSOR_IDS[0]);
     }
   }
   // 开期写入的 transistors → round.processorId（见 adapter.roundFromState）
@@ -359,18 +325,6 @@ export function resolveCampaignDesign(round, book = null, taskbook = null) {
 
   const transistorId = processorId ? transistorIdFor(processorId) : null;
   return {
-    task,
-    taskId: String(round?.taskId ?? task?.id ?? ""),
-    taskName: taskbook?.source === "loading"
-      ? "读取题目中"
-      : taskbook?.source === "live"
-        ? (task?.missing ? "题库未收录" : (task?.name || "—"))
-        : taskbook?.source === "fallback" || taskbook?.source === "error"
-          ? "官方题库暂时没读到"
-          : (task?.missing ? "题库未收录" : (task?.name || "—")),
-    taskTier: task?.tier || "—",
-    taskKind: task?.kind || "",
-    taskParts: Number(task?.g) || 0,
     processorId,
     processor: processorId,
     processorScale: processorId ? processorScale(processorId) : null,
@@ -380,7 +334,7 @@ export function resolveCampaignDesign(round, book = null, taskbook = null) {
     processorKnown: Boolean(processorId),
     chainHashpower: hp,
     chainParts: parts,
-    knownFromChain: hp > 0 || Boolean(round?.taskId != null && String(round.taskId) !== ""),
+    knownFromChain: hp > 0 || parts > 0,
   };
 }
 
@@ -419,59 +373,51 @@ export const PAST_ROUNDS = [
 /**
  * 募集期的预估分配权重。
  *
- * 真实机制下权重来自项目方统一提供的图纸，不是「元件的物理算力」：
- *   募资总额 USDT → BNB → ÷ 元件单价 → 能买多少元件 → 按图纸算 H = (b*+K_task×q) × P
+ * 权重只由「本期烧多少元件」决定：
+ *   募资总额 BNB → ÷ 元件实时单价 → 能买多少元件；H = 元件数 × P
  *
- * 图纸由项目方统一提供且开期后不可改，所以权重是确定的。
- * 唯一会变的是「募资总额按当前报价能买到多少元件」——
- * 买不够图纸所需元件就流片失败，本金不动，可退款或降价重挂。
+ * 元件数由本期募资总额派生（round.partCount），开期后不可改，所以权重是确定的。
+ * 实际入池数量以 Owner 在材料市场买入并确认到账的元件为准（买多少算多少），
+ * 不再推算「需要几个」「募资总额够买几个」。
  *
  * 报价来自实时价格源（`prices.js`），同一期在不同时刻结果不同。
  * execute 之后 book.hashpower 才是实际值。
  */
-export function estimateHashpower(round, quote = QUOTE, sold = null, taskbook = null) {
+export function estimateHashpower(round, quote = QUOTE, sold = null) {
   const shares = sold === null ? round.totalShares : sold;
   // 募集以 BNB 计价，募资总额直接是 BNB，不需要 BNB 价换算
   const hardCapBnb = shares * round.sharePriceBnb;
   const bnbUsdt = quote.bnbUsdt || MARKET.bnbUsdt;
 
-  const chosenTransistor = round.transistorId
-    || (round.processorId === "TapeOut"
-      ? "TAPE_OUT_NAND"
-      : round.processorId === "Behemoth"
-        ? "BEHEMOTH_NAND"
-        : "");
+  /**
+   * 选元件型号：优先用期次上直接记的 transistorId；
+   * 否则按 processorId 查该处理器的代表型号（NAND）。
+   *
+   * ⚠️ 必须查表，不能写成 `processorId === "TapeOut" ? ... : "BEHEMOTH_NAND"`：
+   * 那种二元写法在处理器数量变化后会让新处理器落到 Behemoth 的型号上
+   * （元件价差可达数千倍），且 processorScale 取错，算出「有产出」的假象。
+   */
+  const chosenTransistor =
+    round.transistorId ||
+    (round.processorId && PROCESSOR_IDS.includes(round.processorId)
+      ? transistorIdFor(round.processorId)
+      : "");
   const model = findTransistor(chosenTransistor || DEFAULT_TRANSISTOR);
   const priceBnb = quote.prices?.[model.id] ?? model.priceBnb;
   const P = processorScale(model.processor);
 
-  // 项目方统一图纸：按官方题目的 g / d / K 计算权重（q 固定 1）
-  const task = findTask(round, taskbook);
-  const actual = task
-    ? planTask({
-        task,
-        transistorId: model.id,
-        snapshot: quote,
-        optimal: round.optimal === true,
-        // 开期人写入的流片元件数（不写则按题目 g）
-        partCount: round.partCount ?? null,
-      })
-    : null;
+  // 本期元件数：由募资总额反推，缺省按 1 个兜底
+  const actual = planTask({
+    parts: round.partCount ?? 1,
+    transistorId: model.id,
+    snapshot: quote,
+  });
 
-  // 图纸实际要烧的元件数与成本（这才是流片真正要花的钱）
-  // usedParts 用实际流片数量（开期人改过则不是 task.g），
-  // 否则会出现「改了数量、成本按新数算、元件数却显示旧数」的错位。
-  const usedParts = actual ? actual.totalParts : 0;
-  const needBnb = actual ? actual.partsCost : 0;
+  // 元件数由募资总额反推，成本 = 元件数 × 报价（采购价随市场浮动，不反推需求）
+  const usedParts = actual.totalParts;
+  const needBnb = actual.partsCost;
 
-  // 募资总额按图纸 NAND+LATCH 混合配比的实时均价能买多少元件。
-  // 不能用单一元件价粗估——LATCH 往往更便宜，会低估能买的元件数，
-  // 与 capCoversFloor（needBnb <= hardCapBnb，混合成本）同源。
-  // 图纸未知（actual 为空）时退回单一型号价做兜底。
-  const perPartBnb = usedParts > 0 ? needBnb / usedParts : (priceBnb || 0);
-  const affordableParts = perPartBnb > 0 ? Math.floor(hardCapBnb / perPartBnb) : 0;
-
-  const dailyBem = bemRate(actual?.hashpower || 0);
+  const dailyBem = bemRate(actual.hashpower || 0);
 
   return {
     shares,
@@ -487,49 +433,23 @@ export function estimateHashpower(round, quote = QUOTE, sold = null, taskbook = 
     processorScale: chosenTransistor ? P : null,
     partType: model.part,
     priceBnb,
-    /** 两种元件的实时单价，按种类归位（不依赖型号自身是 NAND 还是 LATCH）*/
-    priceNand: actual?.priceNand ?? priceBnb,
-    priceLatch: actual?.priceLatch ?? priceBnb,
-    priceByPart: actual?.priceByPart ?? null,
-    /** 两种元件各自的数量、单价与小计 */
-    costBreakdown: actual?.costBreakdown ?? null,
-    /** 募资总额能买的元件数 */
-    affordableParts,
-    /** 图纸实际烧掉的元件数 —— 流片真正要买的量 */
+    /** 本期元件数 —— 由募资总额反推，不再拆 NAND / LATCH 配比 */
     usedParts,
-    /** 选题详情 */
-    task,
-    taskName: task?.name || "—",
-    taskTier: task?.tier || "—",
-    /** 图纸算出的权重明细 */
-    area: actual?.area || 0,
-    depth: actual?.task.d || 0,
-    cost: actual?.cost || 0,
-    refCost: actual?.refCost || 0,
-    q: actual?.q ?? 1,
-    refParts: actual?.task.K || 0,
-    latchRatio: actual?.latchRatio ?? 0,
-    nand: actual?.nand || 0,
-    latch: actual?.latch || 0,
-    optimal: round.optimal === true,
-    baseWeight: actual?.baseWeight || 0,
-    designPremium: actual?.designPremium || 0,
-    hashpower: actual?.hashpower || 0,
-    /** 图纸流片成本（BNB）*/
+    hashpower: actual.hashpower || 0,
+    /**
+     * 挖矿闸门：面积超抽检上限则只能进未验证池（分 1%）。
+     * createScene 靠它决定 pool 归属，缺了会让超限期次按已验证池算收益，必须带上。
+     */
+    capped: actual.capped === true,
+    /** 预估采购成本（BNB）= 元件数 × 报价 */
     needBnb: round4(needBnb),
     dailyBem,
     totalNet: round4(dailyBem * round.miningDays * (1 - feeRate(round))),
-    /** 募资总额是否够买到承诺权重的元件 */
-    /**
-     * 募资总额能否覆盖混合成本（NAND/LATCH 按各自实时价计价）。
-     * 不用 affordableParts >= usedParts —— 那是按单一价粗估，混合配比下偏乐观。
-     */
-    capCoversFloor: needBnb <= hardCapBnb,
     quote,
   };
 }
 
-export function hashpowerSensitivity(round, quote = QUOTE, taskbook = null) {
+export function hashpowerSensitivity(round, quote = QUOTE) {
   const model = findTransistor(round.transistorId || DEFAULT_TRANSISTOR);
   /**
    * 同一处理器的 NAND 与 LATCH 是一套东西，会同涨同跌。
@@ -538,33 +458,25 @@ export function hashpowerSensitivity(round, quote = QUOTE, taskbook = null) {
    */
   const siblings = TRANSISTORS.filter((t) => t.processor === model.processor);
   const basePrices = siblings.map((t) => quote.prices?.[t.id] ?? t.priceBnb);
-  const base = estimateHashpower(round, quote, null, taskbook);
+  const base = estimateHashpower(round, quote, null);
 
-  // 真实机制：图纸固定后权重 H 不随价格变，
-  // 变的是「募资总额还能不能买到图纸所需的元件」。买不够就流片失败 -> 退款。
+  // 元件数由募资总额反推，权重 H 不随报价变动；
+  // 报价只影响采购成本占募资总额的比例（买贵了少买、买便宜了多买，都由 Owner 自行决定）。
   return [0.5, 1, 2, 5, 10].map((mult) => {
     const prices = { ...(quote.prices || {}) };
     siblings.forEach((t, i) => { prices[t.id] = basePrices[i] * mult; });
     const q = { ...quote, prices };
-    const est = estimateHashpower(round, q, null, taskbook);
-    const short = Math.max(0, est.usedParts - est.affordableParts);
+    const est = estimateHashpower(round, q, null);
     return {
       mult,
       label: `${mult}x`,
-      /** 两种元件都按同一倍数变动后的实时价 */
-      priceNand: est.priceNand,
-      priceLatch: est.priceLatch,
-      /** 兼容旧字段：等于 NAND 价 */
+      /** 元件按同一倍数变动后的实时价 */
       priceBnb: est.priceBnb,
-      /** 图纸所需元件成本 */
+      /** 预估采购成本 */
       needBnb: est.needBnb,
-      /** 流片后募资总额剩余 */
+      /** 采购后募资总额剩余 */
       marginBnb: round4(est.hardCapBnb - est.needBnb),
-      affordableParts: est.affordableParts,
       usedParts: est.usedParts,
-      shortParts: short,
-      /** 还够不够流片 */
-      canAfford: est.capCoversFloor,
       hashpower: est.hashpower,
       dailyBem: est.dailyBem,
       totalNet: est.totalNet,
@@ -664,26 +576,26 @@ const SCENE_SEED = {
   funding: { sold: 22, mine: 3, harvestCount: 0, claimed: 0, executed: false, circuitId: "—", offset: 0, soldOutAgoHours: null },
   // 售罄 12 小时前 —— 观察期未满，任何人都还不能 execute
   executing: { sold: 100, mine: 13, harvestCount: 0, claimed: 0, executed: false, circuitId: "待流片", offset: 0, soldOutAgoHours: 12 },
-  // 执行时元件涨到 1.5x，募资总额仍够买（约占 61%），权重不变
+  // 执行时元件涨到 1.5x：权重由实际买入的元件数决定，与报价无关
   mining: { sold: 100, mine: 13, harvestCount: 12, claimedRatio: 0.72, executed: true, quoteMult: 1.5, circuitId: "#58241", offset: 1, soldOutAgoHours: 200 },
 };
 
 
-export function createScene(id, round = ROUND, taskbook = null, phase = null, expired = false, execFailed = false) {
+export function createScene(id, round = ROUND, phase = null, expired = false, execFailed = false) {
   const seed = SCENE_SEED[id] || SCENE_SEED.funding;
   const fundingEnd = Date.now() + (6 * 24 * 60 * 60 + 14 * 60 * 60 + 22 * 60) * 1000;
   // 挖矿不设截止日（领取次数不限）；募集截止仅 funding 生效（演示超时可置为过去）；
   // executing 的 endsAt 不用于展示（倒计时显示「—」），保留 fundingEnd 占位无害。
   const endsAt = id === "mining" ? undefined : (expired && id === "funding" ? Date.now() - 86400_000 : fundingEnd);
 
-  // 预估算力按当前报价；实际权重按执行时报价（元件涨价不影响权重，只影响买不买得起）
-  const est = estimateHashpower(round, QUOTE, seed.sold, taskbook);
+  // 预估算力按基准单价；实际权重按执行时成交价（元件涨价不影响权重，只影响买不买得起）
+  const est = estimateHashpower(round, QUOTE, seed.sold);
   const model = findTransistor(round.transistorId || DEFAULT_TRANSISTOR);
   const actualQuote = {
     ...QUOTE,
     prices: { ...QUOTE.prices, [model.id]: QUOTE.prices[model.id] * (seed.quoteMult || 1) },
   };
-  const actual = estimateHashpower(round, actualQuote, seed.sold, taskbook);
+  const actual = estimateHashpower(round, actualQuote, seed.sold);
 
   const hashpower = seed.executed ? actual.hashpower : 0;
   const dailyBem = bemRate(hashpower);
@@ -724,11 +636,11 @@ export function createScene(id, round = ROUND, taskbook = null, phase = null, ex
     hashpower,
     dailyBem,
     /** 费率基点：供 recomputeSelf 重算各钱包可领量，避免再传 round 依赖 */
-    feeBps: round.feeBps,
+    feeBps: feeBpsOf(round),
     /** 总份数：供 recomputeSelf 按钱包份额占比折算 per-wallet 可领量（与 computeHarvest 同口径） */
     totalShares: round.totalShares,
     /**
-     * 是否被挖矿闸门拦住（题目元件数超抽检上限）。
+     * 是否被挖矿闸门拦住（面积超抽检上限）。
      * 被拦住只能进未验证池（分 1%），且拿不到设计溢价。
      */
     capped: Boolean(actual?.capped),
@@ -803,7 +715,7 @@ export function recomputeSelf(book) {
   const dailyBem = bemRate(book.hashpower || 0, {
     pool: book.capped ? "unverified" : "verified",
   });
-  const rate = (book.feeBps || 500) / 10000;
+  const rate = feeRate(book);
   const netPerRound = dailyBem * (1 - rate);
   // 本钱包累计净产出 = 全网日净 × 领取轮数 × 本钱包份额占比（与 computeHarvest 同口径）
   const totalShares = book.totalShares || 0;
@@ -852,14 +764,14 @@ export function seedCalls(round = ROUND) {
   const book = createScene("mining", round);
   const h = computeHarvest(round, book);
   return [
-    { time: now - 2 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，服务费 ${formatBem(h.fee)} BEM` },
-    { time: now - 26 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，服务费 ${formatBem(h.fee)} BEM` },
+    { time: now - 2 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，挖矿产出服务费 ${formatBem(h.fee)} BEM` },
+    { time: now - 26 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，挖矿产出服务费 ${formatBem(h.fee)} BEM` },
     { time: now - 3 * 86400_000, method: "claim", ok: true, message: `${shortAddress(WALLET)} 领取 ${formatBem(book.claimable)} BEM` },
     { time: now - 5 * 86400_000, method: "claim", ok: true, message: "0x8b21…B21A 领取 18.60 BEM" },
     { time: now - 12 * 86400_000, method: "execute", ok: true, message: `购入元件完成流片，权重 ${book.hashpower}，电路 ${book.circuitId}` },
     { time: now - 13 * 86400_000, method: "subscribe", ok: true, message: `0x8b21…B21A 认筹 6 份，支付 ${(6 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000, method: "subscribe", ok: true, message: `${shortAddress(WALLET)} 认筹 4 份，支付 ${(4 * round.sharePriceBnb).toFixed(4)} BNB` },
-    { time: now - 14 * 86400_000 - 3600_000, method: "createCampaign", ok: true, message: `第 ${round.id} 期创建，${round.totalShares} 份 × ${round.sharePriceBnb} BNB，服务费 ${round.feeBps / 100}%` },
+    { time: now - 14 * 86400_000 - 3600_000, method: "createCampaign", ok: true, message: `第 ${round.id} 期创建，${round.totalShares} 份 × ${round.sharePriceBnb} BNB，挖矿产出服务费 ${feePercentOf(round)}%` },
     { time: now - 20 * 86400_000, method: "swapExactTokensForETH", ok: false, message: "拒绝：仅本期合约可调用" },
   ];
 }
@@ -919,19 +831,27 @@ export function applyRefund(round, book, actor = null) {
 
   // 募集失败：募集中 + 超过募集截止时间仍未售罄，本金从未动过，原路退还
   const fundingExpired = book.scene === "funding" && Date.now() > (book.endsAt || Infinity);
-  // 流片失败：待执行 + 已判执行失败（元件暴涨买不起，本金尚未支出），原路退还
+  // 流片失败：待执行 + Owner 已发起退款（本金尚未支出），原路退还
   const executeFailed = book.scene === "executing" && book.executionFailed === true;
+  // 池子不足：待挂单且 raisedBnb 已不够按原价兑付（部分成交后撤单/卖出），按比例退
+  const poolShort = book.scene === "executing"
+    && book.executePhase === "buying"
+    && Number(book.sold || 0) * round.sharePriceBnb > Number(book.bnbPool || 0);
 
-  if (!fundingExpired && !executeFailed) {
+  if (!fundingExpired && !executeFailed && !poolShort) {
     if (book.scene === "funding") return { ok: false, message: "募集尚未结束，不能退款。" };
-    if (book.scene === "executing") return { ok: false, message: "本期尚未判执行失败，不能退款；若执行成功将进入挖矿。" };
-    return { ok: false, message: "只有在「募集超时未售罄」或「流片失败」时才能原路退款。" };
+    if (book.scene === "executing") return { ok: false, message: "本期尚未判执行失败，且池子仍够按原价兑付，不能退款。" };
+    return { ok: false, message: "只有在「募集超时未售罄」「流片失败」或「池子不足以按原价兑付」时才能原路退款。" };
   }
 
-  const refundBnb = round4(selfWallet.mine * round.sharePriceBnb);
+  const refundBnb = poolShort
+    ? round4((Number(book.bnbPool || 0) * selfWallet.mine) / Math.max(1, Number(book.sold || 1)))
+    : round4(selfWallet.mine * round.sharePriceBnb);
   return {
     ok: true,
-    message: `已原路退还 ${refundBnb} BNB（${selfWallet.mine} 份 × ${round.sharePriceBnb} BNB）`,
+    message: poolShort
+      ? `池子不足，已按比例退还 ${refundBnb} BNB（${selfWallet.mine} 份）`
+      : `已原路退还 ${refundBnb} BNB（${selfWallet.mine} 份 × ${round.sharePriceBnb} BNB）`,
     book: recomputeSelf({
       ...book,
       sold: Math.max(0, book.sold - selfWallet.mine),
@@ -1130,7 +1050,7 @@ export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) 
   if (book.executePhase === "listed") {
     return { ok: false, message: "已经调用挂单逻辑，待成交或取消。" };
   }
-  // 买不起失败后可降价重挂；若已退光本金则不可再挂（对齐合约）
+  // 退款后可改价重挂；若已退光本金则不可再挂（对齐合约）
   if (book.executionFailed && (book.sold < round.totalShares || (book.bnbPool || 0) <= 0)) {
     return { ok: false, message: "本金已退或份数已回退，不能再挂单。" };
   }
@@ -1163,10 +1083,13 @@ export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) 
   };
 }
 
+/**
+ * 挂单价缺省值：取报价里的元件单价，不写死常数。
+ * 报价缺失时返回 0 —— 由调用方报「挂单单价须大于 0」，让用户自己填。
+ */
 function quoteUnitFallback(book) {
-  const est = book.estimate || {};
-  if (est.usedParts > 0 && est.needBnb > 0) return round4(est.needBnb / est.usedParts);
-  return 0.005;
+  const unit = Number((book.estimate || {}).priceBnb);
+  return Number.isFinite(unit) && unit > 0 ? round5(unit) : 0;
 }
 
 /**
@@ -1283,11 +1206,11 @@ export function applyConfirmTransistors(round, book, actor = null) {
  * 执行换币 + 流片。这是「预估」变成「实际」的唯一地方。
  *
  * 权限：仅 Factory Owner。晶体管到账后即可执行，不再等待观察期。
- * 执行逻辑：按锁定报价判断募资总额是否买得起图纸所需元件。
- *          买得起 → 直接换币、买入晶体管、流片并开矿，进入 mining；
- *          买不起 → 判 executionFailed，本金尚未支出，持份人可原路退还 BNB。
+ * 执行逻辑：直接按 Owner 在材料市场实际买入并确认到账的元件数量入池开矿。
+ *          元件数不再由图纸推算、也不与募资总额做「买不买得起」的比较——
+ *          买多少算多少，H = 实买元件数 × P。采购款之外的余量按份退回。
  */
-export function applyExecute(round, book, quote = MARKET, actor = null, taskbook = null) {
+export function applyExecute(round, book, quote = MARKET, actor = null) {
   if (book.scene !== "executing") return { ok: false, message: "只有售罄后的待执行状态可以 execute。" };
   if (book.sold < round.totalShares) return { ok: false, message: "份数尚未售罄，不能执行。" };
   /**
@@ -1306,40 +1229,23 @@ export function applyExecute(round, book, quote = MARKET, actor = null, taskbook
     return { ok: false, message: "只 Factory Owner 可以执行换币流片（不可逆操作）。" };
   }
 
-  // 价格快照锁价——以本次执行的报价（或首次进入时锁定的报价）结算，
-  // 避免「按调用瞬间实时价」被抢跑/抬价导致机会损失。失败重试时清除锁价，重新按当时价评估。
+  // 价格快照锁价——以本次执行的报价（或挂单时锁定的报价）结算，
+  // 避免「按调用瞬间实时价」被抢跑/抬价导致机会损失。
   const lockUsed = book.priceLock || quote;
-  const actual = estimateHashpower(round, lockUsed, book.sold, taskbook);
+  const est = estimateHashpower(round, lockUsed, book.sold);
   /**
-   * 图纸固定后权重不变，变的是「募资总额还买不买得起图纸所需元件」。
-   *
-   * 直接比**混合成本**（NAND 与 LATCH 按各自实时价分别计价），
-   * 不用「募资总额 ÷ 主元件价 ≥ 元件数」——那是按单一价的粗估，
-   * 混合配比下会偏乐观，导致实际买不起却判定为成功。
+   * 入池元件数 = Owner 在材料市场实际买入并确认到账的数量（nandQty + latchQty）。
+   * 不再拿它跟任何推算出来的需求配比或「募资总额能买几个」比较——买多少算多少。
    */
-  const partsOk = actual.needBnb <= actual.hardCapBnb;
+  const bought = Math.max(0, Math.floor(Number(book.transistorCount) || 0));
+  const parts = bought > 0 ? bought : est.usedParts;
+  const unit = Number(book.priceLock) > 0 ? Number(book.priceLock) : Number(est.priceBnb) || 0;
+  const actual = planTask({ parts, transistorId: est.transistorId, snapshot: est.quote });
+  const hashpower = actual.hashpower;
+  const dailyBem = bemRate(hashpower);
 
-  if (!partsOk) {
-    const why =
-      `按${actual.processor}当前报价（NAND ${actual.priceNand.toFixed(4)} × ${actual.nand} + LATCH ${actual.priceLatch.toFixed(4)} × ${actual.latch}` +
-      ` = ${actual.needBnb} BNB）超过募资总额 ${actual.hardCapBnb} BNB，缺口 ${round4(actual.needBnb - actual.hardCapBnb)} BNB`;
-    return {
-      ok: true,
-      message: `execute 后校验不通过：${why}。本期判失败，已回到待挂单；可原路退还，或由 Owner 降价重挂。`,
-      book: {
-        ...book,
-        executionFailed: true,
-        executePhase: "buying",
-        transistorCount: 0,
-        actualBnb: actual.bnb,
-        actualQuote: actual.quote,
-        priceLock: undefined,
-      },
-    };
-  }
-
-  // 流片成功：支出购件成本，余量按份退回各钱包（对齐 _returnSurplus）
-  const cost = actual.needBnb;
+  // 流片：支出实际采购款，余量按份退回各钱包（对齐 _returnSurplus）
+  const cost = round4(parts * unit);
   const poolBefore = Number(book.bnbPool || 0);
   const surplus = round4(Math.max(0, poolBefore - cost));
   let wallets = { ...book.wallets };
@@ -1362,26 +1268,26 @@ export function applyExecute(round, book, quote = MARKET, actor = null, taskbook
   return {
     ok: true,
     scene: "mining",
-    message: `${label}触发 execute：募集 ${actual.hardCapBnb} BNB，购入 ${actual.usedParts} 个${actual.transistorName}，` +
-      `流片权重 ${actual.hashpower}` +
+    message: `${label}触发 execute：募集 ${est.hardCapBnb} BNB，购入 ${parts} 个${est.transistorName}，` +
+      `流片权重 ${hashpower}` +
       (surplus > 0 ? `；余量 ${surplus} BNB 已按份退回` : "") +
       `。`,
     book: recomputeSelf({
       ...book,
       wallets,
       scene: "mining",
-      hashpower: actual.hashpower,
-      dailyBem: actual.dailyBem,
+      hashpower,
+      dailyBem,
       harvestCount: 0,
       feeBem: 0,
       distributed: 0,
-      actualBnb: actual.bnb,
-      actualQuote: actual.quote,
+      actualBnb: est.bnb,
+      actualQuote: est.quote,
       executedBy: who.role,
       executionFailed: false,
       executePhase: undefined,
-      priceLock: lockUsed,
-      transistorCount: actual.usedParts,
+      priceLock: unit > 0 ? round5(unit) : undefined,
+      transistorCount: parts,
       bnbPool: 0,
       refundedBnb: round4((book.refundedBnb || 0) + refundedExtra),
       endsAt: undefined,
@@ -1399,7 +1305,7 @@ export function applyHarvest(round, book) {
   // 领取次数不设上限：须有可分发日产，且扣费后净额 > 0
   if (dailyBem <= 0) return { ok: false, message: "当前没有可分发数量（日产为 0），无法 harvest。" };
   const rate = feeRate(round);
-  if (dailyBem * (1 - rate) <= 0) return { ok: false, message: "扣除服务费后没有可分发净额，无法 harvest。" };
+  if (dailyBem * (1 - rate) <= 0) return { ok: false, message: "扣除挖矿产出服务费后没有可分发净额，无法 harvest。" };
   const addr = String(book.selfAddress || WALLET).toLowerCase();
   const wallet = book.wallets[addr] || { mine: 0, listingShares: 0, claimed: 0 };
   const hBefore = computeHarvest(round, book, addr);
@@ -1408,7 +1314,7 @@ export function applyHarvest(round, book) {
   // 所有地址按各自份额自动 accrual（pending = accruedNet − claimed 在 recomputeSelf 里按地址重算）。
   return {
     ok: true,
-    message: `全网分发第 ${nextCount} 轮，本次你分得 ${formatBem(hBefore.userPart)} BEM（服务费 ${formatBem(hBefore.fee)} BEM，次数不限）`,
+    message: `全网分发第 ${nextCount} 轮，本次你分得 ${formatBem(hBefore.userPart)} BEM（挖矿产出服务费 ${formatBem(hBefore.fee)} BEM，次数不限）`,
     book: recomputeSelf({
       ...book,
       harvestCount: nextCount,
@@ -1419,57 +1325,57 @@ export function applyHarvest(round, book) {
   };
 }
 
-export function applyCreate(round, draft, snapshot = QUOTE, taskbook = null) {
+export function applyCreate(round, draft, snapshot = QUOTE) {
   const review = reviewRound(
     {
       sharePriceBnb: draft.sharePriceBnb,
       totalShares: draft.totalShares,
       feePercent: draft.feePercent,
       transistorId: draft.transistorId,
-      taskId: draft.taskId,
-      optimal: draft.optimal,
       feeRecipient: draft.feeRecipient,
       feeShares: draft.feeShares,
-      partCount: draft.partCount,
     },
     snapshot,
     round,
-    taskbook,
   );
   if (!review.ok) return { ok: false, message: review.issues[0] };
 
   const nextId = round.id + 1;
   const model = findTransistor(draft.transistorId || DEFAULT_TRANSISTOR);
-  const feeShares =
-    Array.isArray(draft.feeShares) && draft.feeShares.length
-      ? draft.feeShares.map((row) => ({
-          address: String(row.address || "").trim(),
-          shareBps: Math.round(Number(row.shareBps)),
-        }))
-      : [{ address: draft.feeRecipient, shareBps: 10_000 }];
+  const feeShares = (Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row) => {
+    const percent =
+      row.sharePercent != null && row.sharePercent !== ""
+        ? Number(row.sharePercent)
+        : Number(row.shareBps) / 100;
+    return {
+      address: String(row.address || "").trim(),
+      sharePercent: Math.round(percent),
+      shareBps: Math.round(percent) * 100,
+    };
+  });
   const nextRound = {
     ...round,
     id: nextId,
-    /** 本期选题（官方题库 ID），开期后不可改 */
-    taskId: String(draft.taskId ?? round.taskId),
-    optimal: (draft.optimal ?? round.optimal) === true,
     /**
-     * 开期人手动指定的流片元件总数，写入后不可改。
-     * 空值表示「按题目 g」，用 null 而不是存题目值——
-     * 这样以后改题库的 g 不会让历史期次的语义跟着漂移。
+     * 本期要烧的元件总数（NAND + LATCH），开期后不可改。
+     * 权重 H = 元件数 × P，所以这就是算力的唯一来源。
+     * 不再是开期参数：由本期募资总额按理想成本占比反推。
      */
-    partCount: Number.isFinite(Number(draft.partCount)) && Number(draft.partCount) >= 1
-      ? Math.round(Number(draft.partCount))
-      : null,
+    partCount: derivePartCount({
+      hardCapBnb: Number(draft.sharePriceBnb) * Number(draft.totalShares),
+      transistorId: draft.transistorId,
+      snapshot,
+    }),
     sharePriceBnb: Number(draft.sharePriceBnb),
     totalShares: Number(draft.totalShares),
     fundingDays: Number(draft.fundingDays),
     /** 挖矿期是协议常量，即便 draft 传了也不采纳 */
     miningDays: MINING_DAYS,
-    feeBps: Number(draft.feePercent) * 100,
+    /** 服务费：开期表单填多少就是多少，代码不给默认值 */
+    feePercent: Number(draft.feePercent),
     transistorId: model.id,
     processor: draft.processor,
-    feeRecipient: feeShares[0]?.address || draft.feeRecipient,
+    feeRecipient: feeShares[0]?.address || String(draft.feeRecipient || "").trim(),
     feeShares,
     contract: previewAddress(nextId),
     /** 开期时锁定的报价快照，作为本期预估基准，用户可核对 */
@@ -1481,14 +1387,14 @@ export function applyCreate(round, draft, snapshot = QUOTE, taskbook = null) {
   };
   return {
     ok: true,
-    message: `第 ${nextId} 期开始募集：${model.name}，图纸 ${review.needParts} 元件 / ${review.needBnb.toFixed(4)} BNB，权重 ${review.hashpower}`,
+    message: `第 ${nextId} 期开始募集：${model.name}，募资 ${review.hardCapBnb} BNB，本期 ${review.needParts} 元件，权重 ${review.hashpower}`,
     round: nextRound,
     book: createScene("funding", nextRound),
   };
 }
 
 /**
- * 开期参数校验。`snapshot` 为实时报价，传入后校验结果随市场变化。
+ * 开期参数校验。`snapshot` 为报价口径（缺省 = 静态基准），不联网。
  *
  * 发行规模由开期人手动决定「募资总额」与「总份数」，每份 BNB 据此派生
  * （每份 = 募资总额 ÷ 总份数），不可单独手填——否则会破坏
@@ -1496,12 +1402,11 @@ export function applyCreate(round, draft, snapshot = QUOTE, taskbook = null) {
  *
  * 兼容旧调用：若不传 `hardCapBnb`，则沿用「每份 × 份数」推算募资总额。
  *
- * 无论哪种来源，最终都要校验：募资总额必须够买到图纸所需元件，
- * 否则流片失败并全额退款。
+ * 元件数只由募资总额反推（不再拆 NAND / LATCH 配比），校验只管发行参数本身：
+ * 募资总额、总份数、服务费与分成地址。元件在材料市场自由买卖，不再校验买不买得起。
  */
-export function reviewRound(draft, snapshot = QUOTE, base = ROUND, taskbook = null) {
+export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
   const totalShares = Number(draft.totalShares);
-  const fee = Number(draft.feePercent);
 
   const model = findTransistor(draft.transistorId || DEFAULT_TRANSISTOR);
   const priceBnb = snapshot?.prices?.[model.id] ?? model.priceBnb;
@@ -1520,68 +1425,65 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND, taskbook = nu
     hardCapBnb = sharePriceBnb * totalShares;
   }
 
-  // 项目方统一图纸：按官方题目的 g / d / K 计算（q 固定 1）
-  const task = findTask({ taskId: draft.taskId ?? base.taskId }, taskbook);
+  /**
+   * 本期元件数由募资总额反推，权重 H = 元件数 × P。
+   * 口径必须跟 applyCreate 一致（都用本次表单算出来的募资总额），
+   * 否则「预览 567 颗 / 实际写入 621 颗」会对不上。
+   */
+  const capForParts =
+    Number.isFinite(hardCapBnb) && hardCapBnb > 0 ? hardCapBnb : Number(base.hardCapBnb) || 0;
   const actual = planTask({
-    task,
+    parts: derivePartCount({
+      hardCapBnb: capForParts,
+      transistorId: draft.transistorId ?? base.transistorId,
+      snapshot,
+    }),
     transistorId: model.id,
     snapshot,
-    optimal: (draft.optimal ?? base.optimal) === true,
-    // 开期人手动指定的流片元件数（未填 = 用题目 g）
-    partCount: draft.partCount ?? null,
   });
 
-  // 校验用实际流片数量，与 estimateHashpower 保持同源
-  const needParts = actual.totalParts;
-  const needBnb = actual.partsCost;
-  /**
-   * 募资总额按图纸 NAND+LATCH 混合配比的实时均价能买多少元件。
-   * 不能用单一 NAND 单价（actual.priceNand）粗估——LATCH 往往更便宜，
-   * 单一 NAND 价会把能买的元件数算少，混合配比下尤其失真（用户实测：
-   * 20 BNB 按 NAND 0.44 只算到 45 个，实际混合均价约 0.346 应够 57 个）。
-   * 每元件混合均价 = 图纸总成本 ÷ 图纸元件数，与 capCoversFloor 同源。
-   * 仅供 UI 展示；能否买到的判定仍看 canAfford（needBnb <= hardCapBnb）。
-   */
-  const perPartBnb = needParts > 0 ? needBnb / needParts : 0;
-  const affordableParts = perPartBnb > 0 ? Math.floor(hardCapBnb / perPartBnb) : 0;
-  const canAfford = needBnb <= hardCapBnb;
+  const fee = Number(draft.feePercent);
 
   const issues = [];
   if (!Number.isFinite(hardCapBnb) || hardCapBnb <= 0) issues.push("募资总额必须是大于 0 的 BNB 数");
   if (!Number.isInteger(totalShares) || totalShares <= 0) issues.push("总份数必须是正整数");
-  // 与 CampaignFactory / 链上 createCampaign 一致：服务费 1–20%
-  if (!Number.isInteger(fee) || fee < 1 || fee > 20) issues.push("服务费必须是 1 到 20 之间的整数");
-  if (!isMineable(model.processor)) issues.push(`${model.processor} 不是创世处理器，电路无挖矿资格`);
   /**
-   * 流片元件数校验。
-   * planTask 已把非法值（0/负数/非数字）退回题目值，但要让开期人知道填错了，
-   * 而不是静默按题目值通过——那会让人以为填了 0 却生效了。
+   * 服务费校验（口径：服务费**真正上链**，见 Campaign.setServiceFee）。
+   *
+   * 链上硬约束（合约里写死，前端必须与之一致，否则发了交易也会 revert）：
+   *  - 费率上限 MAX_SERVICE_FEE_BPS = 1000 → 最高 10%；
+   *  - 费率 > 0 时分成表不能为空，费率 = 0 时分成表必须为空；
+   *  - 分成份额合计必须恰好 10000 bps（= 100%）；
+   *  - 收款地址最多 MAX_FEE_RECIPIENTS = 8 个，且不能重复、不能是零地址。
    */
-  if (draft.partCount !== undefined && draft.partCount !== null && draft.partCount !== "") {
-    const pc = Number(draft.partCount);
-    if (!Number.isFinite(pc) || pc < 1) {
-      issues.push("流片元件数必须是 1 以上的整数");
-    } else if (!Number.isInteger(pc)) {
-      issues.push("流片元件数必须是整数（不支持小数颗元件）");
-    }
-  }
-  if (affordableParts < needParts) {
-    const latchTxt = actual.latch > 0 ? ` / LATCH ${actual.priceLatch.toFixed(4)}` : "";
-    issues.push(
-      `募资总额 ${hardCapBnb.toFixed(4)} BNB，按 ${model.processor} 当前报价（NAND ${actual.priceNand.toFixed(4)}${latchTxt} BNB，混合均价 ${perPartBnb.toFixed(4)} BNB/个）只够 ${affordableParts} 个元件，` +
-        `不够图纸所需的 ${needParts} 个（需 ${needBnb.toFixed(4)} BNB，缺 ${needParts - affordableParts} 个）`,
+  if (!Number.isInteger(fee) || fee < 1 || fee > 10) issues.push("挖矿产出服务费必须是 1 到 10 之间的整数（链上硬上限 10%）");
+  /**
+   * 无挖矿产出资格的处理器：**不是错误**。
+   *
+   * 这是一条**数据驱动的通用防御**：若将来官方新增一个 processorMultiplier = 0 的处理器，
+   * 选中它时「可采购、可开期，但本期算力与挖矿产出恒为 0」必须**明示**，
+   * 因此这里进 warnings 而不进 issues —— 绝不能因为它就拦住提交。
+   *
+   * T-59：Genesis CPU（唯一的无产出处理器）已整体移除，当前表内两个处理器都有资格，
+   * 下面的分支暂时不会命中，但机制保留。
+   */
+  const warnings = [];
+  if (!isMineable(model.processor)) {
+    warnings.push(
+      `${model.processor} 没有挖矿产出资格（官方 processorMultiplier = 0）：` +
+        `可正常采购开期，但本期算力与挖矿产出均为 0`,
     );
   }
-  const feeShareRows =
-    Array.isArray(draft.feeShares) && draft.feeShares.length
-      ? draft.feeShares
-      : draft.feeRecipient
-        ? [{ address: draft.feeRecipient, shareBps: 10_000 }]
-        : [];
+  // 分成地址校验：至少一条、地址格式、比例 1–100 整数、合计恰为 100、最多 3 个。
+  // 不设任何兜底值：开期人没填就是没填，直接进校验。
+  const feeShareRows = Array.isArray(draft.feeShares) ? draft.feeShares : [];
   if (feeShareRows.length === 0) {
-    issues.push("至少填写一个服务费收费地址");
+    issues.push("至少填写一个挖矿产出服务费收款地址");
+  } else if (feeShareRows.length > 8) {
+    issues.push("挖矿产出服务费分成地址最多 3 个（链上硬上限）");
   } else {
     let shareSum = 0;
+    const seen = new Set();
     for (const row of feeShareRows) {
       const address = String(row.address || "").trim();
       // Accept whole-percent input (sharePercent) or on-chain bps (shareBps, multiples of 100).
@@ -1591,11 +1493,21 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND, taskbook = nu
           : Number(row.shareBps) / 100;
       const percent = Math.round(rawPercent);
       if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
-        issues.push("服务费收费地址格式不正确");
+        issues.push("挖矿产出服务费收款地址格式不正确");
         break;
       }
+      if (/^0x0{40}$/i.test(address)) {
+        issues.push("挖矿产出服务费收款地址不能是零地址");
+        break;
+      }
+      const key = address.toLowerCase();
+      if (seen.has(key)) {
+        issues.push("挖矿产出服务费收款地址不能重复");
+        break;
+      }
+      seen.add(key);
       if (!Number.isInteger(percent) || percent < 1 || percent > 100 || percent !== rawPercent) {
-        issues.push("服务费分成比例须为 1 到 100 的整数");
+        issues.push("挖矿产出服务费分成比例须为 1 到 100 的整数");
         break;
       }
       shareSum += percent;
@@ -1612,58 +1524,20 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND, taskbook = nu
     model,
     /** 兼容旧字段：等于该型号自身的价 */
     priceBnb,
-    /** 两种元件的实时单价，按种类归位 */
-    priceNand: actual.priceNand,
-    priceLatch: actual.priceLatch,
-    priceByPart: actual.priceByPart,
-    /** 两种元件各自的数量、单价与小计 */
-    costBreakdown: actual.costBreakdown,
-    nand: actual.nand,
-    latch: actual.latch,
-    /** 实际流片元件总数（开期人改过则不等于题目 g） */
-    needParts,
-    /** 题目原本给的元件数，供 UI 对照「已手改」 */
-    baseParts: actual.baseParts,
-    partCountOverridden: actual.partCountOverridden,
-    /** 是否被挖矿闸门拦住（只能进未验证池，拿不到设计溢价） */
+    /** 元件数只由募资总额派生，不再拆 NAND / LATCH 配比 */
+    needParts: actual.totalParts,
+    /** 是否被挖矿闸门拦住（只能进未验证池） */
     capped: actual.capped,
     bnbUsdt,
-    needBnb: round4(needBnb),
-    affordableParts,
-    /** 成本占募资总额；健康区间约 20%–75% */
-    costRatio: hardCapBnb > 0 ? round4(needBnb / hardCapBnb) : 0,
-    /** 流片后剩余 BNB（负值表示买不起） */
-    marginBnb: round4(hardCapBnb - needBnb),
-    /** 元件涨价倍数上限（1 = 现价，1.5 = 涨 50% 触发退款） */
-    priceTolerance: needBnb > 0 ? round4(hardCapBnb / needBnb) : 0,
     /** 日产：已含闸门判定（capped → 未验证池） */
-    dailyBem: actual.dailyBem,
-    /** 缺口（BNB）——基于混合成本计算，不是按单一价折算的元件个数 */
-    shortBnb: round4(Math.max(0, needBnb - hardCapBnb)),
-    shortParts: affordableParts >= needParts
-      ? 0
-      : Math.max(0, needParts - affordableParts),
-    /** 选题 */
-    task,
-    taskName: task.name,
-    taskTier: task.tier,
-    /** 图纸算出的权重明细 */
+    dailyBem: bemRate(actual.hashpower, { pool: actual.capped ? "unverified" : "verified" }),
+    /** 权重 H = 元件数 × 每颗算力 */
     hashpower: actual.hashpower,
-    area: actual.area,
-    depth: task.d,
-    cost: actual.cost,
-    refCost: task.C,
-    q: actual.q,
-    refParts: task.K,
-    nand: actual.nand,
-    latch: actual.latch,
-    latchRatio: actual.latchRatio,
-    optimal: actual.optimal,
     processorScale: actual.processorScale,
-    baseWeight: actual.baseWeight,
-    designPremium: actual.designPremium,
-    canAfford,
+    /** 阻断性问题：不改就不能提交 */
     issues,
+    /** 提示性问题：明示事实但不阻止提交（如某处理器无挖矿产出资格） */
+    warnings,
     ok: issues.length === 0,
   };
 }
@@ -1675,6 +1549,18 @@ export function formatClock(time) {
   const hour = String(date.getHours()).padStart(2, "0");
   const minute = String(date.getMinutes()).padStart(2, "0");
   return `${month}-${day} ${hour}:${minute}`;
+}
+
+/** 剩余时长文案：2 天 3 小时 / 3 小时 12 分 / 12 分。用于 3 天宽限期倒计时。 */
+export function formatRemaining(ms) {
+  const total = Math.max(0, Math.ceil(Number(ms) / 1000));
+  if (total <= 0) return "已到期";
+  const days = Math.floor(total / 86_400);
+  const hours = Math.floor((total % 86_400) / 3_600);
+  const minutes = Math.ceil((total % 3_600) / 60);
+  if (days > 0) return `${days} 天${hours > 0 ? ` ${hours} 小时` : ""}`;
+  if (hours > 0) return `${hours} 小时${minutes > 0 ? ` ${minutes} 分` : ""}`;
+  return `${Math.max(1, minutes)} 分`;
 }
 
 export function formatUsdt(value) {
@@ -1694,56 +1580,3 @@ export function formatBem(value) {
 export function shortAddress(address) {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }
-
-/* ── 产出机制再导出（供 UI 直接引用）── */
-export {
-  NETWORK_DAILY_EMISSION,
-  NETWORK_WEIGHT,
-  BEM_HARD_CAP,
-  HALVING_PERIOD_DAYS,
-  MINE_GATE_LIMIT,
-  POOL,
-  poolDailyYield,
-  currentRate,
-  eraDaily,
-  cumulativeEmission,
-  roiOf,
-} from "./emission.js";
-
-/* ── 价格与题库模块再导出，供 UI 直接引用 ── */
-export {
-  TRANSISTORS,
-  DEFAULT_TRANSISTOR,
-  PROCESSORS,
-  PARTS,
-  findTransistor,
-  isMineable,
-  processorScale,
-  computeHashpower,
-  designMetrics,
-  qualityFactor,
-  createPriceFeed,
-  fetchPriceSnapshot,
-  compareTransistors,
-  planTransistor,
-  isStale,
-  /* 选题相关（findTask 是本文件定义的，不在此再导出）*/
-  planTask,
-  rankTransistors,
-  transistorIdFor,
-  compareProcessors,
-  adviseProcessor,
-  PROCESSOR_IDS,
-  suggestTaskRange,
-  suggestHardCap,
-  designOffering,
-  listTasks,
-  taskTiers,
-  fetchTaskBook,
-  fetchTapeOutData,
-  fetchBnbUsdt,
-  LATCH_RATIO,
-  COST_RATIO_MIN,
-  COST_RATIO_MAX,
-  COST_RATIO_IDEAL,
-} from "./prices.js";

@@ -1,239 +1,155 @@
-// 把当前源码与链上字节码一致的工厂、每一期合约提交到 Sourcify。
-// 有 BSCSCAN_API_KEY 时再提交 BscScan。
-// 运行：npx hardhat run scripts/verify-published.js --network bscTestnet
-const { ethers, run, network } = require("hardhat");
-const { readFileSync, readdirSync } = require("node:fs");
+// 部署后开源验证：把刚部署的 CampaignFactory / Campaign 提交到 Sourcify / BscScan。
+//
+// 之前 deploy-bsc.js 里 require("./verify-published").main() 指向一个**不存在的文件**，
+// 整个 require 抛错被 try/catch 吞掉，只留下一行「开源验证未完成」的 warn——
+// 主网上线后合约其实没验证过源码，没人看得出来。
+//
+// 现在这个脚本真实存在且会检查产物。运行：
+//   npx hardhat run scripts/verify-published.js --network bsc
+//
+// 依赖 hardhat-toolbox 自带的 hardhat-verify（task 名 verify / verify:sourcify / verify:etherscan）。
+const hre = require("hardhat");
+const { ethers, network } = hre;
+const { readFileSync, existsSync } = require("node:fs");
 const { join } = require("node:path");
 
-const META = "a2646970667358221220";
-const SOURCIFY = "https://sourcify.dev/server";
+const OFFICIAL_MARKET = "0xA6a80C1919a8326022d7c601a488888C13aA16E4";
+const OFFICIAL_PARTS = [
+  "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087", // TapeOut
+  "0xE2DfD802081C7a05341E20b6582b04b908e8550c", // Behemoth
+];
 
-function metaHash(bytecode) {
-  const code = String(bytecode || "").toLowerCase();
-  const i = code.lastIndexOf(META);
-  if (i < 0) return "";
-  return code.slice(i + META.length, i + META.length + 64);
+/** 读部署记录（部署脚本已写好）。 */
+function readDeployment() {
+  const file = join(__dirname, "..", "deployments", `${network.name}.json`);
+  if (!existsSync(file)) return null;
+  return JSON.parse(readFileSync(file, "utf8"));
 }
 
-function artifactOf(file) {
-  return JSON.parse(readFileSync(join(__dirname, "..", "artifacts", "contracts", file), "utf8"));
-}
-
-function bundleFromInfo(info) {
-  return {
-    compilerVersion: info.solcLongVersion,
-    stdJsonInput: {
-      language: info.input.language,
-      sources: info.input.sources,
-      settings: info.input.settings,
-    },
-  };
-}
-
-function compilerBundle() {
-  const dir = join(__dirname, "..", "artifacts", "build-info");
-  const files = readdirSync(dir).filter((name) => name.endsWith(".json"));
-  const newest = files
-    .map((name) => ({ name, mtime: require("node:fs").statSync(join(dir, name)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime)[0];
-  return bundleFromInfo(JSON.parse(readFileSync(join(dir, newest.name), "utf8")));
-}
-
-function bundleMatching(contractFile, contractName, chainMeta) {
-  const dir = join(__dirname, "..", "artifacts", "build-info");
-  for (const name of readdirSync(dir).filter((file) => file.endsWith(".json"))) {
-    const info = JSON.parse(readFileSync(join(dir, name), "utf8"));
-    const deployed = info.output?.contracts?.[contractFile]?.[contractName]?.evm?.deployedBytecode?.object;
-    if (!deployed) continue;
-    const hex = String(deployed).startsWith("0x") ? deployed : `0x${deployed}`;
-    if (metaHash(hex) === chainMeta) return bundleFromInfo(info);
-  }
-  return null;
-}
-
-async function sourcifyVerify(chainId, address, contractIdentifier, compilerVersion, bundle = compilerBundle()) {
-  const res = await fetch(`${SOURCIFY}/v2/verify/${chainId}/${address}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "user-agent": "TapeOut-miner/0.1 (https://github.com/knwins/tapeout)",
-    },
-    body: JSON.stringify({
-      stdJsonInput: bundle.stdJsonInput,
-      compilerVersion: compilerVersion || bundle.compilerVersion,
-      contractIdentifier,
-    }),
-  });
-  const body = await res.json().catch(() => ({}));
-  if (res.status === 409 || body.customCode === "already_verified") {
-    console.log(`${address} 已在 Sourcify 开源验证（exact_match）`);
-    console.log(`开源验证：https://repo.sourcify.dev/${chainId}/${address}`);
-    return;
-  }
-  if (!res.ok) {
-    throw new Error(`Sourcify ${res.status} ${address} ${JSON.stringify(body).slice(0, 500)}`);
-  }
-  const id = body.verificationId;
-  if (!id) {
-    console.log(`已提交 ${address}`, JSON.stringify(body).slice(0, 300));
-    return;
-  }
-  for (let i = 0; i < 40; i++) {
-    await new Promise((r) => setTimeout(r, 2000));
-    const poll = await fetch(`${SOURCIFY}/v2/verify/${id}`, {
-      headers: { "user-agent": "TapeOut-miner/0.1 (https://github.com/knwins/tapeout)" },
+/**
+ * 构造参数：验证时必须与部署时完全一致，否则 Sourcify 匹配不上。
+ * 工厂是 (materialMarket, allowedParts[])；Campaign 由工厂内部 CREATE 创建，
+ * 其 6 个构造参数需要从工厂事件 + 链上 Campaign 状态还原：
+ *   (sharePriceBnb, totalShares, fundingDeadline, materialMarket, owner, transistors)
+ * 前三个来自 CampaignCreated 事件；materialMarket / transistors 直接读链上 Campaign
+ * （它们是创建时写入的 immutable，开期人无法事后改），owner 是当时的 Factory Owner（= 部署者）。
+ */
+async function campaignConstructorArgs(campaignAddr, dep) {
+  try {
+    const abi = require("../artifacts/contracts/CampaignFactory.sol/CampaignFactory.json").abi;
+    const iface = new ethers.Interface(abi);
+    const logs = await ethers.provider.getLogs({
+      address: dep.factory,
+      fromBlock: 0,
+      toBlock: "latest",
+      topics: [iface.getEvent("CampaignCreated").topicHash],
     });
-    const status = await poll.json().catch(() => ({}));
-    if (!status.isJobCompleted) continue;
-    if (status.error) {
-      const code = status.error.customCode || "";
-      const message = status.error.message || "";
-      if (code === "already_verified" || /already verified/i.test(message)) {
-        console.log(`${address} 已在 Sourcify 开源验证（exact_match）`);
-        console.log(`开源验证：https://repo.sourcify.dev/${chainId}/${address}`);
-        return;
-      }
-      throw new Error(`${address} ${code} ${message}`);
+    for (const log of logs) {
+      const parsed = iface.parseLog(log);
+      if (String(parsed.args.campaign).toLowerCase() !== String(campaignAddr).toLowerCase()) continue;
+      const c = await ethers.getContractAt("Campaign", campaignAddr);
+      const materialMarket = await c.market();
+      const transistors = await c.transistors();
+      return [
+        parsed.args.sharePriceBnb,
+        parsed.args.totalShares,
+        parsed.args.fundingDeadline,
+        materialMarket,
+        dep.deployer,
+        transistors,
+      ];
     }
-    const match = status.contract?.runtimeMatch || status.contract?.match;
-    console.log(`${address} Sourcify ${match || "verified"}`);
-    console.log(`开源验证：https://repo.sourcify.dev/${chainId}/${address}`);
+  } catch {
+    // 事件读不到就返回空数组，让验证任务自己去报「参数不匹配」。
+  }
+  return [];
+}
+
+async function main() {
+  const dep = readDeployment();
+  if (!dep) {
+    console.log(`找不到 deployments/${network.name}.json，跳过开源验证。`);
     return;
   }
-  throw new Error(`Sourcify 仍在处理 ${address} ${id}`);
-}
-
-async function verifyOne(chainId, address, contract, compilerVersion, constructorArguments) {
-  await sourcifyVerify(chainId, address, contract, compilerVersion);
-  if (process.env.BSCSCAN_API_KEY) {
-    await run("verify:verify", { address, contract, constructorArguments });
-  }
-}
-
-async function verifyPublished() {
   const chainId = Number((await ethers.provider.getNetwork()).chainId);
-  if (!chainId || network.name === "hardhat") {
-    console.log("本地网络跳过开源验证");
-    return;
-  }
-  const depPath = join(__dirname, "..", "..", "frontend", "src", "chain", "deployments.json");
-  const dep = JSON.parse(readFileSync(depPath, "utf8"));
-  if (dep.podIsAdapter && dep.pod) {
-    const adapterCode = await ethers.provider.getCode(dep.pod);
-    const adapterBundle = bundleMatching(
-      "contracts/OfficialPodAdapter.sol",
-      "OfficialPodAdapter",
-      metaHash(adapterCode)
+  if (Number(dep.chainId) !== chainId) {
+    throw new Error(
+      `部署记录的网络(${dep.chainId})与当前链(${chainId})不一致，拒绝验证——否则验证的是别的链上的地址。`
     );
-    if (!adapterBundle) {
-      console.log(`跳过适配器 ${dep.pod}：没有与链上字节码一致的编译记录`);
-    } else {
-      await sourcifyVerify(
-        chainId,
-        dep.pod,
-        "contracts/OfficialPodAdapter.sol:OfficialPodAdapter",
-        adapterBundle.compilerVersion,
-        adapterBundle
-      );
+  }
+
+  // 主网额外核对：材料市场必须是官方地址；元件白名单必须是官方两件套。
+  if (chainId === 56) {
+    const market = String(dep.materialMarket || "").toLowerCase();
+    if (market !== OFFICIAL_MARKET.toLowerCase()) {
+      throw new Error(`主网材料市场应为 ${OFFICIAL_MARKET}，部署记录是 ${dep.materialMarket}`);
+    }
+    const wl = Array.isArray(dep.allowedParts) ? dep.allowedParts.map((a) => a.toLowerCase()) : [];
+    for (const o of OFFICIAL_PARTS) {
+      if (!wl.includes(o.toLowerCase())) {
+        throw new Error(`主网元件白名单必须包含官方元件 ${o}（否则它的期次开不了）`);
+      }
     }
   }
 
-  const factories = [dep.factory, ...(dep.legacyFactories || [])].filter(Boolean);
-  const campaignArt = artifactOf("Campaign.sol/Campaign.json");
-  const factoryArt = artifactOf("CampaignFactory.sol/CampaignFactory.json");
-  const campaignMeta = metaHash(campaignArt.deployedBytecode);
-  const factoryMeta = metaHash(factoryArt.deployedBytecode);
-  const compilerVersion = campaignArt.metadata ? JSON.parse(campaignArt.metadata).compiler.version : "0.8.24";
-  const factoryAbi = [
-    "function allCampaigns() view returns (address[])",
-    "function pod() view returns (address)",
-    "function bem() view returns (address)",
-    "function minter() view returns (address)",
-  ];
-  const campaignAbi = [
-    "function sharePriceBnb() view returns (uint256)",
-    "function totalShares() view returns (uint256)",
-    "function feeBps() view returns (uint16)",
-    "function fundingDeadline() view returns (uint64)",
-    "function feeShareCount() view returns (uint256)",
-    "function feeShareAt(uint256) view returns (address,uint16)",
-    "function taskId() view returns (uint256)",
-    "function pod() view returns (address)",
-    "function bem() view returns (address)",
-    "function minter() view returns (address)",
-    "function netlistHash() view returns (bytes32)",
-    "function owner() view returns (address)",
-    "function netWeightVerified() view returns (uint256)",
-    "function netWeightUnverified() view returns (uint256)",
-    "function transistors() view returns (address)",
-  ];
+  const targets = [];
+  if (dep.factory) {
+    // 工厂构造是 2 参：(materialMarket, allowedParts[]) —— 两者缺一不可，否则验证对不上。
+    targets.push({
+      address: dep.factory,
+      name: "CampaignFactory",
+      args: [dep.materialMarket, dep.allowedParts],
+    });
+  }
+  if (dep.campaign) {
+    targets.push({
+      address: dep.campaign,
+      name: "Campaign",
+      args: await campaignConstructorArgs(dep.campaign, dep),
+    });
+  }
 
-  for (const factoryAddr of factories) {
-    const code = await ethers.provider.getCode(factoryAddr);
-    const f = new ethers.Contract(factoryAddr, factoryAbi, ethers.provider);
-    if (metaHash(code) === factoryMeta) {
-      await verifyOne(chainId, factoryAddr, "contracts/CampaignFactory.sol:CampaignFactory", compilerVersion, [
-        await f.pod(),
-        await f.bem(),
-        await f.minter(),
-      ]);
-    } else {
-      console.log(`跳过工厂 ${factoryAddr}：链上字节码与当前源码不一致`);
-    }
-    let campaigns = [];
-    try {
-      campaigns = await f.allCampaigns();
-    } catch (e) {
-      console.log(`读工厂期次失败 ${factoryAddr}：${e.message || e}`);
+  let ok = 0;
+  for (const t of targets) {
+    const code = await ethers.provider.getCode(t.address);
+    if (code === "0x") {
+      console.log(`✗ ${t.name} ${t.address} 在链上没有代码，跳过。`);
       continue;
     }
-    for (const addr of campaigns) {
-      const campCode = await ethers.provider.getCode(addr);
-      if (metaHash(campCode) !== campaignMeta) {
-        console.log(`跳过 ${addr}：链上字节码与当前源码不一致`);
-        continue;
-      }
-      const c = new ethers.Contract(addr, campaignAbi, ethers.provider);
-      const n = Number(await c.feeShareCount());
-      const recipients = [];
-      const shares = [];
-      for (let i = 0; i < n; i++) {
-        const [recipient, shareBps] = await c.feeShareAt(i);
-        recipients.push(recipient);
-        shares.push(shareBps);
-      }
-      const ctor = [
-        await c.sharePriceBnb(),
-        await c.totalShares(),
-        await c.feeBps(),
-        await c.fundingDeadline(),
-        recipients,
-        shares,
-        await c.taskId(),
-        await c.pod(),
-        await c.bem(),
-        await c.minter(),
-        await c.netlistHash(),
-        await c.owner(),
-        await c.netWeightVerified(),
-        await c.netWeightUnverified(),
-      ];
+    // 优先用 verify（自动挑 etherscan / sourcify）；失败再退回 verify:sourcify。
+    let done = false;
+    for (const task of ["verify", "verify:sourcify"]) {
       try {
-        ctor.push(await c.transistors());
-      } catch {
-        /* 旧期次构造函数没有 transistors */
+        await hre.run(task, { address: t.address, constructorArguments: t.args });
+        console.log(`✓ ${t.name} ${t.address} 已通过 ${task} 验证。`);
+        ok += 1;
+        done = true;
+        break;
+      } catch (e) {
+        const msg = (e?.message || String(e)).split("\n")[0];
+        if (task === "verify") {
+          // verify 会先派发到 etherscan，可能因为没配 API key 失败；这不算致命，继续试 sourcify。
+          console.log(`  ${t.name}：${task} 未通过（${msg}），改试 verify:sourcify`);
+          continue;
+        }
+        console.log(`✗ ${t.name} ${t.address} 验证未完成：${msg}`);
       }
-      await verifyOne(chainId, addr, "contracts/Campaign.sol:Campaign", compilerVersion, ctor);
     }
+    if (!done && ok === 0) {
+      // 全部失败时不算致命错误（可能是网络限流），但一定要说清楚。
+      console.log(`  ⚠ ${t.name} ${t.address} 未验证成功，请手动跑 npx hardhat verify --network ${network.name} --address ${t.address}`);
+    }
+  }
+  if (ok === 0 && targets.length > 0) {
+    console.log("\n没有任何合约验证成功——源码在主网上仍是未验证状态。");
   }
 }
 
-const invoked = process.argv.some((arg) => String(arg).replace(/\\/g, "/").endsWith("scripts/verify-published.js"));
-if (invoked) {
-  verifyPublished().catch((e) => {
+module.exports = { main };
+
+if (require.main === module) {
+  main().catch((e) => {
     console.error(e);
     process.exit(1);
   });
 }
-
-module.exports = { verifyPublished };

@@ -1,40 +1,22 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ContractCalls } from "./Calls.jsx";
 import OnChainPage from "./OnChain.jsx";
 import { formatEther } from "./chain/client.js";
-import { OFFICIAL_CPU_TAPEOUT } from "./podStart.js";
+import { MarketTradePanel } from "./MarketTrades.jsx";
+import { OfficialPricePanel, officialPartPrices } from "./OfficialPricePanel.jsx";
+import { RefundRecords } from "./RefundRecords.jsx";
 import { processorFromPartsContract } from "./tapeout.js";
+import {
+  formatUnitPrice,
+} from "./prices.js";
 import deployments from "./chain/deployments.json";
 import {
-  MARKET,
-  OWNER,
   PAST_ROUNDS,
   QUOTE,
-  TRANSISTORS,
+  ROUND,
   buildHolders,
   clampPriceInput,
-  computeHarvest,
-  findTask,
-  designOffering,
-  transistorIdFor,
-  compareProcessors,
-  adviseProcessor,
-  PROCESSOR_IDS,
-  suggestTaskRange,
-  listTasks,
-  taskTiers,
-  currentRate,
-  NETWORK_WEIGHT,
-  NETWORK_DAILY_EMISSION,
-  BEM_HARD_CAP,
-  HALVING_PERIOD_DAYS,
-  MINE_GATE_LIMIT,
-  MINING_DAYS,
-  COST_RATIO_MIN,
-  COST_RATIO_MAX,
-  estimateHashpower,
-  formatBem,
-  formatClock,
   resolveCampaignDesign,
   reviewRound,
   shortAddress,
@@ -44,84 +26,135 @@ import {
 } from "./fixtures.js";
 
 const EMPTY_FORM = {
-  /** 官方题库 ID。选题决定元件数与深度，进而决定成本与权重。 */
-  taskId: "54",
   /**
-   * 目标处理器：由开期人手动选择，不自动推导。
-   * Behemoth 权重系数 P=6、元件贵约 7.5 倍；TapeOut P=1、元件便宜。
-   */
-  processorId: "Behemoth",
-  /**
-   * 募资总额与总份数：开期人**手动填写**的两个发行参数（默认留空 = 跟随建议方案）。
+   * 募资总额与总份数：开期人**手动填写**的两个发行参数。
    * 每份 BNB 由两者派生（每份 = 募资总额 ÷ 总份数），是只读展示值，不可单独手填——
    * 否则会破坏「募资总额 = 份数 × 每份」这一链上恒等式。
    *
-   * 留空哨兵沿用 #2 的约定：draft.x === "" 表示跟随 designOffering 的建议值，
-   * 渲染与校验时再取 offering 的对应字段。
+   * ⚠️不再有「留空= 跟随建议方案」这回事：建议方案依赖处理器与元件报价，
+   * 而发布期**处理器必须显式选择**（链上模式从工厂白名单选，见 transistors 字段；
+   * 演示模式由系统按默认型号派生）。建议值只在选好处理器后才有意义。
+   * 现在发行参数（总额/份数/天数）都是必填，由开期人自己定。
    *
-   * 开期人可调的旋钮是 募资总额 / 总份数（定规模）、processorId（换处理器）、
-   * fundingDays、feePercent。
+   * 开期人可调的旋钮：募资总额、总份数、募集天数、本期处理器（链上必选）、挖矿产出服务费与分成表。
+   * 元件合约不再由工厂默认写入：开期时从白名单显式选一个处理器，发布后该期锁定其元件合约。
    */
-  /** 募资总额（BNB）：留空 = 跟随建议方案 */
+  /** 募资总额（BNB）：必填 */
   hardCapBnb: "",
-  /** 总份数：留空 = 跟随建议方案 */
+  /** 总份数：必填正整数 */
   totalShares: "",
   fundingDays: "15",
+  /**
+   * 本期处理器（元件合约地址）：链上模式**必选**，从工厂白名单里选，开期后不可改；
+   * 演示模式留空，由模拟引擎按默认型号派生（不写链上）。
+   * T-79 核心改动：工厂不再有默认元件，开期人必须显式选。
+   */
+  transistors: "",
+  /**
+   * 服务费与分成（**链上参数**，口径：服务费真正上链）。
+   *
+   * ⚠️ **服务费是什么（口径澄清）**：
+   *   本期的「服务费」是**挖矿产出奖励的服务费** —— 从矿池打进来的挖矿收益里按比例计提，
+   *   分给下面的分成地址。**认筹款不收服务费**：认购人付的 BNB 全额进认购托管池，
+   *   只用于买元件，链上不存在从认筹款抽服务费的路径。
+   *
+   * 流程：createCampaign 建期（sold == 0）→ 立刻调 Campaign.setServiceFee(bps, recipients, sharesBps)
+   * 一次性写死，之后任何人可读、不可改。合约硬约束：费率 ≤ 10%，分成 ≤ 3 个地址，
+   * 份额合计必须恰好 10000 bps，地址不能重复、不能是零地址。
+   *
+   * 服务费默认 5%（常见口径，开期人可改，1–10 整数）；
+   * 分成**地址**一律留空：必须由开期人自己填，否则 reviewRound 会拦截
+   * （地址格式、比例 1–100、合计恰为 100）。
+   * 唯一例外是连接钱包后把地址回填成当前账户（运行时值，非默认值）。
+   *
+   * 分成**比例**默认 100（首行）：常见情形就是一个人独享全部挖矿产出服务费，
+   * 少填一个字段。地址一填上就能直接提交。
+   * 加第二个地址时新行仍留空——剩余比例怎么分是开期人的决定，不替他算。
+   */
   feePercent: "5",
-  feeRecipient: "0x0000000000000000000000000000000000000fee",
-  feeShares: [{ address: "0x0000000000000000000000000000000000000fee", sharePercent: "100" }],
+  feeRecipient: "",
+  /** 分成表：首行比例默认 100（一人独享）。地址仍留空，必须由开期人填。 */
+  feeShares: [{ address: "", sharePercent: "100" }],
 };
 
 export function OwnerOverview({
-  round, book, copy, pending, pendingTarget = "", actor, executeWait, history, taskbook,
-  onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
-  onPlaceTransistorAsk, onCancelTransistorAsk, onWithdrawMarketProceeds,
-  onExecute, onHarvest, onSetPlan, onRemoveCampaign, onOpenRound, onOpenAssets,
+  round, book, copy, pending, pendingTarget = "", actor, executeWait, history,
+  onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onRecoverBnb, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
+  onPlaceTransistorAsk, onCancelTransistorAsk, onConfirmSale, onWithdrawMarketProceeds,
+  onDepositToPool, onSetMiningPool, onSetPlan, onRemoveCampaign, onOpenRound, onOpenAssets,
   account = "", connected = false, chainHolders = null, holdersCampaign = "", quote, onInvoke,
   transistorUnitPrice = null,
+  official = null,
 }) {
   // 链上：托管池 raisedBnb 为权威；模拟：份数×单价
   const raised = book._chain ? Number(book.bnbPool || 0) : book.sold * round.sharePriceBnb;
+  /**
+   * 「已售未退」份数（当前债务）。sold 是单调的历史事实（本期卖出去过多少），
+   * 退款不会让它变小；判断「还有没有人可退 / 池子够不够退」必须用 outstandingShares。
+   */
+  const outstanding = book.outstandingShares != null
+    ? Number(book.outstandingShares)
+    : Number(book.sold || 0);
   // 池子够不够按份全额退款。缺额时持份人仍可按比例自取，但卖单成交款要先进池子才有机会补上。
-  const refundGap = Math.max(0, Number(book.sold || 0) * Number(round.sharePriceBnb || 0) - raised);
-  const netW = book.capped ? book.netWeightUnverified : book.netWeightVerified;
-  const harvest = computeHarvest(
-    round,
-    book,
-    book.selfAddress,
-    Number.isFinite(netW) ? netW : null
-  );
-  const dailyBem = book._chain && book.dailyBem != null ? book.dailyBem : harvest.dailyBem;
-  const design = resolveCampaignDesign(round, book, taskbook);
-  const needsOfficialStart = Boolean(deployments.podIsAdapter);
-  const [startForm, setStartForm] = useState({
-    cpu: OFFICIAL_CPU_TAPEOUT,
-    circuitId: "",
-    taskId: String(round?.taskId || book?.taskId || "54"),
-    anchor: "0",
-    salt: "",
-    circuits: "",
-    proofs: "",
-    pubs: "",
-    startData: "",
-  });
+  const refundGap = Math.max(0, outstanding * Number(round.sharePriceBnb || 0) - raised);
+  const design = resolveCampaignDesign(round, book);
+  /**
+   * 本期矿池地址（链上事实）。
+   *
+   * `book.miningPool` 由 readState 从 `Campaign.miningPool()` 读出：
+   * 零地址 = 还没设过。之前这个面板只有一个空输入框，Owner 不知道链上是否已经设过，
+   * 设完再回来看到的是同一个空框——容易重复设置或误以为没生效。
+   */
+  const poolOnChain = String(book.miningPool || "");
+  const hasPoolOnChain = /^0x[0-9a-fA-F]{40}$/.test(poolOnChain) && !/^0x0{40}$/i.test(poolOnChain);
+  const [miningPoolAddr, setMiningPoolAddr] = useState("");
+  /**
+   * 链上已设过矿池时回填输入框。
+   *
+   * 只在「链上有值且输入框还空」时回填，不覆盖用户正在输入的内容——
+   * 用户改地址（入池前允许改）不会被刷新打断。
+   */
+  useEffect(() => {
+    if (!hasPoolOnChain) return;
+    setMiningPoolAddr((cur) => (cur ? cur : poolOnChain));
+  }, [hasPoolOnChain, poolOnChain]);
+  /**
+   * 服务费与分成表：**读链上**（口径：服务费真正上链）。
+   *
+   * 之前这里读的是本地发行记录（localStorage），合约里根本没有这个字段，
+   * 换台设备就看不到，还容易被误当成链上事实。现在 serviceFeeBps / feeShares
+   * 都由 readState 从合约读出来，round 上带着，直接用。
+   */
+  const chainFeeShares = Array.isArray(round.feeShares) ? round.feeShares : [];
+  const chainFeePercent = Number(round.serviceFeeBps ?? 0) / 100;
+  const chainFeeSet = Boolean(round.serviceFeeSet);
 
-  const mixedUnit = (() => {
-    const est = book.estimate || {};
-    if (est.usedParts > 0 && est.needBnb > 0) return est.needBnb / est.usedParts;
-    return 0;
-  })();
+  /**
+   * 挂单参考价。
+   *
+   * 优先级：
+   *   1. 链上材料市场单价（transistorUnitPrice，Owner 实际挂单/成交价）—— 最权威
+   *   2. 官方市场最新价（tapeout.net market.json）—— NAND / LATCH 分别取价
+   *   3. 都没有 → 0（表单不预填价格，Owner 自己填）
+   *
+   * 之前只有一个 suggestedUnit，NAND 与 LATCH 共用同一个价——
+   * 但这两种元件市价差得很远（官方 TapeOut NAND 0.0501 / LATCH 0.0455，
+   * Behemoth 差距更大），共用一个价必然有一边挂错价。这里按元件分开。
+   */
   const minterUnit = (() => {
     if (transistorUnitPrice != null && transistorUnitPrice > 0n) {
       try { return Number(formatEther(transistorUnitPrice)); } catch { return 0; }
     }
     return 0;
   })();
-  const suggestedUnit = (() => {
-    if (mixedUnit > 0) return mixedUnit;
-    if (minterUnit > 0) return minterUnit;
-    return 0.005;
-  })();
+  /** 官方市价：按当前处理器的 NAND / LATCH 分别取 */
+  const officialParts = officialPartPrices(official, design.processorId || "TapeOut");
+  const suggestedUnit = minterUnit > 0 ? minterUnit : 0;
+  /** 每种元件的参考价（BNB/颗）：链上优先，官方市价其次 */
+  const refPrice = {
+    NAND: minterUnit > 0 ? minterUnit : officialParts.NAND,
+    LATCH: minterUnit > 0 ? minterUnit : officialParts.LATCH,
+  };
   const [nandQty, setNandQty] = useState("0");
   const [latchQty, setLatchQty] = useState("0");
   const [nandPrice, setNandPrice] = useState("0");
@@ -138,32 +171,30 @@ export function OwnerOverview({
     priceTouched.current = false;
     sellPriceTouched.current = false;
   }, [book.address]);
+  /**
+   * 挂买单不再按任何推算预填数量：元件由材料市场买卖决定，买多少由 Owner 自己填。
+   * 只把单价预填成当前市场参考价（用户改过就不再覆盖）。
+   *
+   * NAND 与 LATCH 各用各的参考价：市价差得远，共用一个价必然有一边挂错。
+   */
   useEffect(() => {
     if (book.executePhase !== "buying" || priceTouched.current) return;
-    if (taskbook?.source === "loading" || design.task?.missing) return;
-    const nand = Number(design.task?.nand) || 0;
-    const latch = Number(design.task?.latch) || 0;
-    if (nand + latch <= 0) return;
-    const est = book.estimate || {};
-    setNandQty(String(nand));
-    setLatchQty(String(latch));
-    setNandPrice(priceText(round5(est.priceNand || suggestedUnit)));
-    setLatchPrice(priceText(round5(est.priceLatch || est.priceNand || suggestedUnit)));
-  }, [book.address, book.executePhase, book.estimate, design.task, suggestedUnit, taskbook?.source]);
+    if (refPrice.NAND > 0) setNandPrice(priceText(round5(refPrice.NAND)));
+    if (refPrice.LATCH > 0) setLatchPrice(priceText(round5(refPrice.LATCH)));
+  }, [book.address, book.executePhase, refPrice.NAND, refPrice.LATCH]);
   useEffect(() => {
     const heldNand = Number(book.partsNand) || 0;
     const heldLatch = Number(book.partsLatch) || 0;
     setSellNandQty(String(heldNand));
     setSellLatchQty(String(heldLatch));
     if (sellPriceTouched.current) return;
-    const est = book.estimate || {};
-    if (heldNand > 0) setSellNandPrice(priceText(round5(est.priceNand || suggestedUnit)));
-    if (heldLatch > 0) setSellLatchPrice(priceText(round5(est.priceLatch || est.priceNand || suggestedUnit)));
-  }, [book.address, book.partsNand, book.partsLatch, book.estimate, suggestedUnit]);
+    if (heldNand > 0 && refPrice.NAND > 0) setSellNandPrice(priceText(round5(refPrice.NAND)));
+    if (heldLatch > 0 && refPrice.LATCH > 0) setSellLatchPrice(priceText(round5(refPrice.LATCH)));
+  }, [book.address, book.partsNand, book.partsLatch, refPrice.NAND, refPrice.LATCH]);
   const historyRows = (history != null ? history : PAST_ROUNDS).map((item) => {
     const onChainRow = history != null;
     const rowDesign = resolveCampaignDesign(
-      { taskId: item.taskId, transistorId: onChainRow ? null : item.transistorId, processorId: onChainRow ? (item.processor || processorFromPartsContract(item.transistors) || null) : item.processor },
+      { transistorId: onChainRow ? null : item.transistorId, processorId: onChainRow ? (item.processor || processorFromPartsContract(item.transistors) || null) : item.processor },
       onChainRow
         ? {
             _chain: true,
@@ -176,13 +207,11 @@ export function OwnerOverview({
             estHashpower: Number(item.estHashpower) || 0,
             transistorCount: Number(item.transistorCount) || 0,
           },
-      taskbook
     );
     return {
       ...item,
-      taskName: rowDesign.taskName,
-      taskId: item.taskId != null && item.taskId !== "" ? item.taskId : rowDesign.taskId,
-      processor: rowDesign.processorKnown ? rowDesign.processorId : "—",
+      /** 处理器只作为链上事实展示；反推不出来就留空，由 UI 决定是否显示 */
+      processor: rowDesign.processorKnown ? rowDesign.processorId : "",
       processorInferred: rowDesign.processorInferred,
     };
   });
@@ -191,9 +220,14 @@ export function OwnerOverview({
   const [openKey, setOpenKey] = useState(null);
   const [detailPane, setDetailPane] = useState("ops");
   const [dialog, setDialog] = useState(null);
-  const statusOptions = ["全部", "募集中", "待执行", "挖矿中", ...Array.from(new Set(
-    historyRows.map((row) => row.status).filter((name) => name && !["募集中", "待执行", "挖矿中"].includes(name))
-  ))];
+  const STATUS_ORDER = ["全部", "募集中", "待执行", "挖矿中", "已结束", "执行失败"];
+  const presentStatuses = Array.from(new Set(
+    historyRows.map((row) => row.status).filter((name) => name && name !== "—" && !STATUS_ORDER.includes(name))
+  ));
+  const statusOptions = [
+    ...STATUS_ORDER.filter((name) => name === "全部" || historyRows.some((row) => row.status === name)),
+    ...presentStatuses,
+  ];
   const visibleRows = historyRows.filter((row) => statusFilter === "全部" || row.status === statusFilter);
   const rowKey = (item) => item.address || `sim-${item.id}`;
   const opened = historyRows.find((row) => rowKey(row) === openKey) || null;
@@ -231,7 +265,7 @@ export function OwnerOverview({
   }, [dialog]);
 
   const isOwner = actor?.role === "owner";
-  // 买不起后合约回到待挂单；未重挂前不可 execute（priceLock/元件数已清）
+  // 取消挂单后合约回到待挂单；未重新挂单前不可 execute（priceLock/元件数已清）
   const canExecute = isOwner && !book.executionFailed && Number(book.priceLock || 0) > 0 && Number(book.transistorCount || 0) > 0;
   const planWritten = Number(book.estHashpower) > 0 || Number(book.transistorCount) > 0;
   const sceneTitle =
@@ -239,10 +273,24 @@ export function OwnerOverview({
       : book.scene === "executing" ? "待执行"
         : book.scene === "mining" ? "挖矿中"
           : "—";
+  // 结束状态不在 scene 里：执行失败且份额全部退回（sold 归零）才叫已结束；
+  // 募集到期仍未售罄同样不会再进入执行，也按已结束展示。
+  const liveEnded = Boolean(book.executionFailed) && outstanding === 0;
+  const liveFundingExpired = book.scene === "funding"
+    && Number(book.endsAt) > 0
+    && Date.now() > Number(book.endsAt)
+    && Number(book.sold || 0) < Number(round.totalShares || 0);
+  const liveStatus = liveEnded || liveFundingExpired
+    ? { badge: "已结束", tone: "done" }
+    : book.executionFailed
+      ? { badge: "执行失败", tone: "back" }
+      : { badge: copy?.badge || "—", tone: copy?.tone || "live" };
   const nextActionByStatus = (status) => {
     if (status === "募集中") return "补 setPlan / 等待售罄";
-    if (status === "待执行") return "挂单 → 确认 → 流片";
-    if (status === "挖矿中") return "领取并分配";
+    if (status === "待执行") return "挂单 → 确认 → 入池";
+    if (status === "挖矿中") return "份额转让";
+    if (status === "已结束") return "查看退款记录";
+    if (status === "执行失败") return "原路退款 / 降价重挂";
     return "查看详情";
   };
 
@@ -266,6 +314,13 @@ export function OwnerOverview({
     )
   );
   const dialogTitle = { ops: "合约操作", holders: "份额明细", calls: "合约调用", onchain: "链上调试" }[dialog?.pane] || "";
+  /** 弹窗内的标签页：四个工具合到一个弹窗里切换，避免开四个不同的弹窗 */
+  const DIALOG_TABS = [
+    { id: "ops", label: "合约操作" },
+    { id: "holders", label: "份额明细" },
+    { id: "calls", label: "合约调用" },
+    { id: "onchain", label: "链上调试" },
+  ];
   const soldPct = round.totalShares > 0 ? Math.min(100, Math.round((book.sold / round.totalShares) * 100)) : 0;
   const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
   const hashLabel = Number(book.hashpower) > 0
@@ -273,9 +328,36 @@ export function OwnerOverview({
     : Number(book.estHashpower) > 0
       ? `${Number(book.estHashpower).toLocaleString()} H`
       : "未记录";
-  const hashHint = Number(book.hashpower) > 0 ? "已执行" : Number(book.estHashpower) > 0 ? "setPlan 预估" : "尚未写入 setPlan";
+  // 链上没有实时算力 getter：book.hashpower 就是 setPlan 写入的 estHashpower，一律按「预估」展示。
+  const hashHint = Number(book.hashpower) > 0 || Number(book.estHashpower) > 0 ? "setPlan 预估" : "尚未写入 setPlan";
+
+  /**
+   * 写操作回调：缺省即视为接线缺失，**直接抛错**，不给「点了没反应」的机会。
+   *
+   * 入池这两步之前写的是 `onSetMiningPool?.(...)` / `onDepositToPool?.()`：可选调用在
+   * 回调没传进来时静默跳过，按钮点击毫无反馈、连控制台报错都没有——用户只看到按钮闪一下。
+   * 排查这种问题的成本远高于省下的两个 `?.`。
+   */
+  function requireOps(name, fn) {
+    return (...args) => {
+      if (typeof fn !== "function") {
+        throw new Error(`${name} 回调未接线：OwnerDesk → OwnerOverview 的 props 里漏传了它`);
+      }
+      return fn(...args);
+    };
+  }
+
+  const submitMiningPool = requireOps("setMiningPool", onSetMiningPool);
+  const submitDepositToPool = requireOps("depositToPool", onDepositToPool);
 
   function renderOps() {
+    // 订单/结算状态一变就重读市场流水（挂单、成交、确认到账、提取卖出款）。
+    const marketRefreshKey = [
+      book.executePhase, book.nandBidId, book.latchBidId,
+      book.nandRemaining, book.latchRemaining,
+      book.nandAskRemaining, book.latchAskRemaining, book.marketOwed,
+      book.partsNand, book.partsLatch, book.orderFilled,
+    ].join("|");
     return (
       <div className="detail-split">
         <article className="card">
@@ -307,27 +389,20 @@ export function OwnerOverview({
                       )}
                     </div>
                     <p className="fine">
-                      募集期用户在「BEM挖矿认筹」按份认筹。Owner 可先 setPlan，把预估算力与需买元件数写上链，供用户核对。
+                      募集期用户在「BEM挖矿认筹」按份认筹。Owner 可先 setPlan，把预估算力写上链，供用户核对。
                       {!isOwner && " 当前钱包不是 Factory Owner，无法写 setPlan。"}
                     </p>
                   </>
                 )}
 
                 {book.scene === "executing" && (() => {
-                  const est = book.estimate || {};
-                  const taskPending = taskbook?.source === "loading" || Boolean(design.task?.missing);
-                  const planNand = taskPending ? 0 : Number(design.task?.nand) || 0;
-                  const planLatch = taskPending ? 0 : Number(design.task?.latch) || 0;
-                  const need = taskPending ? 0 : planNand + planLatch;
                   const phaseLabel =
-                    book.executePhase === "ready" ? "已到账 · 待流片"
+                    book.executePhase === "ready" ? "已到账 · 待入池"
                       : book.executePhase === "listed" ? "挂单中 · 待成交"
                         : "待挂单";
-                  // 图纸不需要的腿数量固定为 0，不展示、不挂单。取消订单只清掉订单数量，不改变题目。
-                  const showNand = planNand > 0;
-                  const showLatch = planLatch > 0;
-                  const nandN = showNand ? Math.max(0, Math.floor(Number(nandQty) || 0)) : 0;
-                  const latchN = showLatch ? Math.max(0, Math.floor(Number(latchQty) || 0)) : 0;
+                  // 买多少由 Owner 自己填：元件在材料市场自由买卖，不按任何推算配比限制，两条腿都可用。
+                  const nandN = Math.max(0, Math.floor(Number(nandQty) || 0));
+                  const latchN = Math.max(0, Math.floor(Number(latchQty) || 0));
                   const nandP = Number(nandPrice) || 0;
                   const latchP = Number(latchPrice) || 0;
                   const orderCostRaw = nandN * nandP + latchN * latchP;
@@ -342,27 +417,47 @@ export function OwnerOverview({
                   const buyOpen = book.executePhase === "listed";
                   const askOpen = Boolean(book.askOpen);
                   const idle = !buyOpen && !askOpen;
+                  // Ready：买单已确认。这里才能卖、入池或退款。卖单成交后必须再确认，才回到可卖、可退。
+                  const ready = book.executePhase === "ready";
+                  const askRecorded = (Number(book.nandAskQty) || 0) > 0 || (Number(book.latchAskQty) || 0) > 0;
+                  const marketOwedEarly = Number(book.marketOwed) || 0;
+                  // 测试网 MockMaterialMarket：可直接在当前买、卖单卡片上模拟对手方成交。
+                  const mockMarket = Boolean(
+                    book._chain
+                    && Number(deployments.chainId) === 97
+                    && (deployments.materialMarket || deployments.minter)
+                    && book.market
+                    && String(book.market).toLowerCase() === String(deployments.materialMarket || deployments.minter).toLowerCase()
+                  );
+                  const saleSettled = ready && !askOpen && (askRecorded || marketOwedEarly > 0);
                   const canBuy = raised > 0 && idle && book.executePhase === "buying";
-                  const canSell = Boolean(book.marketAsks) && (heldNand > 0 || heldLatch > 0) && idle && book.executePhase === "buying";
-                  // 主路径默认买单；仅用户显式切卖，或只能卖时走卖单。
-                  const side = buyOpen ? "buy" : askOpen ? "sell"
-                    : (orderSide === "sell" && canSell) ? "sell"
-                      : canBuy ? "buy"
-                        : canSell ? "sell" : "buy";
+                  const legacyReady = ready && book.readyExit === false;
+                  // 挂卖单要求**市场真的有卖单侧**。官方材料市场只有买单侧
+                  // （placeAsk / asks / nextAskId / cancelAsk / fillAsk 都不存在），
+                  // 这时 placeTransistorAsk 在链上必然 revert，前端不能给入口。
+                  const canSell = Boolean(book.marketAskSide) && (heldNand > 0 || heldLatch > 0) && ready && !legacyReady && !askOpen && !saleSettled;
+                  const side = buyOpen ? "buy" : askOpen || canSell || saleSettled ? "sell" : "buy";
+                  /** 入池只要求手里有元件，不再比对推算出来的配比 */
+                  const partsEnough = heldNand + heldLatch > 0;
+                  // 合约 confirmTransistors() 要求两条腿 remaining 全为 0 **并且** 本期真的持有对应数量的元件。
+                  // 只看 orderFilled 就放行会让「已成交但没发货」的单在链上被 TransistorsNotReady 拒绝。
+                  const needNandOnHand = Number(book.nandQty) || 0;
+                  const needLatchOnHand = Number(book.latchQty) || 0;
+                  const partsShortNand = Math.max(0, needNandOnHand - heldNand);
+                  const partsShortLatch = Math.max(0, needLatchOnHand - heldLatch);
+                  const partsForOrderEnough = partsShortNand === 0 && partsShortLatch === 0;
+                  const partsShortLabel = [
+                    partsShortNand > 0 ? `${partsShortNand} NAND` : null,
+                    partsShortLatch > 0 ? `${partsShortLatch} LATCH` : null,
+                  ].filter(Boolean).join(" + ");
                   // 托管额超过 raisedBnb 时不允许点提交（链上也不会真正挂出）。
                   const overBudget = orderCostRaw > raised;
                   const canPlaceBuy = isOwner && canBuy && side === "buy" && !overBudget
                     && (nandN > 0 || latchN > 0)
-                    && (!showNand || nandN === 0 || nandP > 0)
-                    && (!showLatch || latchN === 0 || latchP > 0);
+                    && (nandN === 0 || nandP > 0)
+                    && (latchN === 0 || latchP > 0);
                   const canPlaceSell = isOwner && canSell && side === "sell" && (sellNandN > 0 || sellLatchN > 0)
                     && (sellNandN === 0 || sellNandP > 0) && (sellLatchN === 0 || sellLatchP > 0);
-                  const partLabel = taskPending
-                    ? "读取题目中"
-                    : [
-                        showNand ? `${planNand} NAND` : null,
-                        showLatch ? `${planLatch} LATCH` : null,
-                      ].filter(Boolean).join(" + ") || "无需元件";
                   const bidRows = [
                     Number(book.nandQty) > 0
                       ? { side: "buy", part: "NAND", id: book.nandBidId || "—", qty: book.nandQty, price: book.nandPrice, remaining: book.nandRemaining }
@@ -393,54 +488,81 @@ export function OwnerOverview({
                     heldNand > 0 ? `${heldNand} NAND` : null,
                     heldLatch > 0 ? `${heldLatch} LATCH` : null,
                   ].filter(Boolean);
+                  /** 元件行只报实际持有量，不再报推算配比 */
+                  const partLabel = partsOnHand.length ? partsOnHand.join(" / ") : "无元件";
                   const flowStep = book.executePhase === "ready" ? 3 : buyOpen ? 2 : 1;
                   // 卖单成交款留在市场 owed 里，未提取时 openRefund 会被合约拒绝。
-                  const marketOwed = Number(book.marketOwed) || 0;
-                  const canWithdraw = isOwner && book.marketAsks && (askOpen || marketOwed > 0);
-                  const canRefund = isOwner && book.executePhase === "buying" && !askOpen && marketOwed <= 0;
+                  const marketOwed = marketOwedEarly;
+                  const canWithdraw = isOwner && book.marketAsks && askOpen && marketOwed > 0;
+                  const canConfirmSale = isOwner && saleSettled;
+                  const canRefund = isOwner && !askOpen && !saleSettled && marketOwed <= 0
+                    && outstanding > 0
+                    && (book.executePhase === "buying" || (ready && !legacyReady));
+                  const dustOnly = isOwner && outstanding === 0 && Number(book.bnbPool || 0) > 0;
                   const refundHint = askOpen
-                    ? "有挂单时不能退款，请先取消"
-                    : marketOwed > 0
-                      ? "市场里还有卖出款未提取，请先点「提取卖出款」"
-                      : undefined;
+                    ? "卖单还挂着，不能退款"
+                    : saleSettled
+                      ? "先确认卖出，再退款"
+                      : legacyReady
+                        ? "这期确认到账后不能退款，只能入池"
+                        : outstanding === 0
+                          ? "份额已全部退完，没有可退对象；池子里的尾差用「取回剩余 BNB」扫出"
+                          : undefined;
                   // 放弃挂单：一次撤销买单剩余 + 撤卖单 + 提取卖出款 + 按池子退款，不需要逐项操作。
-                  const canAbandon = isOwner && (buyOpen || askOpen || marketOwed > 0);
-                  const nextHint = book.executePhase === "ready"
-                    ? (refundGap > 0
-                      ? "元件已到账，可继续流片；若不流片，池子只够按比例退款。"
-                      : "元件已到账，确认参数后流片开矿。")
-                    : marketOwed > 0 && !buyOpen
-                      ? "卖单已全部成交，先「提取卖出款」把 BNB 取回，再退款或重挂买单。"
-                      : askOpen
-                        ? "卖单挂着：成交后提取卖出款，撤清后再退款或重挂买单。"
-                      : Number(book.sold || 0) === 0
+                  // 成交的部分已上链不可撤；只有还剩未成交时才允许放弃。
+                  const hasOpenLeg = [book.nandRemaining, book.latchRemaining, book.nandAskRemaining, book.latchAskRemaining]
+                    .some((remaining) => remaining == null || Number(remaining) > 0);
+                  const canAbandon = isOwner && ((buyOpen && hasOpenLeg) || askOpen);
+                  const nextHint = saleSettled
+                    ? "卖单已成交。点「确认卖出」收到 BNB 并回到待挂单，之后才能再挂买单或退款。"
+                    : askOpen
+                      ? "卖单挂着。全部成交后确认；还没卖完可以取消剩余。"
+                    : legacyReady
+                      ? "这期是已上线的旧合约。确认到账之后只能入池，不能单独取出元件，也不能挂卖或退款。"
+                    : ready
+                      ? (partsEnough
+                        ? "买单已确认。可以挂卖、退款，或取出元件；也可直接 depositToPool 投入矿池。"
+                        : "手里还没有元件，不能入池。先挂买单买入并确认到账，或退款。")
+                      : outstanding === 0
                         ? "已全部退款（份数归零），池子里若还有卖单溢价，Owner 可用「取回 BNB」扫出。"
-                      : buyOpen
-                        ? (book.orderFilled
-                          ? "买单已成交齐，点「确认到账」进入待流片。"
-                          : "等待市场成交。要改价或转卖元件，先取消买单。")
-                        : canBuy
-                          ? "主路径：按图纸挂买单买入元件。"
-                          : canSell
-                            ? "无可用买单资金。有库存时可挂卖单回笼，再退款。"
+                        : buyOpen
+                          ? (book.orderFilled
+                            ? (partsForOrderEnough
+                              ? "买单已成交齐，点「确认到账」。确认后才能卖、入池或退款。"
+                              : `买单已成交，但元件还没进本期合约（还缺 ${partsShortLabel || "元件"}）。` +
+                                (mockMarket
+                                  ? "点「补发元件」按缺额 mint 后再确认；链上 confirmTransistors 要求元件余额到位。"
+                                  : "等卖家把元件转到本期合约后，再点「确认到账」。"))
+                            : "等待市场成交。未成交部分可以取消；成交的不能撤销。")
+                          : canBuy
+                            ? "挂买单买入元件，买多少自己定。成交并确认后，才能卖、入池或退款。"
                             : book.executionFailed
                               ? "上次挂单超余额未挂出，改低单价重试或退款。"
                               : "当前不能挂单。";
-                  const canConfirm = isOwner && buyOpen && (!book.marketOrders || book.orderFilled);
+                  const canConfirm = isOwner && buyOpen && (!book.marketOrders || (book.orderFilled && partsForOrderEnough));
+                  const confirmHint = !buyOpen
+                    ? undefined
+                    : !book.orderFilled
+                      ? "买单还没全部成交"
+                      : !partsForOrderEnough
+                        ? `元件还没到账：还缺 ${partsShortLabel || "元件"}` + (mockMarket ? "。点「补发元件」补齐后再确认。" : "。等卖家把元件转到本期合约后再确认。")
+                        : undefined;
 
                   const renderLegForm = (kind) => {
                     const isBuy = kind === "buy";
+                    /** 每条腿的市价来源：链上单价优先，官方市价其次 */
+                    const priceSource = (part) => (minterUnit > 0 ? "链上市场单价" : "官方市价");
                     const legs = isBuy
                       ? [
-                          showNand && { key: "nand", label: "NAND", qty: nandQty, setQty: setNandQty, price: nandPrice, setPrice: setNandPrice, touch: priceTouched, quote: Number(est.priceNand) || 0 },
-                          showLatch && { key: "latch", label: "LATCH", qty: latchQty, setQty: setLatchQty, price: latchPrice, setPrice: setLatchPrice, touch: priceTouched, quote: Number(est.priceLatch || est.priceNand) || 0 },
+                          { key: "nand", label: "NAND", qty: nandQty, setQty: setNandQty, price: nandPrice, setPrice: setNandPrice, touch: priceTouched, quote: refPrice.NAND, source: priceSource("NAND") },
+                          { key: "latch", label: "LATCH", qty: latchQty, setQty: setLatchQty, price: latchPrice, setPrice: setLatchPrice, touch: priceTouched, quote: refPrice.LATCH, source: priceSource("LATCH") },
                         ].filter(Boolean)
                       : [
-                          heldNand > 0 && { key: "nand", label: "NAND", qty: sellNandQty, setQty: setSellNandQty, price: sellNandPrice, setPrice: setSellNandPrice, touch: sellPriceTouched, quote: Number(est.priceNand) || 0, max: heldNand },
-                          heldLatch > 0 && { key: "latch", label: "LATCH", qty: sellLatchQty, setQty: setSellLatchQty, price: sellLatchPrice, setPrice: setSellLatchPrice, touch: sellPriceTouched, quote: Number(est.priceLatch || est.priceNand) || 0, max: heldLatch },
+                          heldNand > 0 && { key: "nand", label: "NAND", qty: sellNandQty, setQty: setSellNandQty, price: sellNandPrice, setPrice: setSellNandPrice, touch: sellPriceTouched, quote: refPrice.NAND, source: priceSource("NAND"), max: heldNand },
+                          heldLatch > 0 && { key: "latch", label: "LATCH", qty: sellLatchQty, setQty: setSellLatchQty, price: sellLatchPrice, setPrice: setSellLatchPrice, touch: sellPriceTouched, quote: refPrice.LATCH, source: priceSource("LATCH"), max: heldLatch },
                         ].filter(Boolean);
                     if (legs.length === 0) {
-                      return <p className="flow-empty">{isBuy ? "本期图纸不需要 NAND / LATCH。" : "暂无库存可卖。"}</p>;
+                      return <p className="flow-empty">{isBuy ? "填写要买的 NAND / LATCH 数量与单价。" : "暂无库存可卖。"}</p>;
                     }
                     return (
                       <div className="flow-form">
@@ -479,11 +601,13 @@ export function OwnerOverview({
                                     <button
                                       type="button"
                                       className="flow-quote"
+                                      title={`点击填入市价（${leg.source}）`}
                                       onClick={() => { leg.touch.current = true; leg.setPrice(priceText(round5(leg.quote))); }}
                                     >
-                                      {round5(leg.quote).toFixed(5)}
+                                      {formatUnitPrice(round5(leg.quote))}
+                                      <em>{leg.source}</em>
                                     </button>
-                                  ) : "—"}
+                                  ) : <span className="muted-value">无市价</span>}
                                 </td>
                               </tr>
                             ))}
@@ -530,15 +654,14 @@ export function OwnerOverview({
                   };
 
                   return (
-                    <>
+                    <div className="ops-exec">
                       <ul className="bill ops-bill">
                         <li><span>子状态</span><strong>{phaseLabel}</strong></li>
-                        <li><span>目标处理器</span><strong>{design.processorId || round.processorId || "未记录"}</strong></li>
-                        <li><span>图纸</span><strong>{taskPending ? "读取中" : `${need} 颗 · ${partLabel}`}</strong></li>
+                        {design.processorKnown ? (
+                          <li><span>处理器</span><strong>{design.processorId} · P={design.processorScale}</strong></li>
+                        ) : null}
+                        <li><span>库存</span><strong>{partLabel}</strong></li>
                         <li><span>资金 / 库存</span><strong>{round4(raised)} BNB · {partsOnHand.length ? partsOnHand.join(" / ") : "无元件"}</strong></li>
-                        {mixedUnit > 0 && (
-                          <li><span>混合成本</span><strong>{round4(mixedUnit)} BNB/颗</strong></li>
-                        )}
                       </ul>
 
                       <ol className="flow-steps" aria-label="待执行流程">
@@ -549,37 +672,35 @@ export function OwnerOverview({
                           <span>2</span>确认到账
                         </li>
                         <li className={flowStep === 3 ? "is-current" : ""}>
-                          <span>3</span>流片
+                          <span>3</span>入池
                         </li>
                       </ol>
 
                       <p className="flow-next"><strong>下一步</strong>{nextHint}</p>
 
                       {/* 上：当前挂单；下：操作表单 / 主按钮 */}
-                      {(book.executePhase === "buying" || book.executePhase === "listed" || askOpen || marketOwed > 0) && (
+                      {!legacyReady && (book.executePhase === "buying" || book.executePhase === "listed" || ready || askOpen || marketOwed > 0) && (
                         <div className="flow-panel">
                           <div className="flow-panel-head">
                             <div>
                               <h3>
                                 {buyOpen ? "当前买单"
                                   : askOpen ? "当前卖单"
-                                    : marketOwed > 0 ? "卖出款待提取"
-                                      : side === "sell" ? "挂卖单（支线）" : "挂买单（主路径）"}
+                                    : saleSettled ? "卖单待确认"
+                                      : side === "sell" ? "挂卖中" : "挂买中"}
                               </h3>
                               <p>
-                                {buyOpen || askOpen
-                                  ? "同时只能有一单。换方向前先取消当前剩余。"
-                                  : side === "sell"
-                                    ? "卖出库存回笼 BNB，撤清后可退款或再挂买单。"
-                                    : "用募集款托管买入图纸元件。"}
+                                {buyOpen
+                                  ? "未成交部分可取消，已成交部分上链即不可撤。全部成交后才能确认。"
+                                  : askOpen
+                                    ? "卖单未全部成交前不能确认。取消只撤还没卖掉的部分。"
+                                    : saleSettled
+                                      ? "确认后回到待挂单，才能再挂买单或退款。"
+                                      : side === "sell"
+                                        ? "确认到账之后才能卖。卖完并确认，才能再买或退款。"
+                                        : "用募集款买入元件，买多少自己定。确认到账后才能卖、入池或退款。"}
                               </p>
                             </div>
-                            {idle && (canBuy || canSell) && (
-                              <div className="flow-mode">
-                                <button type="button" className={side === "buy" ? "is-on" : ""} disabled={!canBuy} onClick={() => setOrderSide("buy")}>买单</button>
-                                <button type="button" className={side === "sell" ? "is-on" : ""} disabled={!canSell} onClick={() => setOrderSide("sell")}>卖单</button>
-                              </div>
-                            )}
                           </div>
 
                           <div className="flow-panel-body">
@@ -601,7 +722,7 @@ export function OwnerOverview({
                                       return (
                                         <tr key={`${row.side}-${row.part}`}>
                                           <td><strong>{row.part}</strong></td>
-                                          <td>{row.qty} × {round5(row.price || 0).toFixed(5)} BNB</td>
+                                          <td>{row.qty} × {formatUnitPrice(round5(row.price || 0))} BNB</td>
                                           <td className={open ? "is-open" : "is-done"}>
                                             {open
                                               ? (row.remaining == null ? "挂单中" : `剩 ${Number(row.remaining)} · 成 ${Math.max(0, filled)}`)
@@ -621,19 +742,39 @@ export function OwnerOverview({
                                         type="button"
                                         disabled={!canConfirm || Boolean(pending)}
                                         onClick={onConfirmTransistors}
+                                        title={canConfirm ? undefined : confirmHint}
                                       >
                                         {pending === "confirmTransistors"
                                           ? "确认中…"
-                                          : book.orderFilled ? "确认到账" : "等待成交…"}
+                                          : book.orderFilled
+                                            ? (partsForOrderEnough ? "确认到账" : "等待元件到账…")
+                                            : "等待成交…"}
                                       </button>
-                                      <button
-                                        className="btn btn-inline"
-                                        type="button"
-                                        disabled={!isOwner || Boolean(pending)}
-                                        onClick={onCancelTransistorOrder}
-                                      >
-                                        {pending === "cancelTransistorOrder" ? "取消中…" : "取消买单"}
-                                      </button>
+                                      {!book.orderFilled && (
+                                        <button
+                                          className="btn btn-inline"
+                                          type="button"
+                                          disabled={!isOwner || Boolean(pending)}
+                                          onClick={onCancelTransistorOrder}
+                                        >
+                                          {pending === "cancelTransistorOrder" ? "取消中…" : "取消买单"}
+                                        </button>
+                                      )}
+                                      {mockMarket && (!book.orderFilled || !partsForOrderEnough) && (
+                                        <button
+                                          className="btn btn-inline"
+                                          type="button"
+                                          disabled={!connected || Boolean(pending)}
+                                          onClick={() => onInvoke("simulateFillCampaignBids", {})}
+                                          title={book.orderFilled
+                                            ? "测试网 Mock：买单已成交但元件没进本期合约，点这里按缺额补发元件（mint），之后即可确认到账"
+                                            : "测试网 Mock 材料市场：代替卖方成交这两张买单，并把测试元件铸给本期合约"}
+                                        >
+                                          {pending === "simulateFillCampaignBids"
+                                            ? "撮合中…"
+                                            : book.orderFilled ? "补发元件" : "模拟成交"}
+                                        </button>
+                                      )}
                                     </>
                                   )}
                                   {canWithdraw && (
@@ -652,15 +793,36 @@ export function OwnerOverview({
                                       type="button"
                                       disabled={!isOwner || Boolean(pending)}
                                       onClick={onCancelTransistorAsk}
+                                      title="只撤还没卖掉的部分"
                                     >
                                       {pending === "cancelTransistorAsk" ? "取消中…" : "取消卖单"}
                                     </button>
                                   )}
-                                  {!askOpen && marketOwed > 0 && (
-                                    <span className="flow-note">卖单已全部成交，这笔 {round4(marketOwed)} BNB 仍留在材料市场，提取后才能退款。</span>
+                                  {askOpen && mockMarket && (
+                                    <button
+                                      className="btn btn-inline"
+                                      type="button"
+                                      disabled={!connected || Boolean(pending)}
+                                      onClick={() => onInvoke("simulateFillCampaignAsks", {})}
+                                      title="测试网 Mock 材料市场：代替买方按挂单价吃掉这两张卖单，卖出款记入市场 owed"
+                                    >
+                                      {pending === "simulateFillCampaignAsks" ? "吃单中…" : "模拟吃单"}
+                                    </button>
                                   )}
                                 </div>
                               </>
+                            ) : saleSettled ? (
+                              <div className="flow-panel-actions">
+                                <button
+                                  className="btn btn-primary"
+                                  type="button"
+                                  disabled={!canConfirmSale || Boolean(pending)}
+                                  onClick={onConfirmSale}
+                                >
+                                  {pending === "confirmSale" ? "确认中…" : "确认卖出"}
+                                </button>
+                                <span className="flow-note">确认后才能再挂买单或退款。</span>
+                              </div>
                             ) : marketOwed > 0 && !canBuy ? (
                               <div className="flow-panel-actions">
                                 <button
@@ -682,9 +844,11 @@ export function OwnerOverview({
                                 ))}
                                 {side === "sell" && (canSell ? renderLegForm("sell") : (
                                   <p className="flow-empty">
-                                    {!book.marketAsks
-                                      ? "这期合约无卖单接口，需重新部署后开新期。"
-                                      : "暂无库存。买单部分成交并取消后，才能挂卖单。"}
+                                    {book._chain && book.marketAskSide === false
+                                      ? "当前材料市场没有卖单侧（官方市场只有买单），挂卖单链上会直接 revert。元件到账后直接入池即可。"
+                                      : !book.marketAsks
+                                        ? "这期合约无卖单接口，需重新部署后开新期。"
+                                        : "确认买单到账后才能挂卖单。"}
                                   </p>
                                 ))}
                               </>
@@ -693,7 +857,7 @@ export function OwnerOverview({
                         </div>
                       )}
 
-                      {(book.executePhase === "buying" || book.executePhase === "listed" || askOpen) && (
+                      {(book.executePhase === "buying" || book.executePhase === "listed" || ready || askOpen) && (
                         <div className="flow-tools">
                           <button
                             className="btn btn-inline"
@@ -704,145 +868,119 @@ export function OwnerOverview({
                           >
                             {pending === "openRefund" ? "退款中…" : (book.executionFailed ? "退款剩余" : "原路退款")}
                           </button>
+                          {dustOnly && (
+                            <button
+                              className="btn btn-inline"
+                              type="button"
+                              disabled={Boolean(pending)}
+                              onClick={onRecoverBnb}
+                              title="份额已全部退完，池子里的尾差/卖单溢价没有归属。recoverBnb() 无参，一次扫给 Owner。"
+                            >
+                              {pending === "recoverBnb" ? "取回中…" : "取回剩余 BNB"}
+                            </button>
+                          )}
                           {canAbandon && (
                             <button
                               className="btn btn-inline"
                               type="button"
                               disabled={Boolean(pending)}
                               onClick={onAbandonOrder}
-                              title="撤销未成交买单、撤卖单、提取卖出款，然后按当前池子给持份人退款"
+                              title={buyOpen && !hasOpenLeg
+                                ? "买单已全部成交，元件已上链，无法撤销"
+                                : "撤销未成交买单、撤卖单、提取卖出款，然后按当前池子给持份人退款。"}
                             >
                               {pending === "abandonOrder" ? "撤回中…" : "放弃挂单并退款"}
                             </button>
                           )}
                           <a className="btn btn-inline" href="https://tapeout.net/" target="_blank" rel="noreferrer">
-                            tapeout.net
+                            材料市场 ↗
                           </a>
-                          {askOpen === false && idle && canSell && side === "buy" && (
-                            <button type="button" className="flow-link" onClick={() => setOrderSide("sell")}>
-                              改挂卖单回笼 →
-                            </button>
-                          )}
-                          {idle && canBuy && side === "sell" && (
-                            <button type="button" className="flow-link" onClick={() => setOrderSide("buy")}>
-                              ← 回到买单
-                            </button>
-                          )}
                         </div>
                       )}
 
-                      {book.executePhase === "ready" && !book.executionFailed && (
+                      {ready && !book.executionFailed && !askOpen && !saleSettled && (
                         <div className="flow-panel">
                           <div className="flow-panel-head">
                             <div>
-                              <h3>流片开矿</h3>
-                              <p>确认到账完成。执行后进入挖矿，剩余募集款按份退回。</p>
+                              <h3>进入挖矿</h3>
+                              <p>晶体管已确认到账。先设置矿池地址，再把晶体管投入矿池，进入挖矿阶段。入池不可逆，剩余募集款不再退回。</p>
                             </div>
                           </div>
                           <div className="flow-panel-body">
-                            <div className="flow-panel-actions">
+                            {/* 矿池地址：已写入过的回填显示，避免 Owner 每次都要重贴地址 */}
+                            <label className="field">
+                              <span>矿池地址（setMiningPool）</span>
+                              <input
+                                className="mono"
+                                placeholder={hasPoolOnChain ? "" : "0x…"}
+                                value={miningPoolAddr}
+                                onChange={(e) => setMiningPoolAddr(e.target.value)}
+                              />
+                            </label>
+                            {hasPoolOnChain && (
+                              <p className="fine">
+                                本期矿池地址已写入：
+                                <strong className="mono">{poolOnChain}</strong>
+                                <br />
+                                链上 <code>setMiningPool</code> 在入池前可重复调用（改地址）；
+                                一旦 <code>depositToPool</code> 执行，元件不可逆地转入该矿池。
+                              </p>
+                            )}
+                            <div className="flow-panel-actions is-solo">
                               <button
                                 className="btn btn-primary"
                                 type="button"
-                                disabled={!canExecute || Boolean(pending)}
-                                onClick={() => onExecute?.(startForm)}
+                                disabled={!isOwner || Boolean(pending) || !/^0x[0-9a-fA-F]{40}$/.test(miningPoolAddr.trim())}
+                                title={
+                                  !/^0x[0-9a-fA-F]{40}$/.test(miningPoolAddr.trim())
+                                    ? "请填写有效的 20 字节矿池地址"
+                                    : hasPoolOnChain && miningPoolAddr.trim().toLowerCase() === poolOnChain.toLowerCase()
+                                      ? "与链上已写入的地址相同，无需重复设置"
+                                      : undefined
+                                }
+                                onClick={() => submitMiningPool({ pool: miningPoolAddr.trim() })}
                               >
-                                {pending === "execute" ? "流片中…" : "流片并开户挖矿"}
+                                {pending === "setMiningPool"
+                                  ? "设置中…"
+                                  : hasPoolOnChain && miningPoolAddr.trim().toLowerCase() === poolOnChain.toLowerCase()
+                                    ? "已设置该地址"
+                                    : "setMiningPool"}
+                              </button>
+                              <button
+                                className="btn btn-primary"
+                                type="button"
+                                disabled={!isOwner || Boolean(pending) || !hasPoolOnChain}
+                                title={hasPoolOnChain ? undefined : "请先设置矿池地址（链上 depositToPool 要求 miningPool 非零）"}
+                                onClick={() => submitDepositToPool()}
+                              >
+                                {pending === "depositToPool" ? "投入中…" : "depositToPool 进入挖矿"}
                               </button>
                             </div>
                           </div>
                         </div>
                       )}
 
-                      {book.executePhase === "ready" && needsOfficialStart ? (
-                        <div className="fee-share-block" style={{ marginTop: 12 }}>
-                          <p className="fine">
-                            当前 PoD 是官方适配器。execute 前请把电路 NFT 转到当期合约，再填官方 start 参数或粘贴已打包的 startData。
-                            证明数据来自 tapeout.net，不能留空。
-                          </p>
-                          <label className="field">
-                            <span>startData（已打包，优先）</span>
-                            <input
-                              className="mono"
-                              placeholder="0x… abi.encode 整包"
-                              value={startForm.startData}
-                              onChange={(e) => setStartForm((s) => ({ ...s, startData: e.target.value }))}
-                            />
-                          </label>
-                          <div className="form-grid cols-3">
-                            <label className="field">
-                              <span>处理器 cpu</span>
-                              <input className="mono" value={startForm.cpu} onChange={(e) => setStartForm((s) => ({ ...s, cpu: e.target.value }))} />
-                            </label>
-                            <label className="field">
-                              <span>circuitId</span>
-                              <input inputMode="numeric" value={startForm.circuitId} onChange={(e) => setStartForm((s) => ({ ...s, circuitId: e.target.value }))} />
-                            </label>
-                            <label className="field">
-                              <span>taskId</span>
-                              <input inputMode="numeric" value={startForm.taskId} onChange={(e) => setStartForm((s) => ({ ...s, taskId: e.target.value }))} />
-                            </label>
-                            <label className="field">
-                              <span>anchor</span>
-                              <input inputMode="numeric" value={startForm.anchor} onChange={(e) => setStartForm((s) => ({ ...s, anchor: e.target.value }))} />
-                            </label>
-                            <label className="field">
-                              <span>salt（bytes32）</span>
-                              <input className="mono" placeholder="留空=0x00…00" value={startForm.salt} onChange={(e) => setStartForm((s) => ({ ...s, salt: e.target.value }))} />
-                            </label>
-                          </div>
-                          <label className="field">
-                            <span>circuits（hex，逗号分隔）</span>
-                            <input className="mono" value={startForm.circuits} onChange={(e) => setStartForm((s) => ({ ...s, circuits: e.target.value }))} />
-                          </label>
-                          <label className="field">
-                            <span>proofs（hex，逗号分隔）</span>
-                            <input className="mono" value={startForm.proofs} onChange={(e) => setStartForm((s) => ({ ...s, proofs: e.target.value }))} />
-                          </label>
-                          <label className="field">
-                            <span>pubs（JSON bytes32[][]）</span>
-                            <input className="mono" placeholder='[["0x…"]]' value={startForm.pubs} onChange={(e) => setStartForm((s) => ({ ...s, pubs: e.target.value }))} />
-                          </label>
-                        </div>
+                      {(book._chain && book.marketOrders === false) || (book.executionFailed && idle) || !isOwner ? (
+                        <p className="fine ops-note">
+                          {book._chain && book.marketOrders === false && "当前这期仍是旧合约，重新部署并开新期后才会真正调用市场。"}
+                          {book.executionFailed && idle && " 上次买单托管额超过募集余额，交易虽上链但未真正挂出（未扣款）。请降低数量/单价重挂，或直接退款。"}
+                          {!isOwner && " 当前钱包不是 Factory Owner，无法执行写操作。"}
+                        </p>
                       ) : null}
-
-                      <p className="fine ops-note">
-                        {book._chain && book.marketOrders === false && "当前这期仍是旧合约，重新部署并开新期后才会真正调用市场。"}
-                        {book.executionFailed && idle && " 上次买单托管额超过募集余额，交易虽上链但未真正挂出（未扣款）。请降低数量/单价重挂，或直接退款。"}
-                        {!isOwner && " 当前钱包不是 Factory Owner，无法执行写操作。"}
-                      </p>
-                    </>
+                    </div>
                   );
                 })()}
 
                 {book.scene === "mining" && (
                   <>
                     <ul className="bill">
-                      <li><span>当前日产</span><strong>{formatBem(dailyBem)} BEM</strong></li>
-                      <li><span>已分发轮数</span><strong>{harvest.rounds} 次</strong></li>
-                      <li><span>本次可分得（按你的份额）</span><strong>{formatBem(harvest.userPart)} BEM</strong></li>
-                      <li className="due"><span>本阶段可做</span><strong>全网 harvest；个人 claim 在「我的资产」</strong></li>
+                      <li><span>预估算力（setPlan）</span><strong>{Number(book.estHashpower || 0).toLocaleString()} H</strong></li>
+                      <li><span>已入矿池</span><strong>{book.pooled ? "是" : "否"}</strong></li>
+                      <li className="due"><span>本阶段可做</span><strong>份额转让（listShares / takeListing）</strong></li>
                     </ul>
-                    <div className="actions">
-                      <button
-                        className="btn btn-primary"
-                        type="button"
-                        disabled={Boolean(pending) || (!book._chain && !(dailyBem > 0))}
-                        onClick={onHarvest}
-                        title={book._chain || dailyBem > 0 ? undefined : "当前没有可分发数量"}
-                      >
-                        {pending === "harvest" ? "分发中…" : "领取并分配（harvest）"}
-                      </button>
-                      {onOpenAssets && (
-                        <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
-                          去我的资产领取
-                        </button>
-                      )}
-                    </div>
                     <p className="fine">
-                      harvest 任何人可调用：从 PoD 拉本轮实收 BEM（估算日产只作参考）、扣服务费、按份入账。
-                      个人要把 pending 提到钱包，请到「我的资产」claim。
-                      {book._chain && " 测试网若 bemIsMock，前端会先给 MockPoD 注资再 harvest；主网无此捷径，PoD 须已有真实排放。"}
+                      元件已投入矿池，不可撤出。BEM 分配合约接入前 harvest / claim 是占位空实现，
+                      不产出发放；持份用户退出只能通过挖矿份额转让发布出售挂单，由他人接收。
                     </p>
                   </>
                 )}
@@ -856,36 +994,69 @@ export function OwnerOverview({
             </article>
 
             {book._chain && (
-              <article className="card">
-                <div className="card-header">链上参数（本期）</div>
-                <div className="card-body">
-                  <dl className="param-grid">
+              <div className="detail-col">
+                <article className="card">
+                  <div className="card-header">链上参数（本期）</div>
+                  <div className="card-body">
+                    <dl className="param-grid">
                     <div><dt>合约</dt><dd className="mono">{shortAddress(round.contract)}</dd></div>
                     <div><dt>Owner</dt><dd className="mono">{shortAddress(book.owner)}</dd></div>
                     <div>
-                      <dt>服务费分成</dt>
+                      <dt>挖矿产出服务费分成</dt>
                       <dd>
-                        {(Array.isArray(round.feeShares) && round.feeShares.length
-                          ? round.feeShares
-                          : [{ address: round.feeRecipient, shareBps: 10_000 }]
-                        ).map((row) => (
-                          <div key={`${row.address}-${row.shareBps}`} className="mono">
-                            {shortAddress(row.address)} · {Math.round(Number(row.shareBps) / 100)}%
-                          </div>
-                        ))}
+                        {/*
+                         * 读链上（口径：挖矿产出服务费真正上链）。
+                         * serviceFeeBps / 分成表都在 Campaign 里，任何人可读。
+                         * 还没设过（serviceFeeSet == false）就写「未设定」——
+                         * 注意「未设定」和「设为 0%」是两回事，前者还能改，后者已锁定。
+                         */}
+                        {chainFeeSet ? (
+                          <>
+                            <div>挖矿产出服务费 {chainFeePercent}%</div>
+                            {chainFeeShares.map((row) => (
+                              <div key={row.address} className="mono">
+                                {shortAddress(row.address)} · {Math.round(Number(row.sharePercent))}%
+                              </div>
+                            ))}
+                            <div className="param-note">链上设定 · 不可修改 · 从挖矿收益计提</div>
+                          </>
+                        ) : (
+                          <>
+                            <span className="muted-value">未设定</span>
+                            <div className="param-note">尚无人认购时可调 setServiceFee 写入</div>
+                          </>
+                        )}
                       </dd>
                     </div>
-                    <div><dt>本次可分得</dt><dd>{formatBem(harvest.userPart)} BEM</dd></div>
-                    <div><dt>已领次数</dt><dd>{harvest.rounds} 次</dd></div>
+                    <div>
+                      <dt>预估算力</dt>
+                      <dd>
+                        {Number(book.estHashpower || 0) > 0
+                          ? `${Number(book.estHashpower).toLocaleString()} H`
+                          : <span className="muted-value">未写入</span>}
+                      </dd>
+                    </div>
                     <div>
                       <dt>链上算力 / 元件</dt>
                       <dd>
                         {hashLabel}
                         {" · "}
-                        {Number(book.transistorCount) > 0 ? `${book.transistorCount} 颗` : "元件未写入"}
+                        {Number(book.transistorCount) > 0 ? `${book.transistorCount} 颗` : "元件未成交"}
                       </dd>
                     </div>
-                    <div><dt>题目元件</dt><dd>{design.taskParts || "—"} 颗</dd></div>
+                    <div>
+                      <dt>本期元件</dt>
+                      <dd>
+                        {/*
+                         * 元件数权威来源 = 链上 nandQty + latchQty（成交到账量），
+                         * 不是 round.partCount（那是本地发行记录里的推算值，链上不存在）。
+                         * 还没成交就说「未成交」，不拿推算值冒充。
+                         */}
+                        {Number(book.transistorCount) > 0
+                          ? `${book.transistorCount} 颗`
+                          : <span className="muted-value">未成交</span>}
+                      </dd>
+                    </div>
                     <div>
                       <dt>托管 BNB</dt>
                       <dd>
@@ -893,12 +1064,47 @@ export function OwnerOverview({
                         {refundGap > 0 && <span className="flow-gap"> · 距按份全退还差 {round4(refundGap)} BNB</span>}
                       </dd>
                     </div>
-                    <div><dt>已验证权重</dt><dd>{Number(book.netWeightVerified || 0).toLocaleString()}</dd></div>
-                    <div><dt>未验证权重</dt><dd>{Number(book.netWeightUnverified || 0).toLocaleString()}</dd></div>
                     <div><dt>锁价</dt><dd>{book.priceLock ? `${round4(book.priceLock)} BNB` : "未锁"}</dd></div>
                   </dl>
-                </div>
-              </article>
+                  </div>
+                </article>
+                {/*
+                 * 历史交易记录常驻右栏。
+                 * 之前只在 scene === "executing" 时渲染，募资阶段整栏直接消失，
+                 * 右栏只剩「链上参数 + 官方价」，跟设计稿的「历史交易记录」栏对不上。
+                 * 现在无论哪个阶段都在，没挂单时面板自己会说明「还没有向材料市场挂过单」。
+                 *
+                 * 排序：链上参数 → 历史交易记录 → 官方价。
+                 * 交易记录是这一栏的主内容，官方价是参考，放最后。
+                 */}
+                <MarketTradePanel
+                  campaignAddr={round.contract || book.address}
+                  refreshKey={marketRefreshKey}
+                  phase={book.executePhase}
+                  fallbackRows={{
+                    nandBidId: book.nandBidId, latchBidId: book.latchBidId,
+                    nandQty: Number(book.nandQty) || 0, latchQty: Number(book.latchQty) || 0,
+                    nandRemaining: book.nandRemaining, latchRemaining: book.latchRemaining,
+                    nandPrice: Number(book.nandPrice) || 0, latchPrice: Number(book.latchPrice) || 0,
+                    nandAskId: book.nandAskId, latchAskId: book.latchAskId,
+                    nandAskQty: Number(book.nandAskQty) || 0, latchAskQty: Number(book.latchAskQty) || 0,
+                    nandAskRemaining: book.nandAskRemaining, latchAskRemaining: book.latchAskRemaining,
+                    nandAskPrice: Number(book.nandAskPrice) || 0, latchAskPrice: Number(book.latchAskPrice) || 0,
+                    marketOwed: Number(book.marketOwed) || 0,
+                    partsNand: Number(book.partsNand) || 0, partsLatch: Number(book.partsLatch) || 0,
+                  }}
+                />
+                <OfficialPricePanel official={official} processorId={design.processorId} compact dense />
+                {book.scene === "executing" && (book.executionFailed || book.refundShort) && (
+                  <RefundRecords
+                    compact
+                    campaignAddr={round.contract || book.address}
+                    refreshKey={`${book.refundedTotal}|${book.sold}|${book.bnbPool}`}
+                    account={actor?.address}
+                    fallback={{ totalRefunded: book.refundedTotal, pool: book.bnbPool, mine: book.refundedSelf }}
+                  />
+                )}
+              </div>
             )}
           </div>
     );
@@ -945,7 +1151,7 @@ export function OwnerOverview({
             <strong>{statusFilter === "全部" ? "还没有期次" : `「${statusFilter}」下没有期次`}</strong>
             <p>
               {statusFilter === "全部"
-                ? "发布一期之后，会出现在这里。可以按募集中、待执行、挖矿中筛选。"
+                ? "发布一期之后，会出现在这里。可以按募集中、待执行、挖矿中、已结束筛选。"
                 : "换一个状态查看，或等这一阶段有新的期次。"}
             </p>
           </div>
@@ -957,7 +1163,7 @@ export function OwnerOverview({
               const pct = sold != null && total > 0 ? Math.min(100, Math.round((sold / total) * 100)) : null;
               const raised = item.raisedBnb != null ? Number(item.raisedBnb).toFixed(4) : item.raised;
               const cap = item.hardCapBnb != null ? Number(item.hardCapBnb).toFixed(4) : null;
-              const task = item.taskId != null ? `#${item.taskId} ${item.taskName || ""}`.trim() : (item.taskName || "—");
+              const headline = `第 ${item.id} 期`;
               return (
                 <article key={rowKey(item)} className="campaign-card" onClick={() => openRound(item)}>
                   <header className="campaign-card-head">
@@ -966,10 +1172,13 @@ export function OwnerOverview({
                         <strong>第 {item.id} 期</strong>
                         {item.address ? <span className="mono">{shortAddress(item.address)}</span> : null}
                       </div>
-                      <h2>{task}</h2>
-                      <p>目标处理器 {item.processor || "—"}</p>
+                      <h2>{headline}</h2>
+                      {item.processor ? <p>元件合约处理器 {item.processor}</p> : null}
                     </div>
-                    <span className={`badge tone-${item.tone}`}>{item.status}</span>
+                    <div className="campaign-status">
+                      <span className={`badge tone-${item.tone}`}>{item.status}</span>
+                      {item.statusNote ? <small>{item.statusNote}</small> : null}
+                    </div>
                   </header>
                   <dl className="campaign-metrics">
                     <div>
@@ -991,7 +1200,7 @@ export function OwnerOverview({
                       <dd>{item.bem}</dd>
                     </div>
                     <div>
-                      <dt>服务费</dt>
+                      <dt>挖矿产出服务费</dt>
                       <dd>{item.fee}</dd>
                     </div>
                   </dl>
@@ -1003,10 +1212,12 @@ export function OwnerOverview({
                   <footer className="campaign-card-foot">
                     <span>{nextActionByStatus(item.status)}</span>
                     <div className="row-actions" onClick={(event) => event.stopPropagation()}>
-                      <button className="campaign-link" type="button" onClick={() => openTool(item, "holders")}>份额明细</button>
-                      <button className="campaign-link" type="button" onClick={() => openTool(item, "calls")}>合约调用</button>
-                      <button className="campaign-link" type="button" onClick={() => openTool(item, "onchain")}>链上调试</button>
-                      <button className="campaign-link" type="button" onClick={() => openTool(item, "ops")}>合约操作</button>
+                      {/*
+                       * 四个工具合并到一个弹窗里用标签页切换。
+                       * 卡片上只留一个「打开工具」入口——四个平级按钮会让人以为
+                       * 它们打开的是四个不同页面，而不是同一期数的四个视角。
+                       */}
+                      <button className="campaign-link" type="button" onClick={() => openTool(item, "ops")}>打开工具</button>
                       {item.address && isOwner && onRemoveCampaign && (
                         <button
                           className="campaign-link tone-danger"
@@ -1041,7 +1252,15 @@ export function OwnerOverview({
           </div>
         </footer>
       </section>
-      {dialogRow && (
+      {/*
+       * 弹窗用 portal 挂到 body 上。
+       *
+       * 原因：`.main-content` 上有 `isolation: isolate`，它会**建立层叠上下文**，
+       * 于是 .sheet-backdrop 的 z-index: 120 只在 main-content 内部有效，
+       * 根本压不过根层的侧边栏（z-index: 100）——弹窗左半边会被侧边栏盖住，
+       * 标签页点不动。挂到 body 后才是真正的顶层弹窗。
+       */}
+      {dialogRow && typeof document !== "undefined" && createPortal(
         <div className="sheet-backdrop" onClick={() => setDialog(null)}>
           <div
             className={dialog.pane === "ops" || dialog.pane === "onchain" ? "sheet sheet-wide" : "sheet"}
@@ -1052,11 +1271,28 @@ export function OwnerOverview({
           >
             <header className="sheet-head">
               <div>
-                <p className="sheet-kicker">第 {dialogRow.id} 期</p>
+                <p className="sheet-kicker">
+                  第 {dialogRow.id} 期
+                  {dialogRow.address ? <span className="mono sheet-addr"> · {shortAddress(dialogRow.address)}</span> : null}
+                </p>
                 <h2>{dialogTitle}</h2>
               </div>
               <button className="sheet-close" type="button" aria-label="关闭" onClick={() => setDialog(null)}>×</button>
             </header>
+            <nav className="sheet-tabs" role="tablist" aria-label="工具切换">
+              {DIALOG_TABS.map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={dialog.pane === t.id}
+                  className={dialog.pane === t.id ? "sheet-tab is-on" : "sheet-tab"}
+                  onClick={() => setDialog((prev) => (prev ? { ...prev, pane: t.id } : prev))}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </nav>
             <div className="sheet-body">
               {!dialogLive ? (
                 <p className="fine">正在读取这一期…</p>
@@ -1104,14 +1340,23 @@ export function OwnerOverview({
                         <small>{hashHint}</small>
                       </div>
                       <div>
-                        <dt>日产</dt>
-                        <dd>{formatBem(dailyBem)}</dd>
-                        <small>BEM</small>
+                        {/*
+                         * 算力与预估算力是同一个数（book.hashpower = estHashpower），
+                         * 之前并排显示两行、其中一行恒为 0，纯属重复。
+                         * 这里只留「元件」一行，元件数才是链上另一个独立事实。
+                         */}
+                        <dt>已买入元件</dt>
+                        <dd>
+                          {Number(book.transistorCount) > 0
+                            ? `${book.transistorCount} 颗`
+                            : <span className="muted-value">未成交</span>}
+                        </dd>
+                        <small>成交到账的 NAND + LATCH</small>
                       </div>
                       <div>
-                        <dt>已分配</dt>
-                        <dd>{formatBem(book.distributed || 0)}</dd>
-                        <small>服务费 {formatBem(book.feeBem)} BEM</small>
+                        <dt>已入矿池</dt>
+                        <dd>{book.pooled ? "是" : "否"}</dd>
+                        <small>{book.pooled ? "已开始分发" : "待 depositToPool"}</small>
                       </div>
                     </dl>
                     <div className="campaign-progress" aria-hidden="true">
@@ -1124,7 +1369,8 @@ export function OwnerOverview({
               )}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
       </section>
     );
@@ -1153,7 +1399,7 @@ export function OwnerOverview({
         <div className="list-panel-body">
           <div className="list-empty">
             <strong>链上状态对齐中</strong>
-            <p>题目、募集和可执行操作稍后会出现在这里。</p>
+            <p>元件数、募集和可执行操作稍后会出现在这里。</p>
           </div>
         </div>
       </section>
@@ -1167,8 +1413,8 @@ export function OwnerOverview({
           {crumb(`第 ${opened.id} 期`)}
           <div className="list-panel-title">
             <div>
-              <h2>{opened.taskId != null ? `#${opened.taskId} ${opened.taskName || ""}` : (opened.taskName || "本期摘要")}</h2>
-              <p>目标处理器 {opened.processor || "—"} · 这一期没有可操作的链上状态</p>
+              <h2>第 {opened.id} 期</h2>
+              <p>{opened.processor ? `元件合约处理器 ${opened.processor} · ` : ""}这一期没有可操作的链上状态</p>
             </div>
             <span className={`badge tone-${opened.tone}`}>{opened.status}</span>
           </div>
@@ -1180,7 +1426,7 @@ export function OwnerOverview({
               <div><dt>募集</dt><dd>{opened.raised}</dd></div>
               <div><dt>算力</dt><dd>{opened.hashpower || "—"}</dd></div>
               <div><dt>已分配</dt><dd>{opened.bem}</dd></div>
-              <div><dt>服务费</dt><dd>{opened.fee}</dd></div>
+              <div><dt>挖矿产出服务费</dt><dd>{opened.fee}</dd></div>
             </dl>
           </article>
         </div>
@@ -1194,15 +1440,14 @@ export function OwnerOverview({
         {crumb(`第 ${round.id} 期`)}
         <div className="list-panel-title">
           <div>
-            <h2>#{design.taskId} {design.taskName}</h2>
+            <h2>第 {round.id} 期</h2>
             <p>
-              目标处理器 {design.processorKnown ? `${design.processorId} · P=${design.processorScale}` : "未记录"}
-              {design.taskTier ? ` · ${design.taskTier}` : ""}
-              {design.taskParts ? ` · ${design.taskParts} 元件` : ""}
+              {design.processorKnown ? `处理器 ${design.processorId} · P=${design.processorScale}` : "处理器未记录"}
+              {Number(round.partCount) > 0 ? ` · ${round.partCount} 元件` : ""}
               {round.contract ? ` · ${shortAddress(round.contract)}` : ""}
             </p>
           </div>
-          <span className={`badge tone-${copy.tone}`}>{copy.badge}</span>
+          <span className={`badge tone-${liveStatus.tone}`}>{liveStatus.badge}</span>
         </div>
         <div className="desk-tabs detail-tabs" role="tablist" aria-label="本期工具">
           {[
@@ -1244,14 +1489,14 @@ export function OwnerOverview({
               <small>{hashHint}</small>
             </div>
             <div>
-              <dt>日产</dt>
-              <dd>{formatBem(dailyBem)}</dd>
-              <small>BEM</small>
+              <dt>预估算力</dt>
+              <dd>{Number(book.estHashpower || 0).toLocaleString()}</dd>
+              <small>H</small>
             </div>
             <div>
-              <dt>已分配</dt>
-              <dd>{formatBem(book.distributed || 0)}</dd>
-              <small>服务费 {formatBem(book.feeBem)} BEM</small>
+              <dt>已入矿池</dt>
+              <dd>{book.pooled ? "是" : "否"}</dd>
+              <small>{book.pooled ? "已开始分发" : "待 depositToPool"}</small>
             </div>
           </dl>
           <div className="campaign-progress" aria-hidden="true">
@@ -1303,35 +1548,35 @@ export function OwnerCreate({
   onCreate,
   pending,
   snapshot,
-  taskbook,
-  now,
   chainMode = false,
-  defaultFeeRecipient = "",
   factoryOwner = "",
   connectedAccount = "",
+  defaultFeeRecipient = "",
+  allowedParts = [],
   onConnect,
 }) {
-  const [draft, setDraft] = useState(() => ({
-    ...EMPTY_FORM,
-    feeRecipient: defaultFeeRecipient || EMPTY_FORM.feeRecipient,
-    feeShares: [
-      {
-        address: defaultFeeRecipient || EMPTY_FORM.feeRecipient,
-        sharePercent: "100",
-      },
-    ],
-  }));
-  // 连接钱包后把第一条服务费地址默认填成当前账户（尚未手改占位地址时）
+  const [draft, setDraft] = useState(() => ({ ...EMPTY_FORM }));
+  /**
+   * 「碰过才校验」。
+   *
+   * 初始态就满屏红是最差的引导：用户还没填一项，先被三条错误围着，
+   * 反而不知道该从哪开始。这里只在字段失焦过（或点过提交）之后才显示
+   * 对应的红框与错误列表，表单一开始是干净的。
+   */
+  const [touched, setTouched] = useState({});
+  const [submitTried, setSubmitTried] = useState(false);
+  const touch = (key) => setTouched((cur) => (cur[key] ? cur : { ...cur, [key]: true }));
+  const showIssues = submitTried || Object.keys(touched).length > 0;
+  /**
+   * 连接钱包后只回填「地址」这一项（运行时账户，不是预设值）。
+   * 分成比例始终留空由用户填，不替他决定。
+   */
   useEffect(() => {
     if (!defaultFeeRecipient) return;
     setDraft((cur) => {
       const rows = Array.isArray(cur.feeShares) ? cur.feeShares : [];
       const first = rows[0]?.address || cur.feeRecipient;
-      const isPlaceholder =
-        !first ||
-        first === EMPTY_FORM.feeRecipient ||
-        /^0x0+fee$/i.test(first);
-      if (!isPlaceholder) return cur;
+      if (first) return cur; // 已填过地址就不动，避免覆盖用户输入
       const nextShares =
         rows.length === 0
           ? [{ address: defaultFeeRecipient, sharePercent: "100" }]
@@ -1339,6 +1584,113 @@ export function OwnerCreate({
       return { ...cur, feeRecipient: defaultFeeRecipient, feeShares: nextShares };
     });
   }, [defaultFeeRecipient]);
+
+  const isFactoryOwner =
+    !chainMode ||
+    !factoryOwner ||
+    (connectedAccount && String(connectedAccount).toLowerCase() === String(factoryOwner).toLowerCase());
+  /** 开期测算用的报价：链上单价（若有）优先，否则静态基准 */
+  const quote = snapshot || QUOTE;
+
+  /**
+   * 募资总额与总份数：开期人**手动填写**，两项都是必填。
+   *
+   * 总份数定「分成多少份」。每份 BNB 是派生展示值（每份 = 募资总额 ÷ 总份数），
+   * 不可单独手填——填任何一个都会破坏「募资总额 = 份数 × 每份」的链上恒等式。
+   *
+   * ⚠️ 这里**没有**「留空 = 跟随建议」：建议方案依赖处理器与元件报价，
+   * 而发布期不选处理器，建议值就成了来源不明的数字。宁可直接要求开期人自己填。
+   */
+  /**
+   * 本期元件合约（= 处理器）：**开期人必须显式选择**（T-79 核心改动）。
+   *
+   * 工厂不再有「默认元件」：`createCampaign` 第 4 参 transistors 由前端从链上白名单里选，
+   * 零地址一律 revert（主网白名单 = 官方两件套 TapeOut / Behemoth 各自的元件合约）。
+   * 这样单工厂可承载多处理器，每期锁定一个，而不是所有期次被锁死到同一处理器。
+   *
+   * 演示（非链上）模式没有白名单可读，处理器由系统选定，表单不收集、也不校验。
+   */
+  const selectedProcessor = String(draft.transistors || "").trim();
+  const processorOptions = (Array.isArray(allowedParts) ? allowedParts : []).filter(
+    (a) => /^0x[0-9a-fA-F]{40}$/.test(String(a || "").trim())
+  );
+  const capNum = Number(draft.hardCapBnb);
+  const sharesNum = Number(draft.totalShares);
+  /** 募资总额合法性：必须是正数 */
+  const capValid = Number.isFinite(capNum) && capNum > 0;
+  /** 总份数合法性：必须是正整数 */
+  const sharesValid = Number.isInteger(sharesNum) && sharesNum > 0;
+  /** 服务费是否填了合法值（1–10 整数）——先声明再被下方红框判定引用，避免 TDZ 崩白屏 */
+  const feeValid = (() => {
+    const n = Number(draft.feePercent);
+    return Number.isInteger(n) && n >= 1 && n <= 10;
+  })();
+  /** 红框只给「碰过还错」的字段，没碰过的保持干净 */
+  const capInvalid = (touched.hardCapBnb || submitTried) && !capValid;
+  /**
+   * 募集天数校验：链上 createCampaign 直接把 `Number(fundingDays) * 86400`
+   * 当 uint64 写进 deadline。填 0 会得到「已截止」的僵尸期次（建期即过期，
+   * 认购入口永久关闭且无人能救），填非整数会被静默截断——所以前端必须拦。
+   */
+  const daysNum = Number(draft.fundingDays);
+  const daysValid = Number.isInteger(daysNum) && daysNum >= 1 && daysNum <= 3650;
+  const daysInvalid = (touched.fundingDays || submitTried) && !daysValid;
+  const sharesInvalid = (touched.totalShares || submitTried) && !sharesValid;
+  const feeInvalid = (touched.feePercent || submitTried) && !feeValid;
+  /** 处理器（元件合约）：链上模式必选，且必须是合法地址（白名单在链上校验） */
+  const transistorsValid = chainMode
+    ? /^0x[0-9a-fA-F]{40}$/.test(selectedProcessor)
+    : true;
+  const transistorsInvalid =
+    (touched.transistors || submitTried) && chainMode && !transistorsValid;
+  /** 有效口径：直接用手填值。非法值保留原数字交给校验拦截，不静默回退成"建议值" */
+  const effCap = capNum;
+  const effShares = sharesNum;
+  /** 派生每份 = 募资总额 ÷ 总份数。非法输入时为 NaN，展示置空、由红框与校验提示 */
+  const perShareBnb = effCap > 0 && effShares > 0 ? effCap / effShares : NaN;
+  const priceInput = Number.isFinite(perShareBnb) && perShareBnb > 0 ? perShareBnb.toFixed(4) : "";
+  const sharesInput = String(effShares);
+  /** 分成表转链上 bps 口径（UI 收百分比，reviewRound/applyCreate 收 shareBps） */
+  const feeSharesForChain = (Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row) => {
+    const percent = Math.round(Number(row.sharePercent ?? 0));
+    return {
+      address: String(row.address || "").trim(),
+      shareBps: percent * 100,
+    };
+  });
+  const feeSharePercentSum = (Array.isArray(draft.feeShares) ? draft.feeShares : []).reduce(
+    (sum, row) => sum + (Math.round(Number(row.sharePercent)) || 0),
+    0
+  );
+  /**
+   * 开期校验与预估值都用解析后的单价/份数。
+   * 链上 createCampaign 收 单价 / 份数 / 天数 / 元件合约；
+   * 服务费与分成是**建期后的第二笔交易**（setServiceFee，只能在 sold == 0 时调），由 App 侧串联。
+   *
+   * 元件合约（处理器）由开期人显式选（effectiveDraft.transistors）；
+   * 链上模式必填，零地址会被工厂 revert。演示模式留空，由模拟引擎派生。
+   */
+
+  const effectiveDraft = {
+    ...draft,
+    /**
+     * 元件合约：开期人从白名单显式选的处理器地址（链上模式必填；
+     * 演示模式留空，由模拟引擎按默认型号派生，不写链上）。
+     */
+    transistors: selectedProcessor,
+    /** 手动募资总额（权威口径，必填） */
+    hardCapBnb: String(effCap),
+    /** 派生每份：非法输入退为 0，避免下游 NaN 传播 */
+    sharePriceBnb: Number.isFinite(perShareBnb) ? String(perShareBnb) : "0",
+    totalShares: sharesInput,
+    feeShares: feeSharesForChain,
+    feeRecipient: feeSharesForChain[0]?.address || draft.feeRecipient,
+  };
+  const review = reviewRound(effectiveDraft, quote);
+
+  function update(key, value) {
+    setDraft((current) => ({ ...current, [key]: value }));
+  }
 
   const updateFeeShare = (index, key, value) => {
     setDraft((cur) => {
@@ -1366,10 +1718,10 @@ export function OwnerCreate({
   const addFeeShare = () => {
     setDraft((cur) => {
       const rows = [...(Array.isArray(cur.feeShares) ? cur.feeShares : [])];
-      if (rows.length >= 20) return cur;
-      const used = rows.reduce((sum, row) => sum + (Math.round(Number(row.sharePercent)) || 0), 0);
-      const remain = Math.max(0, 100 - used);
-      rows.push({ address: "", sharePercent: String(remain) });
+      // 链上 MAX_FEE_RECIPIENTS = 3，超了 setServiceFee 直接 revert。
+      if (rows.length >= 3) return cur;
+      // 新行比例留空由用户填，不自动补「剩余 100 - 已用」——那是替用户做决定
+      rows.push({ address: "", sharePercent: "" });
       return { ...cur, feeShares: rows };
     });
   };
@@ -1381,245 +1733,18 @@ export function OwnerCreate({
       return { ...cur, feeShares: next, feeRecipient: next[0]?.address || "" };
     });
   };
-  const isFactoryOwner =
-    !chainMode ||
-    !factoryOwner ||
-    (connectedAccount && String(connectedAccount).toLowerCase() === String(factoryOwner).toLowerCase());
-  const quote = snapshot || QUOTE;
 
-  /* ── 目标处理器：由开期人选择，系统只负责把两个选项的账算清楚 ── */
-  const task = findTask({ taskId: draft.taskId }, taskbook);
-  /** 手选的处理器 -> 元件组合 id（NAND/LATCH 配比仍由题目给定，不是二选一） */
-  const processorId = PROCESSOR_IDS.includes(draft.processorId) ? draft.processorId : PROCESSOR_IDS[0];
-  const transistorId = transistorIdFor(processorId);
-
-  /**
-   * 发行方案：每份 BNB 与总份数一起算出来。
-   *
-   * 必须排在处理器对比之前——对比要靠募资总额判断「买不买得起」。
-   * 依赖顺序：题目元件数 -> offering -> 处理器对比。
-   */
-  const offering = designOffering({ task, transistorId, snapshot: quote });
-
-  /**
-   * 募资总额与总份数：开期人**手动填写**（默认留空 = 跟随建议方案）。
-   *
-   * 两者是这一期发行规模的两个旋钮：募资总额定「这期总共募多少 BNB」，
-   * 总份数定「分成多少份」。每份 BNB 是派生展示值（每份 = 募资总额 ÷ 总份数），
-   * 不可单独手填——填任何一个都会破坏「募资总额 = 份数 × 每份」的链上恒等式。
-   *
-   * 留空哨兵：draft.hardCapBnb / draft.totalShares 为 "" 时表示跟随建议，
-   * 渲染与校验时取 offering 的对应字段；用户填了就用填的。
-   *
-   * 改 processorId（换处理器）会改变流片成本，
-   * 进而改变「成本占募资总额」比例——但募资总额与份数本身由开期人决定。
-   */
-  const capRaw = draft.hardCapBnb;
-  const sharesRaw = draft.totalShares;
-  const capFollows = capRaw === "" || capRaw === undefined;
-  const sharesFollows = sharesRaw === "" || sharesRaw === undefined;
-  const capNum = Number(capRaw);
-  const sharesNum = Number(sharesRaw);
-  /** 募资总额合法性：留空跟随建议，或必须是正数 */
-  const capValid = capFollows || (Number.isFinite(capNum) && capNum > 0);
-  /** 总份数合法性：留空跟随建议，或必须是正整数 */
-  const sharesValid = sharesFollows || (Number.isInteger(sharesNum) && sharesNum > 0);
-  /** 有效口径（跟随建议时取方案值；非法值保留原数字交给校验拦截，不静默回退） */
-  const effCap = capFollows ? offering.hardCapBnb : capNum;
-  const effShares = sharesFollows ? offering.totalShares : sharesNum;
-  /**
-   * 派生每份：两者都跟随建议时直接取方案单价（避免 round4 误差），
-   * 否则用「募资总额 ÷ 总份数」。非法输入时为 NaN，展示置空、由红框与校验提示。
-   */
-  const perShareBnb = effCap > 0 && effShares > 0
-    ? (capFollows && sharesFollows ? offering.sharePriceBnb : effCap / effShares)
-    : NaN;
-  const priceInput = Number.isFinite(perShareBnb) && perShareBnb > 0 ? perShareBnb.toFixed(4) : "";
-  const sharesInput = String(effShares);
-  /**
-   * 募资总额（展示与横向对比口径）：手动输入合法时用开期人填的数，
-   * 非法输入时回退到建议方案值，避免处理器卡片/占比出现 NaN 或 Infinity。
-   * 真正的权威值（含非法输入）见 effectiveDraft.hardCapBnb（effCap），交给 reviewRound 校验拦截。
-   */
-  const hardCapBnb = Number.isFinite(effCap) && effCap > 0 ? effCap : offering.hardCapBnb;
-  /** 两个处理器的横向对比，供开期人参考，不代替他做决定 */
-  const options = compareProcessors({ task, hardCapBnb, snapshot: quote });
-  /** 当前所选处理器的方案 */
-  const tplan = options.find((o) => o.processorId === processorId) || options[0];
-  const advice = adviseProcessor({ processorId: tplan.processorId, plan: tplan, hardCapBnb });
-  /**
-   * 开期校验与预估值都用选定的处理器 + 解析后的单价/份数/元件数。
-   * taskbook 必须传——不传会退回离线兜底题库，校验的权重就跟上面展示的对不上了。
-   */
-  /** 开期校验与预估值都用选定的处理器 + 解析后的单价/份数/元件数。 */
-  const feeSharesForChain = (Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row) => {
-    const percent = Math.round(Number(row.sharePercent ?? 0));
-    return {
-      address: String(row.address || "").trim(),
-      shareBps: percent * 100,
-    };
-  });
-  const feeSharePercentSum = (Array.isArray(draft.feeShares) ? draft.feeShares : []).reduce(
-    (sum, row) => sum + (Math.round(Number(row.sharePercent)) || 0),
-    0
-  );
-  const effectiveDraft = {
-    ...draft,
-    transistorId,
-    /** 手动募资总额（权威口径），跟随建议时为方案值 */
-    hardCapBnb: String(effCap),
-    /** 派生每份：非法输入退为 0，避免下游 NaN 传播 */
-    sharePriceBnb: Number.isFinite(perShareBnb) ? String(perShareBnb) : "0",
-    totalShares: sharesInput,
-    feeShares: feeSharesForChain,
-    feeRecipient: feeSharesForChain[0]?.address || draft.feeRecipient,
-  };
-  const review = reviewRound(effectiveDraft, quote, undefined, taskbook);
-
-  const est = estimateHashpower(
-    {
-      ...effectiveDraft,
-      sharePriceBnb: Number(priceInput) || 0,
-      totalShares: Number(sharesInput) || 0,
-      miningDays: MINING_DAYS,
-      feeBps: Number(draft.feePercent) * 100 || 0,
-    },
-    quote,
-  );
-  /* ── 选题 ── */
-  const tiers = taskTiers(taskbook);
-  const [tierFilter, setTierFilter] = useState("");
-  const [taskQuery, setTaskQuery] = useState("");
-  const shown = listTasks(taskbook, {
-    tier: tierFilter || undefined,
-    keyword: taskQuery || undefined,
-  });
-
-  /** 真实产出机制：链上实读的全网权重与当前系数 */
-  const rate = currentRate();
-  /**
-   * 只给日口径，不乘挖矿期天数。
-   *
-   * 天数不该出现在界面上：零和机制下全网权重涨了，挖再久日产也同步下降，
-   * 产出与天数并不成正比。按天数外推的累计值会让人误判收益。
-   * 费率直接取 draft，不做 || 7 兜底——否则输入 0 会被当成 7%。
-   */
-  const feeRateDraft = Number.isFinite(Number(draft.feePercent)) ? Number(draft.feePercent) : 0;
-  const dailyFeeBem = (tplan.dailyBem * feeRateDraft) / 100;
-  const dailyNetBem = tplan.dailyBem * (1 - feeRateDraft / 100);
-  /**
-   * 发布检查逐项核对：数值与 reviewRound 同源，并标出通过 / 警告 / 错误。
-   * 日产用 review.dailyBem（含闸门 → 未验证池），不用 bemRate(hashpower) 硬套已验证池。
-   */
-  const publishChecks = (() => {
-    const hardCap = Number(review.hardCapBnb) || 0;
-    const need = Number(review.needBnb) || 0;
-    const ratio = hardCap > 0 ? need / hardCap : 0;
-    const margin = hardCap - need;
-    const tolerancePct = need > 0 ? ((hardCap / need) - 1) * 100 : 0;
-    const daily = Number(review.dailyBem ?? tplan.dailyBem) || 0;
-    const dailyNet = daily * (1 - feeRateDraft / 100);
-    const feeOk = Number.isInteger(feeRateDraft) && feeRateDraft >= 1 && feeRateDraft <= 20;
-    return [
-      {
-        id: "hardCap",
-        label: "募资总额",
-        value: hardCap > 0 ? `${hardCap.toFixed(4)} BNB` : "—",
-        status: hardCap > 0 ? "ok" : "err",
-        note: hardCap > 0 ? "开期人手填或跟随建议方案" : "募资总额无效",
-      },
-      {
-        id: "need",
-        label: "流片成本（NAND + LATCH）",
-        value: `${need.toFixed(4)} BNB`,
-        status: need > 0 ? (margin >= 0 ? "ok" : "err") : "err",
-        note: need > 0
-          ? `${review.nand || 0} NAND + ${review.latch || 0} LATCH · 共 ${review.needParts || 0} 颗`
-          : "流片成本未算出",
-      },
-      {
-        id: "ratio",
-        label: "成本占募资总额",
-        value: hardCap > 0 ? `${(ratio * 100).toFixed(1)}%` : "—",
-        status:
-          hardCap <= 0 || need <= 0
-            ? "err"
-            : ratio > 1
-              ? "err"
-              : ratio < COST_RATIO_MIN || ratio > COST_RATIO_MAX
-                ? "warn"
-                : "ok",
-        note:
-          hardCap <= 0
-            ? "无法计算占比"
-            : ratio > 1
-              ? "成本超过募资总额，执行将退款"
-              : ratio < COST_RATIO_MIN
-                ? `低于健康下限 ${(COST_RATIO_MIN * 100).toFixed(0)}%，保护厚但募资利用率低`
-                : ratio > COST_RATIO_MAX
-                  ? `高于健康上限 ${(COST_RATIO_MAX * 100).toFixed(0)}%，抗涨价缓冲薄`
-                  : `健康区间 ${(COST_RATIO_MIN * 100).toFixed(0)}%–${(COST_RATIO_MAX * 100).toFixed(0)}%`,
-      },
-      {
-        id: "tolerance",
-        label: "元件涨价多少触发退款",
-        value: need > 0 ? `+${tolerancePct.toFixed(0)}%` : "—",
-        status: need > 0 ? (margin >= 0 ? (tolerancePct < 33 ? "warn" : "ok") : "err") : "err",
-        note: need > 0
-          ? margin >= 0
-            ? `现价 × ${(hardCap / need).toFixed(2)} 触顶`
-            : "现价已买不起"
-          : "无成本基准",
-      },
-      {
-        id: "margin",
-        label: "流片后余量",
-        value: margin >= 0 ? `${margin.toFixed(4)} BNB` : "不足，本期会退款",
-        status: margin >= 0 ? "ok" : "err",
-        note: margin >= 0 ? "募资总额覆盖流片成本后的剩余" : `缺口 ${(-margin).toFixed(4)} BNB`,
-      },
-      {
-        id: "hashpower",
-        label: "本期矿机权重",
-        value: String(review.hashpower ?? "—"),
-        status: Number(review.hashpower) > 0 ? "ok" : "err",
-        note: Number(review.hashpower) > 0
-          ? `${review.needParts} 元件 × P=${review.processorScale}${review.capped ? " · 闸门拦住" : ""}${review.optimal ? ` · 含溢价 q=${review.q}` : " · 无设计溢价"}`
-          : "权重为 0",
-      },
-      {
-        id: "daily",
-        label: review.capped ? "日产（未验证池）" : "日产（已验证池）",
-        value: `${formatBem(daily)} BEM`,
-        status: daily > 0 ? (review.capped ? "warn" : "ok") : "err",
-        note: review.capped
-          ? `题目超过挖矿闸门 ${MINE_GATE_LIMIT} 门，只进未验证池分 1%`
-          : "按全网已验证权重占比估算",
-      },
-      {
-        id: "dailyNet",
-        label: `扣费后日产（服务费 ${feeRateDraft}%）`,
-        value: `${formatBem(dailyNet)} BEM`,
-        status: !feeOk ? "err" : dailyNet > 0 ? "ok" : "err",
-        note: feeOk
-          ? `日产 × (1 − ${feeRateDraft}%) = ${formatBem(dailyNet)}`
-          : "服务费须为 1–20 的整数",
-      },
-    ];
-  })();
-  const schemeRatioPct = review.hardCapBnb > 0 ? (review.needBnb / review.hardCapBnb) * 100 : 0;
-  const schemeRisePct = review.needBnb > 0 ? ((review.hardCapBnb / review.needBnb) - 1) * 100 : 0;
-  const schemeWeight = review.optimal
-    ? `${review.needParts} × P=${review.processorScale} + 设计溢价 = ${review.hashpower}`
-    : `${review.needParts} × P=${review.processorScale} = ${review.hashpower}`;
-
-  function update(key, value) {
-    setDraft((current) => ({ ...current, [key]: value }));
-  }
+  const canSubmit = review.ok && daysValid && transistorsValid && !pending && (chainMode ? isFactoryOwner : true);
+  const submitLabel = pending
+    ? (pending === "createCampaign" ? "发布中…" : String(pending))
+    : chainMode && !connectedAccount
+      ? "请先连接 Owner 钱包"
+      : chainMode && !isFactoryOwner
+        ? "需 Factory Owner 钱包"
+        : "发布众筹挖矿";
 
   return (
     <section>
-      {/* 实时报价只在页头显示这一处，随页面一起滚走 */}
       <header className="publish-head">
         <div className="publish-title-row">
           <div className="publish-title">
@@ -1634,604 +1759,305 @@ export function OwnerCreate({
               <h1>发布众筹挖矿</h1>
               <p>
                 {chainMode
-                  ? "写入测试网后参数不可改。仅 Factory Owner 可发布。"
-                  : "选定处理器与发行规模。参数写入后不能改。"}
+                  ? "四项参数上链后不可改。处理器由工厂统一决定，发布时不可选。"
+                  : "四项参数上链后不可改。处理器由工厂统一决定。"}
               </p>
             </div>
           </div>
-          <LivePriceTag snapshot={quote} now={now} />
+          <div className="publish-meta">
+            {chainMode && (
+              <span className="publish-signer">
+                {isFactoryOwner && connectedAccount
+                  ? `可签名 · ${shortAddress(connectedAccount)}`
+                  : factoryOwner
+                    ? `Owner ${shortAddress(factoryOwner)}`
+                    : "—"}
+              </span>
+            )}
+          </div>
         </div>
-      </header>
-
-      {chainMode && (
-        <article className="card" style={{ marginBottom: 16 }}>
-          <div className="card-header">发布权限</div>
-          <div className="card-body auth-body">
-            <ul className="bill auth-bill">
-              <li>
-                <span>Factory Owner</span>
-                <strong>{factoryOwner ? shortAddress(factoryOwner) : "—"}</strong>
-              </li>
-              <li>
-                <span>当前钱包</span>
-                <strong>
-                  {connectedAccount ? shortAddress(connectedAccount) : "未连接"}
-                  {isFactoryOwner && connectedAccount ? " · 可签名" : ""}
-                </strong>
-              </li>
-            </ul>
+        {chainMode && (!connectedAccount || !isFactoryOwner) && (
+          <div className="publish-auth">
+            <p>
+              {!connectedAccount
+                ? "当前未连接钱包。发布需要 Factory Owner 签名。"
+                : `当前钱包不是 Factory Owner（${shortAddress(factoryOwner)}）。`}
+            </p>
             {!connectedAccount && (
-              <button className="btn btn-primary" type="button" style={{ marginTop: 8 }} onClick={onConnect}>
+              <button className="btn btn-primary btn-inline" type="button" onClick={onConnect}>
                 连接 Owner 钱包
               </button>
             )}
-            {connectedAccount && !isFactoryOwner && (
-              <p className="fine warn-text" style={{ marginTop: 8 }}>
-                当前钱包不是 Factory Owner。请在钱包里切换到 {shortAddress(factoryOwner)} 后再发布。
-              </p>
-            )}
           </div>
-        </article>
-      )}
+        )}
+      </header>
 
-      {/* 发行规模：开期人先定这期总共募多少、分成多少份，再按募资总额选题目 */}
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header">
-          <span>发行规模</span>
-          <span className="stat-label">第一步 · 定募资总额与总份数</span>
-        </div>
-        <div className="card-body">
-          <div className="form-grid cols-3">
-            <label className="field">
-              <span>募资总额（BNB）</span>
-              <input
-                value={draft.hardCapBnb}
-                placeholder={offering.hardCapBnb.toFixed(4)}
-                inputMode="decimal"
-                className={capValid ? undefined : "is-invalid"}
-                title="开期人手动填写：本期总共募集多少 BNB。留空 = 跟随建议方案"
-                onChange={(event) => update("hardCapBnb", event.target.value)}
-              />
-            </label>
-            <label className="field">
-              <span>总份数</span>
-              <input
-                value={draft.totalShares}
-                placeholder={String(offering.totalShares)}
-                inputMode="numeric"
-                className={sharesValid ? undefined : "is-invalid"}
-                title="开期人手动填写：本期分成多少份。留空 = 跟随建议方案"
-                onChange={(event) => update("totalShares", event.target.value)}
-              />
-            </label>
-            <label className="field">
-              <span>每份 BNB</span>
-              <input
-                value={priceInput || "—"}
-                readOnly
-                title="由「募资总额 ÷ 总份数」派生，不可单独手填"
-              />
-            </label>
-          </div>
-          <p className="fine">
-            先定这期总共募多少 BNB、分成多少份，每份 BNB 自动算成「募资总额 ÷ 总份数」（只读）。
-            募资总额决定你能选多大的题目——下方选题列表里标红的题目是流片成本超出募资总额的。
-            总份数越多每份越便宜，但单份认筹门槛更低、持有人更分散。
-          </p>
-        </div>
-      </div>
-
-      {/* 目标处理器：第二步，先于选题——权重与成本都按所选处理器算 */}
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header">
-          <span>目标处理器</span>
-          <span className="stat-label">
-            第二步 · 题目 #{task.id} {task.name}（{task.g} 个元件）
-          </span>
-        </div>
-        <div className="card-body">
-          <div className="transistor-grid">
-            {options.map((plan) => {
-              const active = plan.processorId === processorId;
-              return (
-                <button
-                  key={plan.processorId}
-                  type="button"
-                  className={
-                    (active ? "transistor-card is-on" : "transistor-card") +
-                    (plan.affordable ? "" : " is-short")
-                  }
-                  onClick={() => update("processorId", plan.processorId)}
-                  title={`选择 ${plan.processorId} · P=${plan.processorScale} · ${plan.weightPerBnb} 权重/BNB`}
-                >
-                  <div className="transistor-head">
-                    <strong>{plan.processorId}</strong>
-                    {active ? (
-                      <em className="badge tone-done">已选</em>
-                    ) : (
-                      <em className="badge tone-wait">P={plan.processorScale}</em>
-                    )}
-                  </div>
-                  <div className="transistor-price">
-                    {plan.priceNand.toFixed(4)} <small>BNB/NAND</small>
-                  </div>
-                  <ul className="transistor-specs">
-                    <li>
-                      <span>处理器系数 P</span>
-                      <strong>P={plan.processorScale}</strong>
-                    </li>
-                    {/* 只列题目实际要用到的元件——纯组合逻辑题没有 LATCH */}
-                    <li>
-                      <span>
-                        元件 {plan.costBreakdown.NAND.count} NAND
-                        {plan.costBreakdown.LATCH.count > 0 ? ` + ${plan.costBreakdown.LATCH.count} LATCH` : ""}
-                      </span>
-                      <strong>{plan.priceNand.toFixed(4)} BNB 起</strong>
-                    </li>
-                    <li>
-                      <span>权重 H</span>
-                      <strong>{plan.hashpower}</strong>
-                    </li>
-                    <li>
-                      <span>流片成本</span>
-                      <strong>{plan.partsCost.toFixed(4)} BNB</strong>
-                    </li>
-                    <li>
-                      <span>占募资总额</span>
-                      <strong className={plan.affordable ? "" : "is-short"}>
-                        {(plan.costRatio * 100).toFixed(0)}%
-                      </strong>
-                    </li>
-                    <li>
-                      <span>权重 / BNB</span>
-                      <strong>{plan.weightPerBnb}</strong>
-                    </li>
-                    <li>
-                      <span>日产</span>
-                      <strong>{formatBem(plan.dailyBem)} BEM</strong>
-                    </li>
-                  </ul>
-                  <div className={plan.affordable ? "transistor-foot ok" : "transistor-foot bad"}>
-                    {plan.affordable
-                      ? `涨价 ${((plan.priceTolerance - 1) * 100).toFixed(0)}% 退款`
-                      : `缺 ${(plan.partsCost - hardCapBnb).toFixed(4)} BNB`}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="auto-pick-banner" style={{ marginTop: 14, marginBottom: 0 }}>
-            <div className="auto-pick-head">
-              <strong>已选 {tplan.processorId}</strong>
-              <div className="auto-pick-tags">
-                <em className={tplan.affordable ? "pool-tag" : "pool-tag is-capped"}>
-                  {tplan.affordable
-                    ? `成本占募资总额 ${(tplan.costRatio * 100).toFixed(0)}%`
-                    : "募资总额买不起"}
-                </em>
-                <em className="auto-follow">由开期人选择</em>
-              </div>
+      <form
+        className="publish-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          setSubmitTried(true);
+          if (review.ok && daysValid && transistorsValid) onCreate(effectiveDraft, review);
+        }}
+      >
+        <div className="publish-grid">
+          {/* ── 发行规模 ── */}
+          <article className="card">
+            <div className="card-header">
+              <span>发行规模</span>
+              <span className="stat-label">两项都必填</span>
             </div>
-            <p className="fine">{advice}</p>
-          </div>
-
-          <p className="fine">
-            只有 TapeOut 与 Behemoth 两个创世处理器上的电路具备挖矿资格。Behemoth 权重系数 P=6
-            但元件贵约 7.5 倍；TapeOut P=1 但便宜。系统只把两个选项的账算清楚，选哪个由你决定。
-          </p>
-          <p className="fine">
-            {tplan.latch > 0 ? (
-              <>
-                注意：NAND 与 LATCH 不是二选一——配比由题目给定（本题 {task.nand} NAND +{" "}
-                {task.latch} LATCH），同处理器下两者共用一个合约、只差 tokenId，两种都要买。
-              </>
-            ) : (
-              <>
-                本题是纯组合逻辑，只需要 {task.nand} 个 NAND、没有 LATCH，
-                所以不列 LATCH 的价格——买了也用不上。
-              </>
-            )}
-          </p>
-        </div>
-      </div>
-
-      {/* 第三步：选题（题目决定元件数与深度，按所选处理器实时价估算成本） */}
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header">
-          <span>选题</span>
-          <span className="stat-label">
-            第三步 · 官方题库 {taskbook?.total || 0} 道
-            {taskbook?.source === "live" ? "（公共题库）" : taskbook?.source === "loading" ? "（加载中…）" : "（离线兜底）"}
-          </span>
-        </div>
-        <div className="card-body">
-          <div className="task-toolbar">
-            <input
-              className="task-search"
-              value={taskQuery}
-              placeholder="搜索题名或分类，如 加法器 / 时序 / 42"
-              onChange={(e) => setTaskQuery(e.target.value)}
-            />
-            <div className="tier-row">
-              <button
-                type="button"
-                className={!tierFilter ? "is-on" : ""}
-                onClick={() => setTierFilter("")}
-              >
-                全部
-              </button>
-              {tiers.map((tier) => (
-                <button
-                  key={tier}
-                  type="button"
-                  className={tierFilter === tier ? "is-on" : ""}
-                  onClick={() => setTierFilter(tier)}
-                >
-                  {tier}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="task-list">
-            {shown.length === 0 && <p className="fine">没有匹配的题目。</p>}
-            {shown.slice(0, 60).map((t) => {
-              const active = String(t.id) === String(draft.taskId);
-              // 按该题自己的 NAND/LATCH 配比与各自实时价估算，不用单一均价
-              const tNand = Number.isFinite(t.nand) ? t.nand : Math.max(0, t.g - Math.round(t.g * tplan.latchRatio));
-              const tLatch = Number.isFinite(t.latch) ? t.latch : t.g - tNand;
-              const cost = tNand * tplan.priceNand + tLatch * tplan.priceLatch;
-              const affordable = cost <= hardCapBnb;
-              return (
-                <button
-                  key={t.id}
-                  type="button"
-                  className={`task-item${active ? " is-on" : ""}${affordable ? "" : " is-short"}`}
-                  onClick={() => update("taskId", String(t.id))}
-                  title={`${t.name} · ${t.g} 元件 · 深度 ${t.d}`}
-                >
-                  <div className="task-line1">
-                    <strong>{t.name}</strong>
-                    <em className="tier-tag">{t.tier}</em>
-                  </div>
-                  <div className="task-line2">
-                    <span>#{t.id}</span>
-                    <span>{t.g} 元件</span>
-                    <span>d={t.d}</span>
-                    {t.g > MINE_GATE_LIMIT && <span className="is-gated">超闸门</span>}
-                    <span className={affordable ? "" : "is-short"}>{cost.toFixed(4)} BNB</span>
-                  </div>
-                </button>
-              );
-            })}
-            {shown.length > 60 && (
-              <p className="fine">仅显示前 60 道，共 {shown.length} 道，用搜索缩小范围。</p>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* 选中题目 + 所选处理器的成本与权重拆解 */}
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header">
-          <span>本期题目与权重</span>
-        </div>
-        <div className="card-body">
-          <div className="formula-inline">
-            H = ( b* + K_task × q ) × P= ( {tplan.totalParts} + {task.K} × {tplan.q} ) ×{" "}
-            {tplan.processorScale} = {tplan.hashpower}
-          </div>
-          <ul className="bill">
-            <li>
-              <span>题目</span>
-              <strong>
-                #{task.id} {task.name}
-              </strong>
-            </li>
-            <li>
-              <span>难度 / 题型</span>
-              <strong>
-                {task.tier} · {task.kind === "seq" ? "时序" : "组合"}
-              </strong>
-            </li>
-            <li>
-              <span>元件拆分</span>
-              <strong>
-                {tplan.nand > 0 && tplan.latch > 0
-                  ? `${tplan.nand} NAND + ${tplan.latch} LATCH（LATCH 占 ${Math.round(tplan.latchRatio * 100)}%）`
-                  : tplan.nand > 0
-                    ? `${tplan.nand} NAND（纯组合逻辑，无需锁存器）`
-                    : `${tplan.latch} LATCH`}
-              </strong>
-            </li>
-            {/* 不显示元件单价（BNB/个）—— 那是价格信息，已在「目标处理器」卡片里给出，
-                这里只讲这道题要烧多少、值多少钱。题目不需要的那一类更不该出现。 */}
-            {tplan.nand > 0 && (
-              <li>
-                <span>NAND 小计</span>
-                <strong>{tplan.costBreakdown.NAND.cost.toFixed(4)} BNB</strong>
-              </li>
-            )}
-            {tplan.latch > 0 && (
-              <li>
-                <span>LATCH 小计</span>
-                <strong>{tplan.costBreakdown.LATCH.cost.toFixed(4)} BNB</strong>
-              </li>
-            )}
-            <li className="due">
-              <span>流片成本合计</span>
-              <strong>{tplan.partsCost.toFixed(4)} BNB</strong>
-            </li>
-            <li>
-              <span>本期矿机权重</span>
-              <strong>{tplan.hashpower}</strong>
-            </li>
-            <li>
-              <span>成本占募资总额</span>
-              <strong className={(tplan.costRatio >= 0.2 && tplan.costRatio <= 0.75) ? "" : "is-short"}>
-                {(tplan.costRatio * 100).toFixed(1)}%
-                {offering.tooSmall ? "（题目太小）" : tplan.costRatio > 0.75 ? "（偏高）" : ""}
-              </strong>
-            </li>
-          </ul>
-
-          {/* 真实产出机制：按权重占比分配，不是权重乘固定系数 */}
-          <div className="emit-box">
-            <div className="emit-head">
-              <strong>这台矿机实际能产多少</strong>
-              <em className={tplan.capped ? "pool-tag is-capped" : "pool-tag"}>
-                {tplan.capped ? "未验证池 · 分 1%" : "已验证池 · 分 99%"}
-              </em>
-            </div>
-            <div className="formula-inline">
-              日产 = 池日产 × 我的权重 ÷ 全池权重 = {rate.dailyEmission.toLocaleString()} ×{" "}
-              {tplan.hashpower.toLocaleString()} ÷{" "}
-              {(tplan.capped ? rate.networkWeight.unverified : rate.networkWeight.verified).toLocaleString()} ={" "}
-              {formatBem(tplan.dailyBem)} BEM
-            </div>
-            <ul className="bill">
-              <li className="due">
-                <span>实际日产</span>
-                <strong>{formatBem(tplan.dailyBem)} BEM</strong>
-              </li>
-              <li>
-                <span>扣费后日产（{draft.feePercent}%）</span>
-                <strong>{formatBem(dailyNetBem)} BEM</strong>
-              </li>
-              <li>
-                <span>服务费（{draft.feePercent}%）</span>
-                <strong>−{formatBem(dailyFeeBem)} BEM/天</strong>
-              </li>
-              <li>
-                <span>投入成本（买元件）</span>
-                <strong>{tplan.partsCost.toFixed(4)} BNB</strong>
-              </li>
-            </ul>
-            <p className="fine">
-              这里只给日产。产出是<b>零和</b>的：当前全网已验证权重{" "}
-              {rate.networkWeight.verified.toLocaleString()}，每权重日产{" "}
-              {formatBem(rate.verifiedPerWeight)} BEM。
-              全网权重一变，所有人都同步变——所以「日产」会浮动，
-              而且不随挖多久而累加成一个可靠总数。
-            </p>
-            {tplan.capped && (
-              <p className="fine warn-text">
-                题目 {task.g} 门超过挖矿闸门 {MINE_GATE_LIMIT} 门
-                —— 链上跑不完官方向量，认领不了任何题目，只能进未验证池分 1%，且拿不到设计溢价。
-                撞上闸门会让权重拿不到溢价部分。
-              </p>
-            )}
-          </div>
-          <p className="fine">
-            流片成本 {tplan.partsCost.toFixed(4)} BNB，占募资总额 {(tplan.costRatio * 100).toFixed(1)}%。
-            参考区间 {(COST_RATIO_MIN * 100).toFixed(0)}%–{(COST_RATIO_MAX * 100).toFixed(0)}%。
-            按当前报价，元件再涨 {((tplan.priceTolerance - 1) * 100).toFixed(0)}% 后刚好覆盖流片成本。
-          </p>
-          {offering.tooSmall && (
-            <p className="fine warn-text">
-              这道题太小：元件数由题目写死（只有 {task.g} 个），即使把募资总额压到最低
-              （20 份 × 0.05 BNB = 1 BNB），成本占比也只有{" "}
-              {(offering.bestRatio * 100).toFixed(1)}%，够不到 20% 的健康下限。
-              调参数救不了——建议换元件数更多的题目，或改用更贵的处理器把预算用起来。
-            </p>
-          )}
-          <p className="fine">
-            题目由项目方从官方题库选定，用户不参与设计。q 固定为 1
-            {tplan.optimal ? "（已声明最优首创，含设计溢价）" : "（等同复制官方参考，无设计溢价）"}。
-            {tplan.latch > 0 && (
-              <>
-                {" "}LATCH 占比按题型默认：组合逻辑 20%、时序 50%，因 LATCH 面积为普通门的 6 倍。
-              </>
-            )}
-          </p>
-          <p className="fine">
-            成本随元件实时价格变动。若执行时涨价导致募资总额买不起所需元件，判失败、本金不动，可退款或降价重挂。
-          </p>
-        </div>
-      </div>
-
-      <div className="layout">
-        <article className="card">
-          <div className="card-header"><span>期次参数</span></div>
-          <form
-            className="card-body"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (review.ok) onCreate(effectiveDraft, review);
-            }}
-          >
-            <div className="form-grid cols-3">
-              <label className="field">
-                <span>募集天数</span>
-                <input
-                  value={draft.fundingDays}
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  title="须为正整数天数"
-                  onChange={(event) => {
-                    const digits = event.target.value.replace(/\D/g, "");
-                    update("fundingDays", digits);
-                  }}
-                />
-              </label>
-              <label className="field">
-                <span>服务费 %</span>
-                <input value={draft.feePercent} onChange={(event) => update("feePercent", event.target.value)} />
-              </label>
-              <label className="field">
-                <span>目标处理器</span>
-                <input
-                  value={`${processorId} · P=${tplan.processorScale}`}
-                  readOnly
-                  title="在上方「目标处理器」卡片中点选"
-                />
-              </label>
-            </div>
-            <div className="fee-share-block">
-              <div className="fee-share-row is-head">
-                <span>服务费分成地址</span>
-                <span>比例 %</span>
-              </div>
-              {(Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row, index) => (
-                <div className="fee-share-row" key={`fee-${index}`}>
+            <div className="card-body">
+              <div className="form-grid cols-2">
+                <label className="field">
+                  <span>募资总额（BNB）</span>
                   <input
-                    className="mono"
-                    placeholder="0x…"
-                    value={row.address}
-                    onChange={(event) => updateFeeShare(index, "address", event.target.value)}
+                    value={draft.hardCapBnb}
+                    placeholder="必填"
+                    inputMode="decimal"
+                    className={capInvalid ? "is-invalid" : undefined}
+                    title="本期总共募集多少 BNB，必填，上链后不可改"
+                    onChange={(event) => update("hardCapBnb", event.target.value)}
+                    onBlur={() => touch("hardCapBnb")}
                   />
-                  <div className="fee-share-percent">
-                    <input
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      max={100}
-                      title="1 到 100 的整数。所有地址比例之和必须等于 100"
-                      value={row.sharePercent}
-                      onChange={(event) => updateFeeShare(index, "sharePercent", event.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="btn fee-share-remove"
-                      disabled={(draft.feeShares || []).length <= 1}
-                      onClick={() => removeFeeShare(index)}
-                    >
-                      删除
-                    </button>
-                  </div>
-                </div>
-              ))}
-              <button type="button" className="btn fee-share-add" onClick={addFeeShare}>
-                添加地址
-              </button>
-              <p className={`fine${feeSharePercentSum !== 100 ? " warn-text" : ""}`}>
-                所有分成地址比例之和必须等于 100（当前合计 {feeSharePercentSum} / 100）。每项为 1–100 的整数。整除余数转入 Owner。
+                </label>
+                <label className="field">
+                  <span>总份数</span>
+                  <input
+                    value={draft.totalShares}
+                    placeholder="必填"
+                    inputMode="numeric"
+                    className={sharesInvalid ? "is-invalid" : undefined}
+                    title="本期分成多少份，必填正整数。份数越多，单份门槛越低"
+                    onChange={(event) => update("totalShares", event.target.value)}
+                    onBlur={() => touch("totalShares")}
+                  />
+                </label>
+              </div>
+              <ul className="bill">
+                <li>
+                  <span>每份价格（= 总额 ÷ 份数，不可单独填）</span>
+                  <strong>{priceInput ? `${priceInput} BNB` : "—"}</strong>
+                </li>
+              </ul>
+              <p className="fine">
+                两项必填，上链后不可改。元件数与算力要到执行阶段才确定，发布期不给建议值。
               </p>
             </div>
-            <p className="fine">
-              发行规模、题目与目标处理器都在上方卡片里选定，本区块只汇总、不重复编辑。
-              改「目标处理器」会改变流片成本，进而改变成本占募资总额比例。
-            </p>
-            {review.issues.length > 0 && (
-              <div className="issues">
-                {review.issues.map((issue) => (
-                  <p key={issue}>{issue}</p>
-                ))}
+          </article>
+
+          {/* ── 募集天数 ── */}
+          <article className="card">
+            <div className="card-header">
+              <span>募集天数</span>
+              <span className="stat-label">到期未售罄可原路退款</span>
+            </div>
+            <div className="card-body">
+<label className="field">
+                  <span>天数</span>
+                  <input
+                    value={draft.fundingDays}
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    className={daysInvalid ? "is-invalid" : undefined}
+                    title="须为 1–3650 的整数"
+                    onChange={(event) => update("fundingDays", event.target.value.replace(/\D/g, ""))}
+                    onBlur={() => touch("fundingDays")}
+                  />
+                </label>
+                <ul className="bill">
+                  <li>
+                    <span>截止时间</span>
+                    <strong>
+                      {daysValid
+                        ? (() => {
+                          const ms = Date.now() + daysNum * 86400000;
+                          return new Date(ms).toLocaleString("zh-CN", { hour12: false });
+                        })()
+                        : "—"}
+                    </strong>
+                  </li>
+                </ul>
+                {daysInvalid && (
+                  <p className="fine warn-text">
+                    天数须为 1–3650 的整数（填 0 会建出创建即已截止的期次）。
+                  </p>
+                )}
+                <p className="fine">
+                  上链后不可改。到期未售罄可原路退款。
+                </p>
+            </div>
+          </article>
+
+          {/* ── 本期处理器（元件合约） ── */}
+          {chainMode && (
+            <article className="card">
+              <div className="card-header">
+                <span>本期处理器（元件合约）</span>
+                <span className="stat-label">开期必选 · 锁定后不可改</span>
               </div>
+              <div className="card-body">
+                <label className="field">
+                  <span>处理器</span>
+                  <select
+                    value={selectedProcessor}
+                    className={transistorsInvalid ? "is-invalid" : undefined}
+                    title="从工厂白名单里选一个处理器；该期锁定它的元件合约，开期后不可改"
+                    onChange={(event) => update("transistors", event.target.value)}
+                    onBlur={() => touch("transistors")}
+                  >
+                    <option value="">— 请选择处理器 —</option>
+                    {processorOptions.map((addr) => {
+                      const pid = processorFromPartsContract(addr);
+                      const label = pid ? `${pid}` : "处理器";
+                      return (
+                        <option key={addr} value={addr}>
+                          {`${label} · ${shortAddress(addr)}`}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </label>
+                {processorOptions.length === 0 && (
+                  <p className="fine warn-text">
+                    无法读取工厂元件白名单，请确认链上工厂已部署且白名单非空。
+                  </p>
+                )}
+                {transistorsInvalid && (
+                  <p className="fine warn-text">请选择本期使用的处理器（元件合约），不能留空。</p>
+                )}
+                <p className="fine">
+                  工厂不再预设默认元件：每期必须显式选一个白名单内的处理器，发布后该期锁定其元件合约。
+                </p>
+              </div>
+            </article>
+          )}
+          {/* ── 挖矿产出服务费与分成（链上参数，setServiceFee） ── */}
+          <article className="card" style={{ gridColumn: "1 / -1" }}>
+            <div className="card-header">
+              <span>挖矿产出服务费与分成</span>
+              <span className="stat-label">写入链上 · 一次设定永久锁定</span>
+            </div>
+            <div className="card-body">
+              <div className="fee-head">
+                <label className="field fee-percent-field">
+                  <span>挖矿产出服务费 %</span>
+                  <input
+                    value={draft.feePercent}
+                    inputMode="numeric"
+                    placeholder="1–10"
+                    className={feeInvalid ? "is-invalid" : undefined}
+                    title="1 到 10 的整数（链上硬上限 10%）。按挖矿产出计提，与认筹款无关"
+                    onChange={(event) => update("feePercent", event.target.value.replace(/\D/g, ""))}
+                    onBlur={() => touch("feePercent")}
+                  />
+                </label>
+              </div>
+
+              <div className="fee-share-block">
+                <div className="fee-share-row is-head">
+                  <span>分成地址</span>
+                  <span>比例</span>
+                </div>
+                {(Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row, index) => {
+                  const addrOk = /^0x[a-fA-F0-9]{40}$/.test(String(row.address || "").trim());
+                  const pct = Math.round(Number(row.sharePercent));
+                  const pctOk = Number.isInteger(pct) && pct >= 1 && pct <= 100;
+                  const addrTouched = touched[`feeAddr-${index}`] || submitTried;
+                  const pctTouched = touched[`feePct-${index}`] || submitTried;
+                  return (
+                    <div className="fee-share-row" key={`fee-${index}`}>
+                      <input
+                        className={`mono${String(row.address || "") && addrTouched && !addrOk ? " is-invalid" : ""}`}
+                        placeholder="0x…"
+                        title="0x 开头的地址"
+                        value={row.address}
+                        onChange={(event) => updateFeeShare(index, "address", event.target.value)}
+                        onBlur={() => touch(`feeAddr-${index}`)}
+                      />
+                      <div className="fee-share-percent">
+                        <input
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          max={100}
+                          placeholder="1–100"
+                          className={`${String(row.sharePercent || "") && pctTouched && !pctOk ? " is-invalid" : ""}`}
+                          title="1–100 的整数，所有地址之和须等于 100"
+                          value={row.sharePercent}
+                          onChange={(event) => updateFeeShare(index, "sharePercent", event.target.value)}
+                          onBlur={() => touch(`feePct-${index}`)}
+                        />
+                        <span className="fee-share-unit">%</span>
+                        <button
+                          type="button"
+                          className="btn fee-share-remove"
+                          disabled={(draft.feeShares || []).length <= 1}
+                          onClick={() => removeFeeShare(index)}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+                <div className="fee-share-foot">
+                  <button type="button" className="btn fee-share-add" onClick={addFeeShare} disabled={(draft.feeShares || []).length >= 3}>
+                    添加地址
+                  </button>
+                  <span className={`fee-sum${feeSharePercentSum === 100 ? " is-ok" : " is-warn"}`}>
+                    合计 {feeSharePercentSum} / 100
+                  </span>
+                </div>
+                <p className="fine">
+                  最多 3 个地址，比例之和须正好等于 100，不能重复或为零地址。
+                </p>
+              </div>
+            </div>
+          </article>
+
+
+        </div>
+
+        {showIssues && (review.issues.length > 0 || (submitTried && !daysValid)) && (
+          <div className="issues">
+            {showIssues && !daysValid && (
+              <p>募集天数须为 1–3650 的整数（填 0 会建出创建即已截止的僵尸期次）</p>
             )}
-            {review.ok && <p className="check-ok">参数检查通过，可以发布。</p>}
-            <button
-              className="btn btn-primary"
-              type="submit"
-              disabled={!review.ok || Boolean(pending) || quote.loading || (chainMode && !isFactoryOwner)}
-            >
-              {pending
-                ? pending === "createCampaign" ? "发布中…" : String(pending)
-                : quote.loading
-                  ? "取价中…"
-                  : chainMode && !connectedAccount
-                    ? "请先连接 Owner 钱包"
-                    : chainMode && !isFactoryOwner
-                      ? "需 Factory Owner 钱包"
-                      : "发布众筹挖矿"}
-            </button>
-          </form>
-        </article>
-        <article className="card">
-          <div className="card-header">
-            <span>发布检查</span>
-            <span className="stat-label">
-              {publishChecks.every((c) => c.status === "ok")
-                ? "全部通过"
-                : publishChecks.some((c) => c.status === "err")
-                  ? "有错误项"
-                  : "有警告项"}
+            {review.issues.map((issue) => (
+              <p key={issue}>{issue}</p>
+            ))}
+          </div>
+        )}
+
+        {/* 提示性问题（不阻断提交）：如某处理器无挖矿产出资格 */}
+        {showIssues && (review.warnings || []).length > 0 && (
+          <div className="issues issues-warn">
+            {(review.warnings || []).map((warn) => (
+              <p key={warn}>{warn}</p>
+            ))}
+          </div>
+        )}
+
+        <div className="publish-submit">
+          <div className="publish-submit-text">
+            {/* 显示**当前生效**的规模：用户填了就用填的，别拿建议方案糊弄 */}
+            <strong>{effCap > 0 ? `${Number(effCap).toFixed(4)} BNB` : "—"}</strong>
+            <span>
+              {effShares > 0 ? `${effShares} 份` : "—"} · 每份 {priceInput ? `${priceInput} BNB` : "—"} · 募集 {daysValid ? `${daysNum} 天` : `${draft.fundingDays || "—"} 天（待修正）`}
+              {feeValid ? ` · 挖矿产出服务费 ${Number(draft.feePercent)}%（写入链上）` : ""}
             </span>
           </div>
-          <div className="card-body">
-            <ul className="bill publish-checks">
-              {publishChecks.map((item) => (
-                <li
-                  key={item.id}
-                  className={item.status === "err" ? "is-short" : item.id === "tolerance" ? "due" : undefined}
-                >
-                  <span>
-                    <em className={`check-mark is-${item.status}`} aria-hidden="true">
-                      {item.status === "ok" ? "✓" : item.status === "warn" ? "!" : "×"}
-                    </em>
-                    {item.label}
-                  </span>
-                  <strong title={item.note}>{item.value}</strong>
-                </li>
-              ))}
-            </ul>
-            <ul className="check-notes">
-              {publishChecks
-                .filter((c) => c.status !== "ok")
-                .map((c) => (
-                  <li key={`${c.id}-note`} className={c.status === "err" ? "is-err" : "is-warn"}>
-                    {c.label}：{c.note}
-                  </li>
-                ))}
-            </ul>
-            {publishChecks.every((c) => c.status === "ok") && (
-              <p className="check-ok">发布检查各项通过。</p>
-            )}
-
-            <p className="fine">
-              成本占募资总额 <b>{schemeRatioPct.toFixed(1)}%</b>，参考区间 {(COST_RATIO_MIN * 100).toFixed(0)}%–{(COST_RATIO_MAX * 100).toFixed(0)}%。
-              按当前报价，元件再涨 <b>{schemeRisePct.toFixed(0)}%</b> 后，募资总额刚好覆盖流片成本；超过这个幅度，执行时买不齐元件，判失败后可退款或降价重挂。
-            </p>
-            <p className="fine">
-              权重 H = {schemeWeight}。发布后锁定当前报价快照。
-            </p>
-            <p className="fine">
-              Factory Owner：{shortAddress(factoryOwner || OWNER)}
-              {chainMode && factoryOwner ? "（链上）" : ""}
-            </p>
-          </div>
-        </article>
-      </div>
+          <button
+            className="btn btn-primary btn-inline"
+            type="submit"
+            disabled={!canSubmit}
+            onClick={() => setSubmitTried(true)}
+          >
+            {submitLabel}
+          </button>
+        </div>
+      </form>
     </section>
-  );
-}
-
-/** 实时价格标签：显示更新时间、刷新倒计时与陈旧状态 */
-function LivePriceTag({ snapshot, intervalMs = 5000, now = Date.now() }) {
-  if (!snapshot) return null;
-  const age = snapshot.updatedAt ? now - snapshot.updatedAt : Infinity;
-  // 超过 3 个周期未更新视为陈旧
-  const stale = snapshot.error || age > intervalMs * 3;
-  const secs = snapshot.updatedAt ? Math.max(0, Math.round((intervalMs - age) / 1000)) : 0;
-  return (
-    <span className={stale ? "live-tag is-stale" : "live-tag"} title={snapshot.updatedAt ? formatClock(snapshot.updatedAt) : ""}>
-      <i className="live-dot" />
-      {snapshot.loading && !snapshot.updatedAt
-        ? "取价中…"
-        : snapshot.error
-          ? `取价失败：${snapshot.error}`
-          : `${snapshot.source === "live" || snapshot.bnbLive ? "公共行情 · " : "本地报价 · "}${snapshot.bnbUsdt ? `BNB ${snapshot.bnbUsdt.toFixed(4)} · ` : ""}${formatClock(snapshot.updatedAt || Date.now())} · ${secs}s 后刷新`}
-    </span>
   );
 }
 

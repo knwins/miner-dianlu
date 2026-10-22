@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  IS_CONFIGURED, CHAIN_ID, NETWORK, BEM_ADDRESS, EXPLORER,
+  IS_CONFIGURED, CHAIN_ID, NETWORK,
   SCENE_LABEL, PHASE_LABEL, explorerAddress, explorerTx,
 } from "./chain/config.js";
 import {
@@ -8,14 +8,13 @@ import {
   getCampaignAddress, getRawProvider,
 } from "./chain/client.js";
 import { discoverWallets } from "./chain/wallets.js";
+import { formatRemaining } from "./fixtures.js";
 
 const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "—");
 const fmt = (v, d = 4) => {
   try { return Number(formatEther(v)).toFixed(d); }
   catch { return String(v); }
 };
-/** BEM 金额统一 4 位小数 */
-const fmtBem = (v) => fmt(v, 4);
 const fmtTime = (sec) => (sec > 0 ? new Date(sec * 1000).toLocaleString("zh-CN") : "—");
 
 export default function OnChainPage({ embedded = false }) {
@@ -31,7 +30,13 @@ export default function OnChainPage({ embedded = false }) {
     return () => clearTimeout(timer);
   }, [hint]);
   const [logs, setLogs] = useState([]);
-  const [form, setForm] = useState({ buyCount: 1, listCount: 1, listPrice: "0.02", takeId: 0, takeCount: 1, est: "408", capped: false, trCount: 100, trPrice: "0.005", tapeout: "netlist-v1" });
+  /*
+   * 表单初值一律留空 / 0。
+   * 之前这里硬编码了 est:"408"、nandQty:100、nandPrice:"0.005"、listPrice:"0.02"
+   * 这些演示数字——在链上模式下点「发送」会拿这组值真的发交易，
+   * 等于用演示参数下真单。调试页的所有输入都必须由人自己填。
+   */
+  const [form, setForm] = useState({ buyCount: 1, listCount: 1, listPrice: "", takeId: 0, takeCount: 1, est: "", nandQty: 0, nandPrice: "" });
 
   const account = wallet?.account || null;
   const isOwner = useMemo(() => state && account && state.owner?.toLowerCase() === account.toLowerCase(), [state, account]);
@@ -99,6 +104,13 @@ export default function OnChainPage({ embedded = false }) {
   }
 
   const s = state;
+  // 与合约一致：成交部分上链不可撤，全部成交后不再显示「取消挂单」。
+  const cancelBlockedByFill = Boolean(s?.orderFilled)
+    && [s?.nandRemaining, s?.latchRemaining].every((remaining) => remaining != null && Number(remaining) === 0);
+  // confirmTransistors 还要求本期合约真的持有元件；只成交不发货时链上会 TransistorsNotReady。
+  const partsShort = Boolean(s) && (
+    Number(s.partsNand || 0) < Number(s.nandQty || 0) || Number(s.partsLatch || 0) < Number(s.latchQty || 0)
+  );
   return (
     <section className="chain-debug">
       {!embedded && (
@@ -113,7 +125,6 @@ export default function OnChainPage({ embedded = false }) {
         <div className="card-body">
           <dl className="chain-kv">
             <div><dt>Campaign</dt><dd><a href={explorerAddress(getCampaignAddress())} target="_blank" rel="noreferrer">{short(getCampaignAddress())}</a></dd></div>
-            <div><dt>BEM 代币</dt><dd><a href={explorerAddress(BEM_ADDRESS)} target="_blank" rel="noreferrer">{short(BEM_ADDRESS)}</a></dd></div>
             <div><dt>Owner</dt><dd>{short(s?.owner)}</dd></div>
             <div><dt>我的钱包</dt><dd>{account ? `${short(account)}${isOwner ? " · Owner" : ""}` : "未连接"}</dd></div>
             <div><dt>我的 tBNB</dt><dd>{bnb !== null ? `${fmt(bnb)} tBNB` : "—"}</dd></div>
@@ -139,8 +150,7 @@ export default function OnChainPage({ embedded = false }) {
                 <div><dt>已售 / 总份</dt><dd>{String(s.sold)} / {String(s.totalShares)}</dd></div>
                 <div><dt>每份价格</dt><dd>{fmt(s.sharePriceBnb)} BNB</dd></div>
                 <div><dt>合约托管 BNB</dt><dd>{fmt(s.raisedBnb)}</dd></div>
-                <div><dt>实际日产</dt><dd>{fmtBem(s.dailyBem)} BEM</dd></div>
-                <div><dt>已分发轮数</dt><dd>{String(s.harvestCount)}</dd></div>
+                <div><dt>预估算力</dt><dd>{Number(s.estHashpower) > 0 ? `${Number(s.estHashpower).toLocaleString("zh-CN")} H` : "—"}</dd></div>
                 <div><dt>执行子态</dt><dd>{PHASE_LABEL[s.phase]}</dd></div>
               </dl>
             </div>
@@ -153,9 +163,6 @@ export default function OnChainPage({ embedded = false }) {
                 <dl className="chain-metrics">
                   <div><dt>可用份额</dt><dd>{String(s.self.shares)}</dd></div>
                   <div><dt>挂单锁定</dt><dd>{String(s.self.escrow)}</dd></div>
-                  <div><dt>可领 BEM</dt><dd>{fmtBem(s.self.pending)}</dd></div>
-                  <div><dt>已领 BEM</dt><dd>{fmtBem(s.self.claimed)}</dd></div>
-                  <div><dt>我的 BEM 余额</dt><dd>{fmtBem(s.self.bemBalance)}</dd></div>
                   <div><dt>已退 BNB</dt><dd>{fmt(s.self.refunded)}</dd></div>
                 </dl>
               </div>
@@ -170,7 +177,7 @@ export default function OnChainPage({ embedded = false }) {
                   <label className="field"><span>认筹份数</span><input inputMode="numeric" value={form.buyCount} onChange={(e) => setForm({ ...form, buyCount: e.target.value })} /></label>
                   <div className="field"><span>应付</span>
                     <button className="btn btn-primary" type="button" disabled={busy || !account}
-                      onClick={() => run("认筹", (sg) => tx.subscribe(sg, BigInt(form.buyCount), parseEther(fmt(s.sharePriceBnb)) * BigInt(form.buyCount)))}>
+                      onClick={() => run("认筹", (sg) => tx.subscribe(sg, BigInt(form.buyCount), s.sharePriceBnb * BigInt(form.buyCount)))}>
                       {busy === "认筹" ? "认筹中…" : `认筹 ${form.buyCount} 份（${(Number(fmt(s.sharePriceBnb)) * Number(form.buyCount)).toFixed(4)} BNB）`}
                     </button>
                   </div>
@@ -186,38 +193,65 @@ export default function OnChainPage({ embedded = false }) {
                   {s.phase === 1 && Number(s.raisedBnb) < Number(s.sold) * Number(s.sharePriceBnb) && (
                     <p className="fine chain-warn">池子已低于按份全退所需，持份人现在可按比例退款；卖单成交款提取进池可补回一部分。</p>
                   )}
-                  {s.executionFailed && <p className="fine chain-warn">本期已判流片失败并回到待挂单。可降价重挂，或原路退款；勿在锁价/元件数为 0 时 execute。</p>}
+                  {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降价重挂，或原路退款；勿在锁价/元件数为 0 时 depositToPool。</p>}
                   {isOwner && (
                     <div className="chain-actions">
-                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est), form.capped, BigInt(form.trCount)))}>setPlan</button>}
-                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("挂单", (sg) => tx.placeTransistorOrder(sg, "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087", BigInt(form.trCount), parseEther(form.trPrice), 0n, 0n))}>placeBid</button>}
-                      {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("退款", (sg) => tx.openRefund(sg))}>发起退款</button>}
-                      {s.phase === 2 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("同步成交", (sg) => tx.confirmTransistors(sg))}>同步官方成交</button>}
-                      {s.phase === 2 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("取消挂单", (sg) => tx.cancelTransistorOrder(sg))}>取消挂单</button>}
+                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est)))}>setPlan</button>}
+                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("挂单", (sg) => tx.placeTransistorOrder(sg, s.transistors, BigInt(form.nandQty), parseEther(form.nandPrice), 0n, 0n))}>placeBid</button>}
+                      {(s.phase === 1 || s.phase === 3) && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("退款", (sg) => tx.openRefund(sg))}>发起退款</button>}
+                      {!s.executionFailed && (() => {
+                        // 合约 FAIL_GRACE = 3 天：非 Owner 只能等售罄满 3 天；Owner 随时可判。
+                        const waitMs = !isOwner && s.markFailedAt ? Number(s.markFailedAt) - Date.now() : 0;
+                        const locked = waitMs > 0;
+                        return (
+                          <button
+                            className="btn btn-inline"
+                            type="button"
+                            disabled={busy || locked}
+                            title={locked
+                              ? `非 Owner 须在售罄满 3 天后才能 markFailed；约 ${new Date(Number(s.markFailedAt)).toLocaleString("zh-CN")} 后可调。Owner 现在就可以用「发起退款 / 放弃挂单」立即退款。`
+                              : isOwner
+                                ? "Owner 可随时判失败，为所有持有人打开 refund。"
+                                : "已过 3 天宽限期：任何地址都可判失败，为所有持有人打开 refund。"}
+                            onClick={() => run("判失败", (sg) => tx.markFailed(sg))}
+                          >
+                            {locked
+                              ? `markFailed · 还需 ${formatRemaining(waitMs)}`
+                              : isOwner ? "markFailed（Owner 随时）" : "markFailed（已过 3 天）"}
+                          </button>
+                        );
+                      })()}
+                      {s.phase === 2 && (
+                        <button
+                          className={partsShort ? "btn btn-inline" : "btn btn-primary"}
+                          type="button"
+                          disabled={busy || partsShort}
+                          title={partsShort ? "买单已成交，但元件还没进本期合约（NAND / LATCH 余额不足），链上会 TransistorsNotReady" : undefined}
+                          onClick={() => run("同步成交", (sg) => tx.confirmTransistors(sg))}
+                        >
+                          {partsShort ? "同步官方成交（等待元件到账）" : "同步官方成交"}
+                        </button>
+                      )}
+                      {s.phase === 2 && !cancelBlockedByFill && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("取消挂单", (sg) => tx.cancelTransistorOrder(sg))}>取消挂单</button>}
                       {s.phase === 3 && !s.executionFailed && (
-                        <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("execute", (sg) => tx.execute(sg, new TextEncoder().encode(form.tapeout), "0x12345678"))}>execute 流片开矿</button>
+                        <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("depositToPool", (sg) => tx.depositToPool(sg))}>depositToPool 进入挖矿</button>
                       )}
                     </div>
                   )}
                   {s.executionFailed && s.self && s.self.shares > 0 && (
                     <div className="chain-actions">
-                      <button className="btn btn-inline" type="button" disabled={busy || !account} onClick={() => run("退款", (sg) => tx.refund(sg))}>流片失败 · 原路退款</button>
+                      <button className="btn btn-inline" type="button" disabled={busy || !account} onClick={() => run("退款", (sg) => tx.refund(sg))}>执行失败 · 原路退款</button>
                     </div>
                   )}
                 </div>
               )}
 
               {s.scene === 2 && (
-                <div className="chain-actions">
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={busy || !account}
-                    onClick={() => run("harvest", (sg) => tx.harvest(sg))}
-                  >
-                    全网分发 harvest
-                  </button>
-                  <button className="btn btn-primary" type="button" disabled={busy || !account} onClick={() => run("claim", (sg) => tx.claim(sg))}>领取我的 BEM</button>
+                <div>
+                  <p className="fine">
+                    元件已入池，本期进入挖矿（不可逆）。harvest / claim 为占位空实现，不产出发放；
+                    持份用户退出只能通过「发布转让挂单」走份额转让。
+                  </p>
                 </div>
               )}
             </div>

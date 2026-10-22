@@ -10,4 +10,13 @@ interface IERC1155 {
     function isApprovedForAll(address account, address operator) external view returns (bool);
 
     function safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes calldata data) external;
+
+    /// @notice 批量转账。官方市场一次交付 NAND + LATCH 时会用它。
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] calldata ids,
+        uint256[] calldata amounts,
+        bytes calldata data
+    ) external;
 }

@@ -26,7 +26,11 @@ module.exports = {
   solidity: {
     version: "0.8.24",
     // runs 偏低优先压体积：工厂合约内嵌 Campaign 创建码，主网 24KB 上限。
-    settings: { optimizer: { enabled: true, runs: 1 }, viaIR: true, evmVersion: "paris" },
+    settings: {
+      optimizer: { enabled: true, runs: 1 },
+      viaIR: true,
+      evmVersion: "paris",
+    },
   },
   sourcify: {
     enabled: true,

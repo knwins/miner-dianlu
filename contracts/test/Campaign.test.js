@@ -4,19 +4,13 @@ const { time, loadFixture } = require("@nomicfoundation/hardhat-network-helpers"
 
 const SHARE_PRICE = ethers.parseEther("0.01");
 const TOTAL_SHARES = 100n;
-const FEE_PERCENT = 5;
 const FUNDING_DAYS = 7;
-const TASK_ID = 54n;
-const HASHPOWER = 408n;
-const NETLIST = ethers.keccak256(ethers.toUtf8Bytes("netlist-v1"));
-const RAW_NETLIST = ethers.toUtf8Bytes("netlist-v1");
-const START = "0x12345678";
+// createCampaign 收 seconds，不是 days：单位换算由调用方做，工厂不再乘 1 days。
+const FUNDING_SECONDS = FUNDING_DAYS * 24 * 60 * 60;
+const UNIT = ethers.parseEther("0.005");
 
 const SCENE = { Funding: 0n, Executing: 1n, Mining: 2n };
 const PHASE = { None: 0n, Buying: 1n, Listed: 2n, Ready: 3n };
-const DAILY_BEM = (HASHPOWER * 7200n * 10n ** 18n * 9900n) / (10000n * 1_579_178n);
-const TT = "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087";
-const UNIT = ethers.parseEther("0.005");
 
 function place(campaign, signer, qty, price) {
   return campaign.transistors().then((tt) => campaign.connect(signer).placeTransistorOrder(tt, qty, price, 0, 0));
@@ -37,40 +31,49 @@ async function fillAndConfirm(campaign, market) {
   await campaign.confirmTransistors();
 }
 
+// 工厂构造只传 [materialMarket, allowedParts]，两者都是 immutable；开期只传 sharePriceBnb / totalShares / fundingSeconds / transistors(必选)。
+// 流片 / PoD / BEM 挖矿已移除：元件合约由开期显式指定，相关 mock（MockBEM / MockPoD / MockMinter / MockERC721）已删除。
 async function deployFixture() {
   const [owner, alice, bob, carol, feeRecipient] = await ethers.getSigners();
-  const bem = await ethers.deployContract("MockBEM");
-  const pod = await ethers.deployContract("MockPoD", [await bem.getAddress(), HASHPOWER]);
   const minter = await ethers.deployContract("MockMaterialMarket");
   const parts = await ethers.deployContract("MockERC1155");
+  // 工厂构造：[materialMarket, allowedParts 白名单]。
+  // 白名单是安全边界：主网上只放官方两件套（TapeOut / Behemoth）的元件合约，测试网放 mock。
+  // 工厂不再有「默认元件」：开期时 createCampaign 第 4 参 transistors_ 必须显式传入且非零。
   const factory = await ethers.deployContract("CampaignFactory", [
-    await pod.getAddress(),
-    await bem.getAddress(),
     await minter.getAddress(),
+    [await parts.getAddress()],
   ]);
-  await factory
-    .connect(owner)
-    .createCampaign(
-      SHARE_PRICE,
-      TOTAL_SHARES,
-      FEE_PERCENT,
-      FUNDING_DAYS,
-      [feeRecipient.address],
-      [10_000],
-      TASK_ID,
-      ethers.ZeroAddress,
-      NETLIST,
-      await parts.getAddress()
-    );
+  await factory.connect(owner).createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await parts.getAddress());
   const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
-  return { bem, pod, minter, parts, factory, campaign, owner, alice, bob, carol, feeRecipient };
+  return { minter, parts, factory, campaign, owner, alice, bob, carol, feeRecipient };
+}
+
+// 进入 Mining：认购 → 设计划 → 下单 → 成交确认 → 设矿池 → 打入矿池（不可逆）。
+// 取代旧的 miningFixture（原靠 execute() 到达 Mining，execute 已删除）。
+async function pooledFixture() {
+  const ctx = await loadFixture(deployFixture);
+  const { campaign, alice, bob, owner, minter } = ctx;
+  await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
+  await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
+  expect(await campaign.scene()).to.equal(SCENE.Executing);
+  await campaign.connect(owner).setPlan(408n);
+  await place(campaign, owner, 100n, UNIT);
+  await fillAndConfirm(campaign, minter);
+  const pool = await ethers.deployContract("MockERC1155");
+  await pool.waitForDeployment();
+  await campaign.connect(owner).setMiningPool(await pool.getAddress());
+  await campaign.connect(owner).depositToPool();
+  expect(await campaign.scene()).to.equal(SCENE.Mining);
+  expect(await campaign.pooled()).to.equal(true);
+  return ctx;
 }
 
 describe("escrow can never be stranded", () => {
   it("abandonOrder pays the refund and hands the leftover parts to the owner", async () => {
     const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
@@ -80,27 +83,92 @@ describe("escrow can never be stranded", () => {
     expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
     // Sale 99/100 pro-rata: the holder gets 0.99 back and keeps nothing on the book.
     expect(await campaign.sharesOf(alice.address)).to.equal(0n);
-    expect(await campaign.sold()).to.equal(0n);
+    // outstandingShares（已售未退）归零 = 没有待退份额了。
+    // sold 是单调的历史事实，退款不会让它变小（H-1 后半：退款不能剥夺 owner 的下单资格）。
+    expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.sold()).to.equal(100n);
     expect(await campaign.raisedBnb()).to.equal(0n);
   });
 
   it("markFailed opens refund() when a short pool has no owner around", async () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await campaign.connect(alice).cancelTransistorOrder();
 
+    // Non-owner markFailed is locked for FAIL_GRACE (3 days) after the sell-out.
+    await expect(campaign.connect(alice).markFailed()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+    await time.increase(3 * 24 * 3600);
     await campaign.connect(alice).markFailed();
     await expect(campaign.connect(alice).refund()).to.emit(campaign, "Refunded");
     expect(await campaign.raisedBnb()).to.equal(0n);
   });
 
+  it("non-owner markFailed cancels the untouched bid so the escrow returns", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+
+    const bidId = await campaign.nandBidId();
+    expect(await campaign.phase()).to.equal(PHASE.Listed);
+    // 买单托管已从 raisedBnb 扣走，此时池子是「不足」的。
+    expect(await campaign.raisedBnb()).to.be.lessThan(100n * SHARE_PRICE);
+
+    // 宽限期内非 Owner 仍然不能杀期，也不能撤单。
+    await expect(campaign.connect(alice).markFailed()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+    await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "NotOwner");
+
+    await time.increase(3 * 24 * 3600);
+    // 逃生口：markFailed 先把未成交的买单撤掉，押金退回 raisedBnb，退款口径不变。
+    await expect(campaign.connect(alice).markFailed()).to.emit(campaign, "TransistorOrderCancelled");
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    expect(await campaign.executionFailed()).to.equal(true);
+    expect(await campaign.raisedBnb()).to.equal(100n * SHARE_PRICE);
+    expect(await campaign.nandQty()).to.equal(0n);
+    await expect(campaign.connect(alice).refund()).to.emit(campaign, "Refunded");
+  });
+
+  it("markFailed leaves the round failed and retryable when the market refuses the cancel", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+
+    // 市场拒绝撤单：整笔回滚，期次不会被判失败，恢复后可以重试，避免托管被永远留在市场里。
+    await minter.setBlockCancel(true);
+    await time.increase(3 * 24 * 3600);
+    await expect(campaign.connect(alice).markFailed()).to.be.revertedWithCustomError(minter, "BadBid");
+    expect(await campaign.executionFailed()).to.equal(false);
+    expect(await campaign.phase()).to.equal(PHASE.Listed);
+
+    await minter.setBlockCancel(false);
+    await campaign.connect(alice).markFailed();
+    expect(await campaign.executionFailed()).to.equal(true);
+    expect(await campaign.raisedBnb()).to.equal(100n * SHARE_PRICE);
+    await expect(campaign.connect(alice).refund()).to.emit(campaign, "Refunded");
+  });
+
+  it("a single holder cannot kill a healthy round inside the grace window", async () => {
+    const { campaign, owner, alice, bob } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE });
+    await campaign.connect(bob).subscribe(99n, { value: 99n * SHARE_PRICE });
+
+    await expect(campaign.connect(alice).markFailed()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+    expect(await campaign.sold()).to.equal(TOTAL_SHARES);
+
+    // The owner may still mark at any time (this is how openRefund / abandonOrder work).
+    await campaign.connect(owner).markFailed();
+    expect(await campaign.executionFailed()).to.equal(true);
+  });
+
   it("anyone may cancel an untouched bid once the factory drops the round", async () => {
     const { campaign, factory, owner, alice } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
 
     await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(
@@ -117,98 +185,96 @@ describe("escrow can never be stranded", () => {
   });
 });
 
-async function miningFixture() {
-  const ctx = await loadFixture(deployFixture);
-  const { campaign, alice, bob, owner, pod, bem } = ctx;
-  await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
-  await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
-  expect(await campaign.scene()).to.equal(SCENE.Executing);
-  await campaign.connect(owner).setPlan(408n, false, 100n);
-  await place(campaign, owner, 100n, UNIT);
-  await fillAndConfirm(campaign, ctx.minter);
-  await campaign.connect(owner).execute(RAW_NETLIST, START);
-  expect(await campaign.scene()).to.equal(SCENE.Mining);
-  await bem.mint(await pod.getAddress(), DAILY_BEM * 10n);
-  await pod.setDailyAmount(DAILY_BEM);
-  return ctx;
-}
-
 describe("CampaignFactory", () => {
   it("only Factory Owner can create", async () => {
-    const { factory, alice, feeRecipient } = await loadFixture(deployFixture);
+    const { factory, alice, parts } = await loadFixture(deployFixture);
     await expect(
-      factory
-        .connect(alice)
-        .createCampaign(
-          SHARE_PRICE,
-          TOTAL_SHARES,
-          FEE_PERCENT,
-          FUNDING_DAYS,
-          [feeRecipient.address],
-          [10_000],
-          TASK_ID,
-          ethers.ZeroAddress,
-          NETLIST,
-          TT
-        )
+      factory.connect(alice).createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await parts.getAddress()),
     ).to.be.revertedWithCustomError(factory, "NotOwner");
   });
 
   it("stores campaigns and increments count", async () => {
-    const { factory, owner, feeRecipient } = await loadFixture(deployFixture);
+    const { factory, owner, parts } = await loadFixture(deployFixture);
     expect(await factory.campaignCount()).to.equal(1n);
-    await factory
+    const tx = factory
       .connect(owner)
-      .createCampaign(SHARE_PRICE, 50n, FEE_PERCENT, FUNDING_DAYS, [feeRecipient.address], [10_000], 5n, ethers.ZeroAddress, NETLIST, TT);
+      .createCampaign(SHARE_PRICE, 50n, FUNDING_SECONDS, await parts.getAddress());
+    await tx;
     expect(await factory.campaignCount()).to.equal(2n);
-    const all = await factory.allCampaigns();
-    expect(all.length).to.equal(2);
+    const first = await factory.campaigns(0);
+    const second = await factory.campaigns(1);
+    expect(second).to.not.equal(first);
+    // 事件带上 fundingDeadline，索引器不必回读 Campaign。
+    const deadline = await (await ethers.getContractAt("Campaign", second)).fundingDeadline();
+    await expect(tx)
+      .to.emit(factory, "CampaignCreated")
+      .withArgs(1n, second, SHARE_PRICE, 50n, deadline);
+    // 元件合约由开期显式指定，写入后不可改（Campaign.transistors 是 immutable）。
+    expect(await (await ethers.getContractAt("Campaign", second)).transistors()).to.equal(
+      await parts.getAddress(),
+    );
   });
 
-  it("Owner can update factory pod/bem/minter and ownership", async () => {
-    const { factory, owner, alice, bem, pod, minter } = await loadFixture(deployFixture);
-    const otherBem = await (await ethers.getContractFactory("MockBEM")).deploy();
-    await otherBem.waitForDeployment();
-    await expect(factory.connect(alice).setBem(await otherBem.getAddress())).to.be.revertedWithCustomError(factory, "NotOwner");
-    await expect(factory.connect(owner).setBem(ethers.ZeroAddress)).to.be.revertedWithCustomError(factory, "ZeroAddress");
-    await expect(factory.connect(owner).setBem(await otherBem.getAddress()))
-      .to.emit(factory, "BemUpdated");
-    expect(await factory.bem()).to.equal(await otherBem.getAddress());
-    await factory.connect(owner).setPod(await pod.getAddress());
-    await factory.connect(owner).setMinter(await minter.getAddress());
-    expect(await factory.pod()).to.equal(await pod.getAddress());
-    expect(await factory.minter()).to.equal(await minter.getAddress());
+  it("createCampaign reverts on a zero transistors address", async () => {
+    const { factory, owner } = await loadFixture(deployFixture);
+    await expect(
+      factory.connect(owner).createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, ethers.ZeroAddress),
+    ).to.be.revertedWithCustomError(factory, "ZeroAddress");
+  });
+
+  it("fundingSeconds is added verbatim, and the deadline is reported in the event", async () => {
+    const { factory, owner, parts } = await loadFixture(deployFixture);
+    const now = BigInt(await time.latest());
+    // 90 秒：若工厂还在乘 1 days，截止时间会落在 90 天后，这里会立刻暴露。
+    await factory.connect(owner).createCampaign(SHARE_PRICE, 10n, 90n, await parts.getAddress());
+    const c = await ethers.getContractAt("Campaign", await factory.campaigns(1));
+    const deadline = await c.fundingDeadline();
+    expect(deadline).to.be.greaterThan(now + 80n);
+    expect(deadline).to.be.lessThan(now + 200n);
+  });
+
+  it("factory materialMarket is immutable; ownership still transfers", async () => {
+    const { factory, owner, alice, minter } = await loadFixture(deployFixture);
+    expect(await factory.materialMarket()).to.equal(await minter.getAddress());
+    // 工厂没有 setter：materialMarket 是 immutable，白名单部署时写入不可改。
+    const names = factory.interface.fragments.filter((f) => f.type === "function").map((f) => f.name);
+    expect(names).to.not.include("setMinter");
+    expect(names).to.not.include("setMaterialMarket");
+    expect(names).to.not.include("setDefaultTransistors");
     await factory.connect(owner).transferOwnership(alice.address);
     expect(await factory.owner()).to.equal(alice.address);
-    // restore for isolation ? fixture is fresh per test anyway
-    void bem;
   });
 
-  it("Owner can update campaign pod/bem/minter", async () => {
-    const { campaign, owner, alice, pod, minter } = await loadFixture(deployFixture);
-    const otherBem = await (await ethers.getContractFactory("MockBEM")).deploy();
-    await otherBem.waitForDeployment();
-    await expect(campaign.connect(alice).setBem(await otherBem.getAddress())).to.be.revertedWithCustomError(campaign, "NotOwner");
-    await expect(campaign.connect(owner).setBem(await otherBem.getAddress()))
-      .to.emit(campaign, "BemUpdated");
-    expect(await campaign.bem()).to.equal(await otherBem.getAddress());
-    await campaign.connect(owner).setPod(await pod.getAddress());
-    await campaign.connect(owner).setMinter(await minter.getAddress());
+  it("Owner can update campaign material market", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    const otherMinter = await (await ethers.deployContract("MockMaterialMarket")).getAddress();
+    await expect(campaign.connect(alice).setMaterialMarket(otherMinter)).to.be.revertedWithCustomError(campaign, "NotOwner");
+    await expect(campaign.connect(owner).setMaterialMarket(otherMinter))
+      .to.emit(campaign, "MaterialMarketUpdated");
+    expect(await campaign.market()).to.equal(otherMinter);
+    await campaign.connect(owner).setMaterialMarket(await minter.getAddress());
+    expect(await campaign.market()).to.equal(await minter.getAddress());
   });
 
   it("Owner can remove campaign from registry without destroying it", async () => {
-    const { factory, owner, alice, feeRecipient, campaign } = await loadFixture(deployFixture);
+    const { factory, owner, alice, feeRecipient, campaign, parts } = await loadFixture(deployFixture);
     const first = await factory.campaigns(0);
     await factory
       .connect(owner)
-      .createCampaign(SHARE_PRICE, 50n, FEE_PERCENT, FUNDING_DAYS, [feeRecipient.address], [10_000], 5n, ethers.ZeroAddress, NETLIST, TT);
+      .createCampaign(SHARE_PRICE, 50n, FUNDING_SECONDS, await parts.getAddress());
     const second = await factory.campaigns(1);
     expect(await factory.campaignCount()).to.equal(2n);
 
     await expect(factory.connect(alice).removeCampaign(0)).to.be.revertedWithCustomError(factory, "NotOwner");
     await expect(factory.connect(owner).removeCampaign(9)).to.be.revertedWithCustomError(factory, "IndexOutOfBounds");
 
-    expect(await factory.indexOf(second)).to.equal(1n);
+    // indexOf 已删除：按地址查索引改为遍历 campaigns(0..count)，这也正是前端的做法。
+    const indexOf = async (addr) => {
+      const n = Number(await factory.campaignCount());
+      for (let i = 0; i < n; i++) if ((await factory.campaigns(i)) === addr) return i;
+      return -1;
+    };
+    expect(await indexOf(second)).to.equal(1);
     await expect(factory.connect(owner).removeCampaign(0))
       .to.emit(factory, "CampaignRemoved");
     expect(await factory.campaignCount()).to.equal(1n);
@@ -218,8 +284,8 @@ describe("CampaignFactory", () => {
     expect(await ethers.provider.getCode(first)).to.not.equal("0x");
     expect(await campaign.getAddress()).to.equal(first);
     expect(await campaign.scene()).to.equal(0); // Funding
-    // Absent address reports length, so callers get IndexOutOfBounds from removeCampaign.
-    expect(await factory.indexOf(first)).to.equal(1n);
+    // 已移除的地址遍历不到，返回 -1。
+    expect(await indexOf(first)).to.equal(-1);
   });
 });
 
@@ -247,7 +313,7 @@ describe("funding subscribe", () => {
     const { campaign, alice } = await loadFixture(deployFixture);
     await expect(alice.sendTransaction({ to: await campaign.getAddress(), value: 1n })).to.be.revertedWithCustomError(
       campaign,
-      "DirectTransferNotAllowed"
+      "DirectTransferNotAllowed",
     );
   });
 });
@@ -267,17 +333,17 @@ describe("refund", () => {
     expect(await campaign.refundedOf(alice.address)).to.equal(SHARE_PRICE * 30n);
   });
 
-  it("mining cannot refund", async () => {
-    const { campaign, alice } = await miningFixture();
+  it("mining cannot refund (pooled is irreversible)", async () => {
+    const { campaign, alice } = await pooledFixture();
     await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
   });
 });
 
-describe("transistor order + execute", () => {
+describe("transistor order + deposit to pool", () => {
   it("phase machine and auth", async () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await expect(place(campaign, alice, 100n, UNIT)).to.be.revertedWithCustomError(campaign, "NotOwner");
     await place(campaign, owner, 100n, UNIT);
     expect(await campaign.phase()).to.equal(PHASE.Listed);
@@ -291,66 +357,140 @@ describe("transistor order + execute", () => {
     await place(campaign, owner, 100n, UNIT);
     await expect(campaign.connect(owner).confirmTransistors()).to.be.revertedWithCustomError(
       campaign,
-      "TransistorsNotReady"
+      "TransistorsNotReady",
     );
     await fillAndConfirm(campaign, minter);
     expect(await campaign.phase()).to.equal(PHASE.Ready);
   });
 
-  it("execute gates: not ready / not owner / netlist", async () => {
-    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
-    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
-    await expect(campaign.connect(owner).execute(RAW_NETLIST, START)).to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
-    await place(campaign, owner, 100n, UNIT);
-    await fillAndConfirm(campaign, minter);
-    await expect(campaign.connect(alice).execute(RAW_NETLIST, START)).to.be.revertedWithCustomError(campaign, "NotOwner");
-    await expect(campaign.connect(owner).execute(ethers.toUtf8Bytes("evil"), START)).to.be.revertedWithCustomError(
-      campaign,
-      "NetlistMismatch"
-    );
-  });
-
-  it("execute success returns surplus pro-rata", async () => {
+  it("depositToPool requires Ready, a set pool, and returns surplus pro-rata", async () => {
     const { campaign, owner, minter, alice } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
     await fillAndConfirm(campaign, minter);
+
     const cost = 100n * UNIT;
     const surplus = SHARE_PRICE * 100n - cost;
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+
+    // 未设矿池：PoolNotSet
+    await expect(campaign.connect(owner).depositToPool()).to.be.revertedWithCustomError(campaign, "PoolNotSet");
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+
     const aliceBefore = await ethers.provider.getBalance(alice.address);
-    await expect(campaign.connect(owner).execute(RAW_NETLIST, START))
-      .to.emit(campaign, "Executed")
-      .and.to.emit(campaign, "SurplusReturned")
-      .withArgs(alice.address, surplus);
+    // C-4：余款改 pull 模式 —— 入池时不再遍历持份人转账，只记录基准（surplusPool / surplusBase）。
+    // 所以入池这一步没有 Refunded 事件，持份人自己调 claimSurplus() 才拿得到钱。
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
     expect(await campaign.scene()).to.equal(SCENE.Mining);
-    expect(await campaign.phase()).to.equal(PHASE.None);
+    expect(await campaign.pooled()).to.equal(true);
     expect(await campaign.raisedBnb()).to.equal(0n);
-    expect(await ethers.provider.getBalance(await minter.getAddress())).to.equal(cost);
-    expect(await ethers.provider.getBalance(alice.address) - aliceBefore).to.equal(surplus);
+    expect(await campaign.surplusPool()).to.equal(surplus);
+    expect(await campaign.surplusBase()).to.equal(100n);
+    // 入池时没有钱到账，余额不变；领取时才到账。
+    expect(await ethers.provider.getBalance(alice.address) - aliceBefore).to.equal(0n);
+    await expect(campaign.connect(alice).claimSurplus())
+      .to.emit(campaign, "Refunded")
+      .withArgs(alice.address, surplus);
+    // 领取时 alice 自己付 gas，所以余额差 = 到账额 − gas。用 gas 还原真实到账额。
+    const aliceAfter = await ethers.provider.getBalance(alice.address);
+    expect(aliceAfter).to.be.lt(aliceBefore + surplus);
+    expect(aliceAfter).to.be.gt(aliceBefore + surplus - ethers.parseEther("0.01"));
+    // 元件已转入矿池：余额记录在 transistors 合约上、归 miningPool 所有。
+    const partsC = await ethers.getContractAt("MockERC1155", await campaign.transistors());
+    expect(await partsC.balanceOf(await pool.getAddress(), 0)).to.equal(100n);
+    expect(await partsC.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
+  });
+
+  it("depositToPool is irreversible: refund / recover / abandon are all closed", async () => {
+    const { campaign, owner, minter, alice } = await pooledFixture();
+    await expect(campaign.connect(owner).recoverTransistors(await campaign.transistors(), 0, 1n))
+      .to.be.revertedWithCustomError(campaign, "AlreadyPooled");
+    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+  });
+
+  it("a holder that rejects BNB keeps a claimable surplus instead of losing it forever", async () => {
+    // H-2 回归 + C-4：入池时 _returnSurplus 不再遍历持份人推款（改 pull 模式），
+    // 所以「转账失败」的场景从入池时转移到了**持份人自己领取时**。
+    // 现在：领取失败 → 整笔交易回滚，金额原样留在 pendingSurplus 里，持份人可重试；
+    // owner 也扫不走（recoverBnb 会预留 surplusPool − surplusPaid）。
+    const { campaign, owner, minter, alice } = await loadFixture(deployFixture);
+    const rejector = await ethers.deployContract("Rejector");
+    const rAddr = await rejector.getAddress();
+
+    // alice 认购 60 份，rejector 认购 40 份。
+    await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
+    await rejector.subscribe(await campaign.getAddress(), 40n, { value: SHARE_PRICE * 40n });
+    expect(await campaign.sharesOf(rAddr)).to.equal(40n);
+
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+
+    const cost = 100n * UNIT;
+    const totalRaised = SHARE_PRICE * 100n;
+    const surplus = totalRaised - cost;
+
+    // 入池：不再遍历持份人，只记录余款基准。
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
+    expect(await campaign.surplusPool()).to.equal(surplus);
+    expect(await campaign.surplusBase()).to.equal(100n);
+
+    // rejector 的应得余款 = surplus × 40/100
+    const rShare = (surplus * 40n) / 100n;
+    expect(await campaign.surplusOf(rAddr)).to.equal(rShare);
+    // 这笔钱不能被 owner 扫走
+    await expect(campaign.connect(owner).recoverBnb())
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
+
+    // 还在拒收 → claimSurplus 回滚，金额未发出、可重试
+    await expect(rejector.claimSurplusFrom(await campaign.getAddress()))
+      .to.be.revertedWithCustomError(campaign, "TransferFailed");
+    expect(await campaign.surplusOf(rAddr)).to.equal(rShare);
+    expect(await campaign.pendingSurplus(rAddr)).to.equal(0n);
+
+    // 打开接收 → 领取成功
+    await rejector.accept();
+    const before = await ethers.provider.getBalance(rAddr);
+    await expect(rejector.claimSurplusFrom(await campaign.getAddress())).to.emit(campaign, "Refunded");
+    expect(await ethers.provider.getBalance(rAddr) - before).to.equal(rShare);
+    expect(await campaign.pendingSurplus(rAddr)).to.equal(0n);
+    expect(await campaign.totalPendingSurplus()).to.equal(0n);
+
+    // 没有余款可领时 revert
+    await expect(rejector.claimSurplusFrom(await campaign.getAddress()))
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
   });
 
   it("unaffordable place marks failed without escrowing", async () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await expect(place(campaign, owner, 100n, ethers.parseEther("0.02"))).to.emit(campaign, "ExecutionFailed");
     expect(await campaign.phase()).to.equal(PHASE.Buying);
     expect(await campaign.executionFailed()).to.equal(true);
     expect(await campaign.raisedBnb()).to.equal(SHARE_PRICE * 100n);
-    await expect(campaign.connect(owner).execute(RAW_NETLIST, START)).to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
+    // Buying 态不能 confirm
+    await expect(campaign.connect(owner).confirmTransistors()).to.be.revertedWithCustomError(campaign, "NotListed");
+    // 正常下单进入 Listed，未成交时 confirm 才报 TransistorsNotReady
     await place(campaign, owner, 100n, UNIT);
+    await expect(campaign.connect(owner).confirmTransistors()).to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
     expect(await campaign.executionFailed()).to.equal(false);
     await fillAndConfirm(campaign, minter);
-    await expect(campaign.connect(owner).execute(RAW_NETLIST, START)).to.emit(campaign, "Executed");
-    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    // fillAndConfirm 已经 confirm 过一次：in Require(Ready) 保证此时 phase 已是 Ready。
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    await expect(campaign.connect(owner).confirmTransistors()).to.be.revertedWithCustomError(campaign, "AlreadyReady");
   });
 
   it("unaffordable then user refund", async () => {
     const { campaign, owner, alice } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, ethers.parseEther("0.02"));
     const before = await ethers.provider.getBalance(alice.address);
     const tx = await campaign.connect(alice).refund();
@@ -363,7 +503,7 @@ describe("transistor order + execute", () => {
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
@@ -375,62 +515,90 @@ describe("transistor order + execute", () => {
     const tx = await campaign.connect(alice).refund();
     const receipt = await tx.wait();
     expect(await ethers.provider.getBalance(alice.address) + receipt.gasUsed * receipt.gasPrice - aliceBefore).to.equal(
-      (pool * 60n) / 100n
+      (pool * 60n) / 100n,
     );
     await campaign.connect(bob).refund();
     expect(await campaign.raisedBnb()).to.equal(0n);
     expect(await campaign.sharesOf(bob.address)).to.equal(0n);
   });
 
-  it("partial fill: cancel bid first, then placeAsk, sell and refund", async () => {
+  it("deliverBidAll fills the bid and mints the parts to the buyer", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
+
+    await expect(minter.deliverBidAll(await campaign.nandBidId()))
+      .to.emit(minter, "BidFilled");
+
+    expect(await campaign.nandQty()).to.equal(1n);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(1n);
+    await expect(campaign.connect(owner).confirmTransistors()).to.emit(campaign, "TransistorsConfirmed");
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+  });
+
+  it("emits bid and ask events so the frontend can rebuild the trade log", async () => {
+    const { campaign, owner, alice, bob, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+
+    await expect(place(campaign, owner, 1n, UNIT)).to.emit(minter, "BidPlaced");
+    await minter.deliverBidAll(await campaign.nandBidId());
+    await campaign.confirmTransistors();
+
+    const askPrice = ethers.parseEther("0.03");
+    await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0)).to.emit(minter, "AskPlaced");
+    await expect(minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice }))
+      .to.emit(minter, "AskFilled");
+    await expect(campaign.connect(owner).confirmSale()).to.emit(minter, "ProceedsWithdrawn");
+  });
+
+  it("asks are refused until the buy is confirmed, then a sale must be confirmed before the next bid", async () => {
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
+    const askPrice = ethers.parseEther("0.03");
+    await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0))
+      .to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
+
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
-
-    const askPrice = ethers.parseEther("0.03");
-    // One order at a time: ask while bid is Listed must revert.
-    await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0))
-      .to.be.revertedWithCustomError(campaign, "AlreadyListed");
-
     await campaign.connect(alice).cancelTransistorOrder();
     expect(await campaign.phase()).to.equal(PHASE.Buying);
     await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0))
+      .to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
+
+    await place(campaign, owner, 1n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+    await campaign.confirmTransistors();
+    await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0))
       .to.emit(campaign, "TransistorAskPlaced");
-    expect(await campaign.nandAskId()).to.be.gt(0n);
-
-    await expect(campaign.connect(owner).placeTransistorOrder(ethers.ZeroAddress, 1n, UNIT, 0n, 0))
-      .to.be.revertedWithCustomError(campaign, "AlreadyAsked");
-    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "AlreadyAsked");
-
-    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
-    // Sell proceeds still in market.owed ? refund must wait for withdraw.
-    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "AlreadyAsked");
-    await campaign.withdrawMarketProceeds();
-    await campaign.connect(owner).cancelTransistorAsk();
-    const after = SHARE_PRICE * 100n - UNIT + askPrice;
-    expect(await campaign.raisedBnb()).to.equal(after);
-    await campaign.connect(owner).openRefund();
-    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
-    expect(await campaign.sharesOf(bob.address)).to.equal(0n);
+    // 未设矿池时先撞 PoolNotSet；设好后可以入池（合约自持的 parts 未动，只是挂单在市场上）。
+    await expect(campaign.connect(owner).depositToPool()).to.be.revertedWithCustomError(campaign, "PoolNotSet");
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
   });
 
   it("buy can be placed again after a prior ask fully sold", async () => {
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
-    await place(campaign, owner, 10n, UNIT);
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
-    await campaign.connect(owner).cancelTransistorOrder();
+    await campaign.confirmTransistors();
     const askPrice = ethers.parseEther("0.02");
     await campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0);
     await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
-    await campaign.withdrawMarketProceeds();
-    await campaign.connect(owner).cancelTransistorAsk();
+    await expect(campaign.connect(owner).placeTransistorOrder(ethers.ZeroAddress, 1n, UNIT, 0n, 0))
+      .to.be.revertedWithCustomError(campaign, "AlreadyReady");
+    await campaign.connect(owner).confirmSale();
     await place(campaign, owner, 1n, UNIT);
     expect(await campaign.phase()).to.equal(PHASE.Listed);
   });
@@ -438,52 +606,83 @@ describe("transistor order + execute", () => {
   it("placeAsk returning id 0 reverts instead of unlocking a second order", async () => {
     const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
-    await place(campaign, owner, 10n, UNIT);
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
-    await campaign.connect(owner).cancelTransistorOrder();
+    await campaign.confirmTransistors();
     await minter.setReturnZeroAsk(true);
     await expect(campaign.connect(owner).placeTransistorAsk(1n, UNIT, 0n, 0))
       .to.be.revertedWithCustomError(campaign, "BadAskId");
-    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
   });
 
   it("fully filled ask can be cleared without touching the market", async () => {
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
-    await place(campaign, owner, 10n, UNIT);
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
-    await campaign.connect(owner).cancelTransistorOrder();
+    await campaign.confirmTransistors();
     const askPrice = ethers.parseEther("0.02");
     await campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0);
     await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
-    await campaign.withdrawMarketProceeds();
-    await campaign.connect(owner).cancelTransistorAsk();
+    await campaign.connect(owner).confirmSale();
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
     expect(await campaign.nandAskQty()).to.equal(0n);
-    expect(await campaign.nandAskId()).to.equal(0n);
+    expect(await campaign.raisedBnb()).to.equal(SHARE_PRICE * 100n - UNIT + askPrice);
+  });
+
+  it("withdrawMarketProceeds pulls ask proceeds into the raise; anyone may call, owed=0 is a no-op", async () => {
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await parts.mint(await campaign.getAddress(), 0, 1n);
+    await campaign.confirmTransistors();
+    const askPrice = ethers.parseEther("0.02");
+    await campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0);
+    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
+    // The market owes the campaign the sale proceeds; they are not in raisedBnb yet.
+    expect(await minter.owed(await campaign.getAddress())).to.equal(askPrice);
+    const before = await campaign.raisedBnb();
+    // Anyone may pull the proceeds, and the money lands in the raise via receive().
+    await expect(campaign.connect(bob).withdrawMarketProceeds()).to.emit(minter, "ProceedsWithdrawn");
+    expect(await campaign.raisedBnb()).to.equal(before + askPrice);
+    expect(await minter.owed(await campaign.getAddress())).to.equal(0n);
+    // Nothing owed: the call is a silent no-op, not a revert.
+    await expect(campaign.connect(bob).withdrawMarketProceeds()).to.not.be.reverted;
+    expect(await campaign.raisedBnb()).to.equal(before + askPrice);
+  });
+
+  it("placeTransistorOrder rejects a transistors address that is not the round's parts contract", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    const other = await ethers.deployContract("MockERC1155");
+    await other.waitForDeployment();
+    // A wrong (non-zero) address must not be silently ignored.
+    await expect(
+      campaign.connect(owner).placeTransistorOrder(await other.getAddress(), 1n, UNIT, 0n, 0)
+    ).to.be.revertedWithCustomError(campaign, "WrongTransistors");
+    // Zero address means "use the locked one" and is still accepted.
+    await expect(campaign.connect(owner).placeTransistorOrder(ethers.ZeroAddress, 1n, UNIT, 0n, 0))
+      .to.emit(campaign, "TransistorOrderPlaced");
   });
 
   it("leftover parts plus short raise refund pro-rata and leave no stranded BNB", async () => {
-    // Bid 100 @ UNIT buy only 1 unit; sell 1 unit but raise is short of 100 � 0.01.
+    // Bid 100 @ UNIT buy only 1 unit; sell 1 unit but raise is short of 100 × 0.01.
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
     await campaign.connect(alice).cancelTransistorOrder();
-    // Raise is 0.995 but principal is 1.0. Selling the 1 leftover part is not enough to close the gap.
-    const askPrice = SHARE_PRICE * 25n / 100n;
-    await campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0);
-    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 1n, { value: askPrice });
-    await campaign.withdrawMarketProceeds();
-    await campaign.connect(owner).cancelTransistorAsk();
-
-    const pool = SHARE_PRICE * 100n - UNIT + askPrice;
+    // Raise is 0.995 but principal is 1.0. A partial fill cannot be sold until a later buy is confirmed.
+    const pool = SHARE_PRICE * 100n - UNIT;
     expect(await campaign.raisedBnb()).to.equal(pool);
     expect(await campaign.totalRefunded()).to.equal(0n);
     // Short pool: no owner switch needed, each holder pulls pro-rata.
@@ -494,14 +693,56 @@ describe("transistor order + execute", () => {
     await campaign.connect(bob).refund();
     // Pool fully drained: no stranded BNB behind zeroed shares.
     expect(await campaign.raisedBnb()).to.equal(0n);
-    expect(await campaign.sold()).to.equal(0n);
+    expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.sold()).to.equal(100n);
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+  });
+
+  it("a pro-rata refund that rounds to 0 still settles the holder instead of locking the dust forever", async () => {
+    // 短池下按比例取整可能为 0 wei。原来这时 refund() 直接 revert、份额不清、sold 不减，
+    // 于是 sold 永远不归零 → recoverBnb 不敢扫尾差 → 这笔 BNB 被永久锁在合约里。
+    // 现在：份额照清、sold 照减，余量留给后面的持份人。
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    // alice 持 1 份、bob 持 99 份。owner 买走 1 颗元件，单价几乎吃掉全部募资款，只剩 1 wei 可分。
+    await campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE });
+    await campaign.connect(bob).subscribe(99n, { value: SHARE_PRICE * 99n });
+    await campaign.connect(owner).setPlan(408n);
+    // 单价 0.999999999999999999 BNB：cost = 1e18-1 ≤ 募资 1e18，够下单。
+    const nearlyAll = ethers.parseEther("0.999999999999999999");
+    await place(campaign, owner, 1n, nearlyAll);
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    // 不 mint 元件 → _partsOnHand() 为 false，撤单不会被 OrderFilled 拦。
+    await campaign.connect(alice).cancelTransistorOrder();
+    // 池子里只剩 1 wei：alice 的 1/100 份额按比例取整为 0。
+    const pool = await campaign.raisedBnb();
+    expect(pool).to.equal(1n);
+    expect(pool / 100n).to.equal(0n);
+
+    const aliceBefore = await ethers.provider.getBalance(alice.address);
+    const atx = await campaign.connect(alice).refund();
+    const ar = await atx.wait();
+    await expect(atx).to.emit(campaign, "Refunded").withArgs(alice.address, 0n);
+    // 份额被清掉、outstandingShares 减 1 —— 不再是「永远退不出来」的状态。
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+    expect(await campaign.outstandingShares()).to.equal(99n);
+    expect(await campaign.sold()).to.equal(100n);
+    // alice 没拿到 BNB（比例取整为 0），但她的份额已结清。
+    expect(await ethers.provider.getBalance(alice.address) + ar.gasUsed * ar.gasPrice - aliceBefore).to.equal(0n);
+    // 余量随 sold 变小而变大：bob 现在能按 1/99 全额拿走这 1 wei。
+    const bobBefore = await ethers.provider.getBalance(bob.address);
+    const tx = await campaign.connect(bob).refund();
+    const r = await tx.wait();
+    expect(await ethers.provider.getBalance(bob.address) + r.gasUsed * r.gasPrice - bobBefore).to.equal(1n);
+    expect(await campaign.raisedBnb()).to.equal(0n);
+    expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.sold()).to.equal(100n);
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
   });
 
   it("refund after fundingDeadline can still drain a sold-out pool", async () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, ethers.parseEther("0.02")); // over budget: soft-fail, no order
     await time.increase(FUNDING_DAYS * 24 * 3600 + 1);
     await campaign.connect(owner).openRefund();
@@ -510,19 +751,18 @@ describe("transistor order + execute", () => {
   });
 
   it("openRefund pays principal, leaves the excess sweepable, and burns any residual", async () => {
-    // 100 shares, bid 10 � UNIT, fill 2, cancel the bid, sell the 2 filled parts at 0.02 each.
+    // 100 shares, bid 10 × UNIT, fill 2, cancel the bid, sell the 2 filled parts at 0.02 each.
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 10n);
-    await place(campaign, owner, 10n, UNIT);
-    await minter.fillBid(await campaign.nandBidId(), 2n); // partial fill leaves a cancellable remainder
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 2n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 2n);
     await parts.mint(await campaign.getAddress(), 0, 2n);
-    await campaign.connect(alice).cancelTransistorOrder();
+    await campaign.confirmTransistors();
     const askPrice = ethers.parseEther("0.02");
     await campaign.connect(owner).placeTransistorAsk(2n, askPrice, 0n, 0);
     await minter.connect(bob).fillAsk(await campaign.nandAskId(), 2n, { value: askPrice * 2n });
-    await campaign.withdrawMarketProceeds();
-    await campaign.connect(owner).cancelTransistorAsk();
+    await campaign.connect(owner).confirmSale();
 
     const pool = SHARE_PRICE * 100n - UNIT * 2n + askPrice * 2n;
     const needed = SHARE_PRICE * 100n;
@@ -533,20 +773,20 @@ describe("transistor order + execute", () => {
     // Holders only get principal back; the sale premium stays for the owner as excess over raisedBnb.
     expect(await campaign.raisedBnb()).to.equal(pool - needed);
     // After a full refund sold == 0, so the whole balance is entitled to nobody and the premium can be swept.
-    await campaign.connect(owner).recoverBnb(pool - needed);
+    await campaign.connect(owner).recoverBnb();
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
-    // openRefund is idempotent: every share is already refunded, so nothing moves.
-    await campaign.connect(owner).openRefund();
-    expect(await campaign.raisedBnb()).to.equal(0n);
+    // Every share already left: a second openRefund would refund nobody, so it reverts instead of
+    // mining an empty transaction (the UI now offers recoverBnb in that state).
+    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "ZeroShares");
   });
 
   it("abandonOrder reclaims a cancelable bid and refunds every holder in one call", async () => {
-    // Bid 100 @ UNIT, fill 1, then abandon: cancelBid returns 99 � UNIT, the holder gets principal back,
-    // and the spent 1 � UNIT is a realised loss for the holders (short pool, pro-rata).
+    // Bid 100 @ UNIT, fill 1, then abandon: cancelBid returns 99 × UNIT, the holder gets principal back,
+    // and the spent 1 × UNIT is a realised loss for the holders (short pool, pro-rata).
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
@@ -556,17 +796,18 @@ describe("transistor order + execute", () => {
     expect(await campaign.sharesOf(alice.address)).to.equal(0n);
     expect(await campaign.sharesOf(bob.address)).to.equal(0n);
     expect(await campaign.executionFailed()).to.equal(true);
-    expect(await campaign.nandBidId()).to.equal(0n);
+    // _clearOrder drops quantities and escrow; it no longer rewrites bid ids (see Campaign._clearOrder).
+    expect(await campaign.nandQty()).to.equal(0n);
     expect(await campaign.raisedBnb()).to.equal(0n);
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
-    // 1 � UNIT spent on a part nobody needs is not recoverable.
+    // 1 × UNIT spent on a part nobody needs is not recoverable.
     expect(await campaign.totalRefunded()).to.equal(SHARE_PRICE * 100n - UNIT);
   });
 
   it("abandonOrder also works straight from a live bid and blocks once Ready", async () => {
     const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 10n, UNIT);
     expect(await campaign.phase()).to.equal(PHASE.Listed);
     await campaign.connect(owner).abandonOrder();
@@ -582,7 +823,7 @@ describe("transistor order + execute", () => {
   it("a filled order with parts on hand cannot be cancelled", async () => {
     const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 100n);
     await parts.mint(await campaign.getAddress(), 0, 100n);
@@ -591,10 +832,25 @@ describe("transistor order + execute", () => {
     expect(await campaign.phase()).to.equal(PHASE.Ready);
   });
 
+  it("cancelling an order clears the bid ids so no stale order looks live", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 50n, UNIT);
+    expect(await campaign.nandBidId()).to.not.equal(0n);
+    expect(await campaign.nandQty()).to.equal(50n);
+    await campaign.connect(owner).cancelTransistorOrder();
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    // A stale id must not survive: readers gate on id != 0 to show a live order.
+    expect(await campaign.nandBidId()).to.equal(0n);
+    expect(await campaign.nandQty()).to.equal(0n);
+    expect(await campaign.priceLock()).to.equal(0n);
+  });
+
   it("filled book without parts does not confirm, and cancel lets holders take the leftover", async () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 50n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 50n);
     await expect(campaign.confirmTransistors()).to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
@@ -611,7 +867,7 @@ describe("transistor order + execute", () => {
   it("placeBid that returns id 0 reverts and keeps the pool", async () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await minter.setReturnZeroId(true);
     await expect(place(campaign, owner, 100n, UNIT)).to.be.revertedWithCustomError(campaign, "BadBidId");
     expect(await campaign.phase()).to.equal(PHASE.Buying);
@@ -619,17 +875,56 @@ describe("transistor order + execute", () => {
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(SHARE_PRICE * 100n);
   });
 
-  it("setPlan blocked after listed / mining; count cannot be 0", async () => {
+  it("Ready: confirmed parts can be listed, and depositToPool enters Mining", async () => {
+    const { campaign, owner, alice, bob, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+
+    // Before this change Ready could only execute / refund / recover: the sell path was unreachable.
+    const askPrice = ethers.parseEther("0.03");
+    await expect(campaign.connect(owner).placeTransistorAsk(1n, askPrice, 0n, 0))
+      .to.emit(campaign, "TransistorAskPlaced");
+
+    // execute 已删除；进入 Mining 的唯一路径是 depositToPool。
+    // 挂过卖单后「全部持仓都在手上」不再成立，所以先撤单把 1 份 NAND 拿回来再入池。
+    await campaign.connect(owner).cancelTransistorAsk();
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+  });
+
+  it("Ready refund returns the parts and does not wait on a sale", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 4n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    await expect(campaign.connect(owner).openRefund()).to.emit(campaign, "Refunded");
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(4n);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
+  });
+
+  it("setPlan blocked after listed / mining", async () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
-    await expect(campaign.connect(owner).setPlan(1n, false, 0n)).to.be.revertedWithCustomError(campaign, "ZeroShares");
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+    await campaign.connect(owner).setPlan(408n);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
     await place(campaign, owner, 100n, UNIT);
-    await expect(campaign.connect(owner).setPlan(408n, false, 1n)).to.be.revertedWithCustomError(campaign, "WrongScene");
+    await expect(campaign.connect(owner).setPlan(408n)).to.be.revertedWithCustomError(campaign, "WrongScene");
     await fillAndConfirm(campaign, minter);
-    await expect(campaign.connect(owner).setPlan(408n, false, 1n)).to.be.revertedWithCustomError(campaign, "WrongScene");
-    await campaign.connect(owner).execute(RAW_NETLIST, START);
-    await expect(campaign.connect(owner).setPlan(408n, false, 1n)).to.be.revertedWithCustomError(campaign, "WrongScene");
+    await expect(campaign.connect(owner).setPlan(408n)).to.be.revertedWithCustomError(campaign, "WrongScene");
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await campaign.connect(owner).depositToPool();
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    await expect(campaign.connect(owner).setPlan(408n)).to.be.revertedWithCustomError(campaign, "WrongScene");
   });
 
   it("openRefund batch refunds holders", async () => {
@@ -650,28 +945,39 @@ describe("transistor order + execute", () => {
     expect(await ethers.provider.getBalance(bob.address) - bobBefore).to.equal(SHARE_PRICE * 40n);
     await expect(place(campaign, owner, 100n, UNIT)).to.be.revertedWithCustomError(
       campaign,
-      "RefundNotAvailable"
+      "RefundNotAvailable",
     );
   });
 });
 
-describe("share transfer", () => {
+describe("share transfer (Mining only)", () => {
   it("list escrow / cancel / no self-take", async () => {
-    const { campaign, alice } = await miningFixture();
+    const { campaign, alice } = await pooledFixture();
     await expect(campaign.connect(alice).listShares(100n, SHARE_PRICE)).to.be.revertedWithCustomError(campaign, "InsufficientShares");
     await campaign.connect(alice).listShares(20n, ethers.parseEther("0.02"));
     expect(await campaign.sharesOf(alice.address)).to.equal(40n);
     expect(await campaign.escrowOf(alice.address)).to.equal(20n);
     await expect(campaign.connect(alice).takeListing(0n, 1n, { value: ethers.parseEther("0.02") })).to.be.revertedWithCustomError(
       campaign,
-      "CannotTakeOwnListing"
+      "CannotTakeOwnListing",
     );
     await campaign.connect(alice).cancelListing(0n);
     expect(await campaign.sharesOf(alice.address)).to.equal(60n);
   });
 
+  it("getListing returns the listing the frontend reads", async () => {
+    const { campaign, alice } = await pooledFixture();
+    await campaign.connect(alice).listShares(20n, ethers.parseEther("0.02"));
+    const l = await campaign.getListing(0n);
+    expect(l.seller).to.equal(alice.address);
+    expect(l.shares).to.equal(20n);
+    expect(l.priceBnbPerShare).to.equal(ethers.parseEther("0.02"));
+    expect(l.open).to.equal(true);
+    await expect(campaign.getListing(1n)).to.be.revertedWithCustomError(campaign, "NoListing");
+  });
+
   it("takeListing transfers shares and BNB", async () => {
-    const { campaign, alice, bob } = await miningFixture();
+    const { campaign, alice, bob } = await pooledFixture();
     await campaign.connect(alice).listShares(20n, ethers.parseEther("0.03"));
     const pay = 5n * ethers.parseEther("0.03");
     const aliceBefore = await ethers.provider.getBalance(alice.address);
@@ -683,29 +989,6 @@ describe("share transfer", () => {
     expect(await ethers.provider.getBalance(alice.address) - aliceBefore).to.equal(pay);
   });
 
-  it("takeListing moves claimed pro-rata", async () => {
-    const { campaign, alice, bob, bem, pod } = await miningFixture();
-    await campaign.connect(alice).harvest();
-    const alicePending = await campaign.pendingBem(alice.address);
-    await campaign.connect(alice).claim();
-    const bobPendingBefore = await campaign.pendingBem(bob.address);
-    await campaign.connect(alice).listShares(30n, ethers.parseEther("0.02"));
-    await campaign.connect(bob).takeListing(0n, 30n, { value: 30n * ethers.parseEther("0.02") });
-    const moved = (alicePending * 30n) / 60n;
-    expect(await campaign.claimedOf(alice.address)).to.equal(alicePending - moved);
-    expect(await campaign.claimedOf(bob.address)).to.equal(moved);
-    const bobPendingAfterTake = await campaign.pendingBem(bob.address);
-    expect(bobPendingAfterTake).to.be.closeTo(bobPendingBefore, 1n);
-    await campaign.connect(bob).claim();
-    expect(await bem.balanceOf(bob.address)).to.equal(bobPendingAfterTake);
-    await bem.mint(await pod.getAddress(), DAILY_BEM);
-    await pod.setDailyAmount(DAILY_BEM);
-    await campaign.connect(alice).harvest();
-    const net = (DAILY_BEM * 9500n) / 10000n;
-    expect(await campaign.pendingBem(alice.address)).to.be.closeTo((net * 30n) / 100n, 1n);
-    expect(await campaign.pendingBem(bob.address)).to.be.closeTo((net * 70n) / 100n, 1n);
-  });
-
   it("cannot list while funding", async () => {
     const { campaign, alice } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(10n, { value: SHARE_PRICE * 10n });
@@ -713,113 +996,28 @@ describe("share transfer", () => {
   });
 });
 
-describe("harvest / claim", () => {
-  it("harvest distributes; claim is per-address", async () => {
-    const { campaign, bem, alice, bob, feeRecipient } = await miningFixture();
-    await expect(campaign.connect(alice).harvest()).to.emit(campaign, "Harvested");
-    expect(await campaign.harvestCount()).to.equal(1n);
-    const fee = (DAILY_BEM * 500n) / 10000n;
-    const net = DAILY_BEM - fee;
-    const alicePending = await campaign.pendingBem(alice.address);
-    const bobPending = await campaign.pendingBem(bob.address);
-    expect(alicePending).to.equal((net * 60n) / 100n);
-    expect(bobPending).to.equal((net * 40n) / 100n);
-    expect(alicePending + bobPending).to.be.closeTo(net, 10n);
-    expect(await bem.balanceOf(feeRecipient.address)).to.equal(fee);
-    await campaign.connect(alice).claim();
-    expect(await bem.balanceOf(alice.address)).to.equal(alicePending);
-    expect(await campaign.pendingBem(alice.address)).to.equal(0n);
-    expect(await campaign.pendingBem(bob.address)).to.equal(bobPending);
-    await expect(campaign.connect(alice).claim()).to.be.revertedWithCustomError(campaign, "NothingToClaim");
+describe("harvest / claim (placeholders)", () => {
+  // 流片 / PoD 已移除，harvest / claim 仅作占位：Mining 外 revert WrongScene，Mining 内 no-op / 返回 0。
+  it("harvest and claim are placeholders: revert outside Mining, no-op inside Mining", async () => {
+    const { campaign, alice } = await loadFixture(deployFixture);
+    await expect(campaign.connect(alice).harvest()).to.be.revertedWithCustomError(campaign, "WrongScene");
+    await expect(campaign.connect(alice).claim()).to.be.revertedWithCustomError(campaign, "WrongScene");
+
+    const { campaign: mc } = await pooledFixture();
+    await expect(mc.connect(alice).harvest()).to.not.be.reverted;
+    expect(await mc.connect(alice).claim.staticCall()).to.equal(0n);
   });
+});
 
-  it("splits service fee across recipients; remainder to owner", async () => {
-    const { campaign, bem, alice, bob, carol, owner, feeRecipient } = await miningFixture();
-    await campaign.connect(owner).setFeeShares(
-      [feeRecipient.address, carol.address],
-      [6000, 4000]
-    );
-    const feeBeforeOwner = await bem.balanceOf(owner.address);
-    const feeBeforeA = await bem.balanceOf(feeRecipient.address);
-    const feeBeforeC = await bem.balanceOf(carol.address);
-    await expect(campaign.connect(alice).harvest()).to.emit(campaign, "FeeDistributed");
-    const fee = (DAILY_BEM * 500n) / 10000n;
-    const partA = (fee * 6000n) / 10000n;
-    const partC = (fee * 4000n) / 10000n;
-    const rem = fee - partA - partC;
-    expect(await bem.balanceOf(feeRecipient.address)).to.equal(feeBeforeA + partA);
-    expect(await bem.balanceOf(carol.address)).to.equal(feeBeforeC + partC);
-    expect(await bem.balanceOf(owner.address)).to.equal(feeBeforeOwner + rem);
-    void bob;
-  });
-
-  it("rejects fee shares that do not sum to 10000", async () => {
-    const { campaign, owner, feeRecipient, carol } = await miningFixture();
-    await expect(
-      campaign.connect(owner).setFeeShares([feeRecipient.address, carol.address], [5000, 4000])
-    ).to.be.revertedWithCustomError(campaign, "BadFeeShares");
-  });
-
-  it("rejects fee shares that are not whole percents", async () => {
-    const { campaign, owner, feeRecipient, carol } = await miningFixture();
-    await expect(
-      campaign.connect(owner).setFeeShares([feeRecipient.address, carol.address], [3333, 6667])
-    ).to.be.revertedWithCustomError(campaign, "BadFeeShares");
-  });
-
-  it("unlimited harvest rounds", async () => {
-    const { campaign, alice, pod, bem } = await miningFixture();
-    for (let i = 0; i < 5; i++) {
-      await bem.mint(await pod.getAddress(), DAILY_BEM);
-      await pod.setDailyAmount(DAILY_BEM);
-      await campaign.connect(alice).harvest();
-    }
-    expect(await campaign.harvestCount()).to.equal(5n);
-    const net = DAILY_BEM - (DAILY_BEM * 500n) / 10000n;
-    expect(await campaign.pendingBem(alice.address)).to.equal((net * 5n * 60n) / 100n);
-  });
-
-  it("dailyBem matches Emission", async () => {
-    const { campaign } = await miningFixture();
-    expect(await campaign.dailyBem()).to.equal(DAILY_BEM);
-  });
-
-  it("accounts a smaller pull instead of reverting", async () => {
-    const { campaign, alice, pod } = await miningFixture();
-    const half = DAILY_BEM / 2n;
-    await pod.setDailyAmount(half);
-    await campaign.connect(alice).harvest();
-    const fee = (half * 500n) / 10000n;
-    expect(await campaign.totalDistributed()).to.equal(half - fee);
-    expect(await campaign.pendingBem(alice.address)).to.equal(((half - fee) * 60n) / 100n);
-  });
-
-  it("credits surplus when PoD pays more than the daily estimate", async () => {
-    const { campaign, alice, pod, bem } = await miningFixture();
-    const extra = DAILY_BEM * 3n;
-    await bem.mint(await pod.getAddress(), extra);
-    await pod.setDailyAmount(extra);
-    await campaign.connect(alice).harvest();
-    const fee = (extra * 500n) / 10000n;
-    const net = extra - fee;
-    expect(await campaign.totalDistributed()).to.equal(net);
-    expect(await campaign.pendingBem(alice.address)).to.equal((net * 60n) / 100n);
-  });
-
-  it("NoEmission when PoD pays nothing", async () => {
-    const { campaign, alice, pod } = await miningFixture();
-    await pod.setDailyAmount(0);
-    await expect(campaign.connect(alice).harvest()).to.be.revertedWithCustomError(campaign, "NoEmission");
-  });
-
-  it("owner can recover transistors held by the campaign", async () => {
-    const parts = await ethers.deployContract("MockERC1155");
-
-    // Listed / Ready: order is live ? recovering would strip parts needed for confirm/execute.
+describe("recover transistors / BNB", () => {
+  it("owner can recover transistors held by the campaign (blocked once pooled)", async () => {
+    // Listed still refuses. Ready allows the transfer and keeps the phase, so depositToPool can follow.
     const live = await loadFixture(deployFixture);
+    // Deploy after the fixture snapshot: loadFixture reverts the chain, which wipes code deployed before it.
+    const parts = await ethers.deployContract("MockERC1155");
     await live.campaign.connect(live.alice).subscribe(60n, { value: 60n * SHARE_PRICE });
     await live.campaign.connect(live.bob).subscribe(40n, { value: 40n * SHARE_PRICE });
-    await live.campaign.connect(live.owner).setPlan(408n, false, 100n);
+    await live.campaign.connect(live.owner).setPlan(408n);
     await place(live.campaign, live.owner, 100n, UNIT);
     await parts.mint(await live.campaign.getAddress(), 0, 3n);
     await expect(live.campaign.connect(live.owner).recoverTransistors(await parts.getAddress(), 0, 1n))
@@ -827,129 +1025,421 @@ describe("harvest / claim", () => {
     await live.minter.fillBid(await live.campaign.nandBidId(), await live.campaign.nandQty());
     await live.parts.mint(await live.campaign.getAddress(), 0, await live.campaign.nandQty());
     await live.campaign.confirmTransistors();
+    await live.campaign.connect(live.owner).recoverTransistors(await parts.getAddress(), 0, 1n);
+    expect(await live.campaign.phase()).to.equal(PHASE.Ready);
+    expect(await parts.balanceOf(live.owner.address, 0)).to.equal(1n);
+    expect(await parts.balanceOf(await live.campaign.getAddress(), 0)).to.equal(2n);
+
+    // 打入矿池后不可逆：recoverTransistors 改回 AlreadyPooled。
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await live.campaign.connect(live.owner).setMiningPool(await pool.getAddress());
+    await live.campaign.connect(live.owner).depositToPool();
     await expect(live.campaign.connect(live.owner).recoverTransistors(await parts.getAddress(), 0, 1n))
-      .to.be.revertedWithCustomError(live.campaign, "AlreadyReady");
-
-    const { campaign, owner, alice } = await miningFixture();
-    // miningFixture reverts to the deploy snapshot, so mint on a token deployed after it.
-    const held = await ethers.deployContract("MockERC1155");
-    await held.mint(await campaign.getAddress(), 0, 7n);
-    await held.mint(await campaign.getAddress(), 1, 2n);
-
-    await expect(campaign.connect(alice).recoverTransistors(await held.getAddress(), 0, 7n))
-      .to.be.revertedWithCustomError(campaign, "NotOwner");
-    await expect(campaign.connect(owner).recoverTransistors(ethers.ZeroAddress, 0, 1n))
-      .to.be.revertedWithCustomError(campaign, "ZeroAddress");
-    await expect(campaign.connect(owner).recoverTransistors(await held.getAddress(), 0, 0))
-      .to.be.revertedWithCustomError(held, "Insufficient");
-
-    const scene = await campaign.scene();
-    await campaign.connect(owner).recoverTransistors(await held.getAddress(), 0, 7n);
-    await campaign.connect(owner).recoverTransistors(await held.getAddress(), 1, 2n);
-
-    expect(await held.balanceOf(owner.address, 0)).to.equal(7n);
-    expect(await held.balanceOf(owner.address, 1)).to.equal(2n);
-    expect(await held.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
-    expect(await campaign.scene()).to.equal(scene);
+      .to.be.revertedWithCustomError(live.campaign, "AlreadyPooled");
   });
 
-  it("owner can recover leftover BNB in mining; funding keeps raised escrow", async () => {
-    const leftover = ethers.parseEther("0.05");
+  it("Ready parts can be taken out for the pool and then committed", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    const held = await parts.balanceOf(await campaign.getAddress(), 0);
+    await campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, held);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(held);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
+    // Ready 不能再下买单：要重新买入必须先用 setPhase 回到 Buying（或走 openRefund / confirmSale）。
+    await expect(place(campaign, owner, 1n, UNIT)).to.be.revertedWithCustomError(campaign, "AlreadyReady");
+    await campaign.connect(owner).setPhase(PHASE.Buying);
+    await place(campaign, owner, 1n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+  });
 
+  it("owner can set phase out of Ready and then take the parts out", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
+    await expect(campaign.connect(owner).setPhase(PHASE.Buying)).to.be.revertedWithCustomError(campaign, "AlreadyListed");
+    await fillAndConfirm(campaign, minter);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    await expect(campaign.connect(alice).setPhase(PHASE.Buying)).to.be.revertedWithCustomError(campaign, "NotOwner");
+    await expect(campaign.connect(owner).setPhase(4)).to.be.revertedWithCustomError(campaign, "WrongScene");
+    await campaign.connect(owner).setPhase(PHASE.Buying);
+    expect(await campaign.phase()).to.equal(PHASE.Buying);
+    const held = await parts.balanceOf(await campaign.getAddress(), 0);
+    await campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, held);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(held);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
+    await campaign.connect(owner).openRefund();
+    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
+  });
+
+  it("recoverBnb sweeps excess; reverts when there is no excess over raisedBnb", async () => {
     const funded = await loadFixture(deployFixture);
     await funded.campaign.connect(funded.alice).subscribe(10n, { value: 10n * SHARE_PRICE });
     expect(await funded.campaign.raisedBnb()).to.equal(10n * SHARE_PRICE);
-    await expect(funded.campaign.connect(funded.owner).recoverBnb(SHARE_PRICE))
-      .to.be.revertedWithCustomError(funded.campaign, "WrongScene");
+    // No argument: with nothing above raisedBnb there is nothing safe to sweep, so it reverts.
+    await expect(funded.campaign.connect(funded.owner).recoverBnb())
+      .to.be.revertedWithCustomError(funded.campaign, "ZeroShares");
+    expect(await funded.campaign.raisedBnb()).to.equal(10n * SHARE_PRICE);
 
-    const { campaign, owner, alice } = await miningFixture();
-    await expect(campaign.connect(alice).recoverBnb(1n)).to.be.revertedWithCustomError(campaign, "NotOwner");
-    await expect(campaign.connect(owner).recoverBnb(0)).to.be.revertedWithCustomError(campaign, "ZeroShares");
-
-    // receive() only credits raisedBnb when msg.sender is the material market.
-    await campaign.connect(owner).setMinter(alice.address);
-    await alice.sendTransaction({ to: await campaign.getAddress(), value: leftover });
-    expect(await campaign.raisedBnb()).to.equal(leftover);
-
-    await expect(campaign.connect(owner).recoverBnb(leftover))
-      .to.emit(campaign, "BnbRecovered")
-      .withArgs(leftover, owner.address);
+    // Mining: surplus already returned to holders, raisedBnb == 0, but shares still outstanding,
+    // so there is no excess to sweep -> revert.
+    const { campaign, owner } = await pooledFixture();
     expect(await campaign.raisedBnb()).to.equal(0n);
-    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+    await expect(campaign.connect(owner).recoverBnb()).to.be.revertedWithCustomError(campaign, "ZeroShares");
   });
 });
 
-const OFFICIAL_H = 3n;
-const OFFICIAL_DAILY = (OFFICIAL_H * 7200n * 10n ** 18n * 9900n) / (10000n * 1_579_178n);
-
-function officialStartData() {
-  return ethers.AbiCoder.defaultAbiCoder().encode(
-    ["address", "uint256", "uint32", "uint256", "bytes[]", "bytes[]", "bytes32[][]", "bytes32"],
-    [TT, 1, 4, 0, [], [], [], ethers.ZeroHash]
-  );
-}
-
-describe("OfficialPodAdapter", () => {
-  async function readyFixture() {
-    const ctx = await deployFixture();
-    const { campaign, alice, bob, owner, bem } = ctx;
+// ─────────────────────────────────────────────────────────────────────────────
+// H-1 后半：退款后 owner 仍能下单（sold 单调化）
+// ─────────────────────────────────────────────────────────────────────────────
+describe("H-1b refund no longer locks the owner out", () => {
+  it("a holder refunding does not revoke the owner's ability to order", async () => {
+    const { campaign, owner, alice, bob, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
     await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
-    await campaign.connect(owner).setPlan(408n, false, 100n);
+
+    // 制造短池，让退款路径打开
+    await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 100n, UNIT);
-    await fillAndConfirm(campaign, ctx.minter);
-    const official = await ethers.deployContract("MockOfficialPoD", [await bem.getAddress()]);
-    const adapter = await ethers.deployContract("OfficialPodAdapter", [
-      await official.getAddress(),
-      await bem.getAddress(),
+    await minter.fillBid(await campaign.nandBidId(), 1n);
+    await campaign.connect(alice).cancelTransistorOrder();
+
+    // alice 退款（短池路径）
+    await campaign.connect(alice).refund();
+    // sold 是单调的历史事实：退款不会让它变小
+    expect(await campaign.sold()).to.equal(100n);
+    expect(await campaign.outstandingShares()).to.equal(40n);
+
+    // owner 依然可以下单（原实现里 sold 变小 → 闸门永远拦死）
+    await place(campaign, owner, 1n, UNIT);
+    expect(await campaign.nandQty()).to.equal(1n);
+  });
+
+  it("an unsold round that passes its deadline still lets subscribers pull their principal back", async () => {
+    // 「售罄前不允许退款」不能被照字面实现：否则未售罄 + Funding 过期的期次
+    // 会失去唯一的本金出口，本金被永久锁死（比 H-1 更严重）。
+    const { campaign, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(10n, { value: 10n * SHARE_PRICE });
+    await time.increaseTo((await campaign.fundingDeadline()) + 1n);
+    const before = await ethers.provider.getBalance(alice.address);
+    const tx = await campaign.connect(alice).refund();
+    const r = await tx.wait();
+    expect(
+      await ethers.provider.getBalance(alice.address) + r.gasUsed * r.gasPrice - before
+    ).to.equal(10n * SHARE_PRICE);
+    expect(await campaign.outstandingShares()).to.equal(0n);
+  });
+
+  it("a sold-out round does not allow the deadline refund path", async () => {
+    const { campaign, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await time.increaseTo((await campaign.fundingDeadline()) + 1n);
+    // 售罄的期次：钱已经用于买元件，不允许走「未售罄过期」那条退款路径。
+    await expect(campaign.connect(alice).refund())
+      .to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C-4：余款 pull 模式
+// ─────────────────────────────────────────────────────────────────────────────
+describe("C-4 surplus is pulled, not pushed", () => {
+  it("depositToPool does not iterate holders; each holder claims their own share", async () => {
+    const { campaign, owner, minter, alice, bob } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
+    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+
+    const surplus = 100n * SHARE_PRICE - 100n * UNIT;
+    // 入池时没有任何转账事件：没有遍历、没有 push
+    await expect(campaign.connect(owner).depositToPool())
+      .to.emit(campaign, "DepositedToPool")
+      .and.not.to.emit(campaign, "Refunded");
+    expect(await campaign.surplusPool()).to.equal(surplus);
+    expect(await campaign.surplusBase()).to.equal(100n);
+
+    // alice 领 60%
+    const aBefore = await ethers.provider.getBalance(alice.address);
+    const atx = await campaign.connect(alice).claimSurplus();
+    const ar = await atx.wait();
+    expect(
+      await ethers.provider.getBalance(alice.address) + ar.gasUsed * ar.gasPrice - aBefore
+    ).to.equal((surplus * 60n) / 100n);
+
+    // bob 领 40%
+    const bBefore = await ethers.provider.getBalance(bob.address);
+    const btx = await campaign.connect(bob).claimSurplus();
+    const br = await btx.wait();
+    expect(
+      await ethers.provider.getBalance(bob.address) + br.gasUsed * br.gasPrice - bBefore
+    ).to.equal((surplus * 40n) / 100n);
+
+    // 分毫不差
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+    expect(await campaign.totalPendingSurplus()).to.equal(0n);
+  });
+
+  it("a holder cannot claim the same surplus twice", async () => {
+    const { campaign, owner, minter, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await campaign.connect(owner).depositToPool();
+
+    await campaign.connect(alice).claimSurplus();
+    // 再领一次没有可领的 → revert
+    await expect(campaign.connect(alice).claimSurplus())
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
+  });
+
+  it("the owner cannot sweep the unclaimed surplus away", async () => {
+    const { campaign, owner, minter, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await campaign.connect(owner).depositToPool();
+
+    // 一分钱都不能扫走
+    await expect(campaign.connect(owner).recoverBnb())
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.be.gt(0n);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 服务费真正上链
+// ─────────────────────────────────────────────────────────────────────────────
+describe("service fee is on-chain", () => {
+  it("owner sets the fee and a multi-recipient split table before anyone subscribes", async () => {
+    const { campaign, owner, feeRecipient, carol } = await loadFixture(deployFixture);
+    await expect(
+      campaign
+        .connect(owner)
+        .setServiceFee(500, [feeRecipient.address, carol.address], [7000, 3000])
+    )
+      .to.emit(campaign, "ServiceFeeSet");
+    expect(await campaign.serviceFeeBps()).to.equal(500);
+    expect(await campaign.serviceFeeSet()).to.equal(true);
+    expect(await campaign.feeRecipientCount()).to.equal(2);
+    expect(await campaign.feeRecipientAt(0)).to.equal(feeRecipient.address);
+    expect(await campaign.feeSharesBpsAt(1)).to.equal(3000);
+  });
+
+  it("rejects an invalid table", async () => {
+    const { campaign, owner, feeRecipient, carol, alice, bob } = await loadFixture(deployFixture);
+    // 份额合计不等于 10000
+    await expect(
+      campaign.connect(owner).setServiceFee(500, [feeRecipient.address, carol.address], [7000, 2000])
+    ).to.be.revertedWithCustomError(campaign, "BadFeeConfig");
+    // 超过硬上限 10%
+    await expect(
+      campaign.connect(owner).setServiceFee(1001, [feeRecipient.address], [10000])
+    ).to.be.revertedWithCustomError(campaign, "BadFeeConfig");
+    // 重复地址
+    await expect(
+      campaign
+        .connect(owner)
+        .setServiceFee(500, [feeRecipient.address, feeRecipient.address], [5000, 5000])
+    ).to.be.revertedWithCustomError(campaign, "BadFeeConfig");
+    // 零地址
+    await expect(
+      campaign
+        .connect(owner)
+        .setServiceFee(500, [ethers.ZeroAddress], [10000])
+    ).to.be.revertedWithCustomError(campaign, "BadFeeConfig");
+    // T-72：分成地址超过 3 个（MAX_FEE_RECIPIENTS = 3）
+    await expect(
+      campaign
+        .connect(owner)
+        .setServiceFee(500, [feeRecipient.address, carol.address, alice.address, bob.address], [2500, 2500, 2500, 2500])
+    ).to.be.revertedWithCustomError(campaign, "BadFeeConfig");
+  });
+
+  it("accepts exactly three fee recipients", async () => {
+    const { campaign, owner, feeRecipient, carol, alice } = await loadFixture(deployFixture);
+    await campaign
+      .connect(owner)
+      .setServiceFee(500, [feeRecipient.address, carol.address, alice.address], [5000, 3000, 2000]);
+    expect(await campaign.feeRecipientCount()).to.equal(3);
+  });
+
+  it("freezes the fee once somebody subscribed", async () => {
+    const { campaign, owner, alice, feeRecipient } = await loadFixture(deployFixture);
+    await campaign.connect(owner).setServiceFee(500, [feeRecipient.address], [10000]);
+    await campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE });
+    await expect(
+      campaign.connect(owner).setServiceFee(900, [feeRecipient.address], [10000])
+    ).to.be.revertedWithCustomError(campaign, "ServiceFeeAlreadySet");
+  });
+
+  it("cannot set the fee after someone subscribed but before it was set", async () => {
+    const { campaign, owner, alice, feeRecipient } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE });
+    await expect(
+      campaign.connect(owner).setServiceFee(500, [feeRecipient.address], [10000])
+    ).to.be.revertedWithCustomError(campaign, "ServiceFeeLocked");
+  });
+
+  it("the mining pool's revenue is charged the fee and each recipient pulls its cut", async () => {
+    const { campaign, owner, minter, alice, feeRecipient, carol } = await loadFixture(deployFixture);
+    // 矿池用 EOA 模拟：这样它能自己发交易调用 depositRevenue()。
+    const [, , , , , poolSigner] = await ethers.getSigners();
+    await campaign
+      .connect(owner)
+      .setServiceFee(1000, [feeRecipient.address, carol.address], [6000, 4000]);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    await campaign.connect(owner).setMiningPool(poolSigner.address);
+    await campaign.connect(owner).depositToPool();
+
+    // 矿池打 1 BNB 收益进来 → 10% 服务费 = 0.1 BNB，分成 60% / 40%
+    const gross = ethers.parseEther("1");
+    const fee = ethers.parseEther("0.1");
+    await expect(
+      campaign.connect(poolSigner).depositRevenue({ value: gross })
+    ).to.emit(campaign, "RevenueDeposited");
+    expect(await campaign.revenuePool()).to.equal(gross - fee);
+    expect(await campaign.totalPendingFee()).to.equal(fee);
+    expect(await campaign.pendingFeeOf(feeRecipient.address)).to.equal((fee * 6000n) / 10000n);
+    expect(await campaign.pendingFeeOf(carol.address)).to.equal((fee * 4000n) / 10000n);
+
+    // 收款方自己来领（领取者自己付 gas，所以余额差要用 gas 还原）
+    const fBefore = await ethers.provider.getBalance(feeRecipient.address);
+    const ftx = await campaign.connect(feeRecipient).claimFee();
+    const fr = await ftx.wait();
+    await expect(ftx).to.emit(campaign, "FeePaid");
+    expect(
+      await ethers.provider.getBalance(feeRecipient.address) + fr.gasUsed * fr.gasPrice - fBefore
+    ).to.equal((fee * 6000n) / 10000n);
+    await campaign.connect(carol).claimFee();
+    expect(await campaign.totalPendingFee()).to.equal(0n);
+
+    // owner 扫不走收益池
+    await expect(campaign.connect(owner).recoverBnb())
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
+  });
+
+  it("only the mining pool may deposit revenue", async () => {
+    const { campaign, owner, minter, alice } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await campaign.connect(owner).depositToPool();
+    await expect(
+      campaign.connect(alice).depositRevenue({ value: ethers.parseEther("1") })
+    ).to.be.revertedWithCustomError(campaign, "NotOwner");
+  });
+
+  // ── 口径锁定：服务费 = 挖矿产出奖励的服务费；认筹款不收任何服务费 ──
+  it("never charges a service fee on subscription money", async () => {
+    const { campaign, owner, alice, feeRecipient } = await loadFixture(deployFixture);
+    // 费率拉满 10%，分成表填满 —— 如果实现里有任何「从认购款抽费」的路径，这里必然暴露。
+    await campaign.connect(owner).setServiceFee(1000, [feeRecipient.address], [10000]);
+
+    const paid = 10n * SHARE_PRICE;
+    await campaign.connect(alice).subscribe(10n, { value: paid });
+
+    // 认筹款全额进认购托管池，一分没少。
+    expect(await campaign.raisedBnb()).to.equal(paid);
+    // 服务费相关账本全是 0：没有计提、没有待领、收益池也是空的。
+    expect(await campaign.totalPendingFee()).to.equal(0n);
+    expect(await campaign.pendingFeeOf(feeRecipient.address)).to.equal(0n);
+    expect(await campaign.revenuePool()).to.equal(0n);
+    // 收款方领不到任何东西（没有可领金额）。
+    await expect(campaign.connect(feeRecipient).claimFee())
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
+  });
+
+  it("charges the fee only on mining revenue, never on the subscription escrow", async () => {
+    const { campaign, owner, minter, alice, feeRecipient } = await loadFixture(deployFixture);
+    const [, , , , , poolSigner] = await ethers.getSigners();
+    await campaign.connect(owner).setServiceFee(1000, [feeRecipient.address], [10000]);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    await campaign.connect(owner).setMiningPool(poolSigner.address);
+    await campaign.connect(owner).depositToPool();
+
+    // 记下打收益之前的状态。
+    const escrowBefore = await campaign.raisedBnb();
+    const revenueBefore = await campaign.revenuePool();
+
+    // 矿池打 1 BNB 挖矿收益 → 10% 提成服务费。
+    const gross = ethers.parseEther("1");
+    const fee = ethers.parseEther("0.1");
+    await campaign.connect(poolSigner).depositRevenue({ value: gross });
+    expect(await campaign.totalPendingFee()).to.equal(fee);
+    // 关键：这笔服务费只从**挖矿收益**里出，认购托管池一分没动。
+    expect(await campaign.raisedBnb()).to.equal(escrowBefore);
+    // 收益池增加的是「挖矿收益 − 服务费」，与认购款无关。
+    expect(await campaign.revenuePool()).to.equal(revenueBefore + gross - fee);
+  });
+});
+
+describe("factory parts whitelist", () => {
+  it("lets the owner pick a whitelisted parts contract per round", async () => {
+    const { owner, factory, minter, parts } = await loadFixture(deployFixture);
+    // 白名单里除了默认那件，再加第二件（模拟「官方两件套」里换一个处理器）。
+    const partsB = await ethers.deployContract("MockERC1155");
+    const partsBAddr = await partsB.getAddress();
+    // 重新部署一个白名单含两件的工厂
+    const factory2 = await ethers.deployContract("CampaignFactory", [
+      await minter.getAddress(),
+      [await parts.getAddress(), partsBAddr],
     ]);
-    await campaign.connect(owner).setPod(await adapter.getAddress());
-    return { ...ctx, official, adapter };
-  }
-
-  it("starts as the campaign when it owns the circuit, even with zero transistors", async () => {
-    const { campaign, official, owner } = await loadFixture(readyFixture);
-    expect(await official.transistorBalance(await campaign.getAddress())).to.equal(0n);
-    await official.setCircuitOwner(await campaign.getAddress(), true);
-
-    await campaign.connect(owner).execute(RAW_NETLIST, officialStartData());
-
-    expect(await campaign.scene()).to.equal(SCENE.Mining);
-    expect(await campaign.hashpower()).to.equal(OFFICIAL_H);
-    expect(await official.lastCaller()).to.equal(await campaign.getAddress());
+    await factory2.connect(owner).createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, partsBAddr);
+    const c = await ethers.getContractAt("Campaign", await factory2.campaigns(0));
+    expect(await c.transistors()).to.equal(partsBAddr);
   });
 
-  it("rejects the campaign when it only holds transistors and does not own the circuit", async () => {
-    const { campaign, official, owner } = await loadFixture(readyFixture);
-    await official.setTransistorBalance(await campaign.getAddress(), 1000n);
-    await official.setCircuitOwner(await campaign.getAddress(), false);
-
-    await expect(campaign.connect(owner).execute(RAW_NETLIST, officialStartData())).to.be.revertedWithCustomError(
-      official,
-      "Ownr"
-    );
-    expect(await campaign.scene()).to.equal(SCENE.Executing);
+  it("refuses a parts contract that is not whitelisted", async () => {
+    const { owner, factory, minter, parts } = await loadFixture(deployFixture);
+    const rogue = await ethers.deployContract("MockERC1155");
+    const factory2 = await ethers.deployContract("CampaignFactory", [
+      await minter.getAddress(),
+      [await parts.getAddress()],
+    ]);
+    await expect(
+      factory2.connect(owner).createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await rogue.getAddress())
+    ).to.be.revertedWithCustomError(factory2, "PartsNotAllowed");
   });
 
-  it("harvest pulls official rewards through the campaign", async () => {
-    const { campaign, official, bem, owner, alice } = await loadFixture(readyFixture);
-    await official.setCircuitOwner(await campaign.getAddress(), true);
-    await campaign.connect(owner).execute(RAW_NETLIST, officialStartData());
-    await bem.mint(await official.getAddress(), OFFICIAL_DAILY);
-    await official.setClaimAmount(OFFICIAL_DAILY);
-
-    await campaign.connect(alice).harvest();
-
-    expect(await official.lastCaller()).to.equal(await campaign.getAddress());
-    expect(await campaign.harvestCount()).to.equal(1n);
-    expect(await bem.balanceOf(await campaign.getAddress())).to.equal(OFFICIAL_DAILY - (OFFICIAL_DAILY * 500n) / 10000n);
-  });
-
-  it("accepts a circuit NFT via onERC721Received", async () => {
-    const { campaign, owner } = await loadFixture(readyFixture);
-    const nft = await ethers.deployContract("MockERC721");
-    await nft.mint(owner.address, 42n);
-    await nft.connect(owner).safeTransferFrom(owner.address, await campaign.getAddress(), 42n, "0x");
-    expect(await nft.ownerOf(42n)).to.equal(await campaign.getAddress());
+  it("exposes the whitelist for the frontend", async () => {
+    const { factory, parts } = await loadFixture(deployFixture);
+    expect(await factory.allowedPartsCount()).to.equal(1n);
+    expect(await factory.isAllowedParts(await parts.getAddress())).to.equal(true);
+    const rogue = await ethers.deployContract("MockERC1155");
+    expect(await factory.isAllowedParts(await rogue.getAddress())).to.equal(false);
   });
 });

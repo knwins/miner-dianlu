@@ -1,42 +1,38 @@
-// 部署脚本：先布 MockBEM/PoD/Minter（测试网演示），再布 CampaignFactory 并开一期。
-// 生产环境把 PoD/BEM/Minter 换成真实地址。运行：npx hardhat run scripts/deploy.js --network <net>
+// 本地开发部署：MockMaterialMarket + MockERC1155 → CampaignFactory → 开一期。
+// 流片 / PoD / BEM 挖矿已移除，工厂只需 materialMarket（材料市场，immutable）与元件白名单（构造第 2 参）。
+// 工厂不再有默认元件：开期时显式传一个白名单内的元件合约。
+// 本地只有一个 MockERC1155，所以白名单只有它自己。
+// 运行：npx hardhat run scripts/deploy.js --network <net>
 const { ethers } = require("hardhat");
 
 async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("部署者：", deployer.address);
 
-  const bem = await ethers.deployContract("MockBEM");
-  await bem.waitForDeployment();
-  const pod = await ethers.deployContract("MockPoD", [await bem.getAddress(), 408]);
-  await pod.waitForDeployment();
   const minter = await ethers.deployContract("MockMaterialMarket");
   await minter.waitForDeployment();
+  const parts = await ethers.deployContract("MockERC1155");
+  await parts.waitForDeployment();
 
+  // 工厂构造传 [materialMarket, allowedParts]（2 参，无默认元件）；白名单写入后不可增删。
   const factory = await ethers.deployContract("CampaignFactory", [
-    await pod.getAddress(),
-    await bem.getAddress(),
     await minter.getAddress(),
+    [await parts.getAddress()],
   ]);
   await factory.waitForDeployment();
 
-  console.log("MockBEM           :", await bem.getAddress());
-  console.log("MockPoD           :", await pod.getAddress());
-  console.log("MockMinter        :", await minter.getAddress());
-  console.log("CampaignFactory   :", await factory.getAddress());
+  console.log("MockMaterialMarket :", await minter.getAddress());
+  console.log("MockERC1155       :", await parts.getAddress());
+  console.log("元件白名单         :", Number(await factory.allowedPartsCount()), "项");
+  console.log("CampaignFactory    :", await factory.getAddress());
 
-  const netlist = ethers.keccak256(ethers.toUtf8Bytes("netlist-v1"));
+  // 开一期：份额价 / 总份数 / 募集秒数 / 元件合约（必选，零地址会 revert）。
+  const fundingSeconds = 7n * 86400n;
   const tx = await factory.createCampaign(
     ethers.parseEther("0.01"), // 每份 BNB
     100, // 总份数
-    5, // 服务费 5%
-    7, // 募集 7 天
-    [deployer.address], // 服务费收费地址
-    [10_000], // 100% 分给上述地址；整除余数进 Owner
-    54, // 官方题目
-    ethers.ZeroAddress, // pod 用工厂默认
-    netlist,
-    "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087" // TapeOut 元件合约
+    fundingSeconds, // 募集 7 天（合约收秒）
+    await parts.getAddress() // 元件合约：必选，从白名单里选
   );
   await tx.wait();
   const campaignAddr = await factory.campaigns(0);

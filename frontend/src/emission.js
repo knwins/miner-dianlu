@@ -55,7 +55,7 @@ export const NETWORK_WEIGHT = {
 
 /**
  * 挖矿闸门：门数超过抽检上限，链上跑不完官方向量，
- * 认领不了任何题目，只能进未验证池（分 1%）。
+ * 进不了已验证池，只能进未验证池（分 1%）。
  * 官网原文：「{n} 门超过开挖抽检上限（约 {limit} 门），流片后只能进未验证池（分 1%）。」
  */
 export const MINE_GATE_LIMIT = 1200;
@@ -124,14 +124,21 @@ export function cumulativeEmission(miningDays, startEra = 0) {
 /**
  * 投资回报测算——官网没有直接给，但用户最需要。
  *
- * 真实成本不只是元件：还有服务费（我们收的）、BEM 价格波动、减半。
+ * 真实成本不只是元件：还有服务费（我们从**挖矿产出**里收的）、BEM 价格波动、减半。
+ * 注意服务费作用在产出侧而不是认购侧：认筹款不收服务费。
  * BEM 需按市价折算成 BNB 才可比；未给 BEM 价格时只返回 BEM 侧数字。
  *
  * @param {object} params
  * @param {number} params.costBnb      流片成本（BNB）
  * @param {number} params.dailyBem     日产（BEM）
  * @param {number} params.days         挖矿天数
- * @param {number} params.feeRate      服务费率（如 0.07）
+ * @param {number} params.feeRate      本期服务费率（如 0.05）。
+ *        口径：服务费**真正上链**（Campaign.serviceFeeBps，setServiceFee 写入，
+ *        创期后永久锁定），这里读的应该是链上费率。
+ *        ⚠️ 这是**挖矿产出奖励**的服务费：链上从挖矿收益里按此比例计提
+ *        （depositRevenue），**与认筹款无关** —— 认筹款不收服务费，
+ *        所以这里的扣费**不应该**、也**没有**作用在认购成本上：
+ *        认购人付的 BNB 全额进认购托管池，feeRate 影响的只是挖矿产出的净额。
  * @param {number} [params.bemUsdt]    BEM 市价（USDT）。给了才能算真实 ROI
  * @param {number} [params.bnbUsdt]    BNB 市价（USDT）
  */

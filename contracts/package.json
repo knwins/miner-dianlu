@@ -7,9 +7,12 @@
     "compile": "node ./node_modules/hardhat/internal/cli/bootstrap.js compile",
     "test": "node ./node_modules/hardhat/internal/cli/bootstrap.js test",
     "size": "node ./scripts/check-size.mjs",
-    "deploy:factory": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-factory.js --network bsc",
+    "deploy:factory": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-factory.js --network bscTestnet",
     "predeploy": "npm run size",
-    "verify:published": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-published.js --network bscTestnet",
+    "testnet:setup": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-setup.js --network bscTestnet",
+    "testnet:deploy": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-bsc.js --network bscTestnet",
+    "testnet:open-round": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-open-round.js --network bscTestnet",
+    "market:debug": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/market-debug.js --network bscTestnet",
     "node": "node ./node_modules/hardhat/internal/cli/bootstrap.js node"
   },
   "devDependencies": {
