@@ -8,16 +8,13 @@
  *   - 成交价 = 最近一笔链上成交单价，由官方市场成交事件读出。
  *   - 这不是**本期**的挂单价；本期真实成本以链上 Campaign 记录为准。
  *
- * ── 为什么只有一个模块 ──
- * 材料市场页原先有两个卡片：①「官方元件最新价」②「官方处理器对照」。
- * 两者都按处理器分组、都渲染同一张 NAND/LATCH 价格表 —— 同一份数据画两遍，
- * 用户要在一页里上下滚动才能把「价格」和「这个处理器的地址/资格/白名单」对上。
- * 现在合并成**一个**卡片：每个处理器一节，表下面是该处理器的补充事实
- * （CPU / 元件合约 / 挖矿资格 / 工厂白名单），由调用方通过 `renderFacts` 注入。
+ * ── 两种形态 ──
+ *   - compact（开期表单 / Owner 弹窗）：只显示当前期次那一组，价格用紧凑表格。
+ *   - full（材料市场页）：行情看板 —— 每个处理器一张卡，单价是卡里的主角
+ *     （28px 数字 + 单位），处理器名 / 每颗算力 P 退到卡头，地址与白名单退到卡脚。
  *
- * 三种用法：
- *   - compact（认购页 / 产品页 / 开期表单）：只显示当前期次那一组，不带 tokenId 与事实
- *   - full（材料市场页）：全部处理器 + tokenId 列 + 处理器简介 + 注入事实
+ *   之前 full 形态和 compact 共用同一张 12px 表格：价格、地址、白名单全是同一号字，
+ *   页面上「什么贵、贵多少」要逐字读才发现。行情页的重点本来就该是价格本身。
  *
  * T-59：Genesis CPU 已整体移除（官方 multiplier = 0、永远不出矿）。
  * 「无挖矿产出」标记按挖矿资格数据驱动渲染，将来官方新增无产出处理器时
@@ -32,7 +29,7 @@ import {
   formatUnitPrice,
 } from "./prices.js";
 
-/** 按处理器分组展示：NAND / LATCH 各一行。顺序与 PROCESSOR_IDS 一致，新增处理器自动进表。 */
+/** 按处理器分组展示：NAND / LATCH 各一格。顺序与 PROCESSOR_IDS 一致，新增处理器自动进表。 */
 const BY_PROCESSOR = PROCESSOR_IDS;
 
 function formatPrice(v) {
@@ -40,11 +37,27 @@ function formatPrice(v) {
 }
 
 /**
+ * 快照时间文案。
+ *
+ * `generatedAt` 有两个来源、两种格式：market.json 给 ISO 时间串，
+ * 链上主源给字面量 "onchain"（没有时间戳，只有区块号）。
+ * 直接 `new Date("onchain")` 得到 Invalid Date，页面上会印出
+ * 「NaN-NaN-NaN NaN:NaN」—— 这里必须先判可解析，解析不了就不显示时间。
+ */
+function snapshotTimeText(generatedAt) {
+  if (!generatedAt || generatedAt === "onchain") return "";
+  const d = new Date(generatedAt);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
  * @param {object} props
  * @param {object} props.official   fetchOfficialPrices 的返回值
  * @param {string} props.processorId 当前期次的处理器（TapeOut / Behemoth），可空
  * @param {boolean} [props.compact] 紧凑模式（只显示当前处理器那一组）
- * @param {boolean} [props.full]    完整对照模式：全部处理器 + tokenId 列 + 处理器简介
+ * @param {boolean} [props.full]    完整对照模式：全部处理器 + 行情看板 + 处理器简介
  * @param {string} [props.title]    卡片标题
  * @param {React.ReactNode} [props.badge] 卡片标题右侧的附加标记
  * @param {(processorId: string) => React.ReactNode} [props.renderFacts]
@@ -78,10 +91,13 @@ export function OfficialPricePanel({
     .filter((g) => g.items.length > 0);
   if (shown.length === 0) return null;
 
-  const generated = official?.generatedAt ? new Date(official.generatedAt) : null;
-  const genText = generated
-    ? `${generated.getFullYear()}-${String(generated.getMonth() + 1).padStart(2, "0")}-${String(generated.getDate()).padStart(2, "0")} ${String(generated.getHours()).padStart(2, "0")}:${String(generated.getMinutes()).padStart(2, "0")}`
-    : "";
+  const genText = snapshotTimeText(official?.generatedAt);
+  const block = Number(official?.lastBlock) || 0;
+  const statusText = official?.ok
+    ? (genText ? `官方市场快照 · ${genText}` : "官方市场快照")
+    : official?.error
+      ? "读取失败"
+      : "读取中…";
 
   return (
     <article className="card official-price-card">
@@ -94,9 +110,7 @@ export function OfficialPricePanel({
         */}
         <span className="official-price-card-side">
           {badge}
-          <span className="stat-label">
-            {official?.ok ? "官方市场快照" : official?.error ? "读取失败" : "读取中…"}
-          </span>
+          <span className="stat-label">{statusText}</span>
         </span>
       </div>
       <div className="card-body">
@@ -105,59 +119,104 @@ export function OfficialPricePanel({
             官方市价读取失败（{official.error}）。下方价格可能为空；本期真实挂单价以链上 Campaign 记录为准。
           </p>
         )}
-        <div className="official-price-groups">
-          {shown.map((g) => (
-            <section key={g.processor} className="official-price-group">
-              <h4>
-                {g.name}
-                {processorId === g.processor && <em className="est-tag">本期</em>}
-                {/*
-                  算力 P 只在完整对照模式显示。紧凑模式（认购页 / 产品页 / 开期表单）
-                  保持原样 —— 那里标题旁只有「本期」与「无挖矿产出」两种标记，
-                  塞进 P 会挤占紧凑版面的宽度。
-                */}
-                {full
-                  ? (g.mineable
-                    ? <em className="est-tag">P = {g.scale}</em>
-                    : <em className="est-tag warn-tag">无挖矿产出</em>)
-                  : (!g.mineable && <em className="est-tag warn-tag">无挖矿产出</em>)}
-              </h4>
-              {full && g.desc ? <p className="fine">{g.desc}</p> : null}
-              <table className="official-price-table">
-                <thead>
-                  <tr>
-                    <th>元件</th>
-                    <th>成交价</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {g.items.map(({ model, row }) => (
-                    <tr key={model.id}>
-                      {/*
-                       * tokenId 只有固定两值（NAND=0 / LATCH=1），单独占一列既占宽又
-                       * 每行都重复「0 / 1」。并进元件名后缀，信息不丢、少一列。
-                       */}
-                      <td>
-                        <strong>{model.part}</strong>
-                        {full && <em className="part-id">#{model.tokenId}</em>}
-                      </td>
-                      <td className="mono" style={{ fontWeight: 600 }}>
-                        {row?.last != null ? formatPrice(row.last) : "—"}
-                      </td>
+
+        {full ? (
+          /* ── 行情看板：价格是主角 ── */
+          <div className="price-board">
+            {shown.map((g) => {
+              const current = processorId === g.processor;
+              return (
+                <section
+                  key={g.processor}
+                  className={`official-price-group price-board-card${current ? " is-current" : ""}`}
+                >
+                  <header className="price-board-head">
+                    <div className="price-board-title">
+                      <h4>{g.name}</h4>
+                      {current && <em className="est-tag">本期</em>}
+                    </div>
+                    {g.mineable ? (
+                      <span className="price-board-scale">每颗算力 P = {g.scale}</span>
+                    ) : (
+                      <em className="est-tag warn-tag">无挖矿产出</em>
+                    )}
+                  </header>
+                  {g.desc ? <p className="price-board-desc">{g.desc}</p> : null}
+                  <div className="price-board-prices">
+                    {g.items.map(({ model, row }) => {
+                      const price = row?.last != null ? row.last : null;
+                      return (
+                        <div className="price-cell" key={model.id}>
+                          {/*
+                            tokenId 只有固定两值（NAND=0 / LATCH=1），
+                            作为元件名后缀带着走，不单独占一行。
+                          */}
+                          <span className="price-cell-label">
+                            {model.part}
+                            <em className="part-id">#{model.tokenId}</em>
+                          </span>
+                          <strong className="price-cell-value">
+                            {price != null ? formatPrice(price) : "—"}
+                          </strong>
+                          <span className="price-cell-unit">
+                            {price != null ? "BNB / 颗" : "暂无成交"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {renderFacts ? renderFacts(g.processor) : null}
+                </section>
+              );
+            })}
+          </div>
+        ) : (
+          /* ── 紧凑形态：开期表单 / Owner 弹窗里的一组表格 ── */
+          <div className="official-price-groups">
+            {shown.map((g) => (
+              <section key={g.processor} className="official-price-group">
+                <h4>
+                  {g.name}
+                  {processorId === g.processor && <em className="est-tag">本期</em>}
+                  {!g.mineable && <em className="est-tag warn-tag">无挖矿产出</em>}
+                </h4>
+                <table className="official-price-table">
+                  <thead>
+                    <tr>
+                      <th>元件</th>
+                      <th>成交价</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-              {renderFacts ? renderFacts(g.processor) : null}
-            </section>
-          ))}
-        </div>
+                  </thead>
+                  <tbody>
+                    {g.items.map(({ model, row }) => (
+                      <tr key={model.id}>
+                        <td>
+                          <strong>{model.part}</strong>
+                        </td>
+                        <td className="mono" style={{ fontWeight: 600 }}>
+                          {row?.last != null ? formatPrice(row.last) : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {renderFacts ? renderFacts(g.processor) : null}
+              </section>
+            ))}
+          </div>
+        )}
+
+        {/*
+          口径说明拆成两条完整句子：并成一条时在 1080px 内容宽下会折行，
+          末行只剩「考。」两个字挂在下面，像排版事故。
+        */}
         <p className="fine">
           成交价 = 最近一笔链上成交单价（BNB/颗），由官方市场成交事件读出。
-          {genText ? ` 快照时间 ${genText}` : ""}
-          {official?.lastBlock ? ` · 区块 ${official.lastBlock.toLocaleString("zh-CN")}` : ""}
+          {block ? ` 区块 ${block.toLocaleString("zh-CN")}。` : ""}
         </p>
-        <p className="fine">本期实际成本以链上 Campaign 挂单 / 成交记录为准，这里只作市价参考。</p>
+        {full && (
+          <p className="fine">本期实际成本以链上 Campaign 挂单 / 成交记录为准，这里只作市价参考。</p>
+        )}
       </div>
     </article>
   );

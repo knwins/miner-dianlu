@@ -68,7 +68,7 @@ const LIFE_PAGES = [
  * 单独分组是因为它跟「某一期走完哪一步」无关，是常驻的外部市场视图。
  */
 const MARKET_PAGES = [
-  { id: "market", label: "材料市场", hint: "官方处理器元件与市价" },
+  { id: "market", label: "材料市场", hint: "官方元件成交价与期次锁定" },
 ];
 const OWNER_TABS = [
   { id: "overview", label: "BEM众筹挖矿列表" },

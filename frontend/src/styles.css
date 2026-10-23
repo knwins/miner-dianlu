@@ -909,8 +909,12 @@ h1, h2, h3, p { margin: 0; }
  * 合并后的材料市场模块里，每个处理器一节，节内含「价格表 + 事实格」。
  * 两节之间的 14px 间距在有事实格时显得挤（事实格是带边框的块，
  * 紧贴下一节的标题会读成同一组）—— 给非首节加一条分隔线 + 上边距。
+ *
+ * ⚠️ 必须限定在紧凑容器（.official-price-groups）里：行情看板的卡片
+ * 复用同一个 class 做探针锚点，若不加限定，第二张卡会吃到 padding-top
+ * 与 border-top，卡内被莫名拉出一条分隔线。
  */
-.official-price-group + .official-price-group {
+.official-price-groups .official-price-group + .official-price-group {
   margin-top: 6px;
   padding-top: 16px;
   border-top: 1px solid var(--color-border);
@@ -945,8 +949,117 @@ h1, h2, h3, p { margin: 0; }
 }
 .official-price-table td:first-child { text-align: left; }
 .official-price-table tr:last-child td { border-bottom: 0; }
+
+/* ── 材料市场行情看板：价格是页面的主角 ─────────────────────────────
+   每个处理器一张卡、两张并排，便于直接比价。
+   价格 28px + tabular-nums；处理器名 / 算力 / 地址全部退到次级字号，
+   保证扫一眼就先看到「多少钱一颗」，而不是先读一堆地址。 */
+.price-board {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.price-board-card {
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-container);
+}
+/* 本期锁定的处理器：加一道主色内描边，不靠文案提示 */
+.price-board-card.is-current {
+  border-color: var(--color-primary);
+  box-shadow: inset 0 0 0 1px var(--color-primary-light);
+}
+.price-board-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.price-board-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.price-board-title h4 {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.price-board-title .est-tag { margin-left: 0; }
+.price-board-scale {
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.price-board-desc {
+  margin: 2px 0 0;
+  color: var(--color-text-quaternary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.price-board-prices {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.price-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 10px 12px 9px;
+  border-radius: var(--radius);
+  background: var(--color-bg-elevated);
+}
+.price-cell-label {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.price-cell-label .part-id { margin-left: 4px; }
+.price-cell-value {
+  color: var(--color-text);
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+.price-cell-unit {
+  /* 单位承载含义（BNB / 颗），不跟纯装饰性文字一样淡 */
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+/* 卡脚事实（CPU / 元件合约 / 白名单）：与价格之间拉一条分隔线 */
+.price-board-card .market-page-facts {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border);
+}
+/* 两张卡并排会在窄屏挤到像素级换行，单列更稳 */
+@media (max-width: 1040px) {
+  .price-board { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* 材料市场页（官方处理器并列视图） */
 .market-page { display: block; }
+/*
+ * 期次表是文字表（处理器名 / 地址 / 状态），不是价格表。
+ * .official-price-table 默认右对齐是为了让金额末位对齐，
+ * 用在这里会让「处理器」列悬在中间、状态贴到最右，读起来是散的。
+ */
+.market-page-table th,
+.market-page-table td { text-align: left; }
+.market-page-table td:first-child { white-space: nowrap; }
 .market-page-card { margin-top: 12px; }
 /* 处理器补充事实：由 4 个带框小卡收成一行紧凑键值 */
 .market-page-facts {

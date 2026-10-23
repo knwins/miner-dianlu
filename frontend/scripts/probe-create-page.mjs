@@ -139,7 +139,8 @@ async function probe(port) {
     return { ok: false, reason: "no-market-nav" };
   }
   await page.getByText("材料市场", { exact: false }).first().click();
-  await page.waitForTimeout(2500);
+  // 链上成交价是异步取的：等太短会把「读取中 / —」当成取价失败。
+  await page.waitForTimeout(4500);
   const marketText = await bodyText();
 
   const marketCrashed = pageErrors.some((m) => /is not defined|Cannot read/i.test(m));
@@ -163,29 +164,35 @@ async function probe(port) {
   const noMineWarn = /无挖矿产出|无产出/.test(marketText);
   console.log(`${noMineWarn ? "FAIL" : "ok  "} 无「无挖矿产出」误标${noMineWarn ? " 误标残留" : ""}`);
 
-  // 两个处理器各自的 NAND / LATCH 价格行都应渲染。
-  // ⚠️ 选择器必须精确到「官方处理器与元件市价」卡片（.official-price-card）：
-  //   - 页面别处还有 compact 模式的市价面板（认购页 / 产品页 / 开期表单各一处）；
-  //   - 「链上材料市场」卡片里的期次表也是 .official-price-table。
-  // 全局统计会把这些一并算进来，得到错误的分组数。
+  // 两个处理器各自的 NAND / LATCH 单价都应渲染成行情卡里的价格格。
+  // ⚠️ 选择器必须精确到「官方元件市价」卡片（.official-price-card）：
+  //   - 「各期锁定的元件合约」卡片里也有表格；
+  //   - compact 模式的市价面板（开期表单 / Owner 弹窗）也是同一个 class 前缀。
   const priceRows = await page.evaluate(() =>
     Array.from(document.querySelectorAll(".market-page .official-price-card .official-price-group")).map(
       (g) => ({
         head: (g.querySelector("h4")?.textContent || "").trim(),
-        rows: g.querySelectorAll("tbody tr").length,
-        cols: g.querySelectorAll("thead th").length,
+        cells: Array.from(g.querySelectorAll(".price-cell")).map((c) => ({
+          label: (c.querySelector(".price-cell-label")?.textContent || "").trim(),
+          value: (c.querySelector(".price-cell-value")?.textContent || "").trim(),
+        })),
         facts: g.querySelectorAll(".market-page-facts li").length,
       }),
     ),
   );
   console.log("  处理器分组：", JSON.stringify(priceRows));
   console.log("  截图目录：", SHOT_DIR);
-  // 合并后的单一模块：每个处理器一节 = 元件/ tokenId / 买价 / 成交价 / 买量 五列，
-  // 下方 4 条事实（CPU / 元件合约 / 挖矿资格 / 工厂白名单）。
+  // 行情看板形态：每个处理器一张卡 = NAND / LATCH 两个价格格 + 3 条事实（CPU / 元件合约 / 白名单）。
+  // 价格必须是有值的数字，不能被兜底成「—」—— 那说明市价没取到。
   const groupsOk =
     priceRows.length === 2 &&
-    priceRows.every((g) => g.rows >= 2 && g.cols === 5 && g.facts === 4);
-  console.log(`${groupsOk ? "ok  " : "FAIL"} 合并模块：两个处理器 × (价格表 5 列 + 4 条事实)`);
+    priceRows.every(
+      (g) =>
+        g.cells.length === 2 &&
+        g.cells.every((c) => /NAND|LATCH/.test(c.label) && /\d/.test(c.value)) &&
+        g.facts === 3,
+    );
+  console.log(`${groupsOk ? "ok  " : "FAIL"} 行情看板：两个处理器 × (NAND/LATCH 单价 + 3 条事实)`);
 
   // 整合后必须**只剩一个**市价卡片（原先有「官方元件最新价」+「官方处理器对照」两个）
   const cardCount = await page.evaluate(

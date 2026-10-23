@@ -12,9 +12,11 @@
  *
  * 现在这一页给出完整视图：
  *
- *   1. 官方处理器与元件市价（合并模块）—— 每个处理器一节：
- *      处理器名 / 算力 P / 元件 tokenId 与成交价 / CPU 与元件合约地址 / 挖矿资格 / 工厂白名单状态
- *   2. 链上材料市场 —— 市场合约地址，以及每一期实际锁定的是哪个元件合约
+ *   1. 官方元件市价（行情看板）—— 每个处理器一张卡：
+ *      卡头 = 处理器名 / 每颗算力 P（本期高亮）
+ *      卡身 = NAND 与 LATCH 的最近成交单价（大字号，页面的重点数据）
+ *      卡脚 = CPU 与元件合约地址 / 工厂白名单状态
+ *   2. 各期锁定的元件合约 —— 市场合约地址，以及每一期实际锁定的是哪个元件合约
  *
  * ── 关于「两个模块合并成一个」──
  * 之前这里有两个卡片：①「官方元件最新价」②「官方处理器对照」。
@@ -39,7 +41,7 @@
  * 一期只能锁定一个元件合约（= 一个处理器），开期时由工厂白名单把关。
  */
 import { OfficialPricePanel } from "./OfficialPricePanel.jsx";
-import { PROCESSORS, PROCESSOR_IDS, TRANSISTORS, isMineable } from "./prices.js";
+import { PROCESSORS, TRANSISTORS, isMineable } from "./prices.js";
 import { OFFICIAL_CPUS, OFFICIAL_PARTS_FOR_PROCESSOR, processorFromPartsContract } from "./tapeout.js";
 import deployments from "./chain/deployments.json";
 import { explorerAddress } from "./chain/config.js";
@@ -126,52 +128,40 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
           </div>
         </div>
         <p className="round-hero-lead">
-          官方二级市场同时支持官方处理器：TapeOut、Behemoth（两者均有挖矿产出资格）。
-          市场合约的挂单接受任意元件合约地址，所以两套元件都在同一个市场里买卖；
-          每一期只锁定其中一套（开期时写入，不可更换）。
+          两个官方处理器的元件在同一个二级市场里买卖，下面是各自最近一笔成交价（BNB / 颗）。
+          每一期只锁定其中一套元件合约，开期时写入、不可更换。
         </p>
       </header>
 
       {/*
-        合并后的唯一模块：官方处理器 + 元件市价。
-        完整对照模式（full）：全部处理器 + tokenId 列 + 处理器简介 + 下方事实。
+        唯一的市价模块：行情看板。
+        每个处理器一张卡，价格是主角；地址 / 白名单由本页通过 renderFacts 注入到卡脚。
       */}
       <OfficialPricePanel
         official={official}
         processorId={processorId}
         full
-        title="官方处理器与元件市价"
-        badge={<span className="stat-label">{PROCESSOR_IDS.length} 个</span>}
+        title="官方元件市价"
         renderFacts={renderFacts}
       />
 
       <article className="card market-page-card">
         <div className="card-header">
-          <span>链上材料市场</span>
+          <span>各期锁定的元件合约</span>
           {marketAddr ? (
             <a className="market-link" href={explorerAddress(marketAddr)} target="_blank" rel="noreferrer">
-              {shortAddr(marketAddr)} ↗
+              市场合约 {shortAddr(marketAddr)} ↗
             </a>
           ) : null}
         </div>
         <div className="card-body">
-          {marketAddr ? (
-            <p className="fine">
-              市场合约 <a className="mono" href={explorerAddress(marketAddr)} target="_blank" rel="noreferrer">{marketAddr}</a>
-              ：挂单 placeBid（买单）与挂卖单，撤单 cancelBid，成交看 bids(id).remaining。
-              挂单时传入的是**期次锁定的那个元件合约地址**，所以市场里各套元件各走各的合约。
-            </p>
-          ) : (
-            <p className="fine">未读到材料市场合约地址。</p>
-          )}
-
           {rows.length ? (
-            <table className="official-price-table">
+            <table className="official-price-table market-page-table">
               <thead>
                 <tr>
                   <th>期次</th>
-                  <th>元件合约</th>
                   <th>处理器</th>
+                  <th>元件合约</th>
                   <th>状态</th>
                 </tr>
               </thead>
@@ -184,11 +174,8 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
                   return (
                     <tr key={`${addr}-${index}`}>
                       <td><strong>第 {item?.id ?? index + 1} 期</strong></td>
-                      <td className="mono">{shortAddr(addr)}</td>
                       <td>
-                        {proc
-                          ? PROCESSORS[proc]?.name || proc
-                          : "—"}
+                        {proc ? PROCESSORS[proc]?.name || proc : "—"}
                         {/*
                           按挖矿资格标注，不按处理器名硬编码。
                           T-59 之前开出去的期次可能锁在已移除的元件合约上，
@@ -197,6 +184,7 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
                         */}
                         {proc && !isMineable(proc) ? <em className="est-tag warn-tag">无产出</em> : null}
                       </td>
+                      <td className="mono">{shortAddr(addr)}</td>
                       <td>{item?.status || "—"}</td>
                     </tr>
                   );
@@ -206,6 +194,10 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
           ) : (
             <p className="fine">还没有期次。发布后才会在这里列出各期锁定的元件合约。</p>
           )}
+          <p className="fine">
+            市场合约接受任意元件合约地址，按元件合约分别撮合；每一期用的是开期时锁定的那一个，
+            所以各期元件互不混同。
+          </p>
         </div>
       </article>
     </section>
