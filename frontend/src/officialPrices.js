@@ -23,9 +23,9 @@
  *   data 字 2 = 数量
  *
  * ── 边界（决定它不能 100% 取代 market.json）──
- *   - 公共 RPC 对超过约 5000 块的 getLogs 返回 "Archive requests require a
- *     personal token"，只能读最近窗口内的成交；某元件几小时没成交就取不到，
- *     此时回退 market.json / 静态基准。
+ *   - 成交很稀疏：最近几千块常常一笔成交都没有（2026-10-23 实测 5000 块窗口
+ *     0 条、20000 块才有 32 条）。所以主源按 20000 块一档往回翻，最多 8 档；
+ *     四种元件都凑齐才收工，凑不齐的元件仍要靠 market.json / 静态基准补。
  *   - 只拿到「成交价」，拿不到「买价」（未成交买单最高出价）；
  *     买价仍需扫 bids(1..12万+) —— 那条路仍是 open 问题，本项目不依赖它。
  *   - 官方实现合约闭源，事件布局是反推的；官方升级合约可能失效。
@@ -37,7 +37,7 @@
 
 import { TRANSISTORS } from "./prices.js";
 import { MATERIAL_MARKET_ADDRESS } from "./chain/config.js";
-import { getReadProvider } from "./chain/client.js";
+import { getReadProvider, getLogsWithFailover } from "./chain/client.js";
 
 /** 官方市场快照（兜底来源，经 Vite 代理转发，绕开 tapeout.net 不发 CORS 头的问题） */
 export const OFFICIAL_MARKET_URL = "/tt-api/market.json";
@@ -50,45 +50,30 @@ export const OFFICIAL_MARKET_URL = "/tt-api/market.json";
 const TRADE_TOPIC = "0xcc402b0b2e84e03a81c9a55a11a5a69d5384a8d29c888c6867ecbc8c9ecd51c8";
 
 /**
- * 主源：读链上官方市场的最新成交事件，取本项目四种元件（处理器 × NAND/LATCH）的成交价。
+ * 单个日志窗口的块跨度。
  *
- * 返回形状与 parseOfficialMarket 一致：{ prices: { id: { bid, last, bidQty, lastTs } }, ... }，
- * 这样下游 officialQuote 无需改动即可消费。成交事件只有成交价，故 bid 恒为 null。
- *
- * 取不到（无近期成交 / RPC 失败 / 非主网市场）时返回 { prices: {} }，交由调用方回退。
+ * nodereal 免费档实测上限是「跨度 ≤ 50000」（50001 就报
+ * "exceed maximum block range"），取 20000 留足余量，单次请求实测 0.34s。
+ * publicnode 对大窗口报 "Archive requests require a personal token"，
+ * 由 getLogsWithFailover 轮换到能用大窗口的节点，不在这里硬编码节点。
  */
-async function fetchOnChainPrices() {
-  const market = MATERIAL_MARKET_ADDRESS;
-  if (!market || !/^0x[0-9a-fA-F]{40}$/.test(market)) return { prices: {} };
-  const provider = getReadProvider();
+const ONCHAIN_LOG_SPAN = 20_000;
 
-  let latest;
-  try {
-    latest = await provider.getBlockNumber();
-  } catch {
-    return { prices: {} };
-  }
+/**
+ * 最多回看多少个窗口（8 × 20k ≈ 16 万块 ≈ 5.5 天）。
+ *
+ * 为什么必须翻页：官方市场的成交很稀疏 —— 实测最近 2000 / 5000 块**一条都没有**，
+ * 要到 20000 块窗口才有 32 条。以前只查 [5000, 2000] 两个窗口，主源恒为空，
+ * 市价只能靠 market.json 兜底；生产一旦没配 /tt-api 反代（404），就直接报
+ * 「官方市价读取失败」。也就是说那个报错的根因不是反代，是主源窗口太小。
+ */
+const ONCHAIN_LOG_WINDOWS = 8;
 
-  // 公共 RPC（publicnode 等）对超过约 5000 块的 getLogs 返回
-  // "Archive requests require a personal token"。先用安全窗口，失败再缩到更小窗口。
-  const spans = [5000, 2000];
-  let logs = [];
-  for (const span of spans) {
-    try {
-      logs = await provider.getLogs({
-        address: market,
-        topics: [TRADE_TOPIC],
-        fromBlock: Math.max(0, latest - span),
-        toBlock: latest,
-      });
-      break;
-    } catch {
-      logs = [];
-    }
-  }
-  if (!logs.length) return { prices: {} };
-
-  const prices = {};
+/**
+ * 把一批成交日志里的单价归位到元件 id（同元件取区块最高的那笔 = 最近成交）。
+ * 只写链上成交价，bid 恒为 null —— 买价 market.json 才有。
+ */
+function collectTradePrices(prices, logs) {
   for (const log of logs) {
     // topics[3] = 元件合约地址（零填充的 32 字节 topic，低 20 字节是地址）
     const t3 = log.topics && log.topics[3];
@@ -109,12 +94,64 @@ async function fetchOnChainPrices() {
     if (!(price > 0)) continue;
     const blockNum = Number(BigInt(log.blockNumber));
     const existing = prices[id];
-    // 同一元件可能有多笔成交，取区块最高的那笔（= 最近成交）
     if (!existing || blockNum > existing.lastTs) {
       prices[id] = { bid: null, last: price, bidQty: 0, lastTs: blockNum };
     }
   }
+}
 
+/**
+ * 主源：读链上官方市场的最新成交事件，取本项目四种元件（处理器 × NAND/LATCH）的成交价。
+ *
+ * 返回形状与 parseOfficialMarket 一致：{ prices: { id: { bid, last, bidQty, lastTs } }, ... }，
+ * 这样下游 officialQuote 无需改动即可消费。成交事件只有成交价，故 bid 恒为 null。
+ *
+ * 取不到（窗口内无成交 / 所有节点都读不到 / 非主网市场）时返回 { prices: {} }，交由调用方回退。
+ */
+async function fetchOnChainPrices() {
+  const market = MATERIAL_MARKET_ADDRESS;
+  if (!market || !/^0x[0-9a-fA-F]{40}$/.test(market)) return { prices: {}, error: "未配置官方市场地址" };
+
+  let latest;
+  try {
+    latest = await getReadProvider().getBlockNumber();
+  } catch {
+    return { prices: {}, error: "链上最新区块读取失败" };
+  }
+
+  const prices = {};
+  let windowsRead = 0;
+  for (let w = 0; w < ONCHAIN_LOG_WINDOWS; w++) {
+    const toBlock = Math.max(0, latest - w * ONCHAIN_LOG_SPAN);
+    const fromBlock = Math.max(0, toBlock - ONCHAIN_LOG_SPAN + 1);
+    let logs;
+    try {
+      // 必须走 failover：单节点拿到 publicnode 时大窗口直接 403，
+      // 而「读不到」和「没有成交」在这里都表现为空，单节点无法区分。
+      logs = await getLogsWithFailover({
+        address: market,
+        topics: [TRADE_TOPIC],
+        fromBlock,
+        toBlock,
+      });
+      windowsRead += 1;
+    } catch {
+      break; // 所有节点都读不了这个窗口，往旧翻也一样
+    }
+    if (logs.length) collectTradePrices(prices, logs);
+    // 四种官方元件（TapeOut / Behemoth × NAND / LATCH）都拿到价就收工
+    if (Object.keys(prices).length >= 4) break;
+    if (fromBlock === 0) break;
+  }
+
+  if (!Object.keys(prices).length) {
+    return {
+      prices: {},
+      error: windowsRead === 0
+        ? "所有 RPC 节点都无法读取市场成交日志"
+        : `回看 ${windowsRead * ONCHAIN_LOG_SPAN} 块内无官方市场成交`,
+    };
+  }
   return { prices, generatedAt: "onchain", lastBlock: latest };
 }
 
@@ -206,6 +243,7 @@ export async function fetchOfficialPrices({ force = false } = {}) {
     let lastBlock = 0;
     let generatedAt = "";
     let marketJsonError = null;
+    let onchainError = null;
 
     // ① 主源：链上官方市场最新成交事件（按元件逐个优先）
     try {
@@ -215,9 +253,11 @@ export async function fetchOfficialPrices({ force = false } = {}) {
         sources.push("onchain:officialMarket");
         lastBlock = onchain.lastBlock || lastBlock;
         generatedAt = "onchain";
+      } else {
+        onchainError = onchain?.error || "链上无成交价";
       }
-    } catch {
-      /* 链上失败不致命，继续走兜底 */
+    } catch (e) {
+      onchainError = e?.message || "链上读取异常";
     }
 
     // ② 兜底：官方 market.json（同源反代 /tt-api）。只补链上没覆盖到的元件，
@@ -256,9 +296,15 @@ export async function fetchOfficialPrices({ force = false } = {}) {
       generatedAt,
       lastBlock,
       // 只要任一来源给出价，就不报错误（链上部分覆盖也够用）；全空才报错。
+      // 全空时把两个来源各自的失败原因都带上 —— 只报兜底的 404 会让人以为
+      // 装个反代就好了，实际主因常常是链上没读到（见 ONCHAIN_LOG_WINDOWS）。
       source: sources.join(" + ") || "none",
       fetchedAt: now,
-      error: ok ? null : (marketJsonError || "所有市价来源均无数据"),
+      error: ok
+        ? null
+        : [onchainError && `链上：${onchainError}`, marketJsonError && `market.json：${marketJsonError}`]
+            .filter(Boolean)
+            .join("；") || "所有市价来源均无数据",
     };
     _cache = result;
     _cacheAt = now;

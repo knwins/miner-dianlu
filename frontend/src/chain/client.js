@@ -130,7 +130,7 @@ export async function withReadProvider(run) {
 let _logProvider = null;
 let _logProviderIndex = 0;
 
-async function getLogsWithFailover(query) {
+export async function getLogsWithFailover(query) {
   const urls = NETWORK.rpcUrls;
   let lastErr;
   for (let i = 0; i < urls.length; i++) {
