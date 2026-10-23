@@ -117,7 +117,8 @@ export default function App() {
    *
    * 三个来源，优先级从高到低：
    *   1. 链上实读：Campaign 记录的 Owner 实际挂单/成交单价（由 adapter 写进 book）
-   *   2. 官方市价：tapeout.net 发布的 market.json 订单簿快照（见 useOfficialPrices）
+   *   2. 官方市价：链上官方市场最新成交事件为主源（见 useOfficialPrices / officialPrices.js），
+   *      tapeout.net 的 market.json 作按元件合并补齐的兜底，再无则静态基准
    *   3. 静态基准：prices.js 的 NOMINAL_QUOTE，只在链上与官方都没有价时兜底
    */
   const { quote, official } = useOfficialPrices(QUOTE);
