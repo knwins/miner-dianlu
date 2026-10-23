@@ -2750,8 +2750,6 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   color: var(--color-primary);
   font-size: 12px;
   font-weight: 600;
-  text-decoration: underline;
-  text-underline-offset: 2px;
   cursor: pointer;
   display: inline-flex;
   flex-direction: column;
@@ -2759,13 +2757,73 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   gap: 1px;
   line-height: 1.3;
 }
+/*
+ * 下划线只划「数字」，不划来源说明。
+ * 原来 text-decoration 写在按钮上，子元素 em 的 text-decoration: none 是去不掉的
+ * （祖先的装饰线无法被后代取消），结果「官方市价 · 点填」被一条线划穿。
+ */
+.flow-quote-val {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .flow-quote em {
   color: var(--color-text-tertiary);
-  font-size: 10px;
+  font-size: 11px;
   font-style: normal;
   font-weight: 400;
-  text-decoration: none;
+  white-space: nowrap;
 }
+/*
+ * 挂单表单（买 / 卖共用一张表）的列宽与数字对齐。
+ *
+ * 旧版靠 table-layout: fixed 把四列四等分（各 129.8px）：
+ *   · 「元件」只有 NAND / LATCH 四五个字符，却白占 130px；
+ *   · 「数量」「买价」表头左对齐，而框里的数字右对齐，同列上下错位约 38px；
+ *   · 「数量」框内左对齐、「买价」框内右对齐，相邻两框方向相反；
+ *   · 「市价」内容仅 40px，却从列左端起排，右侧空出 90px，看着像掉在表格中间。
+ * 现在前三列按内容给下限，余量留给「市价」；数字列的表头、输入框、市价
+ * 共用同一条右基线（= 单元格 padding 内边界）。
+ */
+.flow-table-order .col-part { width: 62px; }
+.flow-table-order .col-qty { width: 96px; }
+.flow-table-order .col-price { width: 160px; }
+.flow-table-order .col-quote { width: auto; }
+
+.flow-table-order th:nth-child(n + 2),
+.flow-table-order td:nth-child(n + 2) { text-align: right; }
+
+/* 数量同属数字：与买价一样右对齐 + 等宽数字，逐位比对时不跳动 */
+.flow-table-order td:nth-child(2) input {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 聚焦跟全站 .field 一致：主色描边 + 淡光圈，不用浏览器默认的黑框 */
+.flow-table-order input:focus {
+  outline: 0;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px rgba(13, 158, 168, 0.12);
+}
+
+/* 表头下补一条分隔线：原来 th 无边框，靠 10px + 12px 两段空白硬撑 */
+.flow-table-order th {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--color-border);
+}
+.flow-table-order td {
+  padding-top: 11px;
+  padding-bottom: 11px;
+}
+
+/* 市价两行（数字 + 来源）：与 34px 输入框等高并垂直居中，右端对齐 */
+.flow-table-order .flow-quote {
+  min-height: 34px;
+  justify-content: center;
+  gap: 2px;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.flow-table-order .flow-quote em { line-height: 1.35; }
 .flow-form-bar,
 .flow-panel-actions {
   display: flex;
@@ -2848,6 +2906,18 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   .flow-steps li:last-child { border-bottom: 0; }
   .flow-table input { max-width: none; }
   .flow-table input[step="0.00001"] { min-width: 88px; }
+  /* 挂单表格的固定列宽在窄屏会把「市价」挤到溢出，按比例回收 */
+  .flow-table-order .col-part { width: 52px; }
+  .flow-table-order .col-qty { width: 68px; }
+  .flow-table-order .col-price { width: 96px; }
+  .flow-table-order th { white-space: normal; }
+  /* 上面那条 min-width: 88px 是给无列宽的旧布局写的，这里会把价格框顶出单元格 */
+  .flow-table-order input[step="0.00001"] { min-width: 0; }
+}
+@media (max-width: 480px) {
+  /* 极窄时来源小字放不下：只留数字（主色 + 下划线本身就是「可点填」的暗示） */
+  .flow-table-order .flow-quote-hint { display: none; }
+  .flow-table-order .flow-quote em { display: none; }
 }
 .price-latest {
   align-self: flex-start;

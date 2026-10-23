@@ -99,13 +99,69 @@ console.log("「市价」可点填单元格数:", quoteCells);
 const nextHint = await page.locator(".flow-next").first().innerText().catch(() => "");
 console.log("下一步:", JSON.stringify(nextHint.trim().slice(0, 80)));
 
+// 7. 挂单表格版式：数字列共用一条右基线、市价与输入框等高
+const layout = await page.evaluate(() => {
+  const t = document.querySelector(".ops-exec .flow-table-order");
+  if (!t) return null;
+  const right = (el) => +el.getBoundingClientRect().right.toFixed(1);
+  const ths = [...t.querySelectorAll("th")];
+  const inputs = [...t.querySelectorAll("input")];
+  const quotes = [...t.querySelectorAll(".flow-quote")];
+  const val = t.querySelector(".flow-quote-val");
+  const btn = t.querySelector(".flow-quote");
+  const cellRight = (i) => {
+    const td = t.querySelectorAll("tbody tr:first-child td")[i];
+    const s = getComputedStyle(td);
+    return +(td.getBoundingClientRect().right - parseFloat(s.paddingRight)).toFixed(1);
+  };
+  return {
+    thAlign: ths.map((th) => getComputedStyle(th).textAlign),
+    // 表头文字右边界要减掉自身的右内边距（rect.right 是列右沿，不是文字右沿）
+    thRight: ths.map((th) => +(right(th) - parseFloat(getComputedStyle(th).paddingRight)).toFixed(1)),
+    inputAlign: inputs.map((i) => getComputedStyle(i).textAlign),
+    inputRight: inputs.map(right),
+    quoteRight: quotes.map(right),
+    quoteH: quotes.map((q) => +q.getBoundingClientRect().height.toFixed(1)),
+    inputH: inputs.map((i) => +i.getBoundingClientRect().height.toFixed(1)),
+    // 右基线：数量列(td 1) / 买价列(td 2) / 市价列(td 3) 的 padding 内边界
+    cellRight: [cellRight(1), cellRight(2), cellRight(3)],
+    quoteValUnderlined: val ? getComputedStyle(val).textDecorationLine : null,
+    quoteEmUnderlined: (() => {
+      const em = t.querySelector(".flow-quote em");
+      // 祖先若还有 underline，后代 text-decoration:none 也去不掉，所以查按钮本身
+      return em ? getComputedStyle(btn).textDecorationLine : null;
+    })(),
+  };
+});
+if (!layout) {
+  ok.orderLayout = false;
+  console.log("挂单表格存在: false");
+} else {
+  const [qtyRight, priceRight, quoteCellRight] = layout.cellRight;
+  ok.numHeadsRight = layout.thAlign.slice(1).every((a) => a === "right");
+  ok.numInputsRight = layout.inputAlign.every((a) => a === "right");
+  // 表头文字右边界落在同一列的内容内边界上（允许 0.6px 取整误差）
+  ok.headOnInputBaseline = Math.abs(layout.thRight[1] - qtyRight) < 0.6 && Math.abs(layout.thRight[2] - priceRight) < 0.6;
+  ok.inputsOnBaseline = Math.abs(layout.inputRight[0] - qtyRight) < 0.6 && Math.abs(layout.inputRight[1] - priceRight) < 0.6;
+  ok.quoteOnBaseline = layout.quoteRight.every((r) => Math.abs(r - quoteCellRight) < 0.6);
+  ok.quoteHeightMatch = layout.quoteH.every((h, i) => Math.abs(h - layout.inputH[i * 2]) < 0.6);
+  ok.underlineOnlyValue = layout.quoteValUnderlined === "underline" && layout.quoteEmUnderlined === "none";
+  ok.orderLayout = ok.numHeadsRight && ok.numInputsRight && ok.headOnInputBaseline
+    && ok.inputsOnBaseline && ok.quoteOnBaseline && ok.quoteHeightMatch && ok.underlineOnlyValue;
+  console.log("  数字列表头右对齐:", ok.numHeadsRight, "| 输入框右对齐:", ok.numInputsRight);
+  console.log("  表头↔输入框同右基线:", ok.headOnInputBaseline, "| 输入框↔列内边界:", ok.inputsOnBaseline);
+  console.log("  市价贴列内边界:", ok.quoteOnBaseline, "(quote", JSON.stringify(layout.quoteRight), "vs 列", quoteCellRight + ")");
+  console.log("  市价与输入框等高:", ok.quoteHeightMatch, "(", JSON.stringify(layout.quoteH), "vs", JSON.stringify(layout.inputH[0]), ")");
+  console.log("  下划线只划数字:", ok.underlineOnlyValue, "(value", layout.quoteValUnderlined, "/ button", layout.quoteEmUnderlined + ")");
+}
+
 await page.screenshot({ path: "scripts/_ops.png", fullPage: false }).catch(() => {});
 
 console.log("\n运行时错误数:", errors.length);
 for (const e of errors.slice(0, 10)) console.log("  •", e);
 
 const pass = ok.noOfficialPriceCard && ok.billMinimal && ok.paramNoDup
-  && ok.noDupPanelNote && ok.noMarketExternalLink && errors.length === 0;
+  && ok.noDupPanelNote && ok.noMarketExternalLink && ok.orderLayout && errors.length === 0;
 console.log(pass ? "\n[PASS] 合约操作页简化断言全部通过" : "\n[FAIL] 见上方 false 项");
 await browser.close();
 process.exit(pass ? 0 : 1);

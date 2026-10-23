@@ -581,7 +581,19 @@ export function OwnerOverview({
                     }
                     return (
                       <div className="flow-form">
-                        <table className="flow-table">
+                        {/*
+                         * 列宽不再由 table-layout: fixed 四等分决定 ——
+                         * 四等分会让「元件」白占 130px、让「市价」的 40px 内容
+                         * 贴在列左端而右侧空出 90px。这里给死前四列的最小需求，
+                         * 余量留给「市价」，数字列统一右对齐（见 .flow-table-order）。
+                         */}
+                        <table className="flow-table flow-table-order">
+                          <colgroup>
+                            <col className="col-part" />
+                            <col className="col-qty" />
+                            <col className="col-price" />
+                            <col className="col-quote" />
+                          </colgroup>
                           <thead>
                             <tr>
                               <th>元件</th>
@@ -619,8 +631,11 @@ export function OwnerOverview({
                                       title={`点击填入市价（${leg.source}）`}
                                       onClick={() => { leg.touch.current = true; leg.setPrice(priceText(round5(leg.quote))); }}
                                     >
-                                      {formatUnitPrice(round5(leg.quote))}
-                                      <em>{leg.source}</em>
+                                      <span className="flow-quote-val">{formatUnitPrice(round5(leg.quote))}</span>
+                                      <em>
+                                        {leg.source}
+                                        <span className="flow-quote-hint"> · 点填</span>
+                                      </em>
                                     </button>
                                   ) : <span className="muted-value">无市价</span>}
                                 </td>
