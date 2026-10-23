@@ -3352,8 +3352,16 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 .trade-feed-body a { color: var(--color-primary); text-decoration: none; }
 .trade-feed-body a:hover { text-decoration: underline; }
 .trade-feed-item.is-fill .trade-feed-badge { background: var(--color-success-light); color: var(--color-success); }
-.trade-feed-item.is-cancelled .trade-feed-body p { color: var(--color-text-tertiary); text-decoration: line-through; }
+/* 撤回行只弱化颜色，不划删除线：线会划过「退回 0.0001 BNB」，把要看的金额糊掉 */
+.trade-feed-item.is-cancelled .trade-feed-body p { color: var(--color-text-tertiary); }
 .trade-panel-note { margin-top: 0; font-size: 11.5px; }
+/* 「仅显示最近 5 条」：解释列表为什么停在这里，不抢时间轴本身的注意力 */
+.trade-panel-more {
+  margin: 6px 0 0;
+  color: var(--color-text-quaternary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
 .trade-panel-sub {
   margin-left: 8px;
   font-style: normal;

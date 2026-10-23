@@ -3,6 +3,9 @@ import { readAskSettleTimes, readMarketTrades } from "./chain/client.js";
 import { explorerAddress, explorerTx } from "./chain/config.js";
 import { round4, shortAddress } from "./fixtures.js";
 
+/** 历史交易记录栏只显示最近 5 条（读取端也是按 5 条为上限往前翻）。 */
+const TRADE_FEED_LIMIT = 5;
+
 const TRADE_STATUS = {
   open: "等待成交",
   partial: "部分成交",
@@ -260,7 +263,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
 
         {events && events.length > 0 && (
           <details className="trade-log">
-            <summary>链上成交流水 · {events.length} 条</summary>
+            <summary>链上事件 · 最近 {events.length} 条</summary>
             <ul>
               {events.map((evt, index) => (
                 <li key={`${evt.txHash}-${index}`}>
@@ -307,7 +310,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
   const events = Array.isArray(data?.events) ? data.events : null;
   const marketAddr = data?.market || "";
 
-  const records = events && events.length
+  const allRecords = events && events.length
     ? [...events].reverse().map((evt, index) => ({
         key: `${evt.txHash || "evt"}-${index}`,
         side: evt.side,
@@ -324,6 +327,9 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
         tone: evt.kind === "fill" ? "fill" : evt.kind === "cancel" ? "cancelled" : evt.kind === "withdraw" ? "settled" : "open",
       }))
     : [];
+
+  /** 窄栏只放最近 5 条：再往前翻是翻旧账，对当前决策没用 */
+  const records = allRecords.slice(0, TRADE_FEED_LIMIT);
 
   const partsOnHand = Number(fallbackRows.partsNand || 0) + Number(fallbackRows.partsLatch || 0);
   const stage = phase === "ready"
@@ -415,6 +421,10 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
               ? "链上事件暂未读取到；挂单进度见上方统计。"
               : "提交买单后，这里会按链上事件记录挂单与成交。"}
           </p>
+        )}
+
+        {allRecords.length > records.length && (
+          <p className="trade-panel-more">仅显示最近 {TRADE_FEED_LIMIT} 条</p>
         )}
 
         {/*

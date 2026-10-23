@@ -42,6 +42,7 @@ await page.waitForTimeout(1200);
 await page.locator(".nav-link-main").filter({ hasText: "Owner 工作台" }).first().click();
 await page.waitForTimeout(2000);
 const openTool = page.getByRole("button", { name: "打开工具" }).first();
+const t0 = Date.now();
 if (await openTool.count()) await openTool.click();
 else console.log("!! 没有「打开工具」按钮");
 await page.waitForTimeout(2000);
@@ -51,11 +52,13 @@ console.log(sheetOk ? "ok   弹窗已打开" : "FAIL 弹窗未打开");
 
 // 等历史交易记录出现事件条目（链上事件读取要几秒）
 let feed = [];
-for (let i = 0; i < 20; i++) {
+let firstMs = null;
+for (let i = 0; i < 40; i++) {
   feed = await page.locator(".trade-feed-item").allInnerTexts().catch(() => []);
-  if (feed.length) break;
-  await page.waitForTimeout(1000);
+  if (feed.length) { firstMs = Date.now() - t0; break; }
+  await page.waitForTimeout(250);
 }
+console.log("首条记录耗时:", firstMs == null ? "超时" : `${(firstMs / 1000).toFixed(1)}s`);
 const panelText = await page.locator(".trade-panel").first().innerText().catch(() => "");
 console.log("\n=== 历史交易记录 ===\n" + panelText);
 console.log("\n事件条目数:", feed.length);
@@ -75,6 +78,8 @@ console.log("市价单元格:", JSON.stringify(quoteCell), hasHint ? "（仍含�
 const checks = [
   ["弹窗打开", Boolean(sheetOk)],
   ["历史记录来自链上事件（有条目）", feed.length > 0],
+  ["只显示最近 5 条", feed.length > 0 && feed.length <= 5],
+  ["截断时提示「仅显示最近 5 条」", feed.length === 0 || feed.length < 5 || /仅显示最近 5 条/.test(panelText)],
   ["不再出现「这版市场合约没有事件」", !/这版市场合约没有事件|按订单状态推算/.test(panelText)],
   ["有成交/挂单事件文案", /挂买单|买单 #|成交/.test(feed.join(" "))],
   ["数量默认 1", !hasForm || (qtyVals.length > 0 && qtyVals.every((v) => v === "1"))],

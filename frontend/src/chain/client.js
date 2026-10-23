@@ -1079,8 +1079,10 @@ async function readMarketOwedView(runner, campaignAddr, account) {
 }
 
 // ── 待执行状态的材料市场成交记录 ──
-const MARKET_LOG_WINDOWS = 6; // 首次读取回看 6 × 50k 块，约 3.5 天（BSC 3s 出块）
+const MARKET_LOG_WINDOWS = 6; // 最多回看 6 × 50k 块（约 10 天）；凑满条数会提前停
 const MARKET_LOG_SPAN = 50_000;
+/** 历史交易记录只保留最近这么多条（面板是窄栏，翻旧账没意义）。 */
+const MARKET_TRADE_LIMIT = 5;
 const blockTimeCache = new Map();
 /** 每个市场已扫到哪个块，避免每次刷新都重扫历史区间（旧版 Mock 没有任何事件）。 */
 const marketScanCursor = new Map();
@@ -1332,69 +1334,11 @@ function clearMarketNoEvents(addr) {
   }
 }
 
-async function readMarketLogs(runner, marketAddr, campaignAddr) {
-  const iface = new Interface(MATERIAL_MARKET_ABI);
-  const cacheKey = String(marketAddr).toLowerCase();
-  // 已知没有事件的市场：TTL 内直接跳过，过期后再探最新一个窗口。
-  const knownNoEvents = marketHasNoEvents(marketAddr);
-  if (knownNoEvents) return [];
-  let latest;
-  try {
-    latest = await runner.getBlockNumber();
-  } catch {
-    return null;
-  }
-
-  // 首次回看固定窗口；之后只扫上次水位之后的新块，并把历史日志留在缓存里。
-  const cursor = marketScanCursor.get(cacheKey);
-  const ranges = [];
-  if (cursor == null) {
-    const windows = knownNoEvents ? 1 : MARKET_LOG_WINDOWS;
-    for (let i = 0; i < windows; i++) {
-      const toBlock = latest - i * MARKET_LOG_SPAN;
-      const fromBlock = Math.max(0, toBlock - MARKET_LOG_SPAN + 1);
-      if (toBlock > 0) ranges.push([fromBlock, toBlock]);
-    }
-  } else if (cursor.lastBlock < latest) {
-    for (let from = cursor.lastBlock + 1; from <= latest; from += MARKET_LOG_SPAN) {
-      ranges.push([from, Math.min(latest, from + MARKET_LOG_SPAN - 1)]);
-    }
-  }
-
-  const raw = cursor ? [...cursor.logs] : [];
-  for (const [fromBlock, toBlock] of ranges) {
-    try {
-      const logs = await getLogsWithFailover({ address: marketAddr, fromBlock, toBlock });
-      raw.push(...logs);
-    } catch {
-      // 节点限制区间：首次探测失败就当旧版市场（没有事件）；增量失败下次再补。
-      if (cursor == null && raw.length === 0) return null;
-      return raw;
-    }
-  }
-  marketScanCursor.set(cacheKey, { lastBlock: cursor ? Math.max(cursor.lastBlock, latest) : latest, logs: raw });
-  // 扫完整个回看区间仍然一条事件都没有：记下「没有事件」，之后每次只探最新窗口。
-  if (!raw.length && cursor == null) {
-    if (!knownNoEvents) markMarketNoEvents(marketAddr);
-    return [];
-  }
-  if (!raw.length) return [];
-  if (knownNoEvents) clearMarketNoEvents(marketAddr);
-
-  const me = String(campaignAddr).toLowerCase();
-  const parsed = [];
-  for (const log of raw) {
-    let evt;
-    try {
-      evt = iface.parseLog(log);
-    } catch {
-      continue;
-    }
-    if (!evt) continue;
-    parsed.push({ ...evt, hash: log.transactionHash, blockNumber: log.blockNumber });
-  }
-
-  // 先认领属于本期的订单号，再按订单号筛事件。
+/**
+ * 市场事件 → 历史交易记录行。只认「先出现 BidPlaced/AskPlaced 且买方/卖方是本期」
+ * 的订单号，再按订单号收该单的成交与撤回 —— 否则把别人的成交也画进来。
+ */
+function buildMarketRows(parsed, me) {
   const bidIds = new Set();
   const askIds = new Set();
   const bidMeta = new Map();
@@ -1411,7 +1355,6 @@ async function readMarketLogs(runner, marketAddr, campaignAddr) {
   }
 
   const rows = [];
-  const needsTime = [];
   for (const e of parsed) {
     const id = e.args?.id != null ? String(e.args.id) : "";
     const isBid = e.name.startsWith("Bid");
@@ -1449,9 +1392,85 @@ async function readMarketLogs(runner, marketAddr, campaignAddr) {
       continue;
     }
     rows.push({ ...row, txHash: e.hash, blockNumber: e.blockNumber, ts: null });
-    needsTime.push(rows[rows.length - 1]);
+  }
+  return rows;
+}
+
+/**
+ * 历史交易记录只需最近 MARKET_TRADE_LIMIT 条，所以从最新窗口往旧翻，
+ * 够数就停 —— 不再固定扫满 6 个窗口（6 × 5 万块 ≈ 10 天，光等节点就要好几秒）。
+ */
+async function readMarketLogs(runner, marketAddr, campaignAddr, limit = MARKET_TRADE_LIMIT) {
+  const iface = new Interface(MATERIAL_MARKET_ABI);
+  const cacheKey = String(marketAddr).toLowerCase();
+  // 曾判过「没有事件」的市场：不再整段跳过，只探最新一个窗口 —— 判错（早先节点读不到）
+  // 时能自己恢复，不用等 10 分钟 TTL。
+  const knownNoEvents = marketHasNoEvents(marketAddr);
+  let latest;
+  try {
+    latest = await runner.getBlockNumber();
+  } catch {
+    return null;
   }
 
+  // 首次回看固定窗口；之后只扫上次水位之后的新块，并把历史日志留在缓存里。
+  const cursor = marketScanCursor.get(cacheKey);
+  const ranges = [];
+  if (cursor == null) {
+    const windows = knownNoEvents ? 1 : MARKET_LOG_WINDOWS;
+    for (let i = 0; i < windows; i++) {
+      const toBlock = latest - i * MARKET_LOG_SPAN;
+      const fromBlock = Math.max(0, toBlock - MARKET_LOG_SPAN + 1);
+      if (toBlock > 0) ranges.push([fromBlock, toBlock]);
+    }
+  } else if (cursor.lastBlock < latest) {
+    for (let from = cursor.lastBlock + 1; from <= latest; from += MARKET_LOG_SPAN) {
+      ranges.push([from, Math.min(latest, from + MARKET_LOG_SPAN - 1)]);
+    }
+  }
+
+  const me = String(campaignAddr).toLowerCase();
+  const raw = cursor ? [...cursor.logs] : [];
+  const parsed = [];
+  const ingest = (logs) => {
+    for (const log of logs) {
+      let evt;
+      try {
+        evt = iface.parseLog(log);
+      } catch {
+        continue;
+      }
+      if (!evt) continue;
+      parsed.push({ ...evt, hash: log.transactionHash, blockNumber: log.blockNumber });
+    }
+  };
+  if (cursor) ingest(cursor.logs);
+
+  for (const [fromBlock, toBlock] of ranges) {
+    try {
+      const logs = await getLogsWithFailover({ address: marketAddr, fromBlock, toBlock });
+      raw.push(...logs);
+      ingest(logs);
+    } catch {
+      // 节点限制区间：首次探测失败就当旧版市场（没有事件）；增量失败下次再补。
+      if (cursor == null && raw.length === 0) return null;
+      marketScanCursor.set(cacheKey, { lastBlock: latest, logs: raw });
+      return buildMarketRows(parsed, me);
+    }
+    // 最新窗口往往就够了：凑满 limit 条即停，不再往更早的窗口翻。
+    if (limit > 0 && buildMarketRows(parsed, me).length >= limit) break;
+  }
+  marketScanCursor.set(cacheKey, { lastBlock: cursor ? Math.max(cursor.lastBlock, latest) : latest, logs: raw });
+  // 扫完整个回看区间仍然一条事件都没有：记下「没有事件」，之后每次只探最新窗口。
+  if (!raw.length && cursor == null) {
+    if (!knownNoEvents) markMarketNoEvents(marketAddr);
+    return [];
+  }
+  if (!raw.length) return [];
+  if (knownNoEvents) clearMarketNoEvents(marketAddr);
+
+  const rows = buildMarketRows(parsed, me);
+  const needsTime = rows;
   const times = await Promise.all([...new Set(needsTime.map((r) => r.blockNumber))].map((bn) => blockTime(runner, bn)));
   const byBlock = new Map([...new Set(needsTime.map((r) => r.blockNumber))].map((bn, i) => [bn, times[i]]));
   for (const row of rows) row.ts = byBlock.get(row.blockNumber) ?? null;
