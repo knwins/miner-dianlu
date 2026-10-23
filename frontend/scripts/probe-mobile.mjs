@@ -10,6 +10,9 @@
  *   D 固定层：两个 position:fixed 元素互相遮挡
  *   E 文字截断：overflow:hidden 且 scrollHeight/Width 超出（内容被切掉）
  *   F 横向滚动容器：scrollWidth > clientWidth（表格允许，其余要留意）
+ *   G 生命周期条：三个圆点必须落在同一水平线，副提示必须是单行且不出视口
+ *     （这一条是回归保护：曾经在 390px 下 wrap 成三行、圆圈左右错位，
+ *      数值审计全绿但肉眼一看就是坏的）
  *
  * 已知合法例外（写进来是为了不每次手改脚本）：
  *   - 侧边栏 .sidebar / 遮罩 .backdrop 收起时本就在视口左侧外，不算溢出
@@ -83,7 +86,13 @@ page.on("console", (m) => {
 
 await installWallet(page, OWNER_ADDRESS);
 await page.goto(BASE, { waitUntil: "domcontentloaded" });
-await page.waitForTimeout(2500);
+/**
+ * 必须等链上数据落位再检。`.life-strip` 只在期次数据读到后才渲染，
+ * 拿它当「首屏已就位」的信号；否则截到的是「正在从 BSC 主网读取…」骨架，
+ * 布局虽然也是真的，但量不到真实内容的密度与折行。
+ */
+await page.waitForSelector(".life-strip", { timeout: 30000 }).catch(() => {});
+await page.waitForTimeout(1200);
 
 const MEASURE = ([vw, exempt]) => {
   const de = document.documentElement;
@@ -175,6 +184,45 @@ const audit = async (name) => {
 };
 
 await audit("认筹");
+
+/**
+ * 生命周期条专项：三个圆点同一水平线、副提示单行。
+ * 手机上 circle 尺寸、连接线、副提示都换过算法，任何一处回退都会让这条失败。
+ */
+const auditProgress = async () => {
+  checked++;
+  const g = await page.evaluate(() => {
+    const dots = [...document.querySelectorAll(".life-strip .life-dot")];
+    if (dots.length !== 3) return { dots: dots.length };
+    const tops = dots.map((d) => Math.round(d.getBoundingClientRect().top));
+    const phase = document.querySelector(".life-strip .life-phase");
+    const pr = phase?.getBoundingClientRect();
+    const lh = phase ? parseFloat(getComputedStyle(phase).lineHeight) : 0;
+    return {
+      dots: 3,
+      tops,
+      sameRow: new Set(tops).size === 1,
+      phaseLines: phase ? Math.round(pr.height / lh) : 0,
+      phaseInView: phase ? pr.left >= 8 && pr.right <= innerWidth - 8 : true,
+      phaseText: phase?.textContent?.trim() || "",
+    };
+  });
+  if (g.dots !== 3) {
+    // 读不到链上数据时首屏是骨架，没有进度条，属环境问题不算版式回归
+    console.log(`SKIP 生命周期条：页面上有 ${g.dots} 个圆点（期次数据未加载）`);
+    return;
+  }
+  const bad = !g.sameRow || g.phaseLines > 1 || !g.phaseInView;
+  console.log(
+    `${bad ? "BAD " : "ok  "}生命周期条: 三圆点同行=${g.sameRow} 副提示行数=${g.phaseLines}` +
+      ` 在视口内=${g.phaseInView}${g.phaseText ? ` 「${g.phaseText}」` : ""}`,
+  );
+  if (!g.sameRow) fail.push(`生命周期条：三个圆点不在同一水平线 tops=${JSON.stringify(g.tops)}`);
+  if (g.phaseLines > 1) fail.push(`生命周期条：副提示折成 ${g.phaseLines} 行`);
+  if (!g.phaseInView) fail.push("生命周期条：副提示超出视口");
+};
+
+await auditProgress();
 
 for (const [name, nav] of PAGES) {
   const menuBtn = page.locator(".menu-btn");

@@ -3412,7 +3412,9 @@ input[readonly] {
  * 1) 生命周期条：桌面是「圆圈 + 横向连接线」的横排，390px 下每个 step 的
  *    min-width:120px 放不下（「待挂单买晶体管」这条提示更宽），wrap 成三行、
  *    每行各自 center，导致三个圆圈左右错位、横向连接线伸到文字右边。
- *    手机改成竖排步进：圆圈一列、连接线改成竖向、线左偏移对齐圆心。
+ *    手机改成「三段等分」的紧凑横排：圆圈在上、标签在下，横线由每个 step
+ *    的 ::after 直接画到下一个圆心（原来的 .life-line 只是夹在两个 step 之间
+ *    的 18px 短线，视觉上断在半空）。
  * 2) 分页条：390px 下「第 1–1 条，共 1 条 / 上一页 / 第 1 / 1 页 / 下一页」
  *    四个部分挤在一行，全部折成两行。改成「计数在上、控件在下」，禁止控件内换行。
  * 3) 统计卡奇数张：2 列布局时最后一张独占整行，避免右下留空洞。
@@ -3421,36 +3423,60 @@ input[readonly] {
 @media (max-width: 560px) {
   .life-strip {
     width: 100%;
-    flex-direction: column;
-    align-items: stretch;
-    justify-content: flex-start;
+    flex-direction: row;
+    align-items: flex-start;
     gap: 0;
+    /* 底部留白是给绝对定位的副提示让位（提示不参与等分宽度计算） */
+    padding: 0 0 18px;
     margin-bottom: 12px;
-    padding: 0;
   }
+  /* wrap 自身不生成盒子，step 直接参与 strip 的横向等分 */
   .life-step-wrap,
   .life-step-wrap:last-of-type {
-    flex: none;
-    min-width: 0;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 0;
+    display: contents;
   }
+  /* 手机端的横线改由 .life-step::after 画：原来的 .life-line 只是夹在两个
+     step 之间的 18px 短线，两端各留 4px，视觉上断在半空。改成从本圆点右侧
+     一直连到下一个圆点左侧，中间不留缺口。 */
+  .life-line { display: none; }
   .life-step {
-    min-height: 0;
-    align-items: center;
-    gap: 10px;
-  }
-  .life-dot { width: 28px; height: 28px; font-size: 13px; }
-  .life-text { padding-top: 0; gap: 1px; }
-  .life-label { font-size: 14px; }
-  .life-line {
-    flex: none;
-    width: 1px;
-    height: 14px;
+    position: relative;
+    flex: 1 1 0;
     min-width: 0;
-    /* 28px 圆点的圆心 = 14px，线宽 1px 时左边距取 13.5px 正好居中 */
-    margin: 4px 0 4px 13.5px;
+    min-height: 0;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    text-align: center;
+  }
+  /* 圆心在 13px（26px 圆点的一半），线宽 1px 时上边距取 12.5px；
+     左右各留 4px 与圆点边缘的间隙，宽度 = 相邻圆心距 - 34px */
+  .life-step::after {
+    content: "";
+    position: absolute;
+    top: 12.5px;
+    left: calc(50% + 17px);
+    width: calc(100% - 34px);
+    height: 1px;
+    background: #d5dee8;
+  }
+  .life-step.is-done::after { background: var(--color-success); }
+  .life-step-wrap:last-child .life-step::after { content: none; }
+  .life-dot { width: 26px; height: 26px; font-size: 12px; }
+  .life-text { padding-top: 0; gap: 2px; align-items: center; }
+  .life-label { font-size: 13px; }
+  /* 副提示（「待挂单买晶体管」等）最长 11 个字，塞进 1/3 列宽会折成两三行，
+     最后一行只剩「入池」二字。改成不占列宽、以本步骤为轴居中单行，
+     它落在标签下方那一行，左右不会碰到相邻步骤的文字。 */
+  .life-phase {
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin: 3px 0 0;
+    font-size: 11.5px;
+    line-height: 1.2;
+    white-space: nowrap;
   }
 
   .list-pager {
