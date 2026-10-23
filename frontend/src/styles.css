@@ -2761,17 +2761,11 @@ a.rules-contract-addr:hover { text-decoration: underline; }
  * 下划线只划「数字」，不划来源说明。
  * 原来 text-decoration 写在按钮上，子元素 em 的 text-decoration: none 是去不掉的
  * （祖先的装饰线无法被后代取消），结果「官方市价 · 点填」被一条线划穿。
+ * 现在单元格只剩数字（来源写到列头与 title 里），不存在这个问题。
  */
 .flow-quote-val {
   text-decoration: underline;
   text-underline-offset: 2px;
-}
-.flow-quote em {
-  color: var(--color-text-tertiary);
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 400;
-  white-space: nowrap;
 }
 /*
  * 挂单表单（买 / 卖共用一张表）的列宽与数字对齐。
@@ -2780,8 +2774,8 @@ a.rules-contract-addr:hover { text-decoration: underline; }
  *   · 「元件」只有 NAND / LATCH 四五个字符，却白占 130px；
  *   · 「数量」「买价」表头左对齐，而框里的数字右对齐，同列上下错位约 38px；
  *   · 「数量」框内左对齐、「买价」框内右对齐，相邻两框方向相反；
- *   · 「市价」内容仅 40px，却从列左端起排，右侧空出 90px，看着像掉在表格中间。
- * 现在前三列按内容给下限，余量留给「市价」；数字列的表头、输入框、市价
+ *   · 「官方市价」内容仅 40px，却从列左端起排，右侧空出 90px，看着像掉在表格中间。
+ * 现在前三列按内容给下限，余量留给「官方市价」；数字列的表头、输入框、市价
  * 共用同一条右基线（= 单元格 padding 内边界）。
  */
 .flow-table-order .col-part { width: 62px; }
@@ -2815,15 +2809,14 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   padding-bottom: 11px;
 }
 
-/* 市价两行（数字 + 来源）：与 34px 输入框等高并垂直居中，右端对齐 */
+/* 市价只剩一行数字：与 34px 输入框等高并垂直居中，右端对齐；字号比输入框略小半号 */
 .flow-table-order .flow-quote {
   min-height: 34px;
   justify-content: center;
-  gap: 2px;
   line-height: 1.35;
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
-.flow-table-order .flow-quote em { line-height: 1.35; }
 .flow-form-bar,
 .flow-panel-actions {
   display: flex;
@@ -2913,11 +2906,6 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   .flow-table-order th { white-space: normal; }
   /* 上面那条 min-width: 88px 是给无列宽的旧布局写的，这里会把价格框顶出单元格 */
   .flow-table-order input[step="0.00001"] { min-width: 0; }
-}
-@media (max-width: 480px) {
-  /* 极窄时来源小字放不下：只留数字（主色 + 下划线本身就是「可点填」的暗示） */
-  .flow-table-order .flow-quote-hint { display: none; }
-  .flow-table-order .flow-quote em { display: none; }
 }
 .price-latest {
   align-self: flex-start;
@@ -3664,6 +3652,26 @@ tr:last-child td { border-bottom: 0; }
   gap: 16px;
 }
 .publish-grid > .card + .card { margin-top: 0; }
+/* 整行卡片：发行规模（三个字段并排）、服务费与分成（地址行要宽） */
+.publish-grid > .card.is-wide { grid-column: 1 / -1; }
+
+/*
+ * 只读派生值（每份价格）：长得像输入框、但不能编辑。
+ * 虚线边框 + 浅底 = 「这是算出来的」，与旁边两个实线输入框一眼区分。
+ */
+.field-static {
+  display: flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius);
+  background: #f8fafc;
+  color: var(--color-text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
 
 /* 每份价格 / 建议方案：派生值靠右、可一键恢复 */
 .derived-row {

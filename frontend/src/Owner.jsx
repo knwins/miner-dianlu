@@ -170,8 +170,8 @@ export function OwnerOverview({
     NAND: minterUnit > 0 ? minterUnit : officialParts.NAND,
     LATCH: minterUnit > 0 ? minterUnit : officialParts.LATCH,
   };
-  const [nandQty, setNandQty] = useState("0");
-  const [latchQty, setLatchQty] = useState("0");
+  const [nandQty, setNandQty] = useState("1");
+  const [latchQty, setLatchQty] = useState("1");
   const [nandPrice, setNandPrice] = useState("0");
   const [latchPrice, setLatchPrice] = useState("0");
   const [sellNandQty, setSellNandQty] = useState("0");
@@ -185,10 +185,16 @@ export function OwnerOverview({
   useEffect(() => {
     priceTouched.current = false;
     sellPriceTouched.current = false;
+    // 切期次时把挂买单数量也复位成默认各 1 颗，避免沿用上一期填过的数量
+    setNandQty("1");
+    setLatchQty("1");
   }, [book.address]);
   /**
-   * 挂买单不再按任何推算预填数量：元件由材料市场买卖决定，买多少由 Owner 自己填。
-   * 只把单价预填成当前市场参考价（用户改过就不再覆盖）。
+   * 挂买单：数量默认各 1 颗（NAND / LATCH），单价预填成当前市场参考价
+   * （用户改过就不再覆盖）。
+   *
+   * 数量只是「默认各买一颗」的便利值，不是按募资额或配比反推的结果——
+   * 买多少仍由 Owner 自己改；某条腿改成 0 即不下该腿。
    *
    * NAND 与 LATCH 各用各的参考价：市价差得远，共用一个价必然有一边挂错。
    */
@@ -565,16 +571,20 @@ export function OwnerOverview({
 
                   const renderLegForm = (kind) => {
                     const isBuy = kind === "buy";
-                    /** 每条腿的市价来源：链上单价优先，官方市价其次 */
-                    const priceSource = (part) => (minterUnit > 0 ? "链上市场单价" : "官方市价");
+                    /**
+                     * 市价列来源：链上单价优先（mock / 测试网），官方市价其次（主网）。
+                     * 列头直接写来源，单元格只留数字 —— 数字本身就是可点填的按钮
+                     * （主色 + 下划线 + title 提示），不再挂「官方市价 · 点填」小字。
+                     */
+                    const quoteLabel = minterUnit > 0 ? "链上市场单价" : "官方市价";
                     const legs = isBuy
                       ? [
-                          { key: "nand", label: "NAND", qty: nandQty, setQty: setNandQty, price: nandPrice, setPrice: setNandPrice, touch: priceTouched, quote: refPrice.NAND, source: priceSource("NAND") },
-                          { key: "latch", label: "LATCH", qty: latchQty, setQty: setLatchQty, price: latchPrice, setPrice: setLatchPrice, touch: priceTouched, quote: refPrice.LATCH, source: priceSource("LATCH") },
+                          { key: "nand", label: "NAND", qty: nandQty, setQty: setNandQty, price: nandPrice, setPrice: setNandPrice, touch: priceTouched, quote: refPrice.NAND, source: quoteLabel },
+                          { key: "latch", label: "LATCH", qty: latchQty, setQty: setLatchQty, price: latchPrice, setPrice: setLatchPrice, touch: priceTouched, quote: refPrice.LATCH, source: quoteLabel },
                         ].filter(Boolean)
                       : [
-                          heldNand > 0 && { key: "nand", label: "NAND", qty: sellNandQty, setQty: setSellNandQty, price: sellNandPrice, setPrice: setSellNandPrice, touch: sellPriceTouched, quote: refPrice.NAND, source: priceSource("NAND"), max: heldNand },
-                          heldLatch > 0 && { key: "latch", label: "LATCH", qty: sellLatchQty, setQty: setSellLatchQty, price: sellLatchPrice, setPrice: setSellLatchPrice, touch: sellPriceTouched, quote: refPrice.LATCH, source: priceSource("LATCH"), max: heldLatch },
+                          heldNand > 0 && { key: "nand", label: "NAND", qty: sellNandQty, setQty: setSellNandQty, price: sellNandPrice, setPrice: setSellNandPrice, touch: sellPriceTouched, quote: refPrice.NAND, source: quoteLabel, max: heldNand },
+                          heldLatch > 0 && { key: "latch", label: "LATCH", qty: sellLatchQty, setQty: setSellLatchQty, price: sellLatchPrice, setPrice: setSellLatchPrice, touch: sellPriceTouched, quote: refPrice.LATCH, source: quoteLabel, max: heldLatch },
                         ].filter(Boolean);
                     if (legs.length === 0) {
                       return <p className="flow-empty">{isBuy ? "填写要买的 NAND / LATCH 数量与单价。" : "暂无库存可卖。"}</p>;
@@ -583,9 +593,9 @@ export function OwnerOverview({
                       <div className="flow-form">
                         {/*
                          * 列宽不再由 table-layout: fixed 四等分决定 ——
-                         * 四等分会让「元件」白占 130px、让「市价」的 40px 内容
+                         * 四等分会让「元件」白占 130px、让「官方市价」的 40px 内容
                          * 贴在列左端而右侧空出 90px。这里给死前四列的最小需求，
-                         * 余量留给「市价」，数字列统一右对齐（见 .flow-table-order）。
+                         * 余量留给「官方市价」，数字列统一右对齐（见 .flow-table-order）。
                          */}
                         <table className="flow-table flow-table-order">
                           <colgroup>
@@ -599,7 +609,7 @@ export function OwnerOverview({
                               <th>元件</th>
                               <th>数量</th>
                               <th>{isBuy ? "买价 BNB" : "卖价 BNB"}</th>
-                              <th>市价</th>
+                              <th>{quoteLabel}</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -632,10 +642,6 @@ export function OwnerOverview({
                                       onClick={() => { leg.touch.current = true; leg.setPrice(priceText(round5(leg.quote))); }}
                                     >
                                       <span className="flow-quote-val">{formatUnitPrice(round5(leg.quote))}</span>
-                                      <em>
-                                        {leg.source}
-                                        <span className="flow-quote-hint"> · 点填</span>
-                                      </em>
                                     </button>
                                   ) : <span className="muted-value">无市价</span>}
                                 </td>
@@ -1047,7 +1053,6 @@ export function OwnerOverview({
                                 {shortAddress(row.address)} · {Math.round(Number(row.sharePercent))}%
                               </div>
                             ))}
-                            <div className="param-note">链上设定 · 不可修改 · 从挖矿收益计提</div>
                           </>
                         ) : (
                           <>
@@ -1856,14 +1861,18 @@ export function OwnerCreate({
         }}
       >
         <div className="publish-grid">
-          {/* ── 发行规模 ── */}
-          <article className="card">
+          {/*
+           * 发行规模独占一整行：募资总额 / 总份数 / 每份价格（派生）三格并排。
+           * 旧版是两列布局 + 下面一行 bill 显示单价：两列时右边那列空着，
+           * 派生单价又和输入框分成上下两段，读起来要来回找。
+           */}
+          <article className="card is-wide">
             <div className="card-header">
               <span>发行规模</span>
               <span className="stat-label">两项都必填</span>
             </div>
             <div className="card-body">
-              <div className="form-grid cols-2">
+              <div className="form-grid cols-3">
                 <label className="field">
                   <span>募资总额（BNB）</span>
                   <input
@@ -1888,13 +1897,14 @@ export function OwnerCreate({
                     onBlur={() => touch("totalShares")}
                   />
                 </label>
+                <div className="field">
+                  <span>每份价格</span>
+                  {/* 派生值：总额 ÷ 份数，不可单独填 */}
+                  <div className="field-static" title="由募资总额 ÷ 总份数算出，不可单独填">
+                    {priceInput ? `${priceInput} BNB` : "—"}
+                  </div>
+                </div>
               </div>
-              <ul className="bill">
-                <li>
-                  <span>每份价格（= 总额 ÷ 份数，不可单独填）</span>
-                  <strong>{priceInput ? `${priceInput} BNB` : "—"}</strong>
-                </li>
-              </ul>
               <p className="fine">
                 两项必填，上链后不可改。元件数与算力要到执行阶段才确定，发布期不给建议值。
               </p>
@@ -1908,8 +1918,8 @@ export function OwnerCreate({
               <span className="stat-label">到期未售罄可原路退款</span>
             </div>
             <div className="card-body">
-<label className="field">
-                  <span>天数</span>
+              <label className="field">
+                <span>天数</span>
                   <input
                     value={draft.fundingDays}
                     inputMode="numeric"
@@ -1988,7 +1998,7 @@ export function OwnerCreate({
             </article>
           )}
           {/* ── 挖矿产出服务费与分成（链上参数，setServiceFee） ── */}
-          <article className="card" style={{ gridColumn: "1 / -1" }}>
+          <article className="card is-wide">
             <div className="card-header">
               <span>挖矿产出服务费与分成</span>
               <span className="stat-label">写入链上 · 一次设定永久锁定</span>
@@ -2069,8 +2079,6 @@ export function OwnerCreate({
               </div>
             </div>
           </article>
-
-
         </div>
 
         {showIssues && (review.issues.length > 0 || (submitTried && !daysValid)) && (
@@ -2098,7 +2106,9 @@ export function OwnerCreate({
             {/* 显示**当前生效**的规模：用户填了就用填的，别拿建议方案糊弄 */}
             <strong>{effCap > 0 ? `${Number(effCap).toFixed(4)} BNB` : "—"}</strong>
             <span>
-              {effShares > 0 ? `${effShares} 份` : "—"} · 每份 {priceInput ? `${priceInput} BNB` : "—"} · 募集 {daysValid ? `${daysNum} 天` : `${draft.fundingDays || "—"} 天（待修正）`}
+              {effShares > 0
+                ? `${effShares} 份 · 每份 ${priceInput ? `${priceInput} BNB` : "—"} · 募集 ${daysValid ? `${daysNum} 天` : `${draft.fundingDays || "—"} 天（待修正）`}`
+                : "填写募资总额与总份数后，这里给出本期摘要"}
               {feeValid ? ` · 挖矿产出服务费 ${Number(draft.feePercent)}%（写入链上）` : ""}
             </span>
           </div>

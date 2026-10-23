@@ -2288,7 +2288,7 @@ function RoundFacts({ round, book, quote }) {
             chainFeeSet ? (
               <>
                 <div className="stat-value">{chainFeePercent}%</div>
-                <div className="stat-note">链上设定 · 从挖矿收益计提 · 不可修改</div>
+                <div className="stat-note">链上设定 · 不可修改</div>
               </>
             ) : (
               <>

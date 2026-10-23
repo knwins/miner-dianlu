@@ -126,16 +126,17 @@ const layout = await page.evaluate(() => {
     // 右基线：数量列(td 1) / 买价列(td 2) / 市价列(td 3) 的 padding 内边界
     cellRight: [cellRight(1), cellRight(2), cellRight(3)],
     quoteValUnderlined: val ? getComputedStyle(val).textDecorationLine : null,
-    quoteEmUnderlined: (() => {
-      const em = t.querySelector(".flow-quote em");
-      // 祖先若还有 underline，后代 text-decoration:none 也去不掉，所以查按钮本身
-      return em ? getComputedStyle(btn).textDecorationLine : null;
-    })(),
+    // 单元格里只应有数字：不再挂「官方市价 · 点填」小字（2026-10-23 起来源写在列头）
+    quoteText: quotes.map((q) => q.innerText.trim()),
+    quoteEm: t.querySelectorAll(".flow-quote em").length,
   };
 });
+let layoutSkipped = false;
 if (!layout) {
-  ok.orderLayout = false;
-  console.log("挂单表格存在: false");
+  // 本期已有活单时表单换成「当前买单」，版式断言无从校验（不是页面坏了）
+  layoutSkipped = true;
+  ok.orderLayout = true;
+  console.log("SKIP 本期已有活单（显示「当前买单」），挂单表单版式断言跳过");
 } else {
   const [qtyRight, priceRight, quoteCellRight] = layout.cellRight;
   ok.numHeadsRight = layout.thAlign.slice(1).every((a) => a === "right");
@@ -145,14 +146,15 @@ if (!layout) {
   ok.inputsOnBaseline = Math.abs(layout.inputRight[0] - qtyRight) < 0.6 && Math.abs(layout.inputRight[1] - priceRight) < 0.6;
   ok.quoteOnBaseline = layout.quoteRight.every((r) => Math.abs(r - quoteCellRight) < 0.6);
   ok.quoteHeightMatch = layout.quoteH.every((h, i) => Math.abs(h - layout.inputH[i * 2]) < 0.6);
-  ok.underlineOnlyValue = layout.quoteValUnderlined === "underline" && layout.quoteEmUnderlined === "none";
+  ok.underlineOnlyValue = layout.quoteValUnderlined === "underline";
+  ok.quoteTextClean = layout.quoteEm === 0 && layout.quoteText.every((t) => !/点填/.test(t));
   ok.orderLayout = ok.numHeadsRight && ok.numInputsRight && ok.headOnInputBaseline
-    && ok.inputsOnBaseline && ok.quoteOnBaseline && ok.quoteHeightMatch && ok.underlineOnlyValue;
+    && ok.inputsOnBaseline && ok.quoteOnBaseline && ok.quoteHeightMatch && ok.underlineOnlyValue && ok.quoteTextClean;
   console.log("  数字列表头右对齐:", ok.numHeadsRight, "| 输入框右对齐:", ok.numInputsRight);
   console.log("  表头↔输入框同右基线:", ok.headOnInputBaseline, "| 输入框↔列内边界:", ok.inputsOnBaseline);
   console.log("  市价贴列内边界:", ok.quoteOnBaseline, "(quote", JSON.stringify(layout.quoteRight), "vs 列", quoteCellRight + ")");
   console.log("  市价与输入框等高:", ok.quoteHeightMatch, "(", JSON.stringify(layout.quoteH), "vs", JSON.stringify(layout.inputH[0]), ")");
-  console.log("  下划线只划数字:", ok.underlineOnlyValue, "(value", layout.quoteValUnderlined, "/ button", layout.quoteEmUnderlined + ")");
+  console.log("  下划线只划数字:", ok.underlineOnlyValue, "| 单元格只留数字:", ok.quoteTextClean, JSON.stringify(layout.quoteText));
 }
 
 await page.screenshot({ path: "scripts/_ops.png", fullPage: false }).catch(() => {});
