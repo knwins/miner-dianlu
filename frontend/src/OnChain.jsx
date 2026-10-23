@@ -4,7 +4,7 @@ import {
   SCENE_LABEL, PHASE_LABEL, explorerAddress, explorerTx,
 } from "./chain/config.js";
 import {
-  hasInjected, connectWallet, readState, send, tx, formatEther, parseEther,
+  hasInjected, connectWallet, readState, send, tx, formatEther, parseBnb,
   getCampaignAddress, getRawProvider,
 } from "./chain/client.js";
 import { discoverWallets } from "./chain/wallets.js";
@@ -17,7 +17,7 @@ const fmt = (v, d = 4) => {
 };
 const fmtTime = (sec) => (sec > 0 ? new Date(sec * 1000).toLocaleString("zh-CN") : "—");
 
-export default function OnChainPage({ embedded = false }) {
+export default function OnChainPage({ embedded = false, embeddedAccount = "", embeddedConnected = false, embeddedSigner = null }) {
   const [wallet, setWallet] = useState(null); // { signer, account }
   const [state, setState] = useState(null);
   const [bnb, setBnb] = useState(null);
@@ -36,9 +36,13 @@ export default function OnChainPage({ embedded = false }) {
    * 这些演示数字——在链上模式下点「发送」会拿这组值真的发交易，
    * 等于用演示参数下真单。调试页的所有输入都必须由人自己填。
    */
-  const [form, setForm] = useState({ buyCount: 1, listCount: 1, listPrice: "", takeId: 0, takeCount: 1, est: "", nandQty: 0, nandPrice: "" });
+  const [form, setForm] = useState({ buyCount: 1, listCount: 1, listPrice: "", takeId: 0, takeCount: 1, est: "", nandQty: 0, nandPrice: "", latchQty: 0, latchPrice: "" });
 
-  const account = wallet?.account || null;
+  // 内嵌模式下复用工作台已有的连接（account / connected / signer 由 App 透传），
+  // 避免 Owner 在「链上调试」里再点一次「连接钱包」才能挂买单。
+  // 未连接时退回本页面自己的 wallet 状态（非内嵌或连接丢失后的兜底）。
+  const account = embedded && embeddedConnected ? embeddedAccount : (wallet?.account || null);
+  const activeSigner = embeddedSigner || wallet?.signer || null;
   const isOwner = useMemo(() => state && account && state.owner?.toLowerCase() === account.toLowerCase(), [state, account]);
 
   const refresh = useCallback(async () => {
@@ -73,12 +77,13 @@ export default function OnChainPage({ embedded = false }) {
   }
 
   async function run(label, fn) {
-    if (!wallet) { setErr("请先连接钱包"); return; }
+    const useSigner = activeSigner || (wallet?.signer);
+    if (!useSigner) { setErr("请先连接钱包"); return; }
     setBusy(label);
     setErr("");
     setHint(`请在钱包中确认「${label}」。弹出窗口后点确认，不要关闭本页。`);
     try {
-      const { hash } = await send(fn(wallet.signer), () => {
+      const { hash } = await send(fn(useSigner), () => {
         setHint(`钱包已确认「${label}」，正在等待链上入块。`);
       });
       setHint("");
@@ -111,11 +116,24 @@ export default function OnChainPage({ embedded = false }) {
   const partsShort = Boolean(s) && (
     Number(s.partsNand || 0) < Number(s.nandQty || 0) || Number(s.partsLatch || 0) < Number(s.latchQty || 0)
   );
+  // 挂买单参数与成本预览。
+  // 链上 placeTransistorOrder 在 cost > raisedBnb 时只置 executionFailed、不真正挂单，
+  // 等于用一次失败把整期标记为「执行失败」。前端必须先把超余额挡在签名之外。
+  const raisedBnbNum = s ? Number(formatEther(s.raisedBnb)) : 0;
+  const buyNandN = Math.max(0, Math.floor(Number(form.nandQty) || 0));
+  const buyLatchN = Math.max(0, Math.floor(Number(form.latchQty) || 0));
+  const buyNandP = Number(form.nandPrice) || 0;
+  const buyLatchP = Number(form.latchPrice) || 0;
+  const buyHasLeg = buyNandN > 0 || buyLatchN > 0;
+  const buyLegOk = (buyNandN === 0 || buyNandP > 0) && (buyLatchN === 0 || buyLatchP > 0);
+  const buyCost = buyNandN * buyNandP + buyLatchN * buyLatchP;
+  const buyOverBudget = buyCost > raisedBnbNum;
+  const canPlaceBuy = isOwner && s?.phase === 1 && buyHasLeg && buyLegOk && !buyOverBudget;
   return (
     <section className="chain-debug">
       {!embedded && (
-        <header className="page-header">
-          <div><h1>链上调试</h1><p className="page-subtitle">{NETWORK.name} · chainId {CHAIN_ID} · 实时读写 Campaign</p></div>
+          <header className="page-header">
+          <div><h1>链上调试</h1><p className="page-subtitle">{NETWORK.name} · 实时读写本期 Campaign 合约</p></div>
           <span className="badge tone-live">{s ? SCENE_LABEL[s.scene] : "加载中"}</span>
         </header>
       )}
@@ -196,8 +214,32 @@ export default function OnChainPage({ embedded = false }) {
                   {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降价重挂，或原路退款；勿在锁价/元件数为 0 时 depositToPool。</p>}
                   {isOwner && (
                     <div className="chain-actions">
-                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est)))}>setPlan</button>}
-                      {s.phase === 1 && <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("挂单", (sg) => tx.placeTransistorOrder(sg, s.transistors, BigInt(form.nandQty), parseEther(form.nandPrice), 0n, 0n))}>placeBid</button>}
+                      {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est || "0")))}>写入预估算力</button>}
+                      {s.phase === 1 && (
+                        <div className="buy-debug">
+                          <p className="fine">挂买单买元件（placeTransistorOrder）：元件合约用本期锁定的 {short(s.transistors)}，不用手填。两条腿各自填数量与单价；托管 = 单价 × 数量，合计不可超过募集余额，否则链上会判执行失败、不挂单。</p>
+                          <div className="form-grid cols-2">
+                            <label className="field"><span>NAND 数量</span><input inputMode="numeric" value={form.nandQty} onChange={(e) => setForm({ ...form, nandQty: e.target.value })} /></label>
+                            <label className="field"><span>NAND 买价 BNB</span><input inputMode="decimal" step="0.00001" value={form.nandPrice} onChange={(e) => setForm({ ...form, nandPrice: e.target.value })} /></label>
+                            <label className="field"><span>LATCH 数量</span><input inputMode="numeric" value={form.latchQty} onChange={(e) => setForm({ ...form, latchQty: e.target.value })} /></label>
+                            <label className="field"><span>LATCH 买价 BNB</span><input inputMode="decimal" step="0.00001" value={form.latchPrice} onChange={(e) => setForm({ ...form, latchPrice: e.target.value })} /></label>
+                          </div>
+                          <p className={buyOverBudget ? "chain-warn" : "fine"}>
+                            托管合计 {buyCost.toFixed(4)} BNB · 募集余额 {raisedBnbNum.toFixed(4)} BNB
+                            {buyOverBudget ? " · 超余额，链上不会真正挂出（会判执行失败）" : ""}
+                          </p>
+                          <button
+                            className="btn btn-primary"
+                            type="button"
+                            disabled={busy || !canPlaceBuy}
+                            title={!isOwner ? "仅 Factory Owner 可挂买单" : !buyHasLeg ? "至少填一条腿的数量" : !buyLegOk ? "有数量的腿必须填单价" : buyOverBudget ? "托管超过募集余额，链上不会挂出" : undefined}
+                            onClick={() => run("挂买单", (sg) => tx.placeTransistorOrder(
+                              sg, s.transistors,
+                              BigInt(buyNandN), buyNandN > 0 ? parseBnb(form.nandPrice) : 0n,
+                              BigInt(buyLatchN), buyLatchN > 0 ? parseBnb(form.latchPrice) : 0n,
+                            ))}>挂买单</button>
+                        </div>
+                      )}
                       {(s.phase === 1 || s.phase === 3) && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("退款", (sg) => tx.openRefund(sg))}>发起退款</button>}
                       {!s.executionFailed && (() => {
                         // 合约 FAIL_GRACE = 3 天：非 Owner 只能等售罄满 3 天；Owner 随时可判。

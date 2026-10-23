@@ -2126,6 +2126,7 @@ function OwnerDesk({
           onOpenAssets={onOpenAssets}
           account={account}
           connected={connected}
+          signer={chain.signer}
           chainHolders={chainHolders}
           holdersCampaign={holdersCampaign}
           onInvoke={onInvoke}

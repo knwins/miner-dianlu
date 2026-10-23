@@ -39,7 +39,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "Factory Owner",
           signature: "createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint64 fundingSeconds,address transistors) returns (address)",
-          summary: "发布众筹挖矿。开期需 份额单价 / 总份数 / 募集天数 / 元件合约 四个参数。第三个参数是秒：前端把天数 × 86400 后传入。第四个参数是**元件合约（= 处理器）**：零地址 = 用工厂默认；非零必须在工厂元件白名单内，否则 revert PartsNotAllowed。白名单是安全边界（防期次指向无访问控制的 MockERC1155），部署时写入、不可增删。",
+          summary: "发布众筹挖矿。开期需 份额单价 / 总份数 / 募集天数 / 元件合约 四个参数。第三个参数是秒：前端把天数 × 86400 后传入。第四个参数是**元件合约（= 处理器）**：零地址会 revert（工厂不再有默认元件），必须从工厂白名单里选一个官方元件合约，否则 revert PartsNotAllowed。白名单是安全边界（防期次指向无访问控制的 MockERC1155），部署时写入、不可增删。",
           fields: [
             ["sharePriceBnb", "每份 BNB", round.sharePriceBnb],
             ["totalShares", "总份数", round.totalShares],

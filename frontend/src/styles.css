@@ -2253,6 +2253,12 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   font-size: 13px;
 }
 .chain-debug .form-grid { gap: 12px 16px; margin-top: 12px; }
+.chain-debug .buy-debug {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--color-border, #2a2f3a);
+}
+.chain-debug .buy-debug .fine:first-child { margin-top: 0; }
 .chain-debug .field { gap: 6px; }
 .chain-debug .field span {
   color: var(--color-text-secondary);

@@ -96,8 +96,8 @@ export function OwnerOverview({
   round, book, copy, pending, pendingTarget = "", actor, executeWait, history,
   onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onRecoverBnb, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
   onPlaceTransistorAsk, onCancelTransistorAsk, onConfirmSale, onWithdrawMarketProceeds,
-  onDepositToPool, onSetMiningPool, onSetPlan, onRemoveCampaign, onOpenRound, onOpenAssets,
-  account = "", connected = false, chainHolders = null, holdersCampaign = "", quote, onInvoke,
+  onDepositToPool, onSetMiningPool, onSetPlan,   onRemoveCampaign, onOpenRound, onOpenAssets,
+  account = "", connected = false, signer = null, chainHolders = null, holdersCampaign = "", quote, onInvoke,
   transistorUnitPrice = null,
   official = null,
 }) {
@@ -1383,7 +1383,7 @@ export function OwnerOverview({
                   onInvoke={onInvoke}
                 />
               ) : dialog.pane === "onchain" ? (
-                <OnChainPage embedded />
+                <OnChainPage embedded account={account} connected={connected} signer={signer} />
               ) : (
                 <>
                   <article className="detail-summary">
@@ -1599,7 +1599,7 @@ export function OwnerOverview({
         )}
         {detailPane === "onchain" && (
           <div className="detail-section">
-            <OnChainPage embedded />
+            <OnChainPage embedded account={account} connected={connected} signer={signer} />
           </div>
         )}
         {detailPane === "ops" && renderOps()}
