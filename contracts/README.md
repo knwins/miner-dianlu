@@ -462,7 +462,7 @@ node scripts/testnet-drill.js --network bscTestnet# 测试网完整生命周期�
 
 | 网络 | 工厂 | 说明 |
 |---|---|---|
-| BSC 主网 | `0x2a27334bca2b1a04e4cd369a4e9bd945d9afce55` | **当前版本**。构造 `[0xA6a80C19…16E4, [0xCC42ba5D…8087, 0xE2DfD802…8550c]]`，`campaignCount = 0`（未开期），runtime 22,862 字节。部署交易 `0xa56eb6d9…28e`（块 129,171,092）。Sourcify `exact_match` |
+| BSC 主网 | `0x2a27334bca2b1a04e4cd369a4e9bd945d9afce55` | **当前版本**。构造 `[0xA6a80C19…16E4, [0xCC42ba5D…8087, 0xE2DfD802…8550c]]`，runtime 22,862 字节。部署交易 `0xa56eb6d9…28e`（块 129,171,092）。Sourcify `exact_match`。**期次 #0 = `0xb38de12D…5164e`**（TapeOut、0.07 BNB × 1 份、Funding 中 0 份已售）；⚠️ 该期 `serviceFeeSet = false`——前端发布页服务费第二笔曾被字段断链挡下（已修），`sold = 0` 仍可在 Owner 工作台补设 |
 | BSC 测试网 | `0x5edc8254f9533A6c2CD2Ec99D956b1FE0Fa3f56c` | 当前版本。已完成完整生命周期演练（开期 → 认购售罄 → 挂单成交 → 确认入池 → 份额转让 → 余款领取 → 服务费计提与领取） |
 | legacy | `0x19a47311…` / `0x638744e7…` / `0xB4315F55…` / `0x29f4A375…`（共 4 个） | 记在 `deployments/bsc.json` 的 `legacyFactories`，其期次仍可调用但不出现在新列表 |
 
