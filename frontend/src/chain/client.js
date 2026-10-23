@@ -118,8 +118,39 @@ export async function withReadProvider(run) {
   throw lastErr;
 }
 
-async function injectedChoices() {
-  const choices = await discoverWallets();
+/**
+ * 读事件日志专用：按节点顺序试，哪个能读就用哪个。
+ *
+ * 为什么不直接用 withReadProvider 的轮换：日志读取内部是「失败就当做没有事件」
+ * （返回 null 让 UI 退回状态展示），错误被吞掉，轮换永远不会触发。而公共节点里
+ * 恰好只有 eth_getLogs 限制最严 —— publicnode 把历史日志当 archive 请求（要 token，
+ * 403）、blastapi 的公共端点限流（429），只有 nodereal 允许 5 万块区间。
+ * 于是「市场没有事件」看起来像合约事实，其实是节点读不到。
+ */
+let _logProvider = null;
+let _logProviderIndex = 0;
+
+async function getLogsWithFailover(query) {
+  const urls = NETWORK.rpcUrls;
+  let lastErr;
+  for (let i = 0; i < urls.length; i++) {
+    const index = (_logProviderIndex + i) % urls.length;
+    const provider = index === _logProviderIndex && _logProvider
+      ? _logProvider
+      : makeStaticProvider(urls[index]);
+    try {
+      const logs = await withTimeout(provider.getLogs(query), 8_000, "getLogs");
+      _logProvider = provider;
+      _logProviderIndex = index;
+      return logs;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+async function injectedChoices() {  const choices = await discoverWallets();
   return choices.filter((item) => item.kind === "injected");
 }
 
@@ -1208,11 +1239,12 @@ async function readTradeMarks(runner, campaignAddr, latest) {
     const fresh = [];
     for (let from = cached.lastBlock + 1; from <= latest; from += 50_000) {
       try {
-        const logs = await withTimeout(
-          runner.getLogs({ address: campaignAddr, fromBlock: from, toBlock: Math.min(latest, from + 49_999), topics: [hashes] }),
-          8_000,
-          "getLogs",
-        );
+        const logs = await getLogsWithFailover({
+          address: campaignAddr,
+          fromBlock: from,
+          toBlock: Math.min(latest, from + 49_999),
+          topics: [hashes],
+        });
         fresh.push(...logs);
       } catch {
         return cached.rows;
@@ -1332,11 +1364,7 @@ async function readMarketLogs(runner, marketAddr, campaignAddr) {
   const raw = cursor ? [...cursor.logs] : [];
   for (const [fromBlock, toBlock] of ranges) {
     try {
-      const logs = await withTimeout(
-        runner.getLogs({ address: marketAddr, fromBlock, toBlock }),
-        8_000,
-        "getLogs",
-      );
+      const logs = await getLogsWithFailover({ address: marketAddr, fromBlock, toBlock });
       raw.push(...logs);
     } catch {
       // 节点限制区间：首次探测失败就当旧版市场（没有事件）；增量失败下次再补。
@@ -1396,7 +1424,16 @@ async function readMarketLogs(runner, marketAddr, campaignAddr) {
       row = { kind: "place", side: "buy", id, qty: e.args.quantity, price: e.args.price, amount: null, part: TOKEN_LABEL[Number(e.args.tokenId)] || String(e.args.tokenId) };
     } else if (e.name === "BidFilled") {
       const meta = bidMeta.get(id) || {};
-      row = { kind: "fill", side: "buy", id, qty: e.args.quantity, remaining: e.args.remaining, price: meta.price ?? null, part: meta.part || "—", amount: null };
+      /**
+       * 官方市场：BidFilled(id, seller, quantity, proceeds, fee) —— fee 恒 1%，
+       * 买家为这批元件付出的托管额 = proceeds + fee。
+       * Mock：BidFilled(id, quantity, remaining) —— 没有金额，留空。
+       */
+      let amount = null;
+      if (e.args.proceeds != null && e.args.fee != null) {
+        try { amount = (BigInt(e.args.proceeds) + BigInt(e.args.fee)).toString(); } catch { amount = null; }
+      }
+      row = { kind: "fill", side: "buy", id, qty: e.args.quantity, remaining: e.args.remaining, price: meta.price ?? null, part: meta.part || "—", amount };
     } else if (e.name === "BidCancelled") {
       row = { kind: "cancel", side: "buy", id, amount: e.args.refund };
     } else if (e.name === "AskPlaced") {
@@ -1666,6 +1703,30 @@ async function readMarketTradesOnce(campaignAddr) {
       leg.status = settleAskStatus(leg, owed, leg.part === "NAND" ? partsNand : partsLatch);
     }
 
+    /**
+     * 时间优先取市场事件本身：给的是**这一单**（按订单号）的挂出 / 成交 / 撤回时刻，
+     * 比本期合约的「最近一次挂单」更准。手上有市场事件时不再去扫本期合约日志，
+     * 也就不会出现「事件有了、时间列反而是 —」。
+     */
+    if (Array.isArray(events) && events.length) {
+      const byId = new Map();
+      for (const evt of events) {
+        if (!evt.id) continue;
+        const row = byId.get(String(evt.id)) || {};
+        if (evt.kind === "place" && row.placedAt == null) row.placedAt = evt.ts ?? null;
+        if (evt.kind === "fill" && row.filledAt == null) row.filledAt = evt.ts ?? null;
+        if (evt.kind === "cancel" && row.cancelAt == null) row.cancelAt = evt.ts ?? null;
+        byId.set(String(evt.id), row);
+      }
+      for (const leg of legs) {
+        const ts = byId.get(String(leg.orderId));
+        if (!ts) continue;
+        if (leg.placedAt == null) leg.placedAt = ts.placedAt ?? null;
+        if (leg.filledAt == null) leg.filledAt = ts.filledAt ?? null;
+        if (leg.cancelAt == null) leg.cancelAt = ts.cancelAt ?? null;
+      }
+    }
+
     // 卖单成交 / 撤回时间要二分历史区块，比较慢：这里只挂 placedBlock，
     // 由 readAskSettleTimes 在渲染后补，避免整块记录等十几秒。
     for (const leg of legs) {
@@ -1769,11 +1830,7 @@ async function readCampaignLogs(runner, campaignAddr, latest, topics, kind = "re
     }
     const toBlock = Math.min(latest, from + CAMPAIGN_LOG_SPAN - 1);
     try {
-      const logs = await withTimeout(
-        runner.getLogs({ address: campaignAddr, fromBlock: from, toBlock, topics }),
-        8_000,
-        "getLogs",
-      );
+      const logs = await getLogsWithFailover({ address: campaignAddr, fromBlock: from, toBlock, topics });
       raw.push(...logs);
       lastBlock = toBlock;
     } catch {

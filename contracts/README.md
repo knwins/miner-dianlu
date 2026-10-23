@@ -364,6 +364,24 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 
 **主流程**：`placeBid` → 卖家 `fillBid` → 元件到账 → `depositToPool`
 
+#### 7.1.1 市场事件（2026-10-23 实读主网日志解出）
+
+> 之前前端写「这版市场合约没有事件，记录按订单状态推算」—— **错的**。市场一直在发事件，
+> 是两个原因叠在一起读不到：节点不给历史 `eth_getLogs`，以及事件签名和 Mock 不一致。
+
+| 事件（官方真实签名） | topic0 | 说明 |
+|---|---|---|
+| `BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint256 price, uint256 quantity)` | `0xcc402b0b…` | **价是 `uint256`**；Mock 是 `uint96` → 签名不同，拿 Mock ABI 解析必然失败 |
+| `BidFilled(uint256 indexed id, address indexed seller, uint256 quantity, uint256 proceeds, uint256 fee)` | `0x8ba8eb46…` | 5 参；`proceeds + fee` = 买家为这批元件付出的托管额，`fee` 恒 1% |
+| `BidCancelled(uint256 indexed id, uint256 refund)` | `0x434f4081…` | 与 Mock **同签名** |
+
+- 官方市场**没有** `AskPlaced` / `AskFilled` / `AskCancelled` / `ProceedsWithdrawn`（没有卖单侧）。
+- 前端 `MATERIAL_MARKET_ABI` 同时保留官方与 Mock 两套同名事件，ethers 按 topic0 选。
+- **节点**：`bsc-rpc.publicnode.com` 把历史 `eth_getLogs` 当 archive 请求（403，要 token）、
+  `blastapi` 公共端点限流（429），只有 `bsc-mainnet.nodereal.io/v1/<公开key>` 允许 5 万块区间。
+  日志读取走 `getLogsWithFailover()` 逐节点试，不能靠 `withReadProvider`（后者只在整体抛错时轮换，
+  而日志读取内部是把错误吞掉返回 null）。
+
 ### 7.2 官方处理器
 
 | 处理器 | CPU 地址 | 元件 ERC1155 | P | 可采购 | 可挖矿 |

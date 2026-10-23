@@ -35,9 +35,13 @@ const NETWORKS = {
   56: {
     name: "BSC 主网",
     // 不用 1rpc：免费额度用尽会回 -32001。读链会按顺序自动换节点。
+    // 第三个节点是专门为 eth_getLogs 加的：publicnode 把历史日志当 archive 请求
+    // （要 token，403）、blastapi 的公共 Alchemy 端点限流（429），两者读不到事件；
+    // nodereal 公共网关允许 5 万块区间的 getLogs，交易记录的链上事件靠它。
     rpcUrls: [
       "https://bsc-rpc.publicnode.com",
       "https://bsc-mainnet.public.blastapi.io",
+      "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
     ],
     explorer: "https://bscscan.com",
     currency: { name: "BNB", symbol: "BNB", decimals: 18 },

@@ -278,9 +278,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
         <p className="fine">
           {failed
             ? "读取市场失败：节点暂不可用，先按本地状态展示。"
-            : data && !data.supportsEvents
-              ? "这版材料市场合约没有事件日志，成交进度按 bids/asks/owed 当前状态推算；时间取本期合约的挂单、确认到账事件。"
-              : "数据直接读材料市场的 bids / asks / owed，与合约确认到账、提取卖出款用的是同一份链上状态。"}
+            : "成交进度读材料市场的 bids / asks / owed；挂单、成交与撤单时间取市场合约的链上事件。"}
         </p>
       </div>
     </article>
@@ -297,41 +295,10 @@ function eventText(evt) {
   return "";
 }
 
-/** 从订单状态推导出的“伪流水”：旧版市场没有事件时也能看到挂单/成交。
- *  时间来自本期合约的 TransistorOrderPlaced / TransistorAskPlaced / TransistorsConfirmed。 */
-function derivedRecords(legs) {
-  const rows = [];
-  for (const leg of legs) {
-    if (leg.filled > 0) {
-      rows.push({
-        key: `${leg.side}-${leg.orderId}-fill`,
-        side: leg.side,
-        badge: leg.side === "buy" ? "买入" : "卖出",
-        title: `成交 ${leg.filled} 颗${leg.price ? ` @ ${round4(leg.price)} BNB` : ""}`,
-        note: `#${leg.orderId}${leg.part ? ` · ${leg.part}` : ""}${leg.amount ? ` · ${round4(leg.amount)} BNB` : ""}`,
-        ts: leg.side === "buy" ? leg.confirmedAt : leg.filledAt || null,
-        tsLabel: leg.side === "buy" ? "确认到账" : "成交",
-        tone: "fill",
-      });
-    }
-    const cancelled = leg.status === "cancelled";
-    rows.push({
-      key: `${leg.side}-${leg.orderId}-place`,
-      side: leg.side,
-      badge: leg.side === "buy" ? "买入" : "卖出",
-      title: `挂${leg.side === "buy" ? "买" : "卖"}单${leg.orderQty == null ? "" : ` ${leg.orderQty} 颗`}${leg.price ? ` @ ${round4(leg.price)} BNB` : ""}`,
-      note: `#${leg.orderId}${leg.part ? ` · ${leg.part}` : ""} · ${tradeStatusLabel(leg)}`,
-      ts: cancelled ? leg.cancelAt : leg.placedAt,
-      tsLabel: cancelled ? "撤单" : "挂单",
-      tone: leg.status,
-    });
-  }
-  return rows;
-}
-
 /**
  * 紧凑版：Owner 合约操作弹窗右栏的历史交易记录。
- * 有链上事件时按时间倒序显示真实流水；旧市场退回按订单状态推导。
+ * 记录**只来自市场合约的链上事件**（挂单 / 成交 / 撤单），不再按订单状态反推：
+ * 状态能说「现在成交了几颗」，说不出「什么时候挂的、哪一笔成交的」。
  */
 export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase, title = "历史交易记录" }) {
   const { data, failed } = useMarketTrades(campaignAddr, refreshKey);
@@ -356,7 +323,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
         txHash: evt.txHash,
         tone: evt.kind === "fill" ? "fill" : evt.kind === "cancel" ? "cancelled" : evt.kind === "withdraw" ? "settled" : "open",
       }))
-    : derivedRecords(legs);
+    : [];
 
   const partsOnHand = Number(fallbackRows.partsNand || 0) + Number(fallbackRows.partsLatch || 0);
   const stage = phase === "ready"
@@ -443,7 +410,11 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
             ))}
           </ol>
         ) : (
-          <p className="flow-empty">提交买单后，这里会记录挂单与成交。</p>
+          <p className="flow-empty">
+            {totals.buyQty > 0 || totals.sellQty > 0
+              ? "链上事件暂未读取到；挂单进度见上方统计。"
+              : "提交买单后，这里会按链上事件记录挂单与成交。"}
+          </p>
         )}
 
         {/*
@@ -451,12 +422,8 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
          * 正常态原本还有一句「读材料市场 bids / asks / owed，与确认到账、提取卖出款
          * 同一份状态」—— 那是实现说明，对 Owner 没有任何可操作信息，删掉。
          */}
-        {failed || (data && !data.supportsEvents) ? (
-          <p className="fine trade-panel-note">
-            {failed
-              ? "读取市场失败，先按合约已读状态展示。"
-              : "这版市场合约没有事件，记录按订单状态推算。"}
-          </p>
+        {failed ? (
+          <p className="fine trade-panel-note">读取市场失败，先按合约已读状态展示。</p>
         ) : null}
       </div>
     </article>

@@ -109,8 +109,21 @@ export const CAMPAIGN_ABI = [
 ];
 
 /**
- * 测试网材料市场（MockMaterialMarket）。官方市场 ABI 是 bids/asks/placeBid/fillAsk 的子集，
- * 这里额外带上 mock 的交易辅助入口，供「材料市场（Mock 调试）」页模拟对手方成交。
+ * 材料市场 ABI。
+ *
+ * ⚠️ 同名事件在主网官方市场与 Mock 里的**签名不同**（2026-10-23 用 nodereal 拉
+ * 主网市场日志解出来的，topic0 已逐一核对）：
+ *
+ *   官方 BidPlaced(uint256,address,address,uint8,uint256,uint256)  0xcc402b0b…
+ *     —— 价是 uint256；Mock 是 uint96，签名不同 → 用 Mock ABI 解析必然失败，
+ *        看起来就像「市场没有事件」。两个变体都要留在 ABI 里，ethers 按 topic 选。
+ *   官方 BidFilled(uint256 indexed id, address indexed seller, uint256 quantity,
+ *                  uint256 proceeds, uint256 fee)                  0x8ba8eb46…
+ *     —— 5 个参数；Mock 是 (id, quantity, remaining) 3 个。
+ *        proceeds + fee = 买家为这批元件付出的托管额（fee 恒为 1%）。
+ *   官方 BidCancelled(uint256,uint256) 与 Mock **同签名**（0x434f4081…），只写一份。
+ *   官方市场没有卖单侧（placeAsk 不存在），所以 AskPlaced / AskFilled /
+ *   AskCancelled / ProceedsWithdrawn 只有 Mock 会发。
  */
 export const MATERIAL_MARKET_ABI = [
   "function nextBidId() view returns (uint256)",
@@ -123,9 +136,13 @@ export const MATERIAL_MARKET_ABI = [
   "function cancelBid(uint256 id)",
   "function cancelAsk(uint256 id)",
   "function withdraw()",
+  // —— 官方市场（主网 0xA6a80C19…，EIP-1967 代理）——
+  "event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint256 price, uint256 quantity)",
+  "event BidFilled(uint256 indexed id, address indexed seller, uint256 quantity, uint256 proceeds, uint256 fee)",
+  "event BidCancelled(uint256 indexed id, uint256 refund)",
+  // —— Mock 市场（测试网）——
   "event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint96 price, uint256 quantity)",
   "event BidFilled(uint256 indexed id, uint256 quantity, uint256 remaining)",
-  "event BidCancelled(uint256 indexed id, uint256 refund)",
   "event AskPlaced(uint256 indexed id, address indexed seller, address indexed transistors, uint8 tokenId, uint96 price, uint256 quantity)",
   "event AskFilled(uint256 indexed id, address indexed buyer, uint256 quantity, uint256 paid)",
   "event AskCancelled(uint256 indexed id, uint256 quantity)",
