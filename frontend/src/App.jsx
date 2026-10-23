@@ -1283,7 +1283,7 @@ export default function App() {
             onTake={(args) => act("takeListing", args)}
             onBrowse={() => openPage("round")}
             onConnect={handleConnect}
-            title="资产转让"
+            title="挖矿份额转让"
             periods={usingChain ? chain.campaigns : []}
             onSwitchPeriod={usingChain ? chain.switchCampaign : null}
           />
@@ -2542,8 +2542,6 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
   );
   const locked = Number(book.listingShares) || 0;
   const held = Number(book.mine) || 0;
-  const principal = (held + locked) * round.sharePriceBnb;
-  const mining = book.scene === "mining";
 
   return (
     <section className={embedded ? "embedded-block" : undefined}>
@@ -2566,46 +2564,33 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
             )}
           </div>
           <p className="round-hero-lead">
-            把挖矿份额挂到转让市场。挂出后立即锁定，卖出或撤单后才回到可用份数。
+            唯一退出路径：把持有的挖矿份额挂到转让市场，由其他持份人接收。挂出后立即锁定，成交或撤单后释放。
           </p>
+          <span className={`transfer-gate ${canTransfer ? "is-open" : "is-closed"}`}>
+            {canTransfer ? "转让开放中 · 挖矿中" : `未开放 · 当前${book.scene === "funding" ? "募集中" : book.scene === "executing" ? "待执行" : book.scene}`}
+          </span>
         </header>
       )}
-      {embedded && <h2 className="embedded-title">份额转让</h2>}
+      {embedded && <h2 className="embedded-title">挖矿份额转让</h2>}
 
       {!embedded && (
-        <>
-          <div className="holding-grid transfer-self">
-            <article className="stat-card accent">
-              <div className="stat-label">我的份数</div>
-              <div className="stat-value">{connected ? `${held} 份` : "—"}</div>
-              <div className="stat-note">第 {round.id} 期 · 可发布挂单 {connected ? held : "—"} 份</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-label">挂单锁定</div>
-              <div className="stat-value">{connected ? `${locked} 份` : "—"}</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-label">认筹本金</div>
-              <div className="stat-value">{connected ? `${principal.toFixed(4)} BNB` : "—"}</div>
-              <div className="stat-note">每份 {round.sharePriceBnb.toFixed(4)} BNB</div>
-            </article>
-          </div>
-          <div className="holding-grid transfer-mine">
-            <article className="stat-card accent">
-              <div className="stat-label">预估算力（setPlan）</div>
-              <div className="stat-value">{Number(book.estHashpower) > 0 ? `${Number(book.estHashpower).toLocaleString("zh-CN")} H` : "—"}</div>
-              <div className="stat-note">{mining ? "挖矿中" : copy.badge}</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-label">入池元件</div>
-              <div className="stat-value">{mining ? `${Number(book.transistorCount) || 0} 颗` : "—"}</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-label">已售份数</div>
-              <div className="stat-value">{book.sold}/{round.totalShares}</div>
-            </article>
-          </div>
-        </>
+        <div className="holding-grid transfer-holdings">
+          <article className="stat-card accent">
+            <div className="stat-label">可用份额</div>
+            <div className="stat-value">{connected ? `${held} 份` : "—"}</div>
+            <div className="stat-note">可发布挂单</div>
+          </article>
+          <article className="stat-card">
+            <div className="stat-label">挂单锁定</div>
+            <div className="stat-value">{connected ? `${locked} 份` : "—"}</div>
+            <div className="stat-note">挂单中 · 不可领取</div>
+          </article>
+          <article className="stat-card">
+            <div className="stat-label">我的挂牌</div>
+            <div className="stat-value">{connected ? `${myListings.length} 笔` : "—"}</div>
+            <div className="stat-note">开放中待成交</div>
+          </article>
+        </div>
       )}
 
       {!connected && (
@@ -2618,15 +2603,21 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
       )}
 
       {connected && (
-        <div className="layout transfer-desk">
+        <>
+          {!canTransfer && (
+            <div className="transfer-banner is-closed">
+              份额转让仅在挖矿中开放。当前处于「{book.scene === "funding" ? "募集中" : book.scene === "executing" ? "待执行" : book.scene}」，进入挖矿后才可发布挂单或接收。
+            </div>
+          )}
+          <div className="layout transfer-desk">
           <article className="card">
             <div className="card-header">
-              <span>转让市场 · 接收发布的出售价额</span>
+              <span>转让市场</span>
               <span className="stat-label">开放 {openCount} · 完成 {doneCount}</span>
             </div>
             <div className="card-body">
               {marketRows.length === 0 ? (
-                <p className="fine">还没有人挂单。发布出售后，挂单会显示在这里供其他持份人接收。</p>
+                <p className="fine">还没有人挂单。你发布出售后，挂单会显示在这里，其他持份人可接收。</p>
               ) : (
                 <div className="listing-board">
                   <div className="listing-head">
@@ -2634,7 +2625,7 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
                     <span>份数</span>
                     <span>单价</span>
                     <span>合计</span>
-                    <span>状态</span>
+                    <span>操作</span>
                   </div>
                   <ul>
                     {marketRows.map((l) => (
@@ -2663,7 +2654,7 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
               <span className="stat-label">当前可用 {available} 份</span>
             </div>
             <div className="card-body">
-              <p className="fine">挂单后这部分份额从可用余额扣出并锁定，不能领取或转让，直到成交或撤单。</p>
+              <p className="fine">挂单即锁定：这部分份额从可用余额扣出，成交或撤单后释放。成交时买方 BNB 直接付给你（卖方）。</p>
               <div className="form-grid publish-fields">
                 <label className="field">
                   <span>出售份数</span>
@@ -2705,11 +2696,6 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
               >
                 {pending || "发布出售挂单"}
               </button>
-              {!canTransfer && (
-                <p className="fine">
-                  份额转让仅在挖矿中开放。当前处于「{book.scene === "funding" ? "募集中" : book.scene === "executing" ? "待执行" : book.scene}」，进入挖矿后才可发布挂单或接收。
-                </p>
-              )}
               {canTransfer && !canPublish && (
                 <p className="fine">当前没有可用份额可发布挂单（份额为 0 或已全部挂出）。</p>
               )}
@@ -2717,6 +2703,7 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
           </article>
 
         </div>
+        </>
       )}
     </section>
   );

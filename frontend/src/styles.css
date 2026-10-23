@@ -1157,7 +1157,7 @@ h1, h2, h3, p { margin: 0; }
 .listing-head,
 .listing-row {
   display: grid;
-  grid-template-columns: minmax(96px, 1.1fr) 64px minmax(108px, 1.2fr) 92px minmax(108px, auto);
+  grid-template-columns: minmax(96px, 1.1fr) 64px minmax(108px, 1.2fr) 92px minmax(150px, auto);
   align-items: center;
   gap: 8px;
   white-space: nowrap;
@@ -1396,6 +1396,47 @@ h1, h2, h3, p { margin: 0; }
 .holding-grid.transfer-self,
 .holding-grid.transfer-mine { margin-bottom: 16px; }
 .holding-grid + .card { margin-top: 16px; }
+/* 资产转让：持仓精简为 3 张卡，避免与认筹页重复 */
+.holding-grid.transfer-holdings { grid-template-columns: repeat(3, 1fr); margin-bottom: 16px; }
+@media (max-width: 560px) {
+  .holding-grid.transfer-holdings { grid-template-columns: 1fr; }
+}
+
+/* 转让开放状态徽标 */
+.transfer-gate {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.transfer-gate::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.transfer-gate.is-open { color: var(--color-success); background: var(--color-success-light); }
+.transfer-gate.is-closed { color: var(--color-text-secondary); background: var(--color-bg-spotlight); }
+
+/* 未开放横幅 */
+.transfer-banner {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  font-size: 14px;
+  line-height: 1.5;
+}
+.transfer-banner.is-closed {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-spotlight);
+  border: 1px solid var(--color-border);
+}
 .asset-status-cell { white-space: normal; }
 .asset-status .deal-badge { margin-top: 4px; }
 .asset-status {
