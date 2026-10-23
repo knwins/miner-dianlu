@@ -1424,19 +1424,50 @@ h1, h2, h3, p { margin: 0; }
 .transfer-gate.is-open { color: var(--color-success); background: var(--color-success-light); }
 .transfer-gate.is-closed { color: var(--color-text-secondary); background: var(--color-bg-spotlight); }
 
-/* 未开放横幅 */
+/* 未开放横幅：始终置顶、醒目 */
 .transfer-banner {
-  margin: 0 0 16px;
-  padding: 12px 16px;
-  border-radius: var(--radius);
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 0 0 18px;
+  padding: 14px 18px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-warning);
+  background: var(--color-warning-light);
+}
+.transfer-banner-icon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
   font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--color-warning);
+}
+.transfer-banner strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 15px;
+  font-weight: 700;
   line-height: 1.5;
+  color: var(--color-text);
+}
+.transfer-banner p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--color-text-secondary);
 }
 .transfer-banner.is-closed {
   color: var(--color-text-secondary);
-  background: var(--color-bg-spotlight);
-  border: 1px solid var(--color-border);
 }
+/* 转让区说明文字行距放宽，避免拥挤 */
+.transfer-desk .fine { line-height: 1.8; }
+.transfer-desk .fine + .fine { margin-top: 12px; }
 .asset-status-cell { white-space: normal; }
 .asset-status .deal-badge { margin-top: 4px; }
 .asset-status {

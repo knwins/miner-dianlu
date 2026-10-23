@@ -69,7 +69,14 @@ const banner = page.locator(".transfer-banner.is-closed");
 console.log("未开放横幅存在:", await banner.count() > 0);
 if (await banner.count()) {
   const txt = await banner.first().innerText();
-  console.log("  横幅文案:", txt.slice(0, 40) + "…");
+  console.log("  横幅文案:", txt.slice(0, 48) + "…");
+  const icon = await page.locator(".transfer-banner-icon").count();
+  const head = await page.locator(".transfer-banner strong").innerText().catch(() => "");
+  const hasMiningHint = /挖矿中/.test(head);
+  console.log("  警示图标存在:", icon > 0, "| 标题含「挖矿中」:", hasMiningHint, "| 标题:", JSON.stringify(head.trim()));
+  if (!icon || !hasMiningHint) {
+    console.log("  [WARN] 横幅未达醒目要求（需图标 + 标题含挖矿中）");
+  }
 }
 
 // 转让市场 + 发布出售 两张卡

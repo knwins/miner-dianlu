@@ -2529,6 +2529,7 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
   const available = book.mine;
   const canTransfer = book.scene === "mining";
   const canPublish = available > 0 && canTransfer;
+  const sceneLabel = book.scene === "funding" ? "募集中" : book.scene === "executing" ? "待执行" : book.scene;
   const shareCount = pickShares;
   const shareOk = shareCount >= 1 && (!canPublish || shareCount <= available);
   const marketRows = [...(book.listings || [])].sort((a, b) => {
@@ -2567,7 +2568,7 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
             唯一退出路径：把持有的挖矿份额挂到转让市场，由其他持份人接收。挂出后立即锁定，成交或撤单后释放。
           </p>
           <span className={`transfer-gate ${canTransfer ? "is-open" : "is-closed"}`}>
-            {canTransfer ? "转让开放中 · 挖矿中" : `未开放 · 当前${book.scene === "funding" ? "募集中" : book.scene === "executing" ? "待执行" : book.scene}`}
+            {canTransfer ? "转让开放中 · 挖矿中" : `转让未开放 · 当前${sceneLabel}`}
           </span>
         </header>
       )}
@@ -2593,6 +2594,16 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
         </div>
       )}
 
+      {!canTransfer && (
+        <div className="transfer-banner is-closed" role="status">
+          <span className="transfer-banner-icon" aria-hidden="true">!</span>
+          <div>
+            <strong>挖矿份额转让仅在「挖矿中」阶段开放</strong>
+            <p>当前处于「{sceneLabel}」，进入挖矿后才可以发布挂单，或接收他人转让的份额。此前的募集 / 待执行阶段不支持任何转让操作。</p>
+          </div>
+        </div>
+      )}
+
       {!connected && (
         <div className="empty">
           <p>当前没有连接钱包。</p>
@@ -2604,11 +2615,6 @@ function TransferPage({ round, book, copy, actor, account, pending, connected, o
 
       {connected && (
         <>
-          {!canTransfer && (
-            <div className="transfer-banner is-closed">
-              份额转让仅在挖矿中开放。当前处于「{book.scene === "funding" ? "募集中" : book.scene === "executing" ? "待执行" : book.scene}」，进入挖矿后才可发布挂单或接收。
-            </div>
-          )}
           <div className="layout transfer-desk">
           <article className="card">
             <div className="card-header">
