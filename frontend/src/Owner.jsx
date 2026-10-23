@@ -1306,7 +1306,7 @@ export function OwnerOverview({
       {dialogRow && typeof document !== "undefined" && createPortal(
         <div className="sheet-backdrop" onClick={() => setDialog(null)}>
           <div
-            className={dialog.pane === "ops" || dialog.pane === "onchain" ? "sheet sheet-wide" : "sheet"}
+            className="sheet sheet-wide"
             role="dialog"
             aria-modal="true"
             aria-label={`${dialogTitle} 第 ${dialogRow.id} 期`}
