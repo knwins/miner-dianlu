@@ -465,7 +465,7 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-drill.
 
 | 网络 | 工厂 | 说明 |
 |---|---|---|
-| BSC 主网 | `0x6bf44c46b60d631b2ebee490d6ea6fba032be399` | **当前版本**（源码清理版：注释全英、删 `NotSoldOut`/`pendingFeeOf`、`Campaign.market` → `materialMarket`）。构造 `[0xA6a80C19…16E4, [0xCC42ba5D…8087, 0xE2DfD802…8550c]]`，runtime 22,811 字节。部署交易 `0x406d1159…457c`（块 129,239,494，gasUsed 5,078,205）。Sourcify `exact_match`。已开期 **#0 `0xE92D2f94…3257`**（Behemoth、0.001 BNB × 1 份、募集 1 天，开期交易 `0x4e53a49a…f27b` 块 129,241,768）：已售罄 1/1、`raisedBnb` 0.001、scene=Executing / phase=Buying、`serviceFeeSet = true`（5% / 2 个分成地址） |
+| BSC 主网 | `0x6bf44c46b60d631b2ebee490d6ea6fba032be399` | **当前版本**（源码清理版：注释全英、删 `NotSoldOut`/`pendingFeeOf`、`Campaign.market` → `materialMarket`）。构造 `[0xA6a80C19…16E4, [0xCC42ba5D…8087, 0xE2DfD802…8550c]]`，runtime 22,811 字节。部署交易 `0x406d1159…457c`（块 129,239,494，gasUsed 5,078,205）。Sourcify `exact_match`（工厂与期次 #0 均已验证：`0xE92D2f94…3257` creation/runtime 双 exact，2026-10-23T03:06:45Z）。已开期 **#0 `0xE92D2f94…3257`**（Behemoth、0.001 BNB × 1 份、募集 1 天，开期交易 `0x4e53a49a…f27b` 块 129,241,768）：已售罄 1/1、`raisedBnb` 0.001、scene=Executing / phase=Buying、`serviceFeeSet = true`（5% / 2 个分成地址） |
 | BSC 测试网 | `0x5edc8254f9533A6c2CD2Ec99D956b1FE0Fa3f56c` | 上一版源码（`Campaign.market()` 时代，脚本按旧名读它）。已完成完整生命周期演练（开期 → 认购售罄 → 挂单成交 → 确认入池 → 份额转让 → 余款领取 → 服务费计提与领取） |
 | legacy | `0x2a27334b…` / `0x19a47311…` / `0x638744e7…` / `0xB4315F55…` / `0x29f4A375…`（共 5 个） | 记在 `deployments/bsc.json` 的 `legacyFactories`，其期次仍可调用但不出现在新列表。`0x2a27334b…` 是清理前的主网工厂（Sourcify `exact_match`），名下两期：**#0 `0xb38de12D…5164e`**（TapeOut、0.07 BNB × 1 份、Funding 0 份已售、`serviceFeeSet = false`）与 **`0xB3b9AA36…dfE8`**（Behemoth、0.00005 BNB × 2 份、已售罄 2/2、Executing/Buying、`serviceFeeSet = false`——已有人认购，服务费表永久锁定为不收） |
 

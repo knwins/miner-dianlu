@@ -29,5 +29,5 @@
   "factoryDeploymentTx": "0x406d1159f98b1c26f580b08bab536e19ed61b8f612246ccba2d4f3b99fa1457c",
   "factoryDeploymentBlock": 129239494,
   "factoryRuntimeBytes": 22811,
-  "notes": "BSC 主网工厂（materialMarket + allowedParts 两参构造，开期必选元件）。本版源码 = 注释英文化 + 删冗余（NotSoldOut / pendingFeeOf）+ Campaign.market 更名 materialMarket 之后的新版；旧工厂 0x2a27334b…（Sourcify exact_match 的旧版）连同其两期移入 legacyFactories——主列表不再展示，但合约仍可调用。构造参数已链上读回校验：owner=部署者，materialMarket=官方市场，白名单=官方两件套，runtime 22811 字节（上限 24576）。新工厂已开期 #0 0xE92D2f94…3257（Behemoth、0.001 BNB × 1 份、募集 1 天，tx 0x4e53a49a…f27b 块 129,241,768）：已售罄 1/1、raisedBnb 0.001、scene=Executing phase=Buying、serviceFeeSet=true（5% / 2 个分成地址）。开期需份额价 / 总份数 / 募集天数 / 元件合约（必选，从白名单里选）。"
+  "notes": "BSC 主网工厂（materialMarket + allowedParts 两参构造，开期必选元件）。本版源码 = 注释英文化 + 删冗余（NotSoldOut / pendingFeeOf）+ Campaign.market 更名 materialMarket 之后的新版；旧工厂 0x2a27334b…（Sourcify exact_match 的旧版）连同其两期移入 legacyFactories——主列表不再展示，但合约仍可调用。构造参数已链上读回校验：owner=部署者，materialMarket=官方市场，白名单=官方两件套，runtime 22811 字节（上限 24576）。新工厂已开期 #0 0xE92D2f94…3257（Behemoth、0.001 BNB × 1 份、募集 1 天，tx 0x4e53a49a…f27b 块 129,241,768）：已售罄 1/1、raisedBnb 0.001、scene=Executing phase=Buying、serviceFeeSet=true（5% / 2 个分成地址）。Sourcify exact_match：工厂与期次 #0 均已验证（0xE92D2f94…3257 creation/runtime 双 exact，2026-10-23T03:06:45Z）。开期需份额价 / 总份数 / 募集天数 / 元件合约（必选，从白名单里选）。"
 }

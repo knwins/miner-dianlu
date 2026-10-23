@@ -32,14 +32,15 @@ function readDeployment() {
 /**
  * 找出与链上 runtime 字节数一致的那份编译产物。
  * 仓库里 build-info 会有多份（源码改过就会新增），字节数对不上的那份提交必然失败。
+ * 注意按「本次要验证的合约」取字节码——验证 Campaign 时不能拿 CampaignFactory 的比。
  */
-function pickBuildInfo(targetBytes) {
+function pickBuildInfo(targetBytes, sourceName, contractName) {
   const dir = join(__dirname, "..", "artifacts", "build-info");
   if (!existsSync(dir)) throw new Error("找不到 artifacts/build-info，请先 compile");
   const cands = [];
   for (const f of readdirSync(dir)) {
     const bi = JSON.parse(readFileSync(join(dir, f), "utf8"));
-    const cf = bi.output?.contracts?.["contracts/CampaignFactory.sol"]?.CampaignFactory;
+    const cf = bi.output?.contracts?.[sourceName]?.[contractName];
     if (!cf?.evm?.deployedBytecode?.object) continue;
     cands.push({ file: f, bi, bytes: cf.evm.deployedBytecode.object.length / 2 });
   }
@@ -58,7 +59,10 @@ async function campaignConstructorArgs(campaignAddr, dep) {
   const iface = new ethers.Interface(abi);
   const logs = await ethers.provider.getLogs({
     address: dep.factory,
-    fromBlock: 0,
+    // publicnode 等公共节点拒「越过 archive 截止点」的查询（fromBlock: 0 必 403
+    // "Archive requests require a personal token"）。CampaignCreated 只可能出现在
+    // 工厂部署块之后，从那儿起查；记录里没有块号时退回 0（全archive 节点可用）。
+    fromBlock: dep.factoryDeploymentBlock ?? 0,
     toBlock: "latest",
     topics: [iface.getEvent("CampaignCreated").topicHash],
   });
@@ -126,7 +130,7 @@ async function confirmVerified(chainId, address) {
 async function verifyOne({ chainId, address, contractName, args, sourceName: srcName, creationTxHash }) {
   const sourceName = srcName || `contracts/${contractName}.sol`;
   const targetBytes = await runtimeBytesOf(address);
-  const { bi, file } = pickBuildInfo(targetBytes);
+  const { bi, file } = pickBuildInfo(targetBytes, sourceName, contractName);
   const contractOutput = bi.output.contracts[sourceName]?.[contractName];
   if (!contractOutput?.metadata) throw new Error(`编译产物里没有 ${sourceName}:${contractName} 的 metadata`);
 
