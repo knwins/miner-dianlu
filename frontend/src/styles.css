@@ -3426,9 +3426,11 @@ input[readonly] {
     flex-direction: row;
     align-items: flex-start;
     gap: 0;
-    /* 底部留白是给绝对定位的副提示让位（提示不参与等分宽度计算） */
-    padding: 0 0 18px;
-    margin-bottom: 12px;
+    /* 底部留白是给绝对定位的副提示让位（提示不参与等分宽度计算）；
+       上下外边距是它与上方钱包行、下方标题模块（.round-hero）的行距 ——
+       这两处留白归这个条自己管，别指望邻居的 padding。 */
+    padding: 0 0 24px;
+    margin: 20px 0 28px;
   }
   /* wrap 自身不生成盒子，step 直接参与 strip 的横向等分 */
   .life-step-wrap,
@@ -3446,25 +3448,25 @@ input[readonly] {
     min-height: 0;
     flex-direction: column;
     align-items: center;
-    gap: 6px;
+    gap: 10px;
     text-align: center;
   }
-  /* 圆心在 13px（26px 圆点的一半），线宽 1px 时上边距取 12.5px；
-     左右各留 4px 与圆点边缘的间隙，宽度 = 相邻圆心距 - 34px */
+  /* 圆心在 15px（30px 圆点的一半），线宽 1px 时上边距取 14.5px；
+     左右各留 4px 与圆点边缘的间隙，宽度 = 相邻圆心距 - 38px */
   .life-step::after {
     content: "";
     position: absolute;
-    top: 12.5px;
-    left: calc(50% + 17px);
-    width: calc(100% - 34px);
+    top: 14.5px;
+    left: calc(50% + 19px);
+    width: calc(100% - 38px);
     height: 1px;
     background: #d5dee8;
   }
   .life-step.is-done::after { background: var(--color-success); }
   .life-step-wrap:last-child .life-step::after { content: none; }
-  .life-dot { width: 26px; height: 26px; font-size: 12px; }
+  .life-dot { width: 30px; height: 30px; font-size: 13px; }
   .life-text { padding-top: 0; gap: 2px; align-items: center; }
-  .life-label { font-size: 13px; }
+  .life-label { font-size: 14px; }
   /* 副提示（「待挂单买晶体管」等）最长 11 个字，塞进 1/3 列宽会折成两三行，
      最后一行只剩「入池」二字。改成不占列宽、以本步骤为轴居中单行，
      它落在标签下方那一行，左右不会碰到相邻步骤的文字。 */
@@ -3473,11 +3475,13 @@ input[readonly] {
     top: 100%;
     left: 50%;
     transform: translateX(-50%);
-    margin: 3px 0 0;
-    font-size: 11.5px;
+    margin: 4px 0 0;
+    font-size: 12px;
     line-height: 1.2;
     white-space: nowrap;
   }
+  /* 募集中 / 挖矿中没有副提示，那段让位留白要收掉，否则下方多空 24px */
+  .life-strip:not(:has(.life-phase)) { padding-bottom: 0; }
 
   .list-pager {
     flex-direction: column;
