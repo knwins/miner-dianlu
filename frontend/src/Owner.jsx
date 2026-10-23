@@ -1192,11 +1192,13 @@ export function OwnerOverview({
                 <article key={rowKey(item)} className={`campaign-card ${deal.key === "none" ? "deal-idle" : `deal-${deal.key}`}`} onClick={() => openRound(item)}>
                   <header className="campaign-card-head">
                     <div>
-                      <div className="campaign-kicker">
-                        <strong>第 {item.id} 期</strong>
-                        {item.processor ? <span className="campaign-processor">{item.processor}</span> : null}
-                        {item.address ? <span className="mono">{shortAddress(item.address)}</span> : null}
-                      </div>
+                      {/* 期号只在 h2 里出现一次；kicker 只放处理器与地址，不重复「第 N 期」。 */}
+                      {(item.processor || item.address) ? (
+                        <div className="campaign-kicker">
+                          {item.processor ? <span className="campaign-processor">{item.processor}</span> : null}
+                          {item.address ? <span className="mono">{shortAddress(item.address)}</span> : null}
+                        </div>
+                      ) : null}
                       <h2>{headline}</h2>
                     </div>
                     <div className="campaign-status">
@@ -1211,9 +1213,11 @@ export function OwnerOverview({
                   {deal.key === "waiting" ? (
                     <div className="campaign-hero deal-wait">
                       <div className="hero-pct">{pct != null ? `${pct}` : "—"}<span className="hero-unit">%</span></div>
+                      {/* 份数已在下方指标行显示，这里只给「还差多少 / 已售罄」，不重复 x/y。 */}
                       <div className="hero-sub">
-                        已认筹 {sold != null && total != null ? `${sold}/${total}` : (item.shares || "—")} 份
-                        {sold != null && total != null && total - sold > 0 ? ` · 还差 ${total - sold} 份售罄` : ""}
+                        {sold != null && total != null
+                          ? (total - sold > 0 ? `还差 ${total - sold} 份售罄` : "已售罄 · 待执行")
+                          : (item.shares ? `已认筹 ${item.shares} 份` : "—")}
                       </div>
                       {remainText ? <div className="hero-note">{remainText}</div> : null}
                       {pct != null && (
@@ -1224,13 +1228,20 @@ export function OwnerOverview({
                     </div>
                   ) : deal.key === "done" ? (
                     <div className="campaign-hero deal-done">
+                      {/*
+                       * 认购 deal 已达成 ≠ 元件已买到：售罄后 Owner 可能还没挂单。
+                       * 元件数 > 0 才说「已到账」；为 0 时说「已售罄 / 等待买入」，
+                       * 否则会出现「0 颗 · 成交元件已到账」这种自相矛盾的组合。
+                       */}
                       <div className="hero-pct">
-                        {transistorCount != null ? `${transistorCount} 颗` : (item.hashpower || "—")}
+                        {transistorCount != null && transistorCount > 0
+                          ? `${transistorCount} 颗`
+                          : "已售罄"}
                       </div>
                       <div className="hero-sub">
-                        {transistorCount != null ? `算力 ${item.hashpower || "—"} H` : ""}
-                        {transistorCount != null && (item.bem != null) ? " · " : ""}
-                        已分配 BEM {item.bem ?? "—"}
+                        {transistorCount != null && transistorCount > 0
+                          ? "成交元件已到账"
+                          : "等待 Owner 买入元件"}
                       </div>
                     </div>
                   ) : (

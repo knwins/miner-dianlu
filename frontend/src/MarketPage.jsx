@@ -39,7 +39,7 @@
  * 一期只能锁定一个元件合约（= 一个处理器），开期时由工厂白名单把关。
  */
 import { OfficialPricePanel } from "./OfficialPricePanel.jsx";
-import { PROCESSORS, PROCESSOR_IDS, TRANSISTORS, isMineable, processorScale } from "./prices.js";
+import { PROCESSORS, PROCESSOR_IDS, TRANSISTORS, isMineable } from "./prices.js";
 import { OFFICIAL_CPUS, OFFICIAL_PARTS_FOR_PROCESSOR, processorFromPartsContract } from "./tapeout.js";
 import deployments from "./chain/deployments.json";
 import { explorerAddress } from "./chain/config.js";
@@ -77,7 +77,11 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
     const allowed = whitelist.size
       ? whitelist.has(String(partsAddr).toLowerCase())
       : null;
-    const mineable = isMineable(pid);
+    /*
+     * 只保留标题区没有的信息：两个地址 + 白名单状态。
+     * 「挖矿资格」不再单独一项 —— 处理器标题旁已经显示 P = 6 或「无挖矿产出」，
+     * 下面再写一遍「有（P = 6）」就是同一事实画两遍。
+     */
     return (
       <ul className="market-page-facts">
         <li>
@@ -91,12 +95,6 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
           <a className="mono" href={explorerAddress(partsAddr)} target="_blank" rel="noreferrer">
             {shortAddr(partsAddr)}
           </a>
-        </li>
-        <li>
-          <span>挖矿资格</span>
-          <strong className={mineable ? "" : "market-page-nomine"}>
-            {mineable ? `有（P = ${processorScale(pid)}）` : "无（官方 multiplier = 0）"}
-          </strong>
         </li>
         <li>
           <span>工厂白名单</span>

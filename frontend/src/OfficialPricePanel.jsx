@@ -127,15 +127,20 @@ export function OfficialPricePanel({
                 <thead>
                   <tr>
                     <th>元件</th>
-                    {full && <th>tokenId</th>}
                     <th>成交价</th>
                   </tr>
                 </thead>
                 <tbody>
                   {g.items.map(({ model, row }) => (
                     <tr key={model.id}>
-                      <td><strong>{model.part}</strong></td>
-                      {full && <td className="mono">{model.tokenId}</td>}
+                      {/*
+                       * tokenId 只有固定两值（NAND=0 / LATCH=1），单独占一列既占宽又
+                       * 每行都重复「0 / 1」。并进元件名后缀，信息不丢、少一列。
+                       */}
+                      <td>
+                        <strong>{model.part}</strong>
+                        {full && <em className="part-id">#{model.tokenId}</em>}
+                      </td>
                       <td className="mono" style={{ fontWeight: 600 }}>
                         {row?.last != null ? formatPrice(row.last) : "—"}
                       </td>

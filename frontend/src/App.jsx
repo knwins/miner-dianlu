@@ -2230,6 +2230,7 @@ function RoundFacts({ round, book, quote }) {
             {partsFromChain ? (
               <>
                 权重 {weightValue != null ? weightValue.toLocaleString("zh-CN") : "—"} H
+                {" · "}NAND {Number(book.nandFilled ?? 0) || 0} · LATCH {Number(book.latchFilled ?? 0) || 0}
                 <em className="est-tag">成交口径</em>
               </>
             ) : onChain ? (
@@ -2255,17 +2256,18 @@ function RoundFacts({ round, book, quote }) {
             <div className="stat-note">每颗算力 P 待元件成交后才有意义</div>
           ) : null}
         </article>
+        {/*
+         * 每份 / 总份数 / 募资总额是同一组发行参数（募资总额 = 每份 × 总份数），
+         * 拆成三张卡等于把一条恒等式摊开占三格。合并成一张三行小卡，
+         * 指标卡从 6 张减到 4 张，首屏不再被发行参数占满。
+         */}
         <article className="stat-card">
-          <div className="stat-label">每份</div>
-          <div className="stat-value">{round.sharePriceBnb.toFixed(4)} BNB</div>
-        </article>
-        <article className="stat-card">
-          <div className="stat-label">总份数</div>
-          <div className="stat-value">{round.totalShares}</div>
-        </article>
-        <article className="stat-card">
-          <div className="stat-label">募资总额</div>
-          <div className="stat-value">{hardCap.toFixed(4)} BNB</div>
+          <div className="stat-label">发行参数</div>
+          <dl className="stat-rows">
+            <div><dt>每份</dt><dd>{round.sharePriceBnb.toFixed(4)} BNB</dd></div>
+            <div><dt>总份数</dt><dd>{round.totalShares}</dd></div>
+            <div><dt>募资总额</dt><dd>{hardCap.toFixed(4)} BNB</dd></div>
+          </dl>
         </article>
         <article className="stat-card">
           <div className="stat-label">挖矿产出服务费</div>
@@ -2297,88 +2299,64 @@ function RoundFacts({ round, book, quote }) {
           )}
         </article>
       </div>
-      {onChain && hasBought ? (
-        <div className="stat-grid detail">
-          <article className="stat-card accent span-2">
-            <div className="stat-label">算力（setPlan 已上链）</div>
-            <div className="stat-value">
-              {chainHashpower > 0 ? `${chainHashpower.toLocaleString("zh-CN")} H` : "未写入"}
-            </div>
-          </article>
-          <article className="stat-card span-2">
-            <div className="stat-label">成交元件</div>
-            <div className="stat-value">{chainParts} 颗</div>
-            <div className="stat-note">
-              NAND {Number(book.nandFilled ?? 0) || 0} · LATCH {Number(book.latchFilled ?? 0) || 0}
-            </div>
-          </article>
-          <article className="stat-card span-2">
-            <div className="stat-label">锁价</div>
-            <div className="stat-value">{Number(book.priceLock) > 0 ? `${round4(book.priceLock)} BNB` : "未锁"}</div>
-            <div className="stat-note">挂单时锁定的元件总成本</div>
-          </article>
-          <article className="stat-card note-card">
-            <div className="stat-label">算力是预估值，不是实测</div>
-            <p className="note-copy">
-              setPlan 写入的预估算力供用户核对；BEM 分配合约接入前 harvest / claim 为占位空实现，
-              不产出发放，链上也没有实时算力与日产可读。
-            </p>
-          </article>
-        </div>
-      ) : (
+      {/*
+       * 第二排只在「有内容」时出现：
+       *  - 演示模式：给出按报价反推的算力与估算口径；
+       *  - 链上已成交：给出 setPlan 算力与锁价。
+       * 链上尚未成交时，「未写入 / 成交后才出现」这两张空卡不画 —— 那句话已经在
+       * 上面「元件数」卡的备注和下面的强制提示里各有一份，再画一排只会重复。
+       */}
+      {!onChain ? (
         <div className="stat-grid detail">
           <article className="stat-card span-3">
             <div className="stat-label">
               预估算力
-              {onChain ? <em className="est-tag">未写入</em> : <em className="est-tag">按当前报价</em>}
+              <em className="est-tag">按当前报价</em>
             </div>
-            {/*
-             * 链上没成交元件时没有真实元件数，也就没有真实算力。
-             * 之前这里显示 est.hashpower，而 est 的元件数来自 round.partCount
-             * ——链上模式继承了 fixtures 的 68，于是每期都显示「68 H」这种假值。
-             * 现在链上没买入就写「未写入」，不拿推算值冒充。
-             */}
             <div className="stat-value">
-              {onChain
-                ? <span className="muted-value">未写入</span>
-                : namedProcessor ? `${est.hashpower.toLocaleString("zh-CN")} H` : "—"}
+              {namedProcessor ? `${est.hashpower.toLocaleString("zh-CN")} H` : "—"}
             </div>
-            {onChain && <div className="stat-note">setPlan 写入的算力在元件成交后才出现</div>}
           </article>
           <article className="stat-card note-card half">
             <div className="stat-label">预估随报价浮动，不是承诺</div>
             <p className="note-copy">
-              {book.executionFailed ? (
-                <>本期已退款。合约里剩余 {round4(book.bnbPool || 0)} BNB，累计已退回 {round4(book.refundedTotal || 0)} BNB。上面的算力仍按募资总额与基准单价估算，不是合约余额。</>
-              ) : onChain ? (
-                <>
-                  本期 Owner 尚未买入元件，因此没有真实元件数与算力。
-                  募资总额 {est.hardCapBnb.toFixed(4)} BNB；Owner 在「待执行」阶段挂单买入元件、
-                  成交到账后，元件数与 setPlan 写入的算力才会出现在这里。
-                </>
-              ) : round.processorId ? (
+              {round.processorId ? (
                 <>
                   元件数由募资总额按当前报价反推：本期 {est.usedParts} 颗，
                   权重 H = {est.hashpower} = {est.usedParts} × {est.processorScale}（元件数 × 每颗算力）。
-                  元件实际采购价随市场浮动，上面的算力只是按当前报价的估算。
+                  实际采购价随市场浮动，上面的算力只是估算。
                 </>
               ) : (
-                <>募资总额 {est.hardCapBnb.toFixed(4)} BNB。本期合约没有写入目标处理器，名称是未记录，P 留空。</>
+                <>募资总额 {est.hardCapBnb.toFixed(4)} BNB。本期没有写入目标处理器，名称是未记录，P 留空。</>
               )}
             </p>
           </article>
         </div>
-      )}
+      ) : hasBought ? (
+        <div className="stat-grid detail">
+          <article className="stat-card accent span-3">
+            <div className="stat-label">算力（setPlan 已上链）</div>
+            <div className="stat-value">
+              {chainHashpower > 0 ? `${chainHashpower.toLocaleString("zh-CN")} H` : "未写入"}
+            </div>
+            <div className="stat-note">预估，不是实测；harvest / claim 接入前不产出发放</div>
+          </article>
+          <article className="stat-card span-3">
+            <div className="stat-label">锁价</div>
+            <div className="stat-value">{Number(book.priceLock) > 0 ? `${round4(book.priceLock)} BNB` : "未锁"}</div>
+            <div className="stat-note">挂单时锁定的元件总成本</div>
+          </article>
+        </div>
+      ) : null}
       {/*
-       * C-1 的强制提示（全局一份，认购页按钮旁还有一份）。
-       * 「元件数不构成本期承诺」必须一眼看到，不能只藏在说明文字里。
+       * C-1 的强制提示（全局唯一一份，认购页按钮旁还有一份）。
+       * 「元件数不构成本期承诺」必须一眼看到；正文压到一句，避免与上方卡片重复。
        */}
       <div className="commit-warning wide" role="note">
         <strong>元件数不构成本期承诺。</strong>
         <span>
-          本期不约定买多少元件、也不约定买价。元件数与算力由 Owner 售罄后按市价买入决定，
-          随市场浮动，可能少于按当前报价反推的估值。
-          {" "}挖矿收益 BEM 分配合约接入前不产生实际发放。
+          不约定买多少、也不约定买价，元件数与算力由 Owner 售罄后按市价买入决定，可能低于估值；
+          BEM 分配合约接入前不产生实际发放。
         </span>
       </div>
     </>
@@ -2972,14 +2950,15 @@ function RulesPage({ campaigns = [] }) {
         <section className="rules-block">
           <div className="rules-block-head">
             <h2>入池</h2>
-            <p>晶体管到账后，由 Owner 写入预估计划并把元件投入矿池。</p>
+            <p>晶体管到账后，由 Owner 写入预估计划并把元件投入矿池（不可逆）。</p>
           </div>
-          <ol className="rules-steps">
-            <li><span>1</span>挂单并锁价</li>
-            <li><span>2</span>确认到账</li>
-            <li><span>3</span>depositToPool 进入挖矿</li>
-          </ol>
-          <p className="rules-note">元件到账后入池开矿（不可逆）；入池前本金不动，持份人可原路退款，Owner 也可改价重挂。</p>
+          {/*
+           * 这里不再重复「挂单 → 到账 → depositToPool」三步：
+           * 完整调用顺序在下方「入池条件」里已经是权威的一处，再列一遍只是同一流程换个粒度。
+           */}
+          <p className="rules-note">
+            入池前本金不动，持份人可原路退款，Owner 也可改价重挂。完整调用顺序见下方「入池条件」。
+          </p>
         </section>
       </div>
 
@@ -2993,8 +2972,7 @@ function RulesPage({ campaigns = [] }) {
           <strong>份额售罄 → 买入 NAND / LATCH → 确认到账 → setPlan → setMiningPool → depositToPool</strong>
         </div>
         <p className="rules-note">
-          元件入池后不可撤出。BEM 分配合约接入前 harvest / claim 是占位空实现，不产出发放；
-          挖矿中的退出只有挖矿份额转让，合约不提供本金赎回。
+          元件入池后不可撤出；挖矿中的退出只有挖矿份额转让，合约不提供本金赎回。
         </p>
       </section>
 

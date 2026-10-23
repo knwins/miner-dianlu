@@ -818,7 +818,8 @@ h1, h2, h3, p { margin: 0; }
   gap: 12px;
   margin-bottom: 16px;
 }
-.stat-grid.facts { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+/* 指标区只剩 4 张卡（发行参数已由 3 张合并成 1 张） */
+.stat-grid.facts { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 /* 第二排明细：列数与第一排对齐，保证每排都填满整行，不留孤卡片 */
 .stat-grid.detail { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .stat-card.span-2 { grid-column: span 2; }
@@ -841,6 +842,17 @@ h1, h2, h3, p { margin: 0; }
 }
 /* 半幅说明卡：与同排数据卡并排，凑满整行 */
 .stat-card.note-card.half { grid-column: span 3; }
+/* 「发行参数」一张卡内的多行键值（每份 / 总份数 / 募资总额） */
+.stat-rows { margin: 0; display: flex; flex-direction: column; gap: 5px; }
+.stat-rows > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.stat-rows dt { color: var(--color-text-tertiary); font-size: 12px; }
+.stat-rows dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
 .note-copy {
   margin: 0;
   color: #6d624c;
@@ -939,26 +951,34 @@ h1, h2, h3, p { margin: 0; }
 /* 材料市场页（官方处理器并列视图） */
 .market-page { display: block; }
 .market-page-card { margin-top: 12px; }
+/* 处理器补充事实：由 4 个带框小卡收成一行紧凑键值 */
 .market-page-facts {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 18px;
   margin: 10px 0 0;
   padding: 0;
   list-style: none;
 }
 .market-page-facts li {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 8px 10px;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
+  align-items: baseline;
+  gap: 6px;
+  padding: 0;
   font-size: 12px;
 }
 .market-page-facts li > span {
   color: var(--color-text-tertiary);
   font-size: 11px;
+}
+/* 元件名后缀的固定 tokenId（NAND #0 / LATCH #1） */
+.part-id {
+  margin-left: 6px;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
 }
 .market-page-facts a { color: var(--color-primary); }
 .market-page-nomine { color: #8a5a12; }
