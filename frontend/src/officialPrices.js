@@ -2,33 +2,41 @@
  * 官方元件市价。
  *
  * ════════════════════════════════════════════════════════════════
- * 主源：链上官方市场的最新成交事件（getLogs 读代理合约 0xA6a80…）。
- * 兜底：官方站点 market.json（同源反代 /tt-api）。再不行回退静态基准。
+ * 主源：链上官方市场的**未成交买单**（`nextBidId()` + `bids(id)`，纯 eth_call）。
+ * 兜底：链上成交事件（单窗口 getLogs）→ 官方站点 market.json（同源反代 /tt-api）
+ *      → 静态基准。
  * ════════════════════════════════════════════════════════════════
  *
  * 为什么主源走链上、而不是只拉 market.json：
  *   - market.json 经 Vite 代理 /tt-api 转发，但 vite build 产物不含该代理，
  *     生产静态托管时若没配反代，/tt-api/* 直接 404（M-2 已知风险）。
- *   - 官方市场是代理合约，成交时 emit 事件，单价就在事件 data 里。
- *     按元件合约地址 + tokenId 过滤即可取出本项目的 NAND/LATCH 成交价，
- *     且实测与官方 market.json 的「最近成交价」逐位一致。
+ *   - 官方市场本身是公开的：买单挂在链上，`bids(id)` 就能读到「元件合约 +
+ *     tokenId + 单价 + 剩余量」，不需要任何索引服务。
  *
- * 链上成交事件的布局（反推，官方实现合约未开源）：
- *   topic0    = 0xcc402b0b…（成交 / Fill 事件）
- *   topics[1] = 自增成交 ID
- *   topics[2] = 对手方地址
- *   topics[3] = 元件合约地址（识别处理器：Behemoth / TapeOut）
- *   data 字 0 = tokenId（0 = NAND, 1 = LATCH）
- *   data 字 1 = 单价（wei）
- *   data 字 2 = 数量
+ * 为什么读挂单、而不是扫成交事件（2026-10-23 改）：
+ *   - 官方市场**只有买单侧**（`nextAskId()` 直接 revert），Owner 是卖方，
+ *     他要卖就得吃别人的买单 —— 所以真正相关的价是「当前最高的未成交买价」，
+ *     而不是稀疏的历史成交价。
+ *   - 成交极稀疏：实测最近 2000 / 5000 块**一条成交都没有**，20000 块才有
+ *     33 条。于是扫日志必须回看几万甚至十几万块，公共节点要不是按 archive
+ *     请求 403（publicnode）、要不限制跨度（drpc 10000），只剩 nodereal 一个
+ *     能用，量大就限流。
+ *   - 而挂单是**当前状态**：`nextBidId()` 拿总数、往回读几十笔 `bids(id)` 即可
+ *     覆盖全部四种元件（实测最近 60 笔全覆盖），一次 eth_getLogs 都不发。
+ *     eth_call 读最新状态不需要 archive 数据，任何公共节点都能答。
  *
- * ── 边界（决定它不能 100% 取代 market.json）──
- *   - 成交很稀疏：最近几千块常常一笔成交都没有（2026-10-23 实测 5000 块窗口
- *     0 条、20000 块才有 32 条）。所以主源按 20000 块一档往回翻，最多 8 档；
- *     四种元件都凑齐才收工，凑不齐的元件仍要靠 market.json / 静态基准补。
- *   - 只拿到「成交价」，拿不到「买价」（未成交买单最高出价）；
- *     买价仍需扫 bids(1..12万+) —— 那条路仍是 open 问题，本项目不依赖它。
- *   - 官方实现合约闭源，事件布局是反推的；官方升级合约可能失效。
+ * 官方市场 bids(uint256) 的返回布局（2026-10-23 实测，实现合约未开源）：
+ *   word0 = buyer        word1 = transistors（元件合约）
+ *   word2 = price(wei)   word3 = tokenId（0 = NAND, 1 = LATCH）
+ *   word4 = feeBps(100)  word5 = remaining（剩余未成交量，> 0 才是活跃挂单）
+ * 注意这与 ABI 里声明的打包形态不同（官方 price 是 uint256，不参与打包），
+ * 所以这里**手工解码原始返回**，不走 ethers 的 ABI 解码。
+ *
+ * ── 边界 ──
+ *   - 只回溯最近 120 笔买单。若某个元件刚好在这段里没有活跃挂单，就取不到价，
+ *     交给成交事件 / market.json / 静态基准补。
+ *   - 官方实现合约闭源，结构体布局是实测反推的；官方升级合约可能失效，
+ *     解码函数带合理性校验，解出垃圾价就当没读到（不会显示错误数字）。
  *
  * ── CORS ──
  * market.json 直连 tapeout.net 会被 CORS 拦，走 /tt-api 反代（见 vite.config.js）。
@@ -37,41 +45,173 @@
 
 import { TRANSISTORS } from "./prices.js";
 import { MATERIAL_MARKET_ADDRESS } from "./chain/config.js";
-import { getReadProvider, getLogsWithFailover } from "./chain/client.js";
+import {
+  callBatchWithFailover,
+  getLogsWithFailover,
+  withReadProvider,
+} from "./chain/client.js";
 
 /** 官方市场快照（兜底来源，经 Vite 代理转发，绕开 tapeout.net 不发 CORS 头的问题） */
 export const OFFICIAL_MARKET_URL = "/tt-api/market.json";
 
-/**
- * 链上成交事件的 topic0（反推，官方实现合约未开源）。
- * 仅这个事件带「元件合约地址 + tokenId + 单价」，是取本项目市价的正确来源；
- * 市场上另外两个 topic0（自增 ID + 价格的全局事件等）不含元件信息，忽略。
- */
+/** 链上成交事件的 topic0（反推，官方实现合约未开源）。 */
 const TRADE_TOPIC = "0xcc402b0b2e84e03a81c9a55a11a5a69d5384a8d29c888c6867ecbc8c9ecd51c8";
 
 /**
- * 单个日志窗口的块跨度。
+ * 成交事件的回看跨度。
  *
- * nodereal 免费档实测上限是「跨度 ≤ 50000」（50001 就报
- * "exceed maximum block range"），取 20000 留足余量，单次请求实测 0.34s。
- * publicnode 对大窗口报 "Archive requests require a personal token"，
- * 由 getLogsWithFailover 轮换到能用大窗口的节点，不在这里硬编码节点。
+ * 只用在「挂单没凑齐」的补位上。以前它是主源，为了找稀疏成交要翻 8 × 20k ≈
+ * 16 万块 —— 而公共节点里只有 nodereal 允许这种跨度，量大就限流。现在主源是
+ * 挂单状态（不扫日志），这里只保留单窗口。nodereal 免费档跨度上限 50000。
  */
 const ONCHAIN_LOG_SPAN = 20_000;
 
+/** 买单扫描：每批读多少笔、最多读几批（2 × 60 = 120 笔）。 */
+const BID_BATCH = 60;
+const BID_ROUNDS = 2;
+
+const NEXT_BID_ID_SELECTOR = "0xdc269049"; // nextBidId()
+const BIDS_SELECTOR = "0x4423c5f1"; // bids(uint256)
+
+/** 价格合理性上限（100 万 BNB）：超过说明结构体布局变了，解出来的不是价格。 */
+const MAX_PLAUSIBLE_WEI = 10n ** 24n;
+
 /**
- * 最多回看多少个窗口（8 × 20k ≈ 16 万块 ≈ 5.5 天）。
+ * 解码一笔买单的原始返回。
  *
- * 为什么必须翻页：官方市场的成交很稀疏 —— 实测最近 2000 / 5000 块**一条都没有**，
- * 要到 20000 块窗口才有 32 条。以前只查 [5000, 2000] 两个窗口，主源恒为空，
- * 市价只能靠 market.json 兜底；生产一旦没配 /tt-api 反代（404），就直接报
- * 「官方市价读取失败」。也就是说那个报错的根因不是反代，是主源窗口太小。
+ * 官方市场返回六个独立 word，与 ABI 里声明的打包形态不同（官方 price 是
+ * uint256，不参与打包），所以这里手工解码，不走 ethers 的 ABI 解码。
+ *
+ * @returns {{ parts: string, tokenId: number, price: bigint, remaining: number }|null}
  */
-const ONCHAIN_LOG_WINDOWS = 8;
+function decodeBid(raw) {
+  const hex = typeof raw === "string" && raw.startsWith("0x") ? raw.slice(2) : "";
+  if (hex.length < 64 * 4) return null; // 至少 4 个字
+  const words = hex.length / 64;
+  const w = (i) => BigInt("0x" + hex.slice(i * 64, (i + 1) * 64));
+  const parts = "0x" + hex.slice(88, 128).toLowerCase(); // word1 的低 20 字节
+
+  let price;
+  let tokenId;
+  let remaining;
+  if (words >= 6) {
+    // 官方市场（主网）：price / tokenId / feeBps / remaining 各占一个 word
+    price = w(2);
+    tokenId = Number(w(3));
+    remaining = w(5);
+  } else {
+    // Mock 市场（测试网）：price(96) | tokenId(8) | feeBps(16) 打包在 word2
+    const packed = w(2);
+    price = packed >> 160n;
+    tokenId = Number((packed >> 152n) & 0xffn);
+    remaining = w(3);
+  }
+
+  // 布局万一变了就解出垃圾（比如把地址当价格）。宁可「读不到」也不能显示错价。
+  if (!(price > 0n) || price > MAX_PLAUSIBLE_WEI) return null;
+  if (!(remaining > 0n)) return null; // 已成交完的挂单不代表当前市价
+  if (!Number.isInteger(tokenId) || tokenId > 3) return null;
+  return { parts, tokenId, price, remaining: Number(remaining) };
+}
+
+/**
+ * 主源：读官方市场最近若干笔买单，取本项目每种元件的「最高未成交买价」。
+ *
+ * 官方市场只有买单侧（`nextAskId()` 直接 revert），本项目 Owner 是卖方，要卖
+ * 就得吃别人的买单 —— 所以真正相关的价是**当前最高出价**，不是稀疏的历史成交价。
+ *
+ * 全程 eth_call（读最新状态，不需要 archive 数据，任何公共节点都能答），
+ * 一次 eth_getLogs 都不发。实测最近 60 笔即可覆盖四种官方元件。
+ *
+ * 返回形状与 parseOfficialMarket 一致，下游 officialQuote 无需改动。
+ */
+async function fetchOnChainBids() {
+  const market = MATERIAL_MARKET_ADDRESS;
+  if (!market || !/^0x[0-9a-fA-F]{40}$/.test(market)) {
+    return { prices: {}, error: "未配置官方市场地址" };
+  }
+
+  let nextId;
+  let latest = 0;
+  try {
+    const got = await withReadProvider(async (provider) => ({
+      raw: await provider.call({ to: market, data: NEXT_BID_ID_SELECTOR }),
+      height: await provider.getBlockNumber(),
+    }));
+    nextId = Number(BigInt(got.raw));
+    latest = got.height;
+  } catch {
+    return { prices: {}, error: "市场订单总数读取失败" };
+  }
+  if (!Number.isFinite(nextId) || nextId <= 0) {
+    return { prices: {}, error: "市场订单总数异常" };
+  }
+
+  const best = new Map(); // 元件 id → { bid, bidQty }
+  let scanned = 0;
+  let roundsDone = 0;
+
+  for (let round = 0; round < BID_ROUNDS; round++) {
+    const ids = [];
+    for (let k = 0; k < BID_BATCH; k++) {
+      const id = nextId - 1 - scanned - k;
+      if (id < 0) break;
+      ids.push(id);
+    }
+    if (!ids.length) break;
+
+    let raws;
+    try {
+      raws = await callBatchWithFailover(
+        ids.map((id) => ({
+          to: market,
+          data: BIDS_SELECTOR + id.toString(16).padStart(64, "0"),
+        })),
+      );
+    } catch {
+      // 第一批就全挂 = 节点都读不了；之后的批失败则沿用已拿到的部分
+      if (!roundsDone) return { prices: {}, error: "所有 RPC 节点都无法读取市场挂单" };
+      break;
+    }
+    roundsDone += 1;
+    scanned += ids.length;
+
+    for (const raw of raws) {
+      const bid = decodeBid(raw);
+      if (!bid) continue;
+      const id = OFFICIAL_KEY_MAP.get(`${bid.parts}-${bid.tokenId}`);
+      if (!id) continue; // 不是本项目的官方元件
+      const price = Number(bid.price) / 1e18;
+      if (!(price > 0)) continue;
+      const row = best.get(id);
+      if (!row) {
+        best.set(id, { bid: price, bidQty: bid.remaining });
+      } else {
+        if (price > row.bid) row.bid = price;
+        row.bidQty += bid.remaining;
+      }
+    }
+    if (best.size >= OFFICIAL_KEY_MAP.size) break;
+  }
+
+  if (!best.size) {
+    return {
+      prices: {},
+      lastBlock: latest,
+      error: `回看最近 ${scanned} 笔买单，无本项目元件的活跃挂单`,
+    };
+  }
+
+  const prices = {};
+  for (const [id, row] of best) {
+    prices[id] = { bid: row.bid, last: null, bidQty: row.bidQty, lastTs: 0 };
+  }
+  return { prices, generatedAt: "onchain", lastBlock: latest, scanned };
+}
 
 /**
  * 把一批成交日志里的单价归位到元件 id（同元件取区块最高的那笔 = 最近成交）。
- * 只写链上成交价，bid 恒为 null —— 买价 market.json 才有。
+ * 只写链上成交价，bid 恒为 null —— 买价由 fetchOnChainBids 从挂单读。
  */
 function collectTradePrices(prices, logs) {
   for (const log of logs) {
@@ -101,56 +241,40 @@ function collectTradePrices(prices, logs) {
 }
 
 /**
- * 主源：读链上官方市场的最新成交事件，取本项目四种元件（处理器 × NAND/LATCH）的成交价。
+ * 补位源：扫最近一个窗口的成交事件，给挂单没覆盖到的元件补「最近成交价」。
  *
- * 返回形状与 parseOfficialMarket 一致：{ prices: { id: { bid, last, bidQty, lastTs } }, ... }，
- * 这样下游 officialQuote 无需改动即可消费。成交事件只有成交价，故 bid 恒为 null。
- *
- * 取不到（窗口内无成交 / 所有节点都读不到 / 非主网市场）时返回 { prices: {} }，交由调用方回退。
+ * 只在挂单没收齐时才跑。成交极稀疏（实测 2000 / 5000 块窗口一条都没有），
+ * 为此翻十几万块不值当；主源已经是挂单状态，这里只做一次单窗口尝试。
  */
-async function fetchOnChainPrices() {
+async function fetchOnChainTrades() {
   const market = MATERIAL_MARKET_ADDRESS;
   if (!market || !/^0x[0-9a-fA-F]{40}$/.test(market)) return { prices: {}, error: "未配置官方市场地址" };
 
   let latest;
   try {
-    latest = await getReadProvider().getBlockNumber();
+    latest = await withReadProvider((provider) => provider.getBlockNumber());
   } catch {
     return { prices: {}, error: "链上最新区块读取失败" };
   }
 
-  const prices = {};
-  let windowsRead = 0;
-  for (let w = 0; w < ONCHAIN_LOG_WINDOWS; w++) {
-    const toBlock = Math.max(0, latest - w * ONCHAIN_LOG_SPAN);
-    const fromBlock = Math.max(0, toBlock - ONCHAIN_LOG_SPAN + 1);
-    let logs;
-    try {
-      // 必须走 failover：单节点拿到 publicnode 时大窗口直接 403，
-      // 而「读不到」和「没有成交」在这里都表现为空，单节点无法区分。
-      logs = await getLogsWithFailover({
-        address: market,
-        topics: [TRADE_TOPIC],
-        fromBlock,
-        toBlock,
-      });
-      windowsRead += 1;
-    } catch {
-      break; // 所有节点都读不了这个窗口，往旧翻也一样
-    }
-    if (logs.length) collectTradePrices(prices, logs);
-    // 四种官方元件（TapeOut / Behemoth × NAND / LATCH）都拿到价就收工
-    if (Object.keys(prices).length >= 4) break;
-    if (fromBlock === 0) break;
+  let logs;
+  try {
+    // 必须走 failover：单节点拿到 publicnode 时大窗口直接 403，
+    // 而「读不到」和「没有成交」在这里都表现为空，单节点无法区分。
+    logs = await getLogsWithFailover({
+      address: market,
+      topics: [TRADE_TOPIC],
+      fromBlock: Math.max(0, latest - ONCHAIN_LOG_SPAN + 1),
+      toBlock: latest,
+    });
+  } catch {
+    return { prices: {}, error: "所有 RPC 节点都无法读取市场成交日志" };
   }
 
+  const prices = {};
+  if (logs.length) collectTradePrices(prices, logs);
   if (!Object.keys(prices).length) {
-    return {
-      prices: {},
-      error: windowsRead === 0
-        ? "所有 RPC 节点都无法读取市场成交日志"
-        : `回看 ${windowsRead * ONCHAIN_LOG_SPAN} 块内无官方市场成交`,
-    };
+    return { prices: {}, error: `回看 ${ONCHAIN_LOG_SPAN} 块内无官方市场成交` };
   }
   return { prices, generatedAt: "onchain", lastBlock: latest };
 }
@@ -245,19 +369,42 @@ export async function fetchOfficialPrices({ force = false } = {}) {
     let marketJsonError = null;
     let onchainError = null;
 
-    // ① 主源：链上官方市场最新成交事件（按元件逐个优先）
+    // ① 主源：链上活跃买单（纯 eth_call，不扫日志）
     try {
-      const onchain = await fetchOnChainPrices();
-      if (onchain?.prices && Object.keys(onchain.prices).length) {
-        Object.assign(prices, onchain.prices);
-        sources.push("onchain:officialMarket");
-        lastBlock = onchain.lastBlock || lastBlock;
+      const bids = await fetchOnChainBids();
+      if (bids?.prices && Object.keys(bids.prices).length) {
+        Object.assign(prices, bids.prices);
+        sources.push("onchain:openBids");
+        lastBlock = bids.lastBlock || lastBlock;
         generatedAt = "onchain";
       } else {
-        onchainError = onchain?.error || "链上无成交价";
+        onchainError = bids?.error || "链上无活跃挂单";
       }
     } catch (e) {
       onchainError = e?.message || "链上读取异常";
+    }
+
+    // ② 补位：挂单没凑齐的元件，扫一个窗口的成交事件补「最近成交价」。
+    //    常态下挂单就能凑齐，这一步不跑，也就不会去翻几万块日志。
+    if (Object.keys(prices).length < OFFICIAL_KEY_MAP.size) {
+      try {
+        const trades = await fetchOnChainTrades();
+        let added = 0;
+        for (const [id, row] of Object.entries(trades.prices || {})) {
+          const cur = prices[id];
+          if (!cur) {
+            prices[id] = row;
+            added += 1;
+          } else if (cur.last == null && row.last != null) {
+            cur.last = row.last;
+            cur.lastTs = row.lastTs;
+            added += 1;
+          }
+        }
+        if (added) sources.push("onchain:trades");
+      } catch {
+        /* 补位失败不致命 */
+      }
     }
 
     // ② 兜底：官方 market.json（同源反代 /tt-api）。只补链上没覆盖到的元件，
@@ -297,7 +444,7 @@ export async function fetchOfficialPrices({ force = false } = {}) {
       lastBlock,
       // 只要任一来源给出价，就不报错误（链上部分覆盖也够用）；全空才报错。
       // 全空时把两个来源各自的失败原因都带上 —— 只报兜底的 404 会让人以为
-      // 装个反代就好了，实际主因常常是链上没读到（见 ONCHAIN_LOG_WINDOWS）。
+      // 装个反代就好了，实际主因常常是链上没读到（见 fetchOnChainBids）。
       source: sources.join(" + ") || "none",
       fetchedAt: now,
       error: ok

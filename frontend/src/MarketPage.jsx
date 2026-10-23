@@ -128,7 +128,8 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
           </div>
         </div>
         <p className="round-hero-lead">
-          两个官方处理器的元件在同一个二级市场里买卖，下面是各自最近一笔成交价（BNB / 颗）。
+          两个官方处理器的元件在同一个二级市场里买卖，下面是各自的最新市价（BNB / 颗）：
+          有成交时取最近一笔成交价，暂无成交时取当前最高未成交买价。
           每一期只锁定其中一套元件合约，开期时写入、不可更换。
         </p>
       </header>

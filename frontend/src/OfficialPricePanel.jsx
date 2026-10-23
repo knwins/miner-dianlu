@@ -1,11 +1,12 @@
 /**
  * 官方处理器 · 元件市价面板。
  *
- * 展示 TapeOut / Behemoth 各自的 NAND 与 LATCH 最新成交价（BNB/颗），
- * 数据优先读链上官方市场成交事件，官方 market.json 作兜底，静态基准再兜底。
+ * 展示 TapeOut / Behemoth 各自的 NAND 与 LATCH 市价（BNB/颗），
+ * 数据优先读链上官方市场的活跃买单，成交事件补位，market.json 兜底，静态基准再兜底。
  *
  * 口径说明（面板里也写清楚了，避免被当成链上结算价）：
- *   - 成交价 = 最近一笔链上成交单价，由官方市场成交事件读出。
+ *   - 市价优先取最近一笔链上成交单价；官方市场成交很稀疏，没有成交时取
+ *     当前最高的未成交买价（读 `bids(id)` 得到，见 officialPrices.js）。
  *   - 这不是**本期**的挂单价；本期真实成本以链上 Campaign 记录为准。
  *
  * ── 两种形态 ──
@@ -144,7 +145,9 @@ export function OfficialPricePanel({
                   {g.desc ? <p className="price-board-desc">{g.desc}</p> : null}
                   <div className="price-board-prices">
                     {g.items.map(({ model, row }) => {
-                      const price = row?.last != null ? row.last : null;
+                      // 成交价优先，没有成交时退回「当前最高未成交买价」——
+                      // 官方市场成交很稀疏，常态下挂单才是稳定的价源。
+                      const price = row?.last != null ? row.last : row?.bid != null ? row.bid : null;
                       return (
                         <div className="price-cell" key={model.id}>
                           {/*
@@ -159,7 +162,11 @@ export function OfficialPricePanel({
                             {price != null ? formatPrice(price) : "—"}
                           </strong>
                           <span className="price-cell-unit">
-                            {price != null ? "BNB / 颗" : "暂无成交"}
+                            {/*
+                              有价时只写单位：这一格可能是成交价也可能是买价，
+                              逐格标来源会把卡片撑散，来源统一写在下方 .fine 里。
+                            */}
+                            {price != null ? "BNB / 颗" : "暂无报价"}
                           </span>
                         </div>
                       );
@@ -184,7 +191,11 @@ export function OfficialPricePanel({
                   <thead>
                     <tr>
                       <th>元件</th>
-                      <th>成交价</th>
+                      {/*
+                        列头不写「成交价」：这一列优先取最近成交价，没有成交时取
+                        当前最高买价，写死「成交价」会与实际口径不符。
+                      */}
+                      <th>市价</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -194,7 +205,11 @@ export function OfficialPricePanel({
                           <strong>{model.part}</strong>
                         </td>
                         <td className="mono" style={{ fontWeight: 600 }}>
-                          {row?.last != null ? formatPrice(row.last) : "—"}
+                          {row?.last != null
+                            ? formatPrice(row.last)
+                            : row?.bid != null
+                              ? formatPrice(row.bid)
+                              : "—"}
                         </td>
                       </tr>
                     ))}
@@ -211,7 +226,7 @@ export function OfficialPricePanel({
           末行只剩「考。」两个字挂在下面，像排版事故。
         */}
         <p className="fine">
-          成交价 = 最近一笔链上成交单价（BNB/颗），由官方市场成交事件读出。
+          市价 = 最近一笔链上成交单价（BNB/颗），无成交时取当前最高未成交买价。
           {block ? ` 区块 ${block.toLocaleString("zh-CN")}。` : ""}
         </p>
         {full && (

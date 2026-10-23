@@ -404,7 +404,8 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | `eth_getLogs` | 单窗口上限约 5 万块（10 万被拒），需分页；公共 RPC 普遍 403/限流 → 核对 ABI 只能用 `eth_call` |
 | 行情 | `api.gateio.ws/api/v4/spot/tickers?currency_pair=BNB_USDT` 可直连；binance/mexc/coinbase 空响应，coinex 503 |
 | ethers v6 | **`batchMaxCount` 必须压到 3** —— 默认把同 tick 调用打成 ≤100 的批量数组，drpc 免费档只收 ≤3 → 整批 500 |
-| 官方市价 | 只来自 `https://tapeout.net/market.json`（经 vite 代理 `/tt-api`）。**只有买单侧**：买价 = 最高出价，成交价 = 最近成交单价，**都不是本期挂单价** |
+| 官方市价 | **主源是链上官方市场的活跃买单**（`nextBidId()` + `bids(id)`，纯 `eth_call`，不扫日志；实测最近 60 笔即覆盖全部 4 个元件）。成交事件只作补位（挂单没凑齐时扫一个 20000 块窗口），`tapeout.net/market.json`（经 vite 代理 `/tt-api`）再兜底。**只有买单侧**：买价 = 最高出价，成交价 = 最近成交单价，**都不是本期挂单价** |
+| 官方市场 `bids(uint256)` | 返回**六个独立 word**：`buyer / transistors / price / tokenId / feeBps / remaining`（2026-10-23 实测）。与 ABI 里声明的打包形态（`uint96 price` 参与打包）不同，前端是手工解码；`nextAskId()` 直接 revert（没有卖单侧） |
 
 ---
 
@@ -412,7 +413,7 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 
 1. **服务费 = 挖矿产出奖励的服务费**。`MAX_SERVICE_FEE_BPS = 1000` 约束的是「最多从挖矿产出抽走 10%」。**认筹款不收任何服务费** —— `subscribe` 付的 BNB 全额进 `raisedBnb`，链上不存在从认购款抽服务费的路径。UI 术语统一「**挖矿产出服务费**」（链上函数名 `setServiceFee`/`serviceFeeBps`/`claimFee` 不动，改名破 ABI）。
 2. **`setPlan(uint256 estHashpower)` 只写算力，不写元件数**。链上元件数权威来源 = `nandQty + latchQty`（材料市场实买成交）。元件数由募资总额反推，**不是发布参数**。
-3. 官方市价只来自 `tapeout.net/market.json`，**只有买单侧**，且都不是本期挂单价。
+3. 官方市价主源是**链上官方市场的活跃买单**，不是 `tapeout.net/market.json`（那个只是兜底）。**只有买单侧**，且都不是本期挂单价。
 4. `harvest()` / `claim()` 是占位空实现。**矿池分配合约接入前，UI 不得宣称「投矿池即见收益」**。
 5. 官方市场**没有卖单簿** → `placeTransistorAsk` / `cancelTransistorAsk` / `confirmSale` 在主网必然 revert。
 6. **退款绝不减少 `sold`**。owner 执行闸门只看 `sold`，退款只减 `outstandingShares`。

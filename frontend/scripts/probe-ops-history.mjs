@@ -61,7 +61,15 @@ for (let i = 0; i < 40; i++) {
 console.log("首条记录耗时:", firstMs == null ? "超时" : `${(firstMs / 1000).toFixed(1)}s`);
 const panelText = await page.locator(".trade-panel").first().innerText().catch(() => "");
 console.log("\n=== 历史交易记录 ===\n" + panelText);
-console.log("\n事件条目数:", feed.length);
+// 折叠标题「链上事件 · 最近 N 条」里的 N 是**截断前**的总条数。
+// 只有 N > 3 才该出现「仅显示最近 3 条」；只看已渲染的 feed.length 判断不了
+// 「正好 3 条」和「从更多条截断到 3 条」，会把没截断的情况误判成缺提示。
+// 总条数写在 .trade-log 的 <summary> 里，不在 .trade-panel 的 innerText 范围内。
+// details 折叠时 summary 仍可见，但保险起见从整个弹窗文本里找。
+const sheetText = await page.locator(".sheet").first().innerText().catch(() => "");
+const totalMatch = /链上事件 · 最近\s*(\d+)\s*条/.exec(sheetText);
+const total = totalMatch ? Number(totalMatch[1]) : null;
+console.log("事件条目数:", feed.length, "链上事件总数:", total);
 console.log(feed.slice(0, 6).map((t, i) => `  ${i + 1}. ${t.replace(/\n/g, " | ")}`).join("\n"));
 
 // 挂买单：默认数量 + 市价列
@@ -79,7 +87,11 @@ const checks = [
   ["弹窗打开", Boolean(sheetOk)],
   ["历史记录来自链上事件（有条目）", feed.length > 0],
   ["只显示最近 3 条", feed.length > 0 && feed.length <= 3],
-  ["截断时提示「仅显示最近 3 条」", feed.length === 0 || feed.length < 3 || /仅显示最近 3 条/.test(panelText)],
+  [
+    "截断提示与总条数一致",
+    total == null
+      || (total > 3 ? /仅显示最近 3 条/.test(panelText) : !/仅显示最近 3 条/.test(panelText)),
+  ],
   ["不再出现「这版市场合约没有事件」", !/这版市场合约没有事件|按订单状态推算/.test(panelText)],
   ["有成交/挂单事件文案", /挂买单|买单 #|成交/.test(feed.join(" "))],
   ["数量默认 1", !hasForm || (qtyVals.length > 0 && qtyVals.every((v) => v === "1"))],

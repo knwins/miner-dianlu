@@ -150,6 +150,59 @@ export async function getLogsWithFailover(query) {
   throw lastErr;
 }
 
+/**
+ * 批量 eth_call 专用：按节点顺序试，哪个肯收整批就用哪个。
+ *
+ * 与 getLogsWithFailover 同理，但限制正好反过来 —— eth_call 读的是最新状态，
+ * 不需要 archive 数据，几乎所有公共节点都支持；差别只在「一次肯收几个」：
+ * drpc 免费档只收 ≤3（超了 500），publicnode 实测能收 150。所以 makeStaticProvider
+ * 为了兼容 drpc 把批量压到 3，而批量读几十个挂单时那会变成几十个 HTTP 请求。
+ * 这里单独用 8 个一批（保守值，三个主网节点都收得下），按节点顺序试。
+ */
+let _batchProvider = null;
+let _batchProviderIndex = 0;
+const BATCH_MAX = 8;
+
+function makeBatchProvider(url) {
+  const network = Network.from(CHAIN_ID);
+  const request = new FetchRequest(url);
+  request.timeout = 12_000;
+  return new JsonRpcProvider(request, network, {
+    staticNetwork: network,
+    batchMaxCount: BATCH_MAX,
+  });
+}
+
+/**
+ * @param {{to: string, data: string}[]} calls
+ * @returns {Promise<string[]>} 与 calls 同序的原始返回（0x 开头的 hex）
+ */
+export async function callBatchWithFailover(calls) {
+  const urls = NETWORK.rpcUrls;
+  if (!calls.length) return [];
+  let lastErr;
+  for (let i = 0; i < urls.length; i++) {
+    const index = (_batchProviderIndex + i) % urls.length;
+    const provider =
+      index === _batchProviderIndex && _batchProvider
+        ? _batchProvider
+        : makeBatchProvider(urls[index]);
+    try {
+      const out = await withTimeout(
+        Promise.all(calls.map((c) => provider.call(c))),
+        15_000,
+        "batchCall",
+      );
+      _batchProvider = provider;
+      _batchProviderIndex = index;
+      return out;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 async function injectedChoices() {  const choices = await discoverWallets();
   return choices.filter((item) => item.kind === "injected");
 }
