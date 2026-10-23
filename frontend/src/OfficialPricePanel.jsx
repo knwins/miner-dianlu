@@ -1,13 +1,12 @@
 /**
  * 官方处理器 · 元件市价面板。
  *
- * 展示 TapeOut / Behemoth 各自的 NAND 与 LATCH 最新价，
- * 数据来自 tapeout.net 发布的官方市场快照（market.json）。
+ * 展示 TapeOut / Behemoth 各自的 NAND 与 LATCH 最新成交价（BNB/颗），
+ * 数据优先读链上官方市场成交事件，官方 market.json 作兜底，静态基准再兜底。
  *
  * 口径说明（面板里也写清楚了，避免被当成链上结算价）：
- *   - 买价 = 未成交买单里的最高出价（市场当前愿意付的价）
- *   - 成交价 = 最近一笔已成交单价
- *   - 两者都不是**本期**的挂单价；本期真实成本以链上 Campaign 记录为准。
+ *   - 成交价 = 最近一笔链上成交单价，由官方市场成交事件读出。
+ *   - 这不是**本期**的挂单价；本期真实成本以链上 Campaign 记录为准。
  *
  * ── 为什么只有一个模块 ──
  * 材料市场页原先有两个卡片：①「官方元件最新价」②「官方处理器对照」。
@@ -45,7 +44,6 @@ function formatPrice(v) {
  * @param {object} props.official   fetchOfficialPrices 的返回值
  * @param {string} props.processorId 当前期次的处理器（TapeOut / Behemoth），可空
  * @param {boolean} [props.compact] 紧凑模式（只显示当前处理器那一组）
- * @param {boolean} [props.dense]   紧凑模式下的省列模式（省掉「买量」列）
  * @param {boolean} [props.full]    完整对照模式：全部处理器 + tokenId 列 + 处理器简介
  * @param {string} [props.title]    卡片标题
  * @param {React.ReactNode} [props.badge] 卡片标题右侧的附加标记
@@ -57,7 +55,6 @@ export function OfficialPricePanel({
   official,
   processorId = null,
   compact = false,
-  dense = false,
   full = false,
   title = "官方元件最新价",
   badge = null,
@@ -131,9 +128,7 @@ export function OfficialPricePanel({
                   <tr>
                     <th>元件</th>
                     {full && <th>tokenId</th>}
-                    <th>买价</th>
                     <th>成交价</th>
-                    {!dense && <th>买量</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -141,13 +136,9 @@ export function OfficialPricePanel({
                     <tr key={model.id}>
                       <td><strong>{model.part}</strong></td>
                       {full && <td className="mono">{model.tokenId}</td>}
-                      <td className="mono">{formatPrice(row?.bid)}</td>
-                      <td className="mono">{formatPrice(row?.last)}</td>
-                      {!dense && (
-                        <td className="mono">
-                          {row?.bidQty ? row.bidQty.toLocaleString("zh-CN") : "—"}
-                        </td>
-                      )}
+                      <td className="mono" style={{ fontWeight: 600 }}>
+                        {row?.last != null ? formatPrice(row.last) : "—"}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -157,13 +148,11 @@ export function OfficialPricePanel({
           ))}
         </div>
         <p className="fine">
-          买价 = 官方市场未成交买单最高出价（BNB/颗）；成交价 = 最近一笔成交单价。
+          成交价 = 最近一笔链上成交单价（BNB/颗），由官方市场成交事件读出。
           {genText ? ` 快照时间 ${genText}` : ""}
           {official?.lastBlock ? ` · 区块 ${official.lastBlock.toLocaleString("zh-CN")}` : ""}
         </p>
-        {!dense && (
-          <p className="fine">本期实际成交价以链上 Campaign 挂单/成交记录为准，这里只作市价参考。</p>
-        )}
+        <p className="fine">本期实际成本以链上 Campaign 挂单 / 成交记录为准，这里只作市价参考。</p>
       </div>
     </article>
   );

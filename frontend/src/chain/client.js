@@ -512,8 +512,13 @@ async function readStateOn(runner, account, campaignAddr) {
     totalDistributed: 0n, totalFeeCollected: 0n, totalClaimed: 0n,
     totalRefunded, totalPendingSurplus, raisedBnb, netlistHash: null,
     soldOutAt: Number(soldOutAt), executionFailed, priceLock,
-    /** 元件数不是链上参数：由实际下单的 NAND + LATCH 数量现算 */
-    transistorCount: Number(nandQty) + Number(latchQty), capped: false,
+    /**
+     * 元件数 = **已成交到账量**（各腿 挂单量 − 市场 remaining），不是挂单量。
+     * 合约在 placeTransistorOrder 就把 nandQty/latchQty 写成下单量，
+     * 拿它当「已买入」会让「等待成交」的期次显示已买到元件（数据自相矛盾）。
+     * 挂单量本身仍通过 nandQty/latchQty 暴露，供挂单进度展示。
+     */
+    transistorCount: Number(order.nandFilled ?? 0n) + Number(order.latchFilled ?? 0n), capped: false,
     owner, fundingDeadline: Number(fundingDeadline),
     minter: marketAddr, listings,
     ...order,
@@ -828,6 +833,7 @@ async function readMarketOrder(c) {
     nandAskPrice: 0n, latchAskPrice: 0n, askOpen: false,
     nandAskRemaining: null, latchAskRemaining: null,
     partsNand: 0n, partsLatch: 0n, marketAsks: false,
+    nandFilled: 0n, latchFilled: 0n,
   };
   try {
     const [nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled] = await Promise.all([
@@ -840,9 +846,27 @@ async function readMarketOrder(c) {
       readLegRemaining(c.runner, marketAddr, latchBidId, latchQty),
     ]);
     const asks = await readMarketAsk(c, marketAddr, transistors);
+    /**
+     * 成交到账量 —— 与「挂单量」是两个不同的东西，不能混用。
+     * 合约在 placeTransistorOrder 时就把 nandQty/latchQty 写成**下单量**
+     * （Campaign.sol:669-670），只有撤单 _clearOrder 才清零。
+     * 所以「已经买到几颗」必须用市场剩余量反推：
+     *   filled = 挂单量 − bids(id).remaining
+     * 挂单还在等成交时 remaining == qty → filled = 0。
+     * 撤单后 bid id 归零、qty 也被清，此时手里还留着的元件（余额）就是当初成交到的量。
+     */
+    const filledOf = (qty, remaining, bidId, held) => {
+      if (bidId !== 0n) {
+        const rem = remaining == null ? qty : remaining;
+        return qty > rem ? qty - rem : 0n;
+      }
+      return held || 0n;
+    };
+    const nandFilled = filledOf(nandQty, nandRemaining, nandBidId, asks.partsNand);
+    const latchFilled = filledOf(latchQty, latchRemaining, latchBidId, asks.partsLatch);
     return {
       nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled,
-      marketOrders: true, nandRemaining, latchRemaining, ...asks,
+      marketOrders: true, nandRemaining, latchRemaining, nandFilled, latchFilled, ...asks,
     };
   } catch {
     return empty;
@@ -1861,7 +1885,6 @@ export async function readCampaignSummary(address) {
 
 async function readCampaignSummaryOn(runner, address) {
   const c = campaignContract(runner, address);
-  // 元件数权威来源 = nandQty + latchQty（成交到账的元件数）。
   // 合约**没有** transistorCount() 这个 getter——之前这里调它，
   // 整行 Promise.all 直接 reject，历史期次列表全军覆没（还被 useChain 的 catch
   // 兜底成「—」，页面不报错但数据全假）。
@@ -1875,15 +1898,32 @@ async function readCampaignSummaryOn(runner, address) {
     c.raisedBnb().then((v) => Number(formatEther(v))).catch(() => 0),
     c.transistors().catch(() => "0x0000000000000000000000000000000000000000"),
   ]);
-  const nandQty = await c.nandQty().then(Number).catch(() => 0);
-  const latchQty = await c.latchQty().then(Number).catch(() => 0);
-  const transistorCount = nandQty + latchQty;
+  const [nandQtyBn, latchQtyBn, nandBidId, latchBidId, marketAddr] = await Promise.all([
+    c.nandQty().catch(() => 0n),
+    c.latchQty().catch(() => 0n),
+    c.nandBidId().catch(() => 0n),
+    c.latchBidId().catch(() => 0n),
+    readMaterialMarket(c).catch(() => ZeroAddress),
+  ]);
+  const [nandRemaining, latchRemaining] = await Promise.all([
+    readLegRemaining(runner, marketAddr, nandBidId, nandQtyBn).catch(() => null),
+    readLegRemaining(runner, marketAddr, latchBidId, latchQtyBn).catch(() => null),
+  ]);
+  /**
+   * 元件数 = 已成交到账量（挂单量 − 市场剩余），不是挂单量。
+   * 挂单未成交时 remaining == qty → 0；撤单后 ids/qty 归零，也就没有在途采购。
+   * 拿 nandQty + latchQty 当「已买入」会让等待成交的期次显示已买到元件。
+   */
+  const filledOf = (qty, remaining) => (remaining == null ? 0 : Math.max(0, Number(qty) - Number(remaining)));
+  const transistorCount = filledOf(nandQtyBn, nandRemaining) + filledOf(latchQtyBn, latchRemaining);
   // 结束状态不在 scene 里：执行失败与募集到期必须靠这几项判断。旧期次缺 getter 时按未结束处理。
-  const [phase, executionFailed, fundingDeadline, totalRefunded] = await Promise.all([
+  const [phase, executionFailed, fundingDeadline, totalRefunded, outstandingShares] = await Promise.all([
     c.phase().then(Number).catch(() => 0),
     c.executionFailed().then(Boolean).catch(() => false),
     c.fundingDeadline().then(Number).catch(() => 0),
     c.totalRefunded().then((v) => Number(formatEther(v))).catch(() => 0),
+    // 已售未退（当前债务）。退款后变小，sold 不会 —— 判断「是否已全部退回」只能用它。
+    c.outstandingShares().then(Number).catch(() => null),
   ]);
   return {
     address,
@@ -1892,6 +1932,7 @@ async function readCampaignSummaryOn(runner, address) {
     executionFailed,
     fundingDeadline,
     totalRefunded,
+    outstandingShares,
     sold: Number(sold),
     totalShares: Number(totalShares),
     sharePriceBnb: Number(sharePriceBnb),

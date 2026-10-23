@@ -168,7 +168,13 @@ export function bookFromState(state, account, extra = {}) {
     owner: state.owner,
     selfAddress: account,
     totalShares: Number(state.totalShares),
+    /**
+     * 已成交到账的元件数（各腿 挂单量 − 市场 remaining）。
+     * 注意不是挂单量：nandQty/latchQty 是「下单要买多少」，成交前不等于已买到。
+     */
     transistorCount: Number(state.transistorCount),
+    nandFilled: Number(state.nandFilled ?? 0),
+    latchFilled: Number(state.latchFilled ?? 0),
     estHashpower: Number(state.estHashpower),
     priceLock: bem(state.priceLock),
     marketOrders: Boolean(state.marketOrders),
@@ -307,6 +313,15 @@ export function historyRowFromSummary(summary, index) {
     shares: `${summary.sold}/${summary.totalShares}`,
     sold: summary.sold,
     totalShares: summary.totalShares,
+    /**
+     * 生命周期位：下拉/列表的「成交状态」判定要用 scene（+phase）。
+     * 之前这里只给 status 文案，dealStatus 拿不到 scene 就一律兜底成「—」，
+     * 期次下拉里每期都显示「● —」，像数据丢了。
+     */
+    scene: Number(summary.scene) || 0,
+    phase: Number(summary.phase) || 0,
+    /** 已售未退（当前债务）：退款会让它变小，sold 不会 */
+    outstandingShares: Number(summary.outstandingShares ?? summary.sold) || 0,
     sharePriceBnb: summary.sharePriceBnb,
     hardCapBnb: summary.sharePriceBnb * summary.totalShares,
     raisedBnb: summary.raisedBnb,

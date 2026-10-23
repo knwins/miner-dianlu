@@ -24,6 +24,18 @@ function tradeStatusOf(side, qty, remaining, owed) {
   return "filled";
 }
 
+/** 挂单成交状态：用于「元件数」项（挂出 / 成交两列）的视觉区分。
+ *  - wait     等待成交（挂单中 / 部分成交，仍未全部吃完）
+ *  - done     已成交（全部成交 / 待结算）
+ *  - partial  部分成交（仍属等待成交，但已吃了一部分）
+ *  - cancel   已撤回（既非等待也非成交） */
+function legTradeState(leg) {
+  if (leg.status === "cancelled") return "cancel";
+  if (leg.status === "filled" || leg.status === "settled") return "done";
+  if (leg.status === "partial") return "partial";
+  return "wait";
+}
+
 /** 紧凑时间：10-19 23:12。列表窄，只保留月日与时分。 */
 function formatStamp(ts) {
   if (!ts) return "";
@@ -214,8 +226,14 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
                   <td>{leg.part}</td>
                   <td className="mono">#{leg.orderId}</td>
                   <td>{round4(leg.price)} BNB</td>
-                  <td>{leg.orderQty == null ? "—" : `${leg.orderQty} 颗`}</td>
-                  <td>{leg.filled == null ? "—" : `${leg.filled} 颗`}</td>
+                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="挂出元件数">
+                    <span className="qty-dot" aria-hidden="true" />
+                    {leg.orderQty == null ? "—" : `${leg.orderQty} 颗`}
+                  </td>
+                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="成交元件数">
+                    <span className="qty-dot" aria-hidden="true" />
+                    {leg.filled == null ? "—" : `${leg.filled} 颗`}
+                  </td>
                   <td>{leg.amount == null ? "—" : `${round4(leg.amount)} BNB`}</td>
                   <td
                     className="trade-time"

@@ -1077,7 +1077,10 @@ export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) 
       ...book,
       executionFailed: false,
       executePhase: "listed",
-      transistorCount: count,
+      // 挂单量 ≠ 已买入量：挂出去只是下单，成交到账前晶体管数仍是 0。
+      nandQty: nand,
+      latchQty: latch,
+      transistorCount: 0,
       priceLock: round4(unit),
     },
   };
@@ -1198,7 +1201,12 @@ export function applyConfirmTransistors(round, book, actor = null) {
   return {
     ok: true,
     message: "已确认 tapeout.net 晶体管成交并到账，解锁流片开矿。",
-    book: { ...book, executePhase: "ready" },
+    book: {
+      ...book,
+      executePhase: "ready",
+      // 确认到账后，晶体管数才等于挂单量（成交口径）。
+      transistorCount: (Number(book.nandQty) || 0) + (Number(book.latchQty) || 0),
+    },
   };
 }
 

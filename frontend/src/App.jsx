@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { readCall } from "./Calls.jsx";
+import { dealStatus } from "./dealStatus.js";
 import { OwnerCreate, OwnerOverview } from "./Owner.jsx";
 import { IS_CONFIGURED as CHAIN_CONFIGURED, NETWORK, CHAIN_ID, explorerAddress, sourcifySource } from "./chain/config.js";
 import { useChain } from "./chain/useChain.js";
@@ -1413,6 +1414,7 @@ function PeriodNav({ periods, currentId, onSwitch }) {
         <ul className="period-menu" role="listbox">
           {ordered.map((item) => {
             const on = String(item.id) === String(currentId);
+            const deal = dealStatus(item);
             return (
               <li key={item.address}>
                 <button
@@ -1422,7 +1424,10 @@ function PeriodNav({ periods, currentId, onSwitch }) {
                   className={on ? "is-on" : ""}
                   onClick={() => go(item)}
                 >
-                  第 {item.id} 期
+                  <span>第 {item.id} 期</span>
+                  {deal.key === "none" ? null : (
+                    <span className={`deal-badge deal-badge-sm ${deal.cls}`}>{deal.label}</span>
+                  )}
                 </button>
               </li>
             );
@@ -1433,8 +1438,11 @@ function PeriodNav({ periods, currentId, onSwitch }) {
   );
 }
 
-function RoundTitle({ id, lead, badge, tone, phase, periods, onSwitchPeriod, processor }) {
+function RoundTitle({ id, lead, badge, tone, phase, periods, onSwitchPeriod, processor, deal }) {
   const hasNav = Array.isArray(periods) && periods.length > 0 && onSwitchPeriod;
+  const dealBadge = deal && deal.key !== "none" ? (
+    <span className={`deal-badge ${deal.cls}`} title="众筹认购成交状态">{deal.label}</span>
+  ) : null;
   return (
     <header className="round-hero">
       <div className="round-hero-row">
@@ -1444,6 +1452,7 @@ function RoundTitle({ id, lead, badge, tone, phase, periods, onSwitchPeriod, pro
           </span>
           <h1>BEM众筹挖矿</h1>
           {!hasNav && <span className="round-period">第 {id} 期{phase ? ` · ${phase}` : ""}</span>}
+          {dealBadge}
           <span className={`badge tone-${tone}`}>{badge}</span>
         </div>
         {hasNav ? <PeriodNav periods={periods} currentId={id} onSwitch={onSwitchPeriod} /> : null}
@@ -1467,6 +1476,11 @@ export function outstandingOf(row) {
   const v = row?.outstandingShares;
   return v == null ? Number(row?.sold || 0) : Number(v);
 }
+
+/**
+ * 众筹认购「成交状态」的统一实现见 ./dealStatus.js —— 期次下拉、历史列表、
+ * 资产列表、Owner 卡片共用一份口径，这里只负责引入，不再各写一套。
+ */
 
 /** 生命周期进度条：募集 → 待执行 → 挖矿。全部退款后，待执行改为已结束。 */
 function LifecycleStrip({ scene, phase, ended }) {
@@ -1518,19 +1532,27 @@ function RoundHub({
     { part: "LATCH", qty: Number(book.latchQty) || 0, remaining: book.latchRemaining, price: Number(book.latchPrice) || 0 },
   ].filter((leg) => leg.qty > 0);
   const buyQty = buyLegs.reduce((acc, leg) => acc + leg.qty, 0);
-  const buyFilled = buyLegs.reduce((acc, leg) => acc + Math.max(0, leg.qty - (leg.remaining == null ? 0 : Number(leg.remaining))), 0);
+  /**
+   * 已成交量 = 挂单量 − 市场剩余。
+   * remaining 读不到（RPC 失败）时按「未成交」算，不能按 0 算——
+   * 那会把一笔还在等的挂单显示成全部成交，与市场记录自相矛盾。
+   */
+  const filledOfLeg = (leg) => Math.max(0, leg.qty - (leg.remaining == null ? leg.qty : Number(leg.remaining)));
+  const buyFilled = buyLegs.reduce((acc, leg) => acc + filledOfLeg(leg), 0);
   const sellLegs = [
     { qty: Number(book.nandAskQty) || 0, remaining: book.nandAskRemaining },
     { qty: Number(book.latchAskQty) || 0, remaining: book.latchAskRemaining },
   ].filter((leg) => leg.qty > 0);
   const sellQty = sellLegs.reduce((acc, leg) => acc + leg.qty, 0);
-  const sellFilled = sellLegs.reduce((acc, leg) => acc + Math.max(0, leg.qty - (leg.remaining == null ? 0 : Number(leg.remaining))), 0);
+  const sellFilled = sellLegs.reduce((acc, leg) => acc + filledOfLeg(leg), 0);
   const marketOwed = Number(book.marketOwed) || 0;
   /**
-   * 元件数量有三个不同口径，不能混用：
+   * 元件数量有几个不同口径，不能混用：
+   *  - nandQty / latchQty：**挂单量**（下单要买多少）。合约在 placeTransistorOrder 就写入，
+   *    成交前不代表已买到，不能拿它当「已买入元件」。
    *  - partsOnHand：合约 ERC1155 余额，只在元件还留在本期合约里时大于 0（入池后归 0）。
-   *  - transistorCount：下单量 nandQty + latchQty，成交到账后仍在，可持久展示。
-   *  - buyFilled：买单已成交的量（成交进度）。
+   *  - transistorCount：**已成交到账量**（各腿 挂单量 − 市场 remaining），入池后仍可展示。
+   *  - buyFilled：买单成交进度，与 transistorCount 同口径。
    */
   const partsOnHand = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0);
   const boughtParts = Number(book.transistorCount) || 0;
@@ -1576,6 +1598,7 @@ function RoundHub({
               : "份数已售罄。晶体管到账后即可投入矿池。Owner 也可以直接发起退款，认筹 BNB 会按认筹地址原路退回。"}
             badge={ended ? "已结束" : copy.badge}
             tone={ended ? "done" : copy.tone}
+            deal={dealStatus(book)}
             periods={periods}
             onSwitchPeriod={onSwitchPeriod}
             processor={round.processorId || "未记录"}
@@ -1751,6 +1774,7 @@ function RoundHub({
             lead="元件已投入矿池，本期进入挖矿（不可逆）。BEM 分配合约接入前 harvest / claim 为占位空实现，不产出发放；退出只能走「资产转让」。"
             badge={copy.badge}
             tone={copy.tone}
+            deal={dealStatus(book)}
             periods={periods}
             onSwitchPeriod={onSwitchPeriod}
             processor={round.processorId || "未记录"}
@@ -1960,6 +1984,7 @@ function AssetsHub({
                   const ended = refundSettled(row);
                   const tone = ended ? "done" : row.executionFailed ? "back" : row.scene === "mining" ? "mine" : row.scene === "executing" ? "wait" : "live";
                   const sub = assetSubstatus(row, nowSec);
+                  const deal = dealStatus(row);
                   return (
                     <tr key={row.address || row.id}>
                       <td>第 {row.id} 期</td>
@@ -1967,6 +1992,9 @@ function AssetsHub({
                         <div className={`asset-status tone-${tone}`}>
                           <strong>{ended ? "已结束" : row.sceneLabel}</strong>
                           {sub ? <span>{sub}</span> : null}
+                          {deal.key === "none" ? null : (
+                            <span className={`deal-badge ${deal.cls}`}>{deal.label}</span>
+                          )}
                         </div>
                       </td>
                       <td>{row.totalShares ? `${outstandingOf(row)}/${row.totalShares}` : "—"}</td>
@@ -2144,13 +2172,17 @@ function RoundFacts({ round, book, quote }) {
   const namedProcessor = Boolean(round.processorId);
   const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
   /**
-   * 元件数与算力的权威口径：链上以「实际买入的元件」为准。
-   *  - transistorCount = nandQty + latchQty，是挂单成交到账的元件数（Owner 真的买到的量）。
+   * 元件数与算力的权威口径：链上以「实际成交到账的元件」为准。
+   *  - transistorCount = 各腿（挂单量 − 市场 remaining），成交后才大于 0。
+   *    ⚠️ 不能用 nandQty + latchQty —— 合约在 placeTransistorOrder 时就把这两个
+   *    字段写成**下单量**，成交前拿它当「已买入」会让等待成交的期次显示已买到元件。
    *  - hashpower = estHashpower，是 Owner 用 setPlan 写入的预估算力。
    * 链下演示模式没有链上数据，仍用募资额反推的估算值。
    */
   const onChain = Boolean(book?._chain);
   const chainParts = Number(book?.transistorCount) || 0;
+  /** 挂单量（下单要买多少）：用来区分「还没挂单」与「已挂单等待成交」。 */
+  const bidParts = (Number(book?.nandQty) || 0) + (Number(book?.latchQty) || 0);
   const chainHashpower = Number(book?.hashpower) || Number(book?.estHashpower) || 0;
   /** 链上已有成交元件 → 展示真实值；否则展示募资反推的预期值并标注是预期。 */
   const hasBought = chainParts > 0;
@@ -2188,7 +2220,11 @@ function RoundFacts({ round, book, quote }) {
         <article className="stat-card">
           <div className="stat-label">{partsFromChain ? "已买入元件" : "元件数"}</div>
           <div className="stat-value">
-            {partsValue != null ? `${partsValue} 颗` : "未买入"}
+            {partsValue != null
+              ? `${partsValue} 颗`
+              : onChain && bidParts > 0
+                ? <span className="muted-value">待成交</span>
+                : "未买入"}
           </div>
           <div className="stat-note">
             {partsFromChain ? (
@@ -2197,7 +2233,9 @@ function RoundFacts({ round, book, quote }) {
                 <em className="est-tag">成交口径</em>
               </>
             ) : onChain ? (
-              "尚未挂单买入，元件与算力待成交后确定"
+              bidParts > 0
+                ? `已挂单 ${bidParts} 颗（NAND ${Number(book.nandQty) || 0} · LATCH ${Number(book.latchQty) || 0}），等待成交`
+                : "尚未挂单买入，元件与算力待成交后确定"
             ) : est.hashpower ? (
               `权重 ${est.hashpower}（按募资额预估）`
             ) : (
@@ -2270,7 +2308,9 @@ function RoundFacts({ round, book, quote }) {
           <article className="stat-card span-2">
             <div className="stat-label">成交元件</div>
             <div className="stat-value">{chainParts} 颗</div>
-            <div className="stat-note">NAND {Number(book.nandQty) || 0} · LATCH {Number(book.latchQty) || 0}</div>
+            <div className="stat-note">
+              NAND {Number(book.nandFilled ?? 0) || 0} · LATCH {Number(book.latchFilled ?? 0) || 0}
+            </div>
           </article>
           <article className="stat-card span-2">
             <div className="stat-label">锁价</div>
@@ -2363,6 +2403,7 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, exec
         lead={fundingExpired ? "本期募集已截止且未售罄，认筹 BNB 由认筹地址自己点「原路退回」。" : copy.lead}
         badge={fundingExpired ? "已结束" : copy.badge}
         tone={fundingExpired ? "done" : copy.tone}
+        deal={dealStatus(book)}
         periods={periods}
         onSwitchPeriod={onSwitchPeriod}
         processor={round.processorId || (book?._chain ? "未记录" : est.processor) || "未记录"}

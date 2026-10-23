@@ -513,6 +513,36 @@ h1, h2, h3, p { margin: 0; }
 .tone-back { color: var(--color-danger); background: var(--color-danger-light); }
 .tone-done { color: var(--color-text-tertiary); background: var(--color-bg-spotlight); }
 
+/* 众筹认购「成交状态」徽标：等待成交 / 已成交 / 已流标·已结束。
+   用色块 + 圆点强化区分，避免和数据里其它状态混淆。 */
+.deal-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  padding: 2px 9px 2px 7px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.deal-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.deal-wait { color: #8a5a12; background: var(--color-warning-light); }
+.deal-done { color: var(--color-success); background: var(--color-success-light); }
+.deal-failed { color: var(--color-danger); background: var(--color-danger-light); }
+.deal-idle { color: var(--color-text-tertiary); background: var(--color-bg-spotlight); }
+/* 期次下拉里的小号变体 */
+.deal-badge-sm { padding: 1px 7px 1px 6px; font-size: 11px; line-height: 16px; }
+.deal-badge-sm::before { width: 6px; height: 6px; }
+
 .app-topbar {
   display: flex;
   align-items: center;
@@ -1237,6 +1267,7 @@ h1, h2, h3, p { margin: 0; }
 .holding-grid.transfer-mine { margin-bottom: 16px; }
 .holding-grid + .card { margin-top: 16px; }
 .asset-status-cell { white-space: normal; }
+.asset-status .deal-badge { margin-top: 4px; }
 .asset-status {
   display: flex;
   flex-direction: column;
@@ -1684,6 +1715,44 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   cursor: pointer;
 }
 .campaign-card:hover { box-shadow: 0 1px 0 rgba(15, 23, 42, 0.04), 0 12px 28px rgba(30, 41, 59, 0.1); }
+.campaign-card.deal-wait { border-left: 4px solid var(--color-warning); }
+.campaign-card.deal-done { border-left: 4px solid var(--color-success); }
+.campaign-card.deal-failed,
+.campaign-card.deal-ended { border-left: 4px solid var(--color-danger); }
+.campaign-card.deal-idle { border-left: 4px solid #d3dce6; }
+.campaign-processor {
+  padding: 1px 8px;
+  border-radius: 99px;
+  background: var(--color-bg-spotlight);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+.campaign-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 14px 20px 0;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--color-bg-spotlight);
+}
+.campaign-hero.deal-wait { background: var(--color-warning-light); }
+.campaign-hero.deal-done { background: var(--color-success-light); }
+.campaign-hero.deal-failed,
+.campaign-hero.deal-ended { background: var(--color-danger-light); }
+.campaign-hero .campaign-progress { margin: 4px 0 0; }
+.hero-pct {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  color: #1c2838;
+}
+.hero-unit { font-size: 14px; font-weight: 600; margin-left: 2px; }
+.hero-sub { font-size: 13px; color: var(--color-text-secondary); }
+.hero-note { font-size: 13px; color: var(--color-text-secondary); }
 .campaign-card-head {
   display: flex;
   align-items: flex-start;
@@ -2873,6 +2942,17 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 .trade-status.is-open { background: var(--color-primary-light); color: var(--color-primary); }
 .trade-status.is-partial { background: var(--color-warning-light); color: #a87400; }
 .trade-status.is-filled { background: var(--color-success-light); color: var(--color-success); }
+/* 材料市场交易记录：元件数项（挂出 / 成交）按挂单成交状态着色 */
+.qty-cell { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.qty-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--color-text-tertiary); }
+.qty-wait .qty-dot { background: var(--color-warning); }
+.qty-wait { color: #8a5a12; font-weight: 600; }
+.qty-done .qty-dot { background: var(--color-success); }
+.qty-done { color: var(--color-success); font-weight: 600; }
+.qty-partial .qty-dot { background: var(--color-warning); }
+.qty-partial { color: #8a5a12; }
+.qty-cancel .qty-dot { background: var(--color-text-tertiary); }
+.qty-cancel { color: var(--color-text-tertiary); }
 .trade-status.is-settled { background: #f1f5f9; color: var(--color-text-secondary); }
 .trade-status.is-cancelled { background: #f1f5f9; color: var(--color-text-quaternary); }
 .trade-log {

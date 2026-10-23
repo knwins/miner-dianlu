@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ContractCalls } from "./Calls.jsx";
+import { dealStatus } from "./dealStatus.js";
 import OnChainPage from "./OnChain.jsx";
 import { formatEther } from "./chain/client.js";
 import { MarketTradePanel } from "./MarketTrades.jsx";
@@ -76,6 +77,20 @@ const EMPTY_FORM = {
   /** 分成表：首行比例默认 100（一人独享）。地址仍留空，必须由开期人填。 */
   feeShares: [{ address: "", sharePercent: "100" }],
 };
+
+/** 期次列表的「成交状态」与全站同一份口径（见 ./dealStatus.js） */
+
+
+/** 毫秒 → 人类可读剩余时间（天/小时/分）。 */
+function formatRemain(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d} 天 ${h} 小时`;
+  if (h > 0) return `${h} 小时 ${m} 分`;
+  return `${m} 分`;
+}
 
 export function OwnerOverview({
   round, book, copy, pending, pendingTarget = "", actor, executeWait, history,
@@ -1048,8 +1063,10 @@ export function OwnerOverview({
                       <dt>本期元件</dt>
                       <dd>
                         {/*
-                         * 元件数权威来源 = 链上 nandQty + latchQty（成交到账量），
-                         * 不是 round.partCount（那是本地发行记录里的推算值，链上不存在）。
+                         * 元件数权威来源 = 链上**已成交到账量**（挂单量 − 市场 remaining）。
+                         * 不是 nandQty + latchQty 本身：合约在 placeTransistorOrder 就把它们
+                         * 写成下单量，挂单在等成交时拿它当已买入会与市场记录矛盾。
+                         * 也不是 round.partCount（本地发行记录里的推算值，链上不存在）。
                          * 还没成交就说「未成交」，不拿推算值冒充。
                          */}
                         {Number(book.transistorCount) > 0
@@ -1094,7 +1111,7 @@ export function OwnerOverview({
                     partsNand: Number(book.partsNand) || 0, partsLatch: Number(book.partsLatch) || 0,
                   }}
                 />
-                <OfficialPricePanel official={official} processorId={design.processorId} compact dense />
+                <OfficialPricePanel official={official} processorId={design.processorId} compact />
                 {book.scene === "executing" && (book.executionFailed || book.refundShort) && (
                   <RefundRecords
                     compact
@@ -1164,22 +1181,64 @@ export function OwnerOverview({
               const raised = item.raisedBnb != null ? Number(item.raisedBnb).toFixed(4) : item.raised;
               const cap = item.hardCapBnb != null ? Number(item.hardCapBnb).toFixed(4) : null;
               const headline = `第 ${item.id} 期`;
+              const deal = dealStatus(item);
+              const transistorCount = item.transistorCount != null ? Number(item.transistorCount) : null;
+              const deadline = item.fundingDeadline ? Number(item.fundingDeadline) * 1000 : 0;
+              const remainMs = deadline > 0 ? deadline - Date.now() : 0;
+              const remainText = deadline > 0
+                ? (remainMs > 0 ? `剩余募集 ${formatRemain(remainMs)}` : "募集已截止")
+                : "";
               return (
-                <article key={rowKey(item)} className="campaign-card" onClick={() => openRound(item)}>
+                <article key={rowKey(item)} className={`campaign-card ${deal.key === "none" ? "deal-idle" : `deal-${deal.key}`}`} onClick={() => openRound(item)}>
                   <header className="campaign-card-head">
                     <div>
                       <div className="campaign-kicker">
                         <strong>第 {item.id} 期</strong>
+                        {item.processor ? <span className="campaign-processor">{item.processor}</span> : null}
                         {item.address ? <span className="mono">{shortAddress(item.address)}</span> : null}
                       </div>
                       <h2>{headline}</h2>
-                      {item.processor ? <p>元件合约处理器 {item.processor}</p> : null}
                     </div>
                     <div className="campaign-status">
+                      {deal.key === "none" ? null : (
+                        <span className={`deal-badge ${deal.cls}`}>{deal.label}</span>
+                      )}
                       <span className={`badge tone-${item.tone}`}>{item.status}</span>
                       {item.statusNote ? <small>{item.statusNote}</small> : null}
                     </div>
                   </header>
+
+                  {deal.key === "waiting" ? (
+                    <div className="campaign-hero deal-wait">
+                      <div className="hero-pct">{pct != null ? `${pct}` : "—"}<span className="hero-unit">%</span></div>
+                      <div className="hero-sub">
+                        已认筹 {sold != null && total != null ? `${sold}/${total}` : (item.shares || "—")} 份
+                        {sold != null && total != null && total - sold > 0 ? ` · 还差 ${total - sold} 份售罄` : ""}
+                      </div>
+                      {remainText ? <div className="hero-note">{remainText}</div> : null}
+                      {pct != null && (
+                        <div className="campaign-progress" aria-hidden="true">
+                          <i style={{ width: `${pct}%` }} />
+                        </div>
+                      )}
+                    </div>
+                  ) : deal.key === "done" ? (
+                    <div className="campaign-hero deal-done">
+                      <div className="hero-pct">
+                        {transistorCount != null ? `${transistorCount} 颗` : (item.hashpower || "—")}
+                      </div>
+                      <div className="hero-sub">
+                        {transistorCount != null ? `算力 ${item.hashpower || "—"} H` : ""}
+                        {transistorCount != null && (item.bem != null) ? " · " : ""}
+                        已分配 BEM {item.bem ?? "—"}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="campaign-hero deal-failed">
+                      <div className="hero-note">{item.statusNote || (deal.key === "failed" ? "本期未成交（流标）" : "本期已结束")}</div>
+                    </div>
+                  )}
+
                   <dl className="campaign-metrics">
                     <div>
                       <dt>份数</dt>
@@ -1204,11 +1263,6 @@ export function OwnerOverview({
                       <dd>{item.fee}</dd>
                     </div>
                   </dl>
-                  {pct != null && (
-                    <div className="campaign-progress" aria-hidden="true">
-                      <i style={{ width: `${pct}%` }} />
-                    </div>
-                  )}
                   <footer className="campaign-card-foot">
                     <span>{nextActionByStatus(item.status)}</span>
                     <div className="row-actions" onClick={(event) => event.stopPropagation()}>
