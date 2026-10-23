@@ -587,13 +587,40 @@ export default function App() {
     let feeNote = "挖矿产出服务费未设定";
     try {
       const feePercent = Number(draft.feePercent);
+      /**
+       * 分成表字段口径（必修的断链）：
+       *
+       * effectiveDraft.feeShares 来自 Owner.jsx 的 feeSharesForChain，
+       * 字段是 `{ address, shareBps }` —— **shareBps 已是基点**（10000 = 100%）；
+       * 旧路径可能是 `{ address, sharePercent }` —— 百分比，需 ×100。
+       *
+       * 曾经这里只读 sharePercent，而转换后的对象里该字段已不存在，
+       * Number(undefined) → 0，导致发往链上的份额全是 0，
+       * 被合约 `sharesBps_[i] == 0 → BadFeeConfig` 挡下、estimateGas 失败、
+       * 交易从不广播，而 catch 只把 notice 改成一句「写入失败」——极易漏看。
+       */
       const rows = (Array.isArray(draft.feeShares) ? draft.feeShares : [])
         .filter((row) => String(row?.address || "").trim())
-        .map((row) => ({
-          address: String(row.address).trim(),
-          bps: Math.round(Number(row.sharePercent) || 0) * 100,
-        }));
+        .map((row) => {
+          const rawBps =
+            row.shareBps != null && row.shareBps !== ""
+              ? Number(row.shareBps)
+              : Math.round(Number(row.sharePercent) || 0) * 100;
+          return { address: String(row.address).trim(), bps: Math.round(rawBps) };
+        });
       if (Number.isInteger(feePercent) && feePercent > 0 && rows.length > 0) {
+        /**
+         * 前置闸门：链上硬约束是「每项份额非 0 且合计恰为 10000」。
+         * 不满足就明确抛错，不要发一笔注定 revert 的交易——
+         * 既白耗一次钱包确认，错误还会被降级成 notice 文案。
+         */
+        if (rows.some((r) => !(r.bps > 0))) {
+          throw new Error(`挖矿产出服务费分成份额必须大于 0（当前 ${rows.map((r) => r.bps).join(", ")}）`);
+        }
+        const sumBps = rows.reduce((total, r) => total + r.bps, 0);
+        if (sumBps !== 10000) {
+          throw new Error(`挖矿产出服务费分成份额合计必须等于 10000（100%），当前 ${sumBps}`);
+        }
         await send(
           chainTx.setServiceFee(activeSigner, BigInt(feePercent * 100), rows.map((r) => r.address), rows.map((r) => r.bps)),
           onSigned
