@@ -1229,14 +1229,13 @@ export function OwnerOverview({
                   ) : deal.key === "done" ? (
                     <div className="campaign-hero deal-done">
                       {/*
-                       * 认购 deal 已达成 ≠ 元件已买到：售罄后 Owner 可能还没挂单。
-                       * 元件数 > 0 才说「已到账」；为 0 时说「已售罄 / 等待买入」，
-                       * 否则会出现「0 颗 · 成交元件已到账」这种自相矛盾的组合。
+                       * 已售罄 ≠ 元件已买到：售罄后 Owner 可能还没挂单。
+                       * 「已售罄」由卡片头的状态徽标表达，hero 只讲元件这一维：
+                       * 元件数 > 0 说「N 颗 / 成交元件已到账」，为 0 就说「0 颗 / 等待买入」，
+                       * 不再出现「已售罄 / 已售罄」或「0 颗 · 成交元件已到账」这种自相矛盾。
                        */}
                       <div className="hero-pct">
-                        {transistorCount != null && transistorCount > 0
-                          ? `${transistorCount} 颗`
-                          : "已售罄"}
+                        {transistorCount != null && transistorCount > 0 ? `${transistorCount} 颗` : "0 颗"}
                       </div>
                       <div className="hero-sub">
                         {transistorCount != null && transistorCount > 0
@@ -1246,7 +1245,7 @@ export function OwnerOverview({
                     </div>
                   ) : (
                     <div className="campaign-hero deal-failed">
-                      <div className="hero-note">{item.statusNote || (deal.key === "failed" ? "本期未成交（流标）" : "本期已结束")}</div>
+                      <div className="hero-note">{item.statusNote || (deal.key === "failed" ? "募集到期未售罄（流标）" : "本期已结束")}</div>
                     </div>
                   )}
 

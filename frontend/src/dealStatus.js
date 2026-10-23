@@ -1,16 +1,19 @@
 /**
- * 众筹认购「成交状态」—— 全站唯一口径。
+ * 众筹认购状态 —— 全站唯一口径。
  *
- * 语义：这一期的**认筹 deal 是否达成**，与「执行/挖矿是否顺利」是两件事。
- *  - 募集中（未截止 / 未满额）      = 等待成交
- *  - 募集中但已截止且未售罄          = 已流标（deal 从未达成）
- *  - 已售罄（待执行 / 挖矿 / 执行失败）= 已成交（deal 达成，执行成败由主状态徽标另说）
+ * 语义：这一期的**认筹是否达成**，与「执行/挖矿是否顺利」是两件事。
+ *  - 募集中（未截止 / 未满额）      = 认购中
+ *  - 募集中但已截止且未售罄          = 已流标（认筹从未达成）
+ *  - 已售罄（待执行 / 挖矿 / 执行失败）= 已售罄（认筹达成，执行成败由主状态徽标另说）
  *  - 执行失败且份额已全部退回        = 已结束
  *
- * 之所以单独成模块：期次下拉、历史列表、资产列表、Owner 卡片都用它。
- * 之前 App.jsx 只看 scene 数字、Owner.jsx 只看 status 文案，两条口径必然走偏 ——
- * `chain.campaigns` 的历史行只有 status 没有 scene，于是下拉里每期都渲染成
- * 「● —」（deal-idle 兜底），看起来像数据丢了。
+ * 用词：这一层**不用「成交」**。认购阶段没有成交动作，售出的是份额；
+ * 「成交」在本项目里专指**元件在材料市场成交**与**挖矿份额转让成交**。
+ * 之前这里写「等待成交 / 已成交」，在期次标题旁与「元件数 · 待成交」并排出现，
+ * 被读成「本期元件已经买到了」——表述是错的，故改为「认购中 / 已售罄」。
+ *
+ * 之所以单独成模块：期次标题、历史列表、资产列表、Owner 卡片都用它。
+ * 之前 App.jsx 只看 scene 数字、Owner.jsx 只看 status 文案，两条口径必然走偏。
  *
  * 兼容两种数据形状：
  *  - book / 持仓行：字符串 scene（funding/executing/mining）+ endsAt（毫秒）
@@ -65,11 +68,11 @@ export function dealStatus(row) {
   const expired = endsAtOf(row) > 0 && Date.now() > endsAtOf(row);
 
   if (scene === 0) {
-    // 售罄即 deal 达成（合约会立刻转 scene=1，这里兜住读到的中间态）
-    if (soldOut) return { key: "done", label: "已成交", cls: "deal-done" };
+    // 售罄即认筹达成（合约会立刻转 scene=1，这里兜住读到的中间态）
+    if (soldOut) return { key: "done", label: "已售罄", cls: "deal-done" };
     if (expired) return { key: "failed", label: "已流标", cls: "deal-failed" };
-    return { key: "waiting", label: "等待成交", cls: "deal-wait" };
+    return { key: "waiting", label: "认购中", cls: "deal-wait" };
   }
   if (settledAfterFailure(row)) return { key: "ended", label: "已结束", cls: "deal-failed" };
-  return { key: "done", label: "已成交", cls: "deal-done" };
+  return { key: "done", label: "已售罄", cls: "deal-done" };
 }

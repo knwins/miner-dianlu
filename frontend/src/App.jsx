@@ -1414,7 +1414,11 @@ function PeriodNav({ periods, currentId, onSwitch }) {
         <ul className="period-menu" role="listbox">
           {ordered.map((item) => {
             const on = String(item.id) === String(currentId);
-            const deal = dealStatus(item);
+            /*
+             * 下拉里不画认购状态徽标：一是与「第 N 期」同排太挤，
+             * 二是「成交」在材料市场另有含义（元件成交），摆在期次旁容易被读成
+             * 「本期元件已买到」。要看去期次本身的主状态徽标与资产列表。
+             */
             return (
               <li key={item.address}>
                 <button
@@ -1425,9 +1429,6 @@ function PeriodNav({ periods, currentId, onSwitch }) {
                   onClick={() => go(item)}
                 >
                   <span>第 {item.id} 期</span>
-                  {deal.key === "none" ? null : (
-                    <span className={`deal-badge deal-badge-sm ${deal.cls}`}>{deal.label}</span>
-                  )}
                 </button>
               </li>
             );
@@ -1441,7 +1442,7 @@ function PeriodNav({ periods, currentId, onSwitch }) {
 function RoundTitle({ id, lead, badge, tone, phase, periods, onSwitchPeriod, processor, deal }) {
   const hasNav = Array.isArray(periods) && periods.length > 0 && onSwitchPeriod;
   const dealBadge = deal && deal.key !== "none" ? (
-    <span className={`deal-badge ${deal.cls}`} title="众筹认购成交状态">{deal.label}</span>
+    <span className={`deal-badge ${deal.cls}`} title="认筹状态：认购中 / 已售罄 / 已流标 / 已结束">{deal.label}</span>
   ) : null;
   return (
     <header className="round-hero">
@@ -1595,7 +1596,7 @@ function RoundHub({
             phase={ended ? "已结束" : "待执行"}
             lead={ended
               ? "本期已结束。执行失败，认筹 BNB 已按认筹地址原路退回。"
-              : "份数已售罄。晶体管到账后即可投入矿池。Owner 也可以直接发起退款，认筹 BNB 会按认筹地址原路退回。"}
+              : "晶体管到账后即可投入矿池。Owner 也可以直接发起退款，认筹 BNB 会按认筹地址原路退回。"}
             badge={ended ? "已结束" : copy.badge}
             tone={ended ? "done" : copy.tone}
             deal={dealStatus(book)}

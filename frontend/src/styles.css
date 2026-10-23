@@ -513,8 +513,8 @@ h1, h2, h3, p { margin: 0; }
 .tone-back { color: var(--color-danger); background: var(--color-danger-light); }
 .tone-done { color: var(--color-text-tertiary); background: var(--color-bg-spotlight); }
 
-/* 众筹认购「成交状态」徽标：等待成交 / 已成交 / 已流标·已结束。
-   用色块 + 圆点强化区分，避免和数据里其它状态混淆。 */
+/* 认筹状态徽标：认购中 / 已售罄 / 已流标 · 已结束。
+   这一层不用「成交」——成交专指元件在材料市场成交与挖矿份额转让。 */
 .deal-badge {
   display: inline-flex;
   align-items: center;
@@ -539,9 +539,6 @@ h1, h2, h3, p { margin: 0; }
 .deal-done { color: var(--color-success); background: var(--color-success-light); }
 .deal-failed { color: var(--color-danger); background: var(--color-danger-light); }
 .deal-idle { color: var(--color-text-tertiary); background: var(--color-bg-spotlight); }
-/* 期次下拉里的小号变体 */
-.deal-badge-sm { padding: 1px 7px 1px 6px; font-size: 11px; line-height: 16px; }
-.deal-badge-sm::before { width: 6px; height: 6px; }
 
 .app-topbar {
   display: flex;

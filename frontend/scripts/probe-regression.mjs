@@ -29,7 +29,23 @@ async function probe(port) {
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const errors = [];
-  page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
+  /**
+   * 外部子资源失败噪声：公共 RPC（bsc-rpc.publicnode.com）本机常返 403 / 429，
+   * 浏览器只报「Failed to load resource: … (429)」且不带 URL，会被当成应用错误。
+   * 只有确实观察到**外部主机** 4xx/5xx 时才放过这类通用资源错误；
+   * pageerror 与其它 console.error 照旧严格断言。
+   */
+  const origin = `http://127.0.0.1:${port}`;
+  const externalFailures = new Set();
+  page.on("response", (r) => {
+    if (r.status() >= 400 && !r.url().startsWith(origin)) externalFailures.add(r.url());
+  });
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    const text = m.text();
+    if (text.includes("Failed to load resource") && externalFailures.size > 0) return;
+    errors.push(text);
+  });
   page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
 
   // T-64：Owner 工作台只对 Owner 展示 → 注入 Owner 钱包，否则导航项不存在。
