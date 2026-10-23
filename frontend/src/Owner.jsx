@@ -5,7 +5,7 @@ import { dealStatus } from "./dealStatus.js";
 import OnChainPage from "./OnChain.jsx";
 import { formatEther } from "./chain/client.js";
 import { MarketTradePanel } from "./MarketTrades.jsx";
-import { OfficialPricePanel, officialPartPrices } from "./OfficialPricePanel.jsx";
+import { officialPartPrices } from "./OfficialPricePanel.jsx";
 import { RefundRecords } from "./RefundRecords.jsx";
 import { processorFromPartsContract } from "./tapeout.js";
 import {
@@ -499,13 +499,13 @@ export function OwnerOverview({
                     return Number(row.remaining) > 0;
                   };
                   const liveRows = buyOpen ? bidRows : askOpen ? askRows : [];
-                  const partsOnHand = [
-                    heldNand > 0 ? `${heldNand} NAND` : null,
-                    heldLatch > 0 ? `${heldLatch} LATCH` : null,
-                  ].filter(Boolean);
-                  /** 元件行只报实际持有量，不再报推算配比 */
-                  const partLabel = partsOnHand.length ? partsOnHand.join(" / ") : "无元件";
-                  const flowStep = book.executePhase === "ready" ? 3 : buyOpen ? 2 : 1;
+                  {/*
+                   * 步骤条要落在真实阶段上：
+                   * 旧版 buyOpen 一律算第 2 步「确认到账」，但挂单还在等成交时
+                   * 根本不能确认（合约要求 remaining 全 0），高亮会指错下一步。
+                   * 只有买单全部成交（orderFilled）才进「确认到账」。
+                   */}
+                  const flowStep = book.executePhase === "ready" ? 3 : book.orderFilled ? 2 : 1;
                   // 卖单成交款留在市场 owed 里，未提取时 openRefund 会被合约拒绝。
                   const marketOwed = marketOwedEarly;
                   const canWithdraw = isOwner && book.marketAsks && askOpen && marketOwed > 0;
@@ -585,7 +585,7 @@ export function OwnerOverview({
                           <thead>
                             <tr>
                               <th>元件</th>
-                              <th>{isBuy ? "数量" : "数量"}</th>
+                              <th>数量</th>
                               <th>{isBuy ? "买价 BNB" : "卖价 BNB"}</th>
                               <th>市价</th>
                             </tr>
@@ -670,13 +670,19 @@ export function OwnerOverview({
 
                   return (
                     <div className="ops-exec">
+                      {/*
+                       * 只留「子状态 / 处理器」。
+                       * 资金与元件不在这里报：弹窗顶部概览条已经有份数、募资、
+                       * 算力、已买入元件、已入矿池五项，这里再写一遍就是同一数据
+                       * 在同一个弹窗里出现三次（旧版「库存」+「资金 / 库存」就是这样，
+                       * 而 raised 本身就是 bnbPool，与右栏「托管 BNB」同一个变量）。
+                       * 挂买单能用多少 BNB，由表单栏的「可用 X BNB」现算现显示。
+                       */}
                       <ul className="bill ops-bill">
                         <li><span>子状态</span><strong>{phaseLabel}</strong></li>
                         {design.processorKnown ? (
                           <li><span>处理器</span><strong>{design.processorId} · P={design.processorScale}</strong></li>
                         ) : null}
-                        <li><span>库存</span><strong>{partLabel}</strong></li>
-                        <li><span>资金 / 库存</span><strong>{round4(raised)} BNB · {partsOnHand.length ? partsOnHand.join(" / ") : "无元件"}</strong></li>
                       </ul>
 
                       <ol className="flow-steps" aria-label="待执行流程">
@@ -698,23 +704,18 @@ export function OwnerOverview({
                         <div className="flow-panel">
                           <div className="flow-panel-head">
                             <div>
+                              {/*
+                               * 只留标题：这段原本每个分支都有一句说明，但和正上方
+                               * 「下一步」的 nextHint 逐字重复（例如买单两处都写
+                               * 「买多少自己定，确认后才能卖、入池或退款」）。
+                               * 说明归 nextHint 一处，这里只交代这是哪张单。
+                               */}
                               <h3>
                                 {buyOpen ? "当前买单"
                                   : askOpen ? "当前卖单"
                                     : saleSettled ? "卖单待确认"
                                       : side === "sell" ? "挂卖中" : "挂买中"}
                               </h3>
-                              <p>
-                                {buyOpen
-                                  ? "未成交部分可取消，已成交部分上链即不可撤。全部成交后才能确认。"
-                                  : askOpen
-                                    ? "卖单未全部成交前不能确认。取消只撤还没卖掉的部分。"
-                                    : saleSettled
-                                      ? "确认后回到待挂单，才能再挂买单或退款。"
-                                      : side === "sell"
-                                        ? "确认到账之后才能卖。卖完并确认，才能再买或退款。"
-                                        : "用募集款买入元件，买多少自己定。确认到账后才能卖、入池或退款。"}
-                              </p>
                             </div>
                           </div>
 
@@ -1027,7 +1028,8 @@ export function OwnerOverview({
                          */}
                         {chainFeeSet ? (
                           <>
-                            <div>挖矿产出服务费 {chainFeePercent}%</div>
+                            {/* dt 已写明「挖矿产出服务费分成」，这里不必再重复那五个字 */}
+                            <div>费率 {chainFeePercent}%</div>
                             {chainFeeShares.map((row) => (
                               <div key={row.address} className="mono">
                                 {shortAddress(row.address)} · {Math.round(Number(row.sharePercent))}%
@@ -1043,37 +1045,15 @@ export function OwnerOverview({
                         )}
                       </dd>
                     </div>
-                    <div>
-                      <dt>预估算力</dt>
-                      <dd>
-                        {Number(book.estHashpower || 0) > 0
-                          ? `${Number(book.estHashpower).toLocaleString()} H`
-                          : <span className="muted-value">未写入</span>}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>链上算力 / 元件</dt>
-                      <dd>
-                        {hashLabel}
-                        {" · "}
-                        {Number(book.transistorCount) > 0 ? `${book.transistorCount} 颗` : "元件未成交"}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>本期元件</dt>
-                      <dd>
-                        {/*
-                         * 元件数权威来源 = 链上**已成交到账量**（挂单量 − 市场 remaining）。
-                         * 不是 nandQty + latchQty 本身：合约在 placeTransistorOrder 就把它们
-                         * 写成下单量，挂单在等成交时拿它当已买入会与市场记录矛盾。
-                         * 也不是 round.partCount（本地发行记录里的推算值，链上不存在）。
-                         * 还没成交就说「未成交」，不拿推算值冒充。
-                         */}
-                        {Number(book.transistorCount) > 0
-                          ? `${book.transistorCount} 颗`
-                          : <span className="muted-value">未成交</span>}
-                      </dd>
-                    </div>
+                    {/*
+                     * 算力与元件数不在这里报。
+                     * 旧版是「预估算力」+「链上算力 / 元件」两行，两行的数字同源
+                     * （链上没有实时算力 getter，book.hashpower 就是 setPlan 写进去的
+                     * estHashpower），加上顶部概览条的「算力」「已买入元件」，同一个值
+                     * 会在一个弹窗里出现三次。
+                     * 元件数的权威口径不变：链上**已成交到账量**（挂单量 − 市场 remaining），
+                     * 不是 nandQty + latchQty 本身 —— 那只是下单量，成交前不代表已买到。
+                     */}
                     <div>
                       <dt>托管 BNB</dt>
                       <dd>
@@ -1088,11 +1068,11 @@ export function OwnerOverview({
                 {/*
                  * 历史交易记录常驻右栏。
                  * 之前只在 scene === "executing" 时渲染，募资阶段整栏直接消失，
-                 * 右栏只剩「链上参数 + 官方价」，跟设计稿的「历史交易记录」栏对不上。
-                 * 现在无论哪个阶段都在，没挂单时面板自己会说明「还没有向材料市场挂过单」。
+                 * 右栏只剩「链上参数」，跟设计稿的「历史交易记录」栏对不上。
                  *
-                 * 排序：链上参数 → 历史交易记录 → 官方价。
-                 * 交易记录是这一栏的主内容，官方价是参考，放最后。
+                 * 排序：链上参数 → 历史交易记录。
+                 * 官方元件最新价不再单独成卡 —— 挂买单表单的「市价」列已经给出
+                 * 同源单价（officialPartPrices，点一下即填入），同一数据不出现第二次。
                  */}
                 <MarketTradePanel
                   campaignAddr={round.contract || book.address}
@@ -1111,7 +1091,6 @@ export function OwnerOverview({
                     partsNand: Number(book.partsNand) || 0, partsLatch: Number(book.partsLatch) || 0,
                   }}
                 />
-                <OfficialPricePanel official={official} processorId={design.processorId} compact />
                 {book.scene === "executing" && (book.executionFailed || book.refundShort) && (
                   <RefundRecords
                     compact

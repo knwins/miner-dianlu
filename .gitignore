@@ -34,3 +34,6 @@ MEMORY.md
 
 # ── 探针调试截图（可随时重新生成）──
 frontend/.shots/
+
+# ── 探针运行产物（截图等）──
+frontend/scripts/_*.png

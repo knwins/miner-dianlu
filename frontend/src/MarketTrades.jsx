@@ -443,16 +443,21 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
             ))}
           </ol>
         ) : (
-          <p className="flow-empty">还没有向材料市场挂过单。提交买单后，这里会记录挂单与成交。</p>
+          <p className="flow-empty">提交买单后，这里会记录挂单与成交。</p>
         )}
 
-        <p className="fine trade-panel-note">
-          {failed
-            ? "读取市场失败，先按合约已读状态展示。"
-            : data && !data.supportsEvents
-              ? "这版市场合约没有事件，记录按订单状态推算；时间取本期合约的挂单 / 确认到账事件。"
-              : "读材料市场 bids / asks / owed，与确认到账、提取卖出款同一份状态。"}
-        </p>
+        {/*
+         * 只在真的异常时说话。
+         * 正常态原本还有一句「读材料市场 bids / asks / owed，与确认到账、提取卖出款
+         * 同一份状态」—— 那是实现说明，对 Owner 没有任何可操作信息，删掉。
+         */}
+        {failed || (data && !data.supportsEvents) ? (
+          <p className="fine trade-panel-note">
+            {failed
+              ? "读取市场失败，先按合约已读状态展示。"
+              : "这版市场合约没有事件，记录按订单状态推算。"}
+          </p>
+        ) : null}
       </div>
     </article>
   );
