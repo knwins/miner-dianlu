@@ -89,13 +89,6 @@ export const OFFICIAL_PARTS_FOR_PROCESSOR = Object.entries(OFFICIAL_PARTS).reduc
   {},
 );
 
-/**
- * 元件构成里 LATCH 的默认占比。
- * NAND / LATCH 是同一 ERC1155 的两个 tokenId，拆分只用于展示与成本估算：
- *   comb 组合逻辑：纯逻辑，少量状态 → 20%
- *   seq  时序逻辑：需要锁存状态 → 50%
- */
-export const LATCH_RATIO = { comb: 0.2, seq: 0.5 };
 
 /**
  * 处理器 → 元件 ERC1155 地址（挂单 placeBid 用同一个）。

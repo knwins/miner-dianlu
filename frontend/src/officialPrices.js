@@ -269,10 +269,6 @@ export async function fetchOfficialPrices({ force = false } = {}) {
   return _inflight;
 }
 
-/** 同步读上一次缓存（不触发网络）。 */
-export function peekOfficialPrices() {
-  return _cache;
-}
 
 /**
  * 官方市价 → 本项目 quote 形状。

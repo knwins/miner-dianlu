@@ -2233,16 +2233,6 @@ export async function readFactoryOwner() {
   return await f.owner();
 }
 
-/**
- * 读工厂默认元件合约。
- *
- * ⚠️ T-79 之后工厂**不再有默认元件**：这一查询字段已废弃。保留函数仅作向前兼容，
- * 恒返回空串——开期时处理器必须由前端从白名单（readAllowedParts）里**显式选择**，
- * 不能用任何「默认」冒充。真正驱动表单的是 readAllowedParts，不是这里。
- */
-export async function readFactoryParts() {
-  return "";
-}
 
 /**
  * 读工厂的元件合约白名单（部署时写入、之后不可增删）。

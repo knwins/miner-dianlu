@@ -15,8 +15,6 @@ export const FACTORY_ADDRESS = deployments.factory || "";
  * minter 是旧记录里的字段名，只为读旧记录兜底。
  */
 export const MATERIAL_MARKET_ADDRESS = deployments.materialMarket || deployments.minter || "";
-/** 工厂元件白名单：开期时前端从链上读，这里是部署记录里的快照（离线兜底）。 */
-export const ALLOWED_PARTS = Array.isArray(deployments.allowedParts) ? deployments.allowedParts : [];
 
 // 工厂已部署即可对接。campaign 为空表示尚未开期，页面不回退到本地模拟数据。
 export const IS_CONFIGURED = isAddr(FACTORY_ADDRESS);

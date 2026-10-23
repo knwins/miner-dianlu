@@ -165,9 +165,6 @@ export function executeUnlockIn() {
   return 0;
 }
 
-export function executeUnlocked(round, book, now = Date.now()) {
-  return executeUnlockIn(round, book, now) === 0;
-}
 
 /** 预览用的场景，用户可在顶栏切换观察各阶段表现。 */
 export const SCENES = [
@@ -247,10 +244,6 @@ export function bemRate(hashpower, opts = {}) {
   return Math.round(v * 10000) / 10000;
 }
 
-/** 两位小数：金额与份数口径 */
-export function round2(value) {
-  return Math.round((Number(value) || 0) * 100) / 100;
-}
 
 /** 四位小数：单价与每权重日产口径（0.0045 这类系数必须保留精度） */
 export function round4(value) {
@@ -449,41 +442,6 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
   };
 }
 
-export function hashpowerSensitivity(round, quote = QUOTE) {
-  const model = findTransistor(round.transistorId || DEFAULT_TRANSISTOR);
-  /**
-   * 同一处理器的 NAND 与 LATCH 是一套东西，会同涨同跌。
-   * 只放大型号自身的价格会让另一种元件留在原价，敏感度分析失真——
-   * 比如传 NAND 时 LATCH 不涨，Behemoth 的成本涨幅会被系统性低估。
-   */
-  const siblings = TRANSISTORS.filter((t) => t.processor === model.processor);
-  const basePrices = siblings.map((t) => quote.prices?.[t.id] ?? t.priceBnb);
-  const base = estimateHashpower(round, quote, null);
-
-  // 元件数由募资总额反推，权重 H 不随报价变动；
-  // 报价只影响采购成本占募资总额的比例（买贵了少买、买便宜了多买，都由 Owner 自行决定）。
-  return [0.5, 1, 2, 5, 10].map((mult) => {
-    const prices = { ...(quote.prices || {}) };
-    siblings.forEach((t, i) => { prices[t.id] = basePrices[i] * mult; });
-    const q = { ...quote, prices };
-    const est = estimateHashpower(round, q, null);
-    return {
-      mult,
-      label: `${mult}x`,
-      /** 元件按同一倍数变动后的实时价 */
-      priceBnb: est.priceBnb,
-      /** 预估采购成本 */
-      needBnb: est.needBnb,
-      /** 采购后募资总额剩余 */
-      marginBnb: round4(est.hardCapBnb - est.needBnb),
-      usedParts: est.usedParts,
-      hashpower: est.hashpower,
-      dailyBem: est.dailyBem,
-      totalNet: est.totalNet,
-      drop: base.dailyBem > 0 ? Math.round((1 - est.dailyBem / base.dailyBem) * 100) : 0,
-    };
-  });
-}
 
 /** 预览用合约地址：保证是合法 hex 长度，不是真实部署地址。 */
 export function previewAddress(id) {
@@ -1009,25 +967,6 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
   };
 }
 
-export function applyClaim(round, book) {
-  if (book.scene !== "mining") {
-    return { ok: false, message: "只有挖矿中才能领取。" };
-  }
-  // F1：领取只针对当前连接钱包的可领量（pending），不再抽走全局池
-  const addr = String(book.selfAddress || WALLET).toLowerCase();
-  const wallet = book.wallets[addr] || { mine: 0, listingShares: 0, claimed: 0 };
-  const h = computeHarvest(round, book, addr);
-  if (h.pending <= 0) return { ok: false, message: "当前没有可领取的 BEM。" };
-  const amount = h.pending;
-  return {
-    ok: true,
-    message: `已领取 ${formatBem(amount)} BEM`,
-    book: recomputeSelf({
-      ...book,
-      wallets: { ...book.wallets, [addr]: { ...wallet, claimed: round4((wallet.claimed || 0) + amount) } },
-    }),
-  };
-}
 
 /**
  * Owner 调用 tapeout.net 晶体管挂单逻辑（链上交易）。
@@ -1099,10 +1038,6 @@ function quoteUnitFallback(book) {
  * 待挂单时由 Factory Owner 决定开放退款，不判断当前报价买不买得起。
  * 持份人再到「我的资产」原路退还。已挂单、非 Owner 均拒绝。
  */
-/** @deprecated 请用 applyOpenRefund；保留别名避免旧引用 */
-export function applyAbortUnaffordable(round, book, actor = null) {
-  return applyOpenRefund(round, book, actor);
-}
 
 export function applyOpenRefund(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
@@ -1571,9 +1506,6 @@ export function formatRemaining(ms) {
   return `${Math.max(1, minutes)} 分`;
 }
 
-export function formatUsdt(value) {
-  return `${new Intl.NumberFormat("zh-CN").format(value)} USDT`;
-}
 
 /** BEM 展示统一精确到小数点后 4 位 */
 export function formatBem(value) {

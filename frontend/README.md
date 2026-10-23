@@ -140,8 +140,8 @@
 - **领取次数不设上限**：只要本期还在出矿（`dailyBem > 0`），持份人就能一直领取，不存在"90 天/90 次封顶"终态；挖矿也不设截止日（`endsAt` 置 `undefined`）。
 - `computeHarvest()` 已 `maxRounds = Infinity / exhausted = false / totalGross = totalNet = null`，界面只展示"每次能领多少、是否已出矿"及"已领取次数"，**不展示任何整期总额外推**。
 - 产出机制（零和）：`日产 = 池日产 × 我的权重占比`；全网权重涨，所有人产出同步降。
-- `applyHarvest` 按 `userPart <= 0` 拒领（而非旧版按次数上限拒绝）；触发全网按份额分发，并把本钱包增量记入 accrual。
-- `applyClaim` 领取**本钱包**已累计的 `pending`（存量领取，与 harvest 增量区分），写 `wallets[addr].claimed`；两者都只作用于「可用余额」，已挂出（escrow）份额不参与。
+- `applyHarvest` 按 `userPart <= 0` 拒领（而非旧版按次数上限拒绝）；触发全网按份额分发，并把本钱包增量记入 accrual。只作用于「可用余额」，已挂出（escrow）份额不参与。
+- 存量领取（旧的 `applyClaim`）已随链上 `harvest`/`claim` 归一为占位实现一并移除 —— 前端不再有第二条领取路径。
 
 ---
 
@@ -165,7 +165,6 @@
 | `applyListShares` | 发布转让挂单 | 仅 mining；余额足够；escrow 锁定 |
 | `applyCancelListing` | 撤单 | 仅挂单方或 Owner；释放锁定 |
 | `applyTakeListing` | 接收挂单 | 仅 mining；不能买自己；跨钱包过户 + BNB 原子结算 |
-| `applyClaim` | 领取存量 `claimable` | 仅 mining；按本钱包 pending 领，写 `wallets[addr].claimed` |
 | `applyHarvest` | 增量领取 | 仅 mining；`userPart>0`；次数不限；全网按份 accrual |
 | `applyPlaceTransistorOrder` | 调用 tapeout.net 挂单 | 仅 Owner；executing |
 | `applyCancelTransistorOrder` | 取消挂单 | 仅 Owner；须 listed |
@@ -192,7 +191,7 @@
 | F9 | 挖矿期冗余 `endsAt` 终态 | 低 | 移除，领取不设次数/时间上限 |
 | F10 | 文档滞后 | — | 本 README 已同步 |
 
-> 迁移注意：F1 使 `computeHarvest` 新增 `address` 参数并改变 `applyClaim/applyHarvest` 语义（per-wallet）；`book` 新增 `totalShares / bnbPool`，`wallets[addr]` 新增 `claimed / refunded / bnb`；`Calls.readCall("pendingBem")` 改按地址算，`callGate("execute")` 与 `Owner` execute 权限改 Owner-only。相关断言已在 `verify.mjs` 同步更新。
+> 迁移注意：F1 使 `computeHarvest` 新增 `address` 参数并把领取语义改成 per-wallet；`book` 新增 `totalShares / bnbPool`，`wallets[addr]` 新增 `claimed / refunded / bnb`；`Calls.readCall("pendingBem")` 改按地址算，`callGate("execute")` 与 `Owner` execute 权限改 Owner-only。（当时一并调整的 `applyClaim` 后来随链上 `claim` 占位化被删除，见 §6。）
 
 ---
 

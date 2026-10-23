@@ -86,84 +86,10 @@ export function poolDailyYield(hashpower, opts = {}) {
   return (hashpower / total) * poolDaily;
 }
 
-/** 当前每权重日产（两池各一），供 UI 展示「当前系数」 */
-export function currentRate(network = NETWORK_WEIGHT) {
-  return {
-    verifiedPerWeight: poolDailyYield(1, { pool: "verified", networkWeight: network.verified }),
-    unverifiedPerWeight: poolDailyYield(1, { pool: "unverified", networkWeight: network.unverified }),
-    networkWeight: network,
-    dailyEmission: NETWORK_DAILY_EMISSION,
-    hardCap: BEM_HARD_CAP,
-    halvingDays: HALVING_PERIOD_DAYS,
-    source: network.source,
-  };
-}
 
 /** 第 N 纪元的日产（每纪元减半） */
 export function eraDaily(eraIndex) {
   return NETWORK_DAILY_EMISSION / Math.pow(2, Math.max(0, eraIndex));
 }
 
-/**
- * 挖矿期内累计可分 BEM（考虑纪元减半，逐纪元折半累加）。
- * 90 天 << 一个纪元（1460 天），所以实际几乎不会跨纪元。
- */
-export function cumulativeEmission(miningDays, startEra = 0) {
-  let total = 0;
-  let era = startEra;
-  let remain = miningDays;
-  while (remain > 0) {
-    const span = Math.min(remain, HALVING_PERIOD_DAYS);
-    total += eraDaily(era) * span;
-    remain -= span;
-    era += 1;
-  }
-  return total;
-}
 
-/**
- * 投资回报测算——官网没有直接给，但用户最需要。
- *
- * 真实成本不只是元件：还有服务费（我们从**挖矿产出**里收的）、BEM 价格波动、减半。
- * 注意服务费作用在产出侧而不是认购侧：认筹款不收服务费。
- * BEM 需按市价折算成 BNB 才可比；未给 BEM 价格时只返回 BEM 侧数字。
- *
- * @param {object} params
- * @param {number} params.costBnb      流片成本（BNB）
- * @param {number} params.dailyBem     日产（BEM）
- * @param {number} params.days         挖矿天数
- * @param {number} params.feeRate      本期服务费率（如 0.05）。
- *        口径：服务费**真正上链**（Campaign.serviceFeeBps，setServiceFee 写入，
- *        创期后永久锁定），这里读的应该是链上费率。
- *        ⚠️ 这是**挖矿产出奖励**的服务费：链上从挖矿收益里按此比例计提
- *        （depositRevenue），**与认筹款无关** —— 认筹款不收服务费，
- *        所以这里的扣费**不应该**、也**没有**作用在认购成本上：
- *        认购人付的 BNB 全额进认购托管池，feeRate 影响的只是挖矿产出的净额。
- * @param {number} [params.bemUsdt]    BEM 市价（USDT）。给了才能算真实 ROI
- * @param {number} [params.bnbUsdt]    BNB 市价（USDT）
- */
-export function roiOf({ costBnb, dailyBem, days, feeRate = 0, bemUsdt = 0, bnbUsdt = 0 }) {
-  const grossBem = dailyBem * days;
-  const feeBem = grossBem * feeRate;
-  const netBem = grossBem - feeBem;
-  const out = {
-    costBnb,
-    grossBem,
-    feeBem,
-    netBem,
-    /** 净产出可覆盖多少比例的成本（需BEM 价格） */
-    coverage: null,
-    /** 回本天数（需 BEM 价格） */
-    paybackDays: null,
-    /** 扣服务费后是否覆盖成本 */
-    netVsCost: null,
-  };
-  if (bemUsdt > 0 && bnbUsdt > 0) {
-    const costUsdt = costBnb * bnbUsdt;
-    const netUsdt = netBem * bemUsdt;
-    out.coverage = costUsdt > 0 ? netUsdt / costUsdt : null;
-    out.netVsCost = netUsdt - costUsdt;
-    out.paybackDays = dailyBem > 0 ? costUsdt / (dailyBem * (1 - feeRate) * bemUsdt) : null;
-  }
-  return out;
-}

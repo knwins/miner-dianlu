@@ -1652,7 +1652,7 @@ function RoundHub({
                       ? "执行失败，本金未支出。可到「我的资产」原路退还；Owner 也可降价重挂或批量退款剩余。"
                       : book.refundShort
                         ? `托管池已不足以按原价兑付（约 ${Number(book.refundRatio || 0).toFixed(4)} BNB/份），合约允许持份人按比例退款。`
-                        : "晶体管到账后即可投入矿池。待挂单中，Owner 也可以直接发起退款。入池后未花完的募集款会按份退回。"}
+                        : "入池后未花完的募集款按份退回。"}
               </p>
               <div className="actions">
                 {isOwner && book.executePhase === "buying" && (

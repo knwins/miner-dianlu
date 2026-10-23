@@ -497,81 +497,7 @@ export function transistorIdFor(processor) {
  */
 export const PROCESSOR_IDS = ["Behemoth", "TapeOut"];
 
-/**
- * 横向比较两个可选处理器在「当前元件数 + 当前募资总额 + 报价」下的表现。
- * 只负责把账算清楚供开期人参考，**不做选择**。
- */
-export function compareProcessors({ parts, hardCapBnb, snapshot, latchRatio = null }) {
-  const round4v = (v) => Math.round((Number(v) || 0) * 10000) / 10000;
-  return PROCESSOR_IDS.map((processorId) => {
-    const p = planTask({ parts, transistorId: transistorIdFor(processorId), snapshot, latchRatio });
-    const ratio = hardCapBnb > 0 ? p.partsCost / hardCapBnb : Infinity;
-    return {
-      ...p,
-      processorId,
-      /** 元件组合 id（处理器的 NAND 代表） */
-      transistorId: p.model.id,
-      costRatio: round4v(ratio),
-      affordable: hardCapBnb >= p.partsCost,
-      /** 每 BNB 投入换到的权重 */
-      weightPerBnb: p.partsCost > 0 ? round4v(p.hashpower / p.partsCost) : 0,
-      /** 采购后剩余的 BNB */
-      marginBnb: round4v(hardCapBnb - p.partsCost),
-      /** 元件涨价多少倍就不再够买 */
-      priceTolerance: p.partsCost > 0 ? round4v(hardCapBnb / p.partsCost) : 0,
-    };
-  });
-}
 
-/**
- * 针对某个已选处理器给一句风险提示。
- * 只描述事实与后果，不劝进也不劝退——选择权在开期人手里。
- *
- * 可负担性按传入的 hardCapBnb 现场判断，不读 plan.affordable——
- * 后者是算 plan 时用另一个募资总额得出的，直接用会在募资总额变化后给出过期结论。
- */
-export function adviseProcessor({ processorId, plan, hardCapBnb }) {
-  const name = PROCESSORS[processorId]?.name || processorId;
-  const cost = plan.partsCost;
-  const affordable = hardCapBnb >= cost;
-  const ratio = hardCapBnb > 0 ? cost / hardCapBnb : Infinity;
-  const tolerance = cost > 0 ? hardCapBnb / cost : 0;
-  const ratioPct = (ratio * 100).toFixed(1);
-  /**
-   * 无挖矿产出资格的处理器先说这件事（数据驱动的通用防御，
-   * 当前表内两个处理器都有资格，此分支为将来新增处理器预留）：
-   * 不管成本账算得多好看，这条期次的算力恒为 0、挖矿产出恒为 0。
-   */
-  if (!isMineable(processorId)) {
-    return (
-      `${name}：元件可正常采购，但**没有挖矿产出资格**` +
-      `（官方 mining 合约 processorMultiplier = 0），` +
-      `元件成本 ${cost.toFixed(6)} BNB，本期算力与挖矿产出均为 0`
-    );
-  }
-  if (!affordable) {
-    return (
-      `${name}：采购需 ${cost.toFixed(4)} BNB，募资总额只有 ${hardCapBnb.toFixed(4)} BNB，` +
-      `挂单时会买不到元件，判失败后可退款或降价重挂`
-    );
-  }
-  if (ratio < COST_RATIO_MIN) {
-    return (
-      `${name}：元件成本 ${cost.toFixed(4)} BNB 仅占募资总额 ${ratioPct}%，` +
-      `保护很厚，但留存的资金也不会产出`
-    );
-  }
-  if (ratio > COST_RATIO_MAX) {
-    return (
-      `${name}：元件成本占募资总额 ${ratioPct}%，偏高；` +
-      `价格上涨 ${((tolerance - 1) * 100).toFixed(0)}% 就买不起，缓冲较薄`
-    );
-  }
-  return (
-    `${name}：元件成本 ${cost.toFixed(4)} BNB 占募资总额 ${ratioPct}%，` +
-    `权重 ${plan.hashpower}，可承受 ${((tolerance - 1) * 100).toFixed(0)}% 的价格上涨`
-  );
-}
 
 /**
  * 反向：给定募资总额，推荐能负担的元件数量区间。
@@ -599,15 +525,3 @@ export function suggestPartRange({ hardCapBnb, snapshot, transistorId }) {
   };
 }
 
-/** 为「烧 N 颗元件」推荐能覆盖成本的最小募资总额（含安全垫） */
-export function suggestHardCap({ parts, transistorId, snapshot, cushion = 0.3 }) {
-  const plan = planTask({ parts, transistorId, snapshot });
-  const bnb = plan.partsCost * (1 + cushion);
-  return {
-    plan,
-    /** 建议募资总额（BNB） */
-    bnb,
-    /** 等值 USDT（固定口径，仅供填写参考） */
-    usdt: bnb * NOMINAL_BNB_USDT,
-  };
-}
