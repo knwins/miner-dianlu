@@ -78,8 +78,8 @@ console.log("市价单元格:", JSON.stringify(quoteCell), hasHint ? "（仍含�
 const checks = [
   ["弹窗打开", Boolean(sheetOk)],
   ["历史记录来自链上事件（有条目）", feed.length > 0],
-  ["只显示最近 5 条", feed.length > 0 && feed.length <= 5],
-  ["截断时提示「仅显示最近 5 条」", feed.length === 0 || feed.length < 5 || /仅显示最近 5 条/.test(panelText)],
+  ["只显示最近 3 条", feed.length > 0 && feed.length <= 3],
+  ["截断时提示「仅显示最近 3 条」", feed.length === 0 || feed.length < 3 || /仅显示最近 3 条/.test(panelText)],
   ["不再出现「这版市场合约没有事件」", !/这版市场合约没有事件|按订单状态推算/.test(panelText)],
   ["有成交/挂单事件文案", /挂买单|买单 #|成交/.test(feed.join(" "))],
   ["数量默认 1", !hasForm || (qtyVals.length > 0 && qtyVals.every((v) => v === "1"))],

@@ -1,10 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { readAskSettleTimes, readMarketTrades } from "./chain/client.js";
+import { readAskSettleTimes, readMarketTrades, MARKET_TRADE_LIMIT } from "./chain/client.js";
 import { explorerAddress, explorerTx } from "./chain/config.js";
 import { round4, shortAddress } from "./fixtures.js";
-
-/** 历史交易记录栏只显示最近 5 条（读取端也是按 5 条为上限往前翻）。 */
-const TRADE_FEED_LIMIT = 5;
 
 const TRADE_STATUS = {
   open: "等待成交",
@@ -328,8 +325,8 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
       }))
     : [];
 
-  /** 窄栏只放最近 5 条：再往前翻是翻旧账，对当前决策没用 */
-  const records = allRecords.slice(0, TRADE_FEED_LIMIT);
+  /** 窄栏只放最近几条：再往前翻是翻旧账，对当前决策没用（条数见 MARKET_TRADE_LIMIT） */
+  const records = allRecords.slice(0, MARKET_TRADE_LIMIT);
 
   const partsOnHand = Number(fallbackRows.partsNand || 0) + Number(fallbackRows.partsLatch || 0);
   const stage = phase === "ready"
@@ -424,7 +421,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
         )}
 
         {allRecords.length > records.length && (
-          <p className="trade-panel-more">仅显示最近 {TRADE_FEED_LIMIT} 条</p>
+          <p className="trade-panel-more">仅显示最近 {MARKET_TRADE_LIMIT} 条</p>
         )}
 
         {/*

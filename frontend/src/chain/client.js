@@ -1081,8 +1081,8 @@ async function readMarketOwedView(runner, campaignAddr, account) {
 // ── 待执行状态的材料市场成交记录 ──
 const MARKET_LOG_WINDOWS = 6; // 最多回看 6 × 50k 块（约 10 天）；凑满条数会提前停
 const MARKET_LOG_SPAN = 50_000;
-/** 历史交易记录只保留最近这么多条（面板是窄栏，翻旧账没意义）。 */
-const MARKET_TRADE_LIMIT = 5;
+/** 历史交易记录只保留最近这么多条（窄栏放不下更多，也不该翻旧账）。 */
+export const MARKET_TRADE_LIMIT = 3;
 const blockTimeCache = new Map();
 /** 每个市场已扫到哪个块，避免每次刷新都重扫历史区间（旧版 Mock 没有任何事件）。 */
 const marketScanCursor = new Map();
