@@ -908,9 +908,6 @@ export function OwnerOverview({
                               {pending === "abandonOrder" ? "撤回中…" : "放弃挂单并退款"}
                             </button>
                           )}
-                          <a className="btn btn-inline" href="https://tapeout.net/" target="_blank" rel="noreferrer">
-                            材料市场 ↗
-                          </a>
                         </div>
                       )}
 

@@ -87,6 +87,12 @@ console.log("  面板标题:", JSON.stringify(panelTitle));
 const steps = await page.locator(".flow-steps li").allInnerTexts().catch(() => []);
 console.log("步骤条:", JSON.stringify(steps));
 
+// 5b. 「材料市场 ↗」外链已移除（弹出框内不应再出现该外链）
+const marketLink = await page.locator('.sheet a[href*="tapeout.net"]').count().catch(() => 0);
+const marketLinkText = bodyText.includes("材料市场 ↗");
+console.log("「材料市场 ↗」外链（应为 0）:", marketLink, "| 文案残留:", marketLinkText);
+ok.noMarketExternalLink = marketLink === 0 && !marketLinkText;
+
 // 6. 挂买单表单仍可用（这是删卡后「市价」列必须自己扛住的地方）
 const quoteCells = await page.locator(".ops-exec .flow-quote").count().catch(() => 0);
 console.log("「市价」可点填单元格数:", quoteCells);
@@ -99,7 +105,7 @@ console.log("\n运行时错误数:", errors.length);
 for (const e of errors.slice(0, 10)) console.log("  •", e);
 
 const pass = ok.noOfficialPriceCard && ok.billMinimal && ok.paramNoDup
-  && ok.noDupPanelNote && errors.length === 0;
+  && ok.noDupPanelNote && ok.noMarketExternalLink && errors.length === 0;
 console.log(pass ? "\n[PASS] 合约操作页简化断言全部通过" : "\n[FAIL] 见上方 false 项");
 await browser.close();
 process.exit(pass ? 0 : 1);
