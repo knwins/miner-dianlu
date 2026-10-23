@@ -117,7 +117,7 @@ function contractCatalog(round, book = {}) {
         { name: "totalPendingSurplus", kind: "read", caller: "任何人", signature: "totalPendingSurplus() view", summary: "全期待领取余款总额（BNB）。这部分钱不属于 Owner，recoverBnb 不会扫走。", fields: [] },
         { name: "raisedBnb", kind: "read", caller: "任何人", signature: "raisedBnb() view", summary: "合约代持的 BNB 托管池。", fields: [] },
         { name: "transistors", kind: "read", caller: "任何人", signature: "transistors() view", summary: "开期锁定的元件 ERC1155 合约（TapeOut / Behemoth 或测试网 Mock）。", fields: [] },
-        { name: "market", kind: "read", caller: "任何人", signature: "market() view", summary: "材料市场地址。", fields: [] },
+        { name: "materialMarket", kind: "read", caller: "任何人", signature: "materialMarket() view", summary: "材料市场地址。旧工厂造出来的期次（主网期次 #0、测试网期次）该 getter 名为 market()，读取时双名回退。", fields: [] },
         { name: "executionFailed", kind: "read", caller: "任何人", signature: "executionFailed() view", summary: "是否已判执行失败；为真时持有人可 refund。", fields: [] },
         { name: "soldOutAt", kind: "read", caller: "任何人", signature: "soldOutAt() view", summary: "售罄时刻；非 Owner 的 markFailed 要等到售罄满 3 天。", fields: [] },
         { name: "priceLock", kind: "read", caller: "任何人", signature: "priceLock() view", summary: "挂单锁定的元件总成本（BNB）与颗粒数。", fields: [] },
@@ -324,7 +324,7 @@ function contractCatalog(round, book = {}) {
     {
       id: "market",
       name: "材料市场（Mock 调试）",
-      address: book.market || "由本期合约 market() 读取",
+      address: book.market || "由本期合约 materialMarket() 读取（旧期次为 market()）",
       methods: [
         {
           name: "marketOpenOrders",
@@ -906,7 +906,7 @@ export function readCall(method, args, round, book, quote = QUOTE) {
   if (method === "totalRefunded") return `${Number(book.refundedTotal || 0).toFixed(4)} BNB`;
   if (method === "raisedBnb") return `${(book.bnbPool || 0).toFixed(4)} BNB`;
   if (method === "transistors") return book.transistors || "—";
-  if (method === "market") return book.market || "—";
+  if (method === "market" || method === "materialMarket") return book.market || "—";
   /**
    * 工厂元件白名单读项（模拟模式）。
    *

@@ -1,4 +1,6 @@
 // 与 contracts/contracts/Campaign.sol 对齐的最小 ABI（human-readable，ethers v6 直接可用）。
+// materialMarket() 是新代码的材料市场 getter；market() 保留给旧工厂造出来的期次
+// （含主网期次 #0 与测试网期次）—— 读取处的双名回退见 client.js 的 readMaterialMarket()。
 export const CAMPAIGN_ABI = [
   // ── 自动 getter（public 状态变量） ──
   "function scene() view returns (uint8)",
@@ -10,7 +12,7 @@ export const CAMPAIGN_ABI = [
   "function feeRecipientCount() view returns (uint256)",
   "function feeRecipientAt(uint256) view returns (address)",
   "function feeSharesBpsAt(uint256) view returns (uint16)",
-  "function pendingFeeOf(address) view returns (uint256)",
+  "function pendingFee(address) view returns (uint256)",
   "function totalPendingFee() view returns (uint256)",
   "function revenuePool() view returns (uint256)",
   "function surplusPool() view returns (uint256)",
@@ -40,7 +42,8 @@ export const CAMPAIGN_ABI = [
   "function totalShares() view returns (uint256)",
   "function fundingDeadline() view returns (uint64)",
   "function transistors() view returns (address)",
-  "function market() view returns (address)",
+  "function materialMarket() view returns (address)",
+  "function market() view returns (address)", // 旧工厂期次专用 getter（主网期次 #0 / 测试网期次）
   "function miningPool() view returns (address)",
   "function factory() view returns (address)",
   "function owner() view returns (address)",

@@ -66,11 +66,18 @@ async function campaignConstructorArgs(campaignAddr, dep) {
     const parsed = iface.parseLog(log);
     if (String(parsed.args.campaign).toLowerCase() !== String(campaignAddr).toLowerCase()) continue;
     const c = await ethers.getContractAt("Campaign", campaignAddr);
+    // 新代码 getter 是 materialMarket()；旧工厂造出来的期次只有 market()，两种都认。
+    let marketAddr;
+    try {
+      marketAddr = await c.materialMarket();
+    } catch {
+      marketAddr = await c.market();
+    }
     return [
       parsed.args.sharePriceBnb,
       parsed.args.totalShares,
       parsed.args.fundingDeadline,
-      await c.market(),
+      marketAddr,
       dep.deployer,
       await c.transistors(),
     ];

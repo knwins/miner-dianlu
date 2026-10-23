@@ -429,7 +429,7 @@ async function readStateOn(runner, account, campaignAddr) {
     withDefault(c.executionFailed(), false),
     c.raisedBnb(),
     withDefault(c.totalRefunded(), 0n),
-    c.fundingDeadline(), c.transistors(), c.market(), c.factory(),
+    c.fundingDeadline(), c.transistors(), readMaterialMarket(c), c.factory(),
     c.owner(),
     withDefault(c.pooled(), false),
     withDefault(c.miningPool(), ZeroAddress),
@@ -624,6 +624,7 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
     case "transistors":
       return state.transistors || "—";
     case "market":
+    case "materialMarket":
       return state.market || "—";
     case "marketOpenOrders":
       return readMarketBook(campaignAddr);
@@ -797,6 +798,27 @@ export async function readAccountAcrossCampaigns(account, addrs) {
   return rows;
 }
 
+/**
+ * 读本期接的材料市场地址。
+ * 新代码 getter 是 materialMarket()；旧工厂造出来的期次（主网期次 #0、测试网期次、
+ * legacyFactories 里的期次）只有 market()。两个都试，新的优先，都失败回 ZeroAddress。
+ */
+async function readMaterialMarket(c) {
+  try {
+    const a = await c.materialMarket();
+    if (isAddr(a) && a !== ZeroAddress) return a;
+  } catch {
+    /* 旧合约没有这个 getter，走 market() */
+  }
+  try {
+    const a = await c.market();
+    if (isAddr(a) && a !== ZeroAddress) return a;
+  } catch {
+    return ZeroAddress;
+  }
+  return ZeroAddress;
+}
+
 /** 新期次才有官方买单字段。旧合约调用会 revert，按「尚未对接市场」处理。 */
 async function readMarketOrder(c) {
   const empty = {
@@ -812,7 +834,7 @@ async function readMarketOrder(c) {
       c.nandBidId(), c.latchBidId(), c.nandQty(), c.latchQty(), c.nandPrice(), c.latchPrice(),
       c.transistors(), c.orderFilled(),
     ]);
-    const marketAddr = await c.market().catch(() => null);
+    const marketAddr = await readMaterialMarket(c);
     const [nandRemaining, latchRemaining] = await Promise.all([
       readLegRemaining(c.runner, marketAddr, nandBidId, nandQty),
       readLegRemaining(c.runner, marketAddr, latchBidId, latchQty),
@@ -945,7 +967,7 @@ const shortAddr = (a) => (isAddr(a) ? `${a.slice(0, 6)}…${a.slice(-4)}` : Stri
 /** 本期合约接的材料市场，并确认它带 Mock 订单簿（nextBidId / bids）。 */
 async function marketHandle(runner, campaignAddr = getCampaignAddress()) {
   const campaign = campaignContract(runner, campaignAddr);
-  const marketAddr = await campaign.market();
+  const marketAddr = await readMaterialMarket(campaign);
   if (!isAddr(marketAddr) || marketAddr === ZeroAddress) {
     throw new Error("本期合约没有配置材料市场（market 为 0）。");
   }
@@ -1091,7 +1113,7 @@ export async function readAskSettleTimes(campaignAddr, legs) {
   if (!asks.length) return {};
   return withReadProvider(async (runner) => {
     const c = campaignContract(runner, campaignAddr);
-    const marketAddr = await c.market().catch(() => null);
+    const marketAddr = await readMaterialMarket(c);
     if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return {};
     const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
     const latest = await runner.getBlockNumber().catch(() => null);
@@ -1412,12 +1434,7 @@ const marketTradesInflight = new Map();
 async function readMarketTradesOnce(campaignAddr) {
   return withReadProvider(async (runner) => {
     const c = campaignContract(runner, campaignAddr);
-    let marketAddr;
-    try {
-      marketAddr = await c.market();
-    } catch {
-      return null;
-    }
+    const marketAddr = await readMaterialMarket(c);
     if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return null;
     const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
 

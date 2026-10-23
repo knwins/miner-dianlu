@@ -18,11 +18,13 @@ import {IMaterialMarket} from "./interfaces/IMaterialMarket.sol";
 ///  - Share transfer (listShares / takeListing / cancelListing) is Mining-only. Buyer BNB is paid
 ///    straight to the seller, not into raisedBnb.
 ///
-///  NOTE: tape-out (流片) and PoD mining have been REMOVED. In their place, an owner commits the
+///  NOTE: tape-out and PoD mining have been REMOVED. In their place, an owner commits the
 ///  round's transistors into a mining pool via depositToPool() — an IRREVERSIBLE action that transfers
 ///  the held ERC1155 parts to `miningPool`, returns any unspent subscription BNB to holders (shares kept),
 ///  and moves the round into the Mining scene. harvest() / claim() remain placeholders: the Mining scene is
 ///  now reachable, but no BEM distribution is implemented yet, so they no-op / return 0.
+///  Business rules (fee = mining-output fee only, `sold` monotonic, refund denominators, refund exit
+///  paths, ...) live in contracts/README.md §8; comments here only point there.
 interface IFactory {
     function isRegistered(address campaign) external view returns (bool);
 }
@@ -52,19 +54,11 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     uint256 internal constant FAIL_GRACE = 3 days;
-    /// @notice 服务费硬上限（基点）。1000 = 10%。
-    ///         ⚠️ **口径澄清（必须记住）**：本期的「服务费」是**挖矿产出奖励的服务费**，
-    ///         它只在矿池把挖矿收益打进 depositRevenue() 时从**收益**里计提，
-    ///         **与认筹款（subscribe 付的 BNB）完全无关**。
-    ///         认购人付的 BNB 全额进 raisedBnb（认购托管池），只用于买元件，
-    ///         链上**不存在**任何从认购款里抽服务费的路径。
-    ///         所以这个上限约束的是「最多从挖矿产出里抽走 10% 给服务费收款方」，
-    ///         **不是**「不能吃掉认购款」。
+    /// @notice Service-fee hard ceiling (bps). 1000 = 10%. The fee is charged on mining output
+    ///         only, never on subscription BNB — see README §8 rule 1.
     uint16 internal constant MAX_SERVICE_FEE_BPS = 1000;
-    /// @notice 服务费分成表最多几个地址。限制数组长度，避免计提时的循环把 gas 撑爆。
-    ///         T-72：8 → 3。分成表每多一个地址都要多存一份地址 + 份额，
-    ///         而常见场景就是「一个人独享」或「平台 + 创始人」两三个地址。
-    ///         3 个已足够，且链上字节与循环成本都更低。
+    /// @notice Max service-fee recipients. 3 covers "solo" / "platform + founder" and keeps the
+    ///         accrual loop and storage cost down.
     uint256 internal constant MAX_FEE_RECIPIENTS = 3;
 
     // ─────────────────────── immutable config (fixed at creation) ───────────────────────
@@ -75,7 +69,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Locked at create; placeBid uses it. The processor model is fixed here, not chosen per order.
     address public immutable transistors;
     /// @notice Material market (placeBid / cancelBid / bids). Testnets may use a matching mock.
-    IMaterialMarket public market;
+    ///         The owner may swap it via setMaterialMarket; every market that ever served this round
+    ///         stays an accepted sender in receive() (async settlements).
+    IMaterialMarket public materialMarket;
     /// @notice Mining pool address. Owner-set before depositToPool(); the held transistors are sent here
     ///         irreversibly. May be any ERC1155-receiving contract (must implement onERC1155Received).
     address public miningPool;
@@ -83,35 +79,31 @@ contract Campaign is Ownable, ReentrancyGuard {
     // ─────────────────────── mutable state ───────────────────────
     Scene public scene;
     Phase public phase;
-    /// @notice 本期**累计**售出的份数。只在 subscribe 里增加，**退款不会让它变小**。
-    ///         为什么要单调：owner 下单的闸门是「本期必须售罄」（sold == totalShares）。
-    ///         退款原本会递减 sold，于是任何一个持份人退款后，owner 就永久失去下单资格
-    ///         （H-1 后半）。改成单调后，退款只影响 outstandingShares，owner 的执行资格不受影响。
+    /// @notice Cumulative shares ever sold. Monotonic: refunds never decrease it.
+    ///         The owner's "must have sold out" gate reads this, so a refund can never
+    ///         permanently revoke the owner's ordering right — see README §8 rule 5.
     uint256 public sold;
-    /// @notice 已售出但**尚未退款**的份数。退款时递减；按比例退款的分母就是它。
-    ///         与 sold 的差别：sold 记「卖出去过多少」（历史事实），outstandingShares 记「还欠多少人」（当前债务）。
+    /// @notice Shares sold and not yet refunded. Decreases on refund; it is the pro-rata
+    ///         refund denominator. `sold` is history, `outstandingShares` is current debt.
     uint256 public outstandingShares;
-    /// @notice 本期服务费率（基点，1/10000）。0 = 不收。
-    ///         由开期人在**尚无人认购时**通过 setServiceFee 设定并固定下来，
-    ///         链上前端可读 —— 不再是前端本地记录（口径反转：服务费真正上链）。
-    ///
-    ///         ⚠️ **口径澄清（勿回退）**：本字段是**挖矿产出奖励的服务费率**。
-    ///         它只在 depositRevenue()（矿池把挖矿收益打进来）时从**收益**里计提，
-    ///         **与认筹款无关** —— subscribe() 收的 BNB 全额进 raisedBnb，
-    ///         链上不存在从认购款抽服务费的任何路径。
+    /// @notice Service-fee rate (bps, 1/10000). 0 = none. Settable once while nobody has
+    ///         subscribed (sold == 0), then frozen forever. Mining-output fee only — see
+    ///         README §8 rule 1.
     uint16 public serviceFeeBps;
-    /// @notice 服务费分成地址（多地址分成表）。长度 = feeRecipientCount()。
+    /// @notice Service-fee recipients (split table). Length = feeRecipientCount().
     address[] private _feeRecipients;
-    /// @notice 各分成地址的份额（基点，合计 10000）。与 _feeRecipients 一一对应。
+    /// @notice Per-recipient share (bps). Sums to 10000; index-aligned with _feeRecipients.
     uint16[] private _feeSharesBps;
-    /// @notice 各分成地址已计提但未领取的服务费。收款方自己调 claimFee() 领（pull 模式）。
+    /// @notice Accrued-but-unclaimed service fee per recipient; pulled via claimFee().
     mapping(address => uint256) public pendingFee;
-    /// @notice pendingFee 的总额。recoverBnb 必须把它留出来，否则 owner 会吞掉收款方的服务费。
+    /// @notice Sum of pendingFee. recoverBnb must reserve it, or the owner would swallow
+    ///         the recipients' fees.
     uint256 public totalPendingFee;
-    /// @notice 服务费是否已被设定过。设定后（哪怕 bps = 0）不再允许修改。
+    /// @notice True once the fee table was written. Frozen forever once set (even at 0 bps).
     bool public serviceFeeSet;
     uint64 public soldOutAt;
-    /// @notice 最后一次 placeTransistorOrder 的时间戳。非 owner 调用 markFailed 的宽限期从它算起。
+    /// @notice Timestamp of the last placeTransistorOrder. The non-owner markFailed grace
+    ///         period is measured from it.
     uint64 public lastOrderAt;
     bool public executionFailed;
     /// @notice True once the held transistors have been committed to the mining pool. Irreversible:
@@ -120,11 +112,11 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     uint256 public raisedBnb; // subscription escrow. Bids debit it; market refunds credit it via receive
     uint256 public totalRefunded; // cumulative refunded BNB (all wallets)
-    /// @notice 累计已支付出去的服务费（wei）。
+    /// @notice Cumulative service fee paid out (wei).
     uint256 public totalFeesPaid;
-    /// @notice 挖矿收益池：矿池打进来的收益，扣掉服务费后的净额。
-    ///         分配给持份人的逻辑等矿池接口就绪后在 harvest()/claim() 里实现（当前是占位）。
-    ///         ⚠️ 这个池子装的是**挖矿产出**，不是认筹款。认筹款在 raisedBnb 里。
+    /// @notice Mining revenue pool: revenue net of the service fee. Holder distribution lands
+    ///         with harvest()/claim() once the mining-pool interface is ready (placeholders today).
+    ///         Holds mining output, not subscription funds.
     uint256 public revenuePool;
 
     uint256 public priceLock; // total bid escrow (wei), not a unit price. 0 = no live order
@@ -147,36 +139,42 @@ contract Campaign is Ownable, ReentrancyGuard {
     mapping(address => uint256) private _shares; // available shares
     mapping(address => uint256) private _escrow; // shares locked in a listing
     mapping(address => uint256) private _refunded; // BNB already refunded to this wallet
-    /// @notice 入池时未发出去的余款（按份应得但转账失败）。持份人可自行 claimSurplus() 领取。
+    /// @notice Surplus accrued at pool time but not yet transferred; claimable via claimSurplus().
     mapping(address => uint256) public pendingSurplus;
 
-    /// @notice pendingSurplus 的总额。recoverBnb 在「sold == 0」分支会扫走整个余额，
-    ///         必须先把这笔钱留出来，否则 owner 会吞掉持份人尚未领取的余款。
+    /// @notice Sum of pendingSurplus. recoverBnb sweeps the balance in the "sold == 0" branch and
+    ///         must reserve this, or the owner would swallow holders' unclaimed surplus.
     uint256 public totalPendingSurplus;
-    /// @notice 入池时可分配的余款总额（= 入池瞬间的 raisedBnb）。它是按份计算的**分子基准**，不随退款变化。
+    /// @notice Surplus bookable at pool time (= raisedBnb at that instant). It is the numerator base
+    ///         for the per-share math and does not move when holders later exit.
     uint256 public surplusPool;
-    /// @notice 余款分配的份额分母（= 入池瞬间的 outstandingShares）。持份人后来增减不影响已定基准。
+    /// @notice Surplus denominator (= outstandingShares at pool time). Later holder churn does not
+    ///         move an already-fixed base.
     uint256 public surplusBase;
-    /// @notice 已经按份算过账的份数（用于把取整尾差交给最后一位来领，保证分毫不差地发完）。
+    /// @notice Shares already counted toward the surplus split (the rounding dust goes to the last
+    ///         claimant, so the pool is paid out to the last wei).
     uint256 public surplusClaimedShares;
-    /// @notice 已经按份「分配」出去的总额（= 已计提给各持份人但未必已转账，含 pendingSurplus 里的）。
-    ///         分配口径必须与 surplusPaid 分开：计提发生在 accrue，转账发生在 claim。
+    /// @notice Total surplus already allocated (accrued to holders, transferred or not). Allocation
+    ///         (accrue) and payout (claim) are deliberately separate ledgers.
     uint256 public surplusAllocated;
-    /// @notice 已经真正转给持份人的余款总额。owner 扫钱时用 surplusPool − surplusPaid 算「还欠多少」。
+    /// @notice Surplus actually transferred to holders. recoverBnb uses surplusPool − surplusPaid
+    ///         for "still owed".
     uint256 public surplusPaid;
-    /// @notice 每个持份人已经计入余款分配的份数。用于防止同一个人重复领取。
+    /// @notice Shares already counted into the surplus split per holder; prevents double claims.
     mapping(address => uint256) public surplusCounted;
-    address[] private _holders; // subscribers and listing buyers. openRefund and surplus use this list
-    // NOTE: 只增不减（已退款 / 已领完的地址仍留在数组里），因为 _holders 的下标被 holderAt() 暴露给前端。
-    // 代价是 _refundAll / _returnSurplus 每次全量遍历：每条约 2.1k gas（冷 SLOAD），
-    // 即 1,000 个地址约 2.1M gas、10,000 个约 21M gas——会逼近区块 gas 上限。
-    // 单期份数天然有上限（totalShares 由开期人定），目前够用；
-    // 若将来要让 owner 能给上万地址退款，需改成可分批的 pull 退款（分段游标）而不是继续加长这个数组。
+    address[] private _holders; // subscribers and listing buyers; openRefund / _refundAll walks it
+    // Append-only (refunded / fully-claimed addresses stay): _holders indexes are exposed to the
+    // frontend via holderAt(). The cost is that _refundAll walks the whole array — ~2.1k gas per
+    // cold SLOAD, i.e. ~2.1M gas for 1,000 holders, ~21M for 10,000, nearing the block gas limit.
+    // A round's holder count is naturally bounded by totalShares (set by the opener), which is enough
+    // today; owner-triggered refunds for tens of thousands of addresses would need a batched pull
+    // refund (segment cursor) instead of growing this array.
     mapping(address => bool) private _holderSeen;
 
     Listing[] private _listings;
-    /// @dev 曾担任过本期末次市场的地址。receive() 接受其中任何一个的打款——
-    ///      市场结算/撤单是异步的，只认当前 market 会把迟到的款项永久拒收。
+    /// @dev Addresses that ever served as this round's market. receive() accepts BNB from any of
+    ///      them: market settlement / bid cancellation is asynchronous, and recognizing only the
+    ///      current market would permanently reject late-arriving funds.
     address[] private _marketHistory;
 
     // ─────────────────────── events ───────────────────────
@@ -207,17 +205,27 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice The round's transistors were committed to the mining pool. IRREVERSIBLE.
     event DepositedToPool(address indexed pool, uint256 nandAmount, uint256 latchAmount);
     /// @notice The Executing sub-phase changed. Emitted by every path that writes `phase`.
-    /// @dev 前端不能只靠事件驱动状态——但有事件总比没有强：
-    ///      setPhase 之前**不发任何事件**，链下监控与前端完全看不到这一步被推过。
+    /// @dev The frontend must not drive state from events alone — but emitting beats silence:
+    ///      before _setPhase existed, some phase writes emitted nothing and off-chain monitors
+    ///      could not see the transition at all.
     event PhaseChanged(uint8 indexed previous, uint8 indexed next);
     /// @notice The round's sale order was settled and the proceeds pulled. The phase returns to Buying.
     event AskSettled(uint256 proceeds);
+    /// @notice Surplus was accrued to a holder. Amount is now claimable via claimSurplus().
+    event SurplusAccrued(address indexed holder, uint256 amountBnb);
+    /// @notice Service-fee configuration was set. Only settable while nobody has subscribed yet.
+    event ServiceFeeSet(uint16 feeBps, address[] recipients, uint16[] sharesBps);
+    /// @notice A service-fee share was accrued to a recipient. The recipient pulls it via claimFee().
+    event FeeAccrued(address indexed to, uint256 amount);
+    /// @notice Mining revenue was deposited into the round. `fee` was withheld, `net` went to the revenue pool.
+    event RevenueDeposited(uint256 gross, uint256 fee, uint256 net);
+    /// @notice A service-fee share was paid out at claimFee() time.
+    event FeePaid(address indexed to, uint256 amount);
 
     // ─────────────────────── errors ───────────────────────
     error DirectTransferNotAllowed();
     error WrongScene();
     error FundingEnded();
-    error NotSoldOut();
     error TransistorsNotReady();
     error RefundNotAvailable();
     error ZeroShares();
@@ -250,20 +258,11 @@ contract Campaign is Ownable, ReentrancyGuard {
     error ServiceFeeAlreadySet();
     /// @notice The service fee can no longer be changed because somebody already subscribed.
     error ServiceFeeLocked();
-    /// @notice The round is not sold out. Owner may not clear a round that subscribers can still exit from.
+    /// @notice The round has not sold out. Owner may not place a parts order for a round that is
+    ///         still funding.
     error NotSoldOutYet();
-    /// @notice Surplus was accrued to a holder. Amount is now claimable via claimSurplus().
-    event SurplusAccrued(address indexed holder, uint256 amountBnb);
-    /// @notice Service-fee configuration was set. Only settable while nobody has subscribed yet.
-    event ServiceFeeSet(uint16 feeBps, address[] recipients, uint16[] sharesBps);
-    /// @notice A service-fee share was accrued to a recipient. The recipient pulls it via claimFee().
-    event FeeAccrued(address indexed to, uint256 amount);
-    /// @notice Mining revenue was deposited into the round. `fee` was withheld, `net` went to the revenue pool.
-    event RevenueDeposited(uint256 gross, uint256 fee, uint256 net);
-    /// @notice A service-fee share was paid out at claimFee() time.
-    event FeePaid(address indexed to, uint256 amount);
 
-    /// @param materialMarket_ Material-market address. Stored in the `market` state var; read it via market().
+    /// @param materialMarket_ Material-market address. Stored in the `materialMarket` state var; read it via materialMarket().
     /// @param transistors_ Official ERC1155 parts contract for this round (TapeOut or Behemoth processor parts).
     ///        Locked at create; placeBid uses it. The processor model is fixed here, not chosen per order.
     constructor(
@@ -280,7 +279,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         sharePriceBnb = sharePriceBnb_;
         totalShares = totalShares_;
         fundingDeadline = fundingDeadline_;
-        market = IMaterialMarket(materialMarket_);
+        materialMarket = IMaterialMarket(materialMarket_);
         transistors = transistors_;
         scene = Scene.Funding;
         phase = Phase.None;
@@ -296,11 +295,12 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///      letting a stranger over-claim from the pool. A retired round's cancelBid refund still originates from
     ///      the market, so it is accepted here the same way — the factory registry state changes nothing.
     receive() external payable {
-        // 接受**任何曾经是本期末次市场**的地址，不只是当前 market。
+        // Accept BNB from any address that ever served as this round's market, not just the current one.
         //
-        // 为什么要历史：市场结算/撤单/提取是异步的。owner 若在款项到账前调了 setMaterialMarket，
-        // 那笔钱会被 DirectTransferNotAllowed 拒收——BSC 上不可追回，
-        // 用户本金就永久卡在旧市场里（合约里没有任何函数能取回它）。
+        // Why history: market settlement / cancellation / withdrawal are asynchronous. If the owner calls
+        // setMaterialMarket before a payment lands, the funds would be rejected by DirectTransferNotAllowed —
+        // unrecoverable on BSC, with the subscribers' principal permanently stuck in the old market (no
+        // function can pull it back).
         if (!_isKnownMarket(msg.sender)) revert DirectTransferNotAllowed();
         raisedBnb += msg.value;
     }
@@ -314,9 +314,9 @@ contract Campaign is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev 该地址是否曾经担任过本期的材料市场。
+    /// @dev True when `who` ever served as this round's material market.
     function _isKnownMarket(address who) internal view returns (bool) {
-        if (who == address(market)) return true;
+        if (who == address(materialMarket)) return true;
         for (uint256 i = 0; i < _marketHistory.length; i++) {
             if (_marketHistory[i] == who) return true;
         }
@@ -324,42 +324,34 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     /// @notice Replace the material market (official placeBid contract, or a matching test mock).
-    ///
-    ///         ⚠️ 加严说明（主网前）：
-    ///         原来这个函数**没有任何阶段限制**，也不撤销旧市场的 operator 授权。
-    ///         两个后果：
-    ///           1. 在 Listed 阶段换市场 → 撤单路径全部改调新市场的 cancelBid，
-    ///              而 bid 在旧市场上。要么新市场没有这个 bid 而 revert，
-    ///              要么旧市场的 cancelBid 把 BNB 退回来却被 receive() 拒收——
-    ///              **用户的全部认购款永久留在旧市场里，合约内没有任何函数能取回**。
-    ///           2. 换市场后，此前 placeTransistorAsk 给旧市场授的 setApprovalForAll 永久保留，
-    ///              旧市场可以随时把合约持有的 ERC1155 拿走。
-    ///         现在：有挂单或有卖单时禁止换；换的时候把旧市场的授权撤销。
+    ///         Blocked while a bid or an ask is live — their escrow would be stranded on the old
+    ///         market, unrecoverable on-chain. The old market's ERC1155 operator approval is revoked
+    ///         on the way out, so it can no longer pull this round's parts.
     function setMaterialMarket(address materialMarket_) external onlyOwner {
         if (materialMarket_ == address(0)) revert ZeroAddress();
-        // 有活跃挂单 / 卖单时换市场 = 把 escrow 丢在旧市场里。必须先撤干净。
+        // Swapping markets with a live order/ask strands the escrow on the old market. Cancel first.
         if (phase == Phase.Listed) revert AlreadyListed();
         if (_askOpen()) revert AlreadyAsked();
-        // 旧市场的 operator 授权要撤销，否则它随时能拿走本期的 ERC1155。
-        // revoke 失败不阻断换市场（老市场可能没实现 / 已自毁），但要留下痕迹。
-        address previous = address(market);
+        // Revoke the old market's operator approval, else it could still pull this round's ERC1155.
+        // A failed revoke does not block the swap (an old market may not implement it) but leaves a trace.
+        address previous = address(materialMarket);
         if (previous != materialMarket_) {
             _revokeApproval(previous);
         }
         emit MaterialMarketUpdated(previous, materialMarket_);
-        market = IMaterialMarket(materialMarket_);
+        materialMarket = IMaterialMarket(materialMarket_);
         if (previous != materialMarket_) {
             _marketHistory.push(previous);
         }
     }
 
-    /// @dev 撤销对某市场 operator 授权。失败静默——老市场可能不认这个调用。
+    /// @dev Revoke a market's operator approval. Silent on failure — an old market may not implement it.
     function _revokeApproval(address operator) internal {
         if (operator == address(0)) return;
         try IERC1155(transistors).setApprovalForAll(operator, false) {
             emit MaterialMarketApprovalRevoked(operator);
         } catch {
-            // 忽略：老市场 / 已弃用的元件合约不实现 setApprovalForAll。
+            // Ignore: an old / deprecated parts contract may not implement setApprovalForAll.
         }
     }
 
@@ -387,12 +379,9 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Buy an integer number of shares. msg.value must equal count × sharePriceBnb.
     ///         Subscribe is still allowed when timestamp == fundingDeadline. A sell-out moves the round to Executing / Buying.
-    ///
-    ///         ⚠️ **认筹款不收服务费（口径澄清，勿回退）**：
-    ///         这里的 BNB **全额**进 raisedBnb（认购托管池），只用于买元件。
-    ///         本期的「服务费」是**挖矿产出奖励的服务费**，只在 depositRevenue() 里从
-    ///         矿池打进来的收益中计提 —— 与本函数收的认筹款**完全无关**。
-    ///         链上**不存在**从认筹款抽服务费的路径，认购人付多少就全额进池子。
+    ///         Subscription BNB is never charged a service fee — it lands in raisedBnb in full and
+    ///         only funds the parts purchase. The service fee applies to mining output only
+    ///         (README §8 rule 1).
     function subscribe(uint256 count) external payable nonReentrant {
         if (scene != Scene.Funding) revert WrongScene();
         if (block.timestamp > fundingDeadline) revert FundingEnded();
@@ -420,19 +409,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Only allowed while **nobody has subscribed yet** (sold == 0). After that it is frozen
     ///         forever — subscribers must be able to trust the numbers they saw when they subscribed.
     ///         0 bps with an empty table = no fee (the default for a round nobody configures).
-    ///
-    ///         ⚠️ **服务费是什么、不是什么（口径澄清，勿回退）**：
-    ///           - 是：**挖矿产出奖励的服务费**。从矿池打进来的挖矿收益里按比例计提。
-    ///           - 不是：**认筹款（认购款）的服务费**。认购人付的 BNB **全额**进 raisedBnb
-    ///             （认购托管池），只用于买元件。链上**不存在**任何从认购款抽服务费的路径，
-    ///             也不存在「服务费吃掉认购款」这回事。
-    ///         收取点唯一：depositRevenue()（仅 miningPool 可调）—— 矿池把挖矿收益打进来时，
-    ///         合约自动按 serviceFeeBps 计提并按分成表切分，净额进 revenuePool。
-    ///
-    ///         为什么服务费必须上链（口径反转）：
-    ///         之前服务费只是**前端本地记录**（issuanceRecords.js / fixtures.js），
-    ///         链上既不收也不可查，用户看到的分配表可以随便改。
-    ///         现在费率与分成表都存在链上，任何人可读、可验证。
+    ///         The fee is charged on mining output only, at depositRevenue() — never on subscription
+    ///         BNB (README §8 rule 1). Rate and table live on-chain so anyone can verify them.
     ///
     ///         @param bps_ Fee rate in basis points (1/10000). Hard-capped at MAX_SERVICE_FEE_BPS (10%).
     ///         @param recipients_ Fee recipients. Max MAX_FEE_RECIPIENTS. May be empty only if bps_ == 0.
@@ -466,7 +444,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit ServiceFeeSet(bps_, recipients_, sharesBps_);
     }
 
-    /// @notice Service-fee recipients, for the frontend to read the split table.
+    /// @notice Number of service-fee recipients.
     function feeRecipientCount() external view returns (uint256) {
         return _feeRecipients.length;
     }
@@ -479,11 +457,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     function feeSharesBpsAt(uint256 index) external view returns (uint16) {
         if (index >= _feeSharesBps.length) revert BadFeeConfig();
         return _feeSharesBps[index];
-    }
-
-    /// @notice Total service fee accrued to `who` and not yet pulled.
-    function pendingFeeOf(address who) external view returns (uint256) {
-        return pendingFee[who];
     }
 
     /// @notice A fee recipient pulls its accrued service fee. Recipients may be contracts that reject
@@ -530,28 +503,21 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         A full pool pays count × sharePriceBnb. A short pool pays pro-rata of raisedBnb.
     ///         A sold-out round cannot use the deadline path: buyers funded the parts purchase, not a refund.
     ///         Reverts if this wallet still has escrowed shares.
-    ///
-    ///         ⚠️ 「未售罄不许退款」的实现口径（主网前修复，H-1 后半）：
-    ///         用户要求「在没有售罄前不允许退款」。字面照做会制造一个**新的 Critical**：
-    ///         未售罄 + Funding 过期的期次是**唯一**能让认购人拿回本金的出口，
-    ///         把它封掉等于把所有人的本金永久锁在合约里（owner 也扫不走：raisedBnb 还在）。
-    ///         所以实现为「owner 的下单资格不受退款影响」，用两个变量分工：
-    ///           - sold（单调，只增不减）= 本期卖出去过多少 → owner 的执行闸门只看它，
-    ///             退款不再剥夺 owner 的下单资格（H-1 后半的真正病根）；
-    ///           - outstandingShares（可减）= 还欠多少人 → 按比例退款的分母、_shortfall 的判据。
-    ///         未售罄时本来就没有任何退款路径（scene 必须已经是 Executing，即已售罄），
-    ///         唯一例外是 Funding 过期且未售罄 —— 那是本金出口，必须保留。
+    ///         The never-sold-out deadline path is the only principal exit for such rounds and must stay
+    ///         open (README §8 rule 6); the owner's ordering gate reads the monotonic `sold` instead
+    ///         (rule 5), so refunds never revoke it.
     function refund() external nonReentrant {
         bool execFailed = scene == Scene.Executing && executionFailed;
         bool short = scene == Scene.Executing && phase == Phase.Buying && _shortfall();
-        // 未售罄的期次只保留一条本金出口：Funding 过了截止时间。
-        // soldOutAt == 0 ⇔ 从未售罄（scene 转 Executing 的那一刻会写入它）。
+        // Never-sold-out rounds keep exactly one principal exit: Funding past its deadline.
+        // soldOutAt == 0 ⇔ never sold out (it is written the moment the scene turns Executing).
         bool neverSoldOut = scene == Scene.Funding && soldOutAt == 0 && block.timestamp > fundingDeadline;
         if (!neverSoldOut && !execFailed && !short) revert RefundNotAvailable();
 
         // A failed send must revert the whole tx. Soft-fail would surface as ZeroShares.
-        // 份额被清掉就算成功：池子相对份数太小时，按比例取整可能是 0，
-        // 这时不该让持份人永远退不出来（份额永远归不了零 → outstandingShares 永远不归零 → 尾差永远锁死）。
+        // Shares are cleared even when the pro-rata amount rounds to 0: a pool too small for the
+        // share count must not trap a holder forever (unsettled shares keep `outstandingShares`
+        // above 0 and lock the rounding dust).
         uint256 before = _shares[msg.sender];
         uint256 amount = _refundHolder(msg.sender, false);
         if (amount == 0 && _shares[msg.sender] == before) revert ZeroShares();
@@ -563,9 +529,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         _holders.push(who);
     }
 
-    /// @dev 统一写 phase 的入口，顺带发 PhaseChanged。
-    ///      之前 phase 有 8 个写入点，只有部分路径发事件——
-    ///      链下靠事件推导状态必然漏。现在所有写入都必须走这里。
+    /// @dev Single writer for `phase`; emits PhaseChanged. Every phase write goes through here
+    ///      so off-chain state derived from events never misses a transition.
     function _setPhase(Phase next) internal {
         uint8 previous = uint8(phase);
         phase = next;
@@ -573,23 +538,16 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     /// @dev Refund this wallet. Returns 0 if shares are 0, any shares are escrowed, or the pro-rata share rounds to 0.
-    ///      A full pool pays count × price. A short pool pays raisedBnb × shares / sold pro-rata.
+    ///      A full pool pays count × price. A short pool pays raisedBnb × shares / outstandingShares pro-rata.
     ///      soft=true (openRefund): a failed send restores this wallet and is skipped.
     ///      soft=false: a failed send reverts the whole transaction.
-    ///
-    ///      ⚠️ 取整为 0 也要清份额（主网前修复）：
-    ///      原来 `if (amount == 0) return 0;` 直接返回，**份额不清、sold 不减**。
-    ///      后果是短池下按比例取整为 0 的持份人永远退不出来：
-    ///        - 他的份额永远在 _shares 里 → sold 永远不归零；
-    ///        - sold != 0 时 recoverBnb 不敢扫尾差（要留给持份人）；
-    ///        - 于是这笔 BNB 被永久锁在合约里，谁也拿不走。
-    ///      现在：份额照清、outstandingShares 照减，池子里的余量留给后面的持份人
-    ///      （比例随 outstandingShares 变小而变大），最终由最后一位持份人按比例拿走，
-    ///      取整尾差不再被锁死。
-    ///
-    ///      ⚠️ 分母用 outstandingShares 而不是 sold（主网前修复，H-1 后半）：
-    ///      sold 改成单调的「历史事实」后退款不再递减它，用它做分母会把
-    ///      「已经退出的人」也算进分母里 → 池子永远发不完，最后几位拿不到应得的钱。
+    ///      Shares are cleared even when the amount rounds to 0, so a holder in a short pool can never be
+    ///      stuck: their shares would otherwise keep `sold` above 0 forever, recoverBnb could not sweep
+    ///      the dust, and the BNB would be locked with nobody able to take it. The pool keeps the dust
+    ///      for the remaining holders (their pro-rata grows as `outstandingShares` shrinks) and the last
+    ///      holder takes it by proportion.
+    ///      The denominator is `outstandingShares`, not `sold`: counting exited holders in the base
+    ///      would leave the pool permanently unpayable for the last few holders.
     function _refundHolder(address who, bool soft) internal returns (uint256 amount) {
         uint256 s = _shares[who];
         if (s == 0 || _escrow[who] != 0 || outstandingShares == 0) return 0;
@@ -690,11 +648,11 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (_askOpen()) revert AlreadyAsked();
         if (transistors_ != address(0) && transistors_ != transistors) revert WrongTransistors();
         _requireLegParams(nandQty_, nandPrice_, latchQty_, latchPrice_);
-        // 本期必须售罄过才允许下单。sold 是单调的，退款不会把它拉低，
-        // 所以这个条件不会因为「有人退过款」而失效（H-1 后半）。
+        // The round must have sold out at least once. `sold` is monotonic, so refunds cannot
+        // make this gate fail (README §8 rule 5).
         if (sold < totalShares) revert NotSoldOutYet();
-        // sold 现在是单调的「历史事实」：退款不会让它变小，所以这个闸门
-        // 表达的是「本期必须售罄过」而不是「此刻没人退过款」（H-1 后半）。
+        // `sold` is a monotonic historical fact: the gate means "this round sold out", not
+        // "nobody has refunded" (README §8 rule 5).
         if (executionFailed && (sold < totalShares || raisedBnb == 0)) revert RefundNotAvailable();
 
         uint256 nandCost = nandQty_ * uint256(nandPrice_);
@@ -716,8 +674,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         nandBidId = _placeBidLeg(0, nandQty_, nandPrice_, nandCost);
         latchBidId = _placeBidLeg(1, latchQty_, latchPrice_, latchCost);
         _setPhase(Phase.Listed);
-        // 每次下单都把非 owner 的 markFailed 宽限期推后。
-        // 宽限期从「最后一次下单」算起，owner 一直在推进就不会被阻击者掐断。
+        // Each order pushes the non-owner markFailed grace period forward: an owner who keeps
+        // making progress is never griefed by a bystander.
         lastOrderAt = uint64(block.timestamp);
         emit TransistorOrderPlaced(nandQty_ + latchQty_, cost);
     }
@@ -755,7 +713,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         _setPhase(Phase.Buying);
         _cancelOpenAsk();
         _returnHeldParts();
-        if (_owed() > 0) market.withdraw();
+        if (_owed() > 0) materialMarket.withdraw();
         markFailed();
         _refundAll();
     }
@@ -789,20 +747,11 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Lets holders refund even when no owner is around: the live bid's escrow would otherwise stay
     ///         in the market, so a non-owner call first cancels the unfilled legs (escrow returns here via
     ///         receive() and is credited to raisedBnb). Only the bid is touched; the refund formula is unchanged.
-    ///
-    ///         ⚠️ 宽限期基准修正（主网前）：
-    ///         原来非 owner 的宽限期从 `soldOutAt`（售罄时刻）算起，而且是**一次性的**。
-    ///         两个后果：
-    ///           1. 售罄 3 天后，任何地址都能把一个健康的执行期置为 executionFailed，
-    ///              并取消 owner 正在挂的买单——owner 之后再也无法下单（见 placeTransistorOrder 的闸门）。
-    ///              攻击成本 = 一次 1 份认购 + 等 3 天。
-    ///           2. owner 重新下单会把 executionFailed 重置为 false，于是宽限期「复活」，
-    ///              同样的阻击可以无限重复。
-    ///         现在宽限期从「最后一次有意义的动作」算起，取 `soldOutAt`（售罄时刻）与
-    ///         `lastOrderAt`（最后一次下单时刻）中的**较晚者**：
-    ///           - 只用 lastOrderAt：售罄后从未下单时基准为 0，宽限期形同虚设；
-    ///           - 只用 soldOutAt：owner 每次重新下单都会让 executionFailed 复活，阻击可无限重复。
-    ///         取较晚者后，owner 每次下单都会把宽限期推后，而「售罄后迟迟不下单」也不再被立刻处死。
+    ///         The grace base is the later of soldOutAt and lastOrderAt: basing it on soldOutAt alone let a
+    ///         bystander grief a healthy round each time the owner re-ordered (the reset revived the grace,
+    ///         so the attack could repeat forever), while lastOrderAt alone made the grace void before the
+    ///         first order. With the later of the two, every order pushes the grace forward and a round that
+    ///         never orders after selling out is not killed instantly.
     function markFailed() public {
         if (scene != Scene.Executing || executionFailed) return;
         uint256 graceBase = uint256(lastOrderAt) > uint256(soldOutAt) ? uint256(lastOrderAt) : uint256(soldOutAt);
@@ -842,7 +791,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (nandQty_ > 0 && token.balanceOf(address(this), 0) < nandQty_) revert InsufficientParts();
         if (latchQty_ > 0 && token.balanceOf(address(this), 1) < latchQty_) revert InsufficientParts();
         // Idempotent; skips the extra isApprovedForAll SLOAD/external call.
-        token.setApprovalForAll(address(market), true);
+        token.setApprovalForAll(address(materialMarket), true);
 
         nandAskQty = nandQty_;
         latchAskQty = latchQty_;
@@ -870,7 +819,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (_askOpen()) revert AlreadyAsked();
         uint256 owed = _owed();
         if (!_askRecorded() && owed == 0) revert NotAsked();
-        if (owed > 0) market.withdraw();
+        if (owed > 0) materialMarket.withdraw();
         _clearAsk();
         _setPhase(Phase.Buying);
         emit AskSettled(owed);
@@ -880,7 +829,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Anyone may call. No-op when owed is 0.
     function withdrawMarketProceeds() external nonReentrant {
         if (_owed() == 0) return;
-        market.withdraw();
+        materialMarket.withdraw();
     }
 
     /// @notice Anyone may call. Does not move tokens.
@@ -917,14 +866,14 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice Commit the round's transistors to the mining pool. IRREVERSIBLE.
     ///         Owner only, callable once the order is filled and the parts are on hand (phase Ready).
     ///         1. Transfers every held ERC1155 part (NAND id 0, LATCH id 1) to `miningPool`.
-    ///         2. Returns any unspent subscription BNB to holders pro-rata (shares are kept), so the owner
+    ///         2. Books any unspent subscription BNB as a pro-rata surplus pool (shares are kept), so the owner
     ///            cannot later sweep holder surplus via recoverBnb.
     ///         3. Sets `pooled = true` and moves the round into the Mining scene.
     ///         After this, recoverTransistors / refund / abandon / markFailed all revert (parts are gone and
     ///         the round is committed); the Mining scene is now reachable for the harvest() / claim() shells.
     ///         The pool contract must implement onERC1155Received; a failing receive reverts the whole tx.
-    ///         Gas note: step 2 walks the whole holder list, so a round with tens of thousands of
-    ///         holders can exceed the block gas limit and block the owner from pooling. See _holders.
+    ///         Gas note: step 2 books two numbers (pool + base) and each holder pulls via claimSurplus(),
+    ///         so the cost does not grow with the holder count.
     function depositToPool() external onlyOwner nonReentrant {
         if (pooled) revert AlreadyPooled();
         _requireExecuting();
@@ -959,12 +908,12 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice The mining pool deposits this round's mining revenue. Only the mining pool may call it.
     ///         This is the **only** place the service fee is ever collected on-chain
-    ///         (口径：服务费 = 挖矿产出奖励的服务费，不是认筹款的服务费):
+    ///         (the fee is on mining output, never on subscription BNB — README §8 rule 1):
     ///           - fee = gross × serviceFeeBps / 10000, split across the on-chain recipient table;
     ///           - the rest goes to `revenuePool`, waiting for the distribution logic that lands with
     ///             the mining-pool interface (harvest()/claim() are still placeholders).
-    ///         ⚠️ 认筹款（subscribe 付的 BNB）**不经过这里**，也不会被抽任何服务费：
-    ///         它全额留在 raisedBnb 里，只用于买元件。
+    ///         Subscription BNB never passes through here and is never charged a fee: it stays in raisedBnb
+    ///         and only funds the parts purchase.
     ///         Rounding dust stays in revenuePool, so the fee is never over-charged.
     ///         The accrued fee is **pulled** by each recipient via claimFee(); it is never pushed, so a
     ///         recipient contract that rejects BNB cannot block the pool's revenue deposit.
@@ -1016,17 +965,14 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── internal ───────────────────────────
 
-    /// @dev 把入池时未花出去的本金划成「按份分配的余款池」，**不再遍历持份人、不再逐笔转账**（C-4）。
-    ///      为什么改 pull：原来这里全量遍历 _holders 并给每人转账，
-    ///      每条约 35–45k gas（转账 21k + 冷 SLOAD），BSC 区块上限约 140M →
-    ///      约 3,500–4,000 个持份人就顶满上限，owner 会被永久卡住无法入池。
-    ///      现在只记录两个基准（分子 surplusPool、分母 surplusBase），
-    ///      每个人自己调 claimSurplus() 时才按累计份额公式算出应得额。
-    ///
-    ///      累计份额公式（与「谁先领」无关，且最后一人自动拿走取整尾差）：
-    ///        target = surplusPool × (已领份数累计 + 本人份数) / surplusBase
-    ///        本人应得 = target − 已发放总额
-    ///      所有人领完后 target = surplusPool，尾差自动归最后一人。
+    /// @dev Book the unspent principal at pool time as a pro-rata surplus pool. No holder loop and no
+    ///      per-holder transfer: only two numbers are stored (numerator surplusPool, denominator
+    ///      surplusBase) and each holder computes their cut in claimSurplus(). A full holder loop with
+    ///      per-holder transfers (~35-45k gas each) would block the owner from pooling past a few
+    ///      thousand holders against the BSC block gas limit.
+    ///      Cumulative-share formula (order-independent; the last claimant takes the rounding dust):
+    ///        target = surplusPool × (shares already counted + own shares) / surplusBase
+    ///        own cut = target − total already allocated
     function _returnSurplus() internal {
         uint256 pool = raisedBnb;
         if (pool == 0) return;
@@ -1035,17 +981,17 @@ contract Campaign is Ownable, ReentrancyGuard {
         surplusClaimedShares = 0;
         surplusAllocated = 0;
         surplusPaid = 0;
-        // 本金池清零：这些钱现在由 surplusPool 记账，由 claimSurplus() 分发。
-        // recoverBnb 的受保护金额会算上 surplusPool − surplusPaid，owner 扫不走。
+        // The principal pool is zeroed: the money is now tracked by surplusPool and distributed by
+        // claimSurplus(). recoverBnb's reserved amount covers surplusPool − surplusPaid, so the owner
+        // cannot sweep it.
         raisedBnb = 0;
     }
 
-    /// @notice 领取入池时应得但还没领的余款。
-    ///         两种来源：
-    ///           1. 懒计算应得额（正常路径）：按 surplusPool / surplusBase 的累计份额公式算；
-    ///           2. 之前 accrue 过但转账失败：这笔钱挂在 pendingSurplus 里，重试即可。
-    ///         为什么必须有这条路径：入池后 refund() 永久关闭，
-    ///         没有 claimSurplus 的话这笔钱会永远卡在合约里，owner 也扫不走。
+    /// @notice Claim the surplus booked for you at pool time.
+    ///         Two sources: the lazily computed entitlement (normal path) and a previously accrued
+    ///         amount whose transfer failed (pendingSurplus, retryable).
+    ///         Required because refund() is closed forever after pooling: without it the money would
+    ///         be stuck in the contract and not even the owner could sweep it.
     function claimSurplus() external nonReentrant {
         uint256 amt = pendingSurplus[msg.sender];
         if (amt == 0) {
@@ -1056,8 +1002,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         totalPendingSurplus -= amt;
         surplusPaid += amt;
         if (!_trySend(msg.sender, amt)) {
-            // 还是发不出去：整个交易回滚，pendingSurplus 里的钱原样保留，
-            // 持份人可以自己重试（或换地址 / 用智能合约钱包）。
+            // Still undeliverable: the whole tx reverts and the money in pendingSurplus is kept as-is;
+            // the holder can retry (or switch address / use a smart-contract wallet).
             revert TransferFailed();
         }
         _refunded[msg.sender] += amt;
@@ -1065,17 +1011,17 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit Refunded(msg.sender, amt);
     }
 
-    /// @dev 懒计算某人应得的余款，并把结果记账进 pendingSurplus。
-    ///      每个持份人只会被计入一次（surplusCounted 记录他已计入的份数），
-    ///      所以重复调用 claimSurplus 不会重复领钱。
-    ///      取整尾差（pool 减去各人按份算出的总和）归最后一个计入满 base 的人。
+    /// @dev Lazily compute a holder's surplus and book it into pendingSurplus.
+    ///      Each holder is counted once (surplusCounted), so repeated calls never pay twice.
+    ///      The rounding dust (pool minus the sum of per-share cuts) goes to the claimant who
+    ///      completes the base, so surplusPool is paid out to the last wei.
     function _accrueSurplus(address who) internal returns (uint256 amt) {
         uint256 s = _shares[who];
         if (s == 0 || surplusBase == 0 || surplusPool == 0) return 0;
         uint256 already = surplusCounted[who];
-        if (already >= s) return 0; // 已经计过份了
+        if (already >= s) return 0; // already counted
         uint256 newShares = s - already;
-        // 防御：入池后份额若因异常变化超过基准，超出部分不再发放。
+        // Defense: if shares grew past the base after pooling, the excess is not paid out.
         if (surplusClaimedShares + newShares > surplusBase) {
             newShares = surplusBase - surplusClaimedShares;
             if (newShares == 0) return 0;
@@ -1084,8 +1030,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         surplusClaimedShares += newShares;
 
         amt = (surplusPool * newShares) / surplusBase;
-        // 最后一个计入满基准的人拿走**全部剩余**（含前面各人取整产生的尾差），
-        // 保证 surplusPool 分毫不差地发完、也不会多发。
+        // The claimant who completes the base takes everything left (including earlier rounding dust),
+        // so surplusPool is paid out exactly, never over-paid.
         if (surplusClaimedShares == surplusBase) {
             amt = surplusPool - surplusAllocated;
         }
@@ -1095,7 +1041,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit SurplusAccrued(who, amt);
     }
 
-    /// @notice 某人当前可领取的余款（含还没记账的懒计算部分）。前端展示用。
+    /// @notice Surplus claimable by `who` right now (including the not-yet-booked lazy part). For display.
     function surplusOf(address who) external view returns (uint256) {
         uint256 amt = pendingSurplus[who];
         if (amt != 0) return amt;
@@ -1127,7 +1073,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     function _owed() internal view returns (uint256) {
-        return market.owed(address(this));
+        return materialMarket.owed(address(this));
     }
 
     function _requireExecuting() internal view {
@@ -1141,14 +1087,14 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     function _placeBidLeg(uint8 tokenId, uint256 qty, uint96 price, uint256 cost) internal returns (uint256 id) {
         if (qty == 0) return 0;
-        id = market.placeBid{value: cost}(transistors, tokenId, price, qty);
+        id = materialMarket.placeBid{value: cost}(transistors, tokenId, price, qty);
         if (id == 0) revert BadBidId();
     }
 
     /// @dev A zero id would make _askOpen() read remaining 0 and silently unlock a second order.
     function _placeAskLeg(uint8 tokenId, uint256 qty, uint96 price) internal returns (uint256 id) {
         if (qty == 0) return 0;
-        id = market.placeAsk(transistors, tokenId, price, qty);
+        id = materialMarket.placeAsk(transistors, tokenId, price, qty);
         if (id == 0) revert BadAskId();
     }
 
@@ -1163,7 +1109,7 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @dev Cancel the unfilled remainder. A filled leg (remaining == 0) is left alone; cancelBid would revert.
     function _cancelOpenLeg(uint256 id, uint256 qty) internal {
-        if (qty != 0 && id != 0 && _remaining(id) != 0) market.cancelBid(id);
+        if (qty != 0 && id != 0 && _remaining(id) != 0) materialMarket.cancelBid(id);
     }
 
     /// @dev True when raised BNB can no longer repay every outstanding share at the subscription price.
@@ -1180,7 +1126,7 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     function _remaining(uint256 id) internal view returns (uint256 remaining) {
         if (id == 0) return 0;
-        (,,,,, remaining) = market.bids(id);
+        (,,,,, remaining) = materialMarket.bids(id);
     }
 
     function _clearOrder() internal {
@@ -1208,7 +1154,7 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     function _askRemaining(uint256 id) internal view returns (uint256 remaining) {
         if (id == 0) return 0;
-        (,,,, remaining) = market.asks(id);
+        (,,,, remaining) = materialMarket.asks(id);
     }
 
     /// @dev Cancel both open ask legs and drop the record. Fully filled legs are skipped.
@@ -1216,8 +1162,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         uint256 a = nandAskId;
         uint256 b = latchAskId;
         _clearAsk();
-        if (_askRemaining(a) != 0) market.cancelAsk(a);
-        if (_askRemaining(b) != 0) market.cancelAsk(b);
+        if (_askRemaining(a) != 0) materialMarket.cancelAsk(a);
+        if (_askRemaining(b) != 0) materialMarket.cancelAsk(b);
     }
 
     function _clearAsk() internal {
@@ -1231,11 +1177,12 @@ contract Campaign is Ownable, ReentrancyGuard {
         return this.onERC1155Received.selector;
     }
 
-    /// @notice 批量交割钩子。
-    /// @dev 官方市场如果用 safeBatchTransferFrom 一次交付 NAND + LATCH，
-    ///      缺这个函数会让整笔交付 revert——而市场侧可能已经先扣掉了 remaining，
-    ///      于是 _partsOnHand() 永远为 false，confirmTransistors / depositToPool 永久 revert，
-    ///      同时 raisedBnb 已在下单时被扣减，用户的本金和已成交的元件同时被困。
+    /// @notice Batch delivery hook.
+    /// @dev If the official market delivers NAND + LATCH in one safeBatchTransferFrom, missing this
+    ///      function reverts the whole delivery — the market may already have decremented `remaining`,
+    ///      so _partsOnHand() would stay false and confirmTransistors / depositToPool would revert
+    ///      forever while raisedBnb is already spent: the subscribers' principal and the delivered
+    ///      parts would both be trapped.
     function onERC1155BatchReceived(
         address,
         address,
@@ -1246,8 +1193,9 @@ contract Campaign is Ownable, ReentrancyGuard {
         return this.onERC1155BatchReceived.selector;
     }
 
-    /// @notice ERC165 接口声明。
-    /// @dev 缺这个函数，部分标准实现会拒绝与本合约交互（safeTransferFrom 前置检查）。
+    /// @notice ERC165 interface declaration.
+    /// @dev Without it, some standard implementations refuse to interact with this contract
+    ///      (safeTransferFrom pre-check).
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
         return
             interfaceId == 0x01ffc9a7 || // ERC165
@@ -1260,27 +1208,18 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Does not move tokens and does not cancel a market order.
     ///         Listed is refused: cancel or abandon that bid first, or its escrow stays on the market.
     ///         0 None, 1 Buying, 2 Listed, 3 Ready.
-    ///
-    ///         ⚠️ 加严说明（主网前）：
-    ///         原来这个函数只校验 `next <= Ready` 与「当前不是 Listed」，
-    ///         owner 可以不挂任何单直接把 phase 推到 Ready——而 Ready 的语义是
-    ///         「元件已到账」。推过去之后 confirmTransistors / depositToPool 的前置检查
-    ///         会被绕过（空数量时 orderFilled / _partsOnHand 都恒为 true），
-    ///         期次可以零采购进入 Mining，之后退款 / 撤单 / 找回全部永久关闭。
-    ///         而且它**不发事件**，事后无法证明期次是被人为推过去的。
-    ///
-    ///         现在：
-    ///           - 进入 Ready 必须真的满足「买单已吃完 + 元件已到账」——
-    ///             这是唯一被封锁的方向，因为 Ready 蕴含「元件已到账」这个不变量；
-    ///           - 其余方向（Ready → Buying 等）保持可用，那是元件找回 / 退款清算的逃生路径，
-    ///             封掉它等于把 owner 密钥丢失变成用户的永久损失；
-    ///           - 每次变更都发 PhaseChanged。
+    ///         Entering Ready requires the objective facts (orderFilled() && _partsOnHand()): Ready means
+    ///         "parts are here", an invariant that must come from data, not from the owner's word — writing
+    ///         it directly would let a round reach Mining with zero purchase and close refund / cancel /
+    ///         recover forever. Every other direction stays open: Ready → Buying is the escape path for
+    ///         part recovery and refund settlement, and closing it would turn a lost owner key into a
+    ///         permanent loss for holders.
     function setPhase(uint8 next) external onlyOwner {
         if (scene != Scene.Executing) revert WrongScene();
         if (phase == Phase.Listed) revert AlreadyListed();
         if (next > uint8(Phase.Ready)) revert WrongScene();
-        // Ready = 元件已到账。这个不变量必须由数据说话，不能由 owner 一句话写进去。
-        // 其他方向不设限：Ready → Buying 是元件找回与退款清算的逃生路径。
+        // Ready = parts are here. The invariant must come from data, not from the owner's word.
+        // Other directions are unrestricted: Ready → Buying is the recovery / refund escape path.
         if (next == uint8(Phase.Ready) && !(orderFilled() && _partsOnHand())) {
             revert TransistorsNotReady();
         }
@@ -1297,22 +1236,25 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         balance leaves and raisedBnb is zeroed.
     function recoverBnb() external onlyOwner nonReentrant {
         uint256 amount = address(this).balance;
-        // 三笔钱永远不是 owner 的：
-        //   - raisedBnb：认购托管池（还有份没结清时）
-        //   - 未领取的余款（totalPendingSurplus）
-        //   - 未领取的服务费（totalPendingFee）与挖矿收益池（revenuePool）
-        // 少了任何一条，owner 就能把持份人/收款方的钱扫走。
+        // Three pots are never the owner's:
+        //   - raisedBnb: the subscription escrow (while shares are outstanding)
+        //   - unclaimed surplus: surplusPool − surplusPaid. totalPendingSurplus is a subset of that
+        //     (accrued but not sent) — adding it again would double-reserve.
+        //   - unclaimed service fee (totalPendingFee) and the mining revenue pool (revenuePool)
+        // Missing any one would let the owner sweep holders' / recipients' money.
         uint256 reserved = totalPendingFee + revenuePool;
-        // 未发放的余款：surplusPool 减去已经真正转出去的部分。
-        // 注意 totalPendingSurplus 是 surplusPool 的子集（已计提未转账），不能再加一次，否则重复预留。
+        // Unpaid surplus: surplusPool minus what was actually transferred. Note totalPendingSurplus is a
+        // subset of surplusPool − surplusPaid (accrued but not sent) — adding it again would double-reserve.
         if (surplusPool > surplusPaid) reserved += surplusPool - surplusPaid;
         if (outstandingShares == 0) {
-            // 所有份额已结清 → 托管池释放，全部余额归 owner（但上面 reserved 的钱要留下）。
+            // Every share settled → the escrow pool is released; the whole balance goes to the owner
+            // (minus the reserved pots above).
             if (amount <= reserved) revert ZeroShares();
             amount -= reserved;
             raisedBnb = 0;
         } else {
-            // 仍有未结清的份额 → 只有超出托管池（raisedBnb，已包含待领取余款）的部分可扫。
+            // Shares still outstanding → only the excess over the escrow pool (raisedBnb, which already
+            // covers claimable surplus) may leave.
             uint256 keep = raisedBnb + reserved;
             if (amount <= keep) revert ZeroShares();
             amount -= keep;

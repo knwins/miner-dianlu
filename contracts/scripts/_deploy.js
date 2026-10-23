@@ -1,15 +1,17 @@
 // 部署辅助：绕开 hardhat-ethers 在「合约创建交易」上的格式化崩溃。
 //
-// ⚠️ 背景（必读，不要改成 ethers.deployContract）：
-// @nomicfoundation/hardhat-ethers@3.1.3 的 HardhatEthersProvider.getTransaction() 会把
-// 原始 RPC 返回交给 formatTransactionResponse()，其中 `to` 的格式化是
-// `allowNull(getAddress, null)` —— 只放行 null / undefined。
-// 但 hardhat 对**合约创建交易**返回的 to 是**空字符串 ""**（不是 null），
-// 于是 getAddress("") 抛 `invalid value for value.to (invalid address, value="")`，
-// 栈落在 HardhatEthersSigner.sendTransaction → checkTx → provider.getTransaction。
-//
+// ⚠️ 背景（必读，不要改成 ethers.deployContract / factory.deploy()）：
+// @nomicfoundation/hardhat-ethers@3.1.3 的 HardhatEthersSigner.sendTransaction() 分两步：
+//   1. _sendUncheckedTransaction() → provider.send("eth_sendTransaction") —— 广播成功；
+//   2. checkTx() → provider.getTransaction(hash) 回读 —— HardhatEthersProvider.getTransaction()
+//      把 RPC 返回值交给 formatTransactionResponse()，其中 `to` 的格式化是
+//      allowNull(getAddress, null)（只放行 null / undefined）。hardhat 对**合约创建交易**返回的
+//      to 是**空字符串 ""**（不是 null），于是 getAddress("") 抛
+//      `invalid value for value.to (invalid address, value="")`。
 // 交易本身已经广播成功，只是回读失败 —— 极易误判成「部署失败」而重复部署。
-// 本模块自己算 CREATE 地址（getCreateAddress）、自己轮询回执，不碰那条格式化路径。
+// signTransaction() 在该类里是 NotImplementedError，没法本地签名绕开。
+// 本模块的对策：sendTransaction 崩了之后，按 CREATE 地址（部署前就能算出来）在最近若干个块里
+// 找回执，找到就当作广播成功继续；找不到才真的抛错。绝不重复部署。
 const { ethers } = require("hardhat");
 
 /** 按 CREATE 地址规则推导合约地址（keccak(rlp([sender, nonce]))[12:]）。 */
@@ -32,9 +34,22 @@ async function deployContract(contractName, args = [], opts = {}) {
   const deployTx = await factory.getDeployTransaction(...args);
 
   const nonce = await ethers.provider.getTransactionCount(from, "pending");
-  const sent = await signer.sendTransaction(deployTx);
-  const hash = sent.hash;
   const address = createAddress(from, nonce);
+
+  let hash;
+  try {
+    const sent = await signer.sendTransaction(deployTx);
+    hash = sent.hash;
+  } catch (e) {
+    // 已知 bug：广播已成功、回读崩溃（见文件头）。按 CREATE 地址在最近块里找回执——
+    // 那个地址只可能由这笔部署交易获得代码，匹配上就是它。
+    const found = await findReceiptByContractAddress(address);
+    if (!found) {
+      throw new Error(`部署 ${contractName} 广播失败（链上未找到 ${address} 的创建回执）：${e.message}`);
+    }
+    hash = found.transactionHash;
+    console.log(`   ↳ sendTransaction 回读崩溃（已知 hardhat-ethers bug），按 CREATE 地址找回执：${hash}`);
+  }
 
   // 直接用原始 RPC 拿回执，绕开 getTransaction 的格式化。
   const receipt = await waitReceiptRaw(hash);
@@ -96,6 +111,26 @@ async function fetchReceipt(hash) {
   } catch {
     return null;
   }
+}
+
+/** 按 CREATE 地址在最近若干个块里找回执（回读崩溃时的恢复路径）。 */
+async function findReceiptByContractAddress(address, maxBlocks = 40) {
+  const latest = await ethers.provider.getBlockNumber();
+  const lower = String(address).toLowerCase();
+  for (let b = latest; b > latest - maxBlocks && b >= 0; b--) {
+    let receipts;
+    try {
+      receipts = await ethers.provider.send("eth_getBlockReceipts", ["0x" + b.toString(16)]);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(receipts)) continue;
+    const hit = receipts.find(
+      (r) => r && r.contractAddress && String(r.contractAddress).toLowerCase() === lower
+    );
+    if (hit) return hit;
+  }
+  return null;
 }
 
 /** 轮询直到拿到回执。 */

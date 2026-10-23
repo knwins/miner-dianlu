@@ -251,9 +251,9 @@ describe("CampaignFactory", () => {
     await expect(campaign.connect(alice).setMaterialMarket(otherMinter)).to.be.revertedWithCustomError(campaign, "NotOwner");
     await expect(campaign.connect(owner).setMaterialMarket(otherMinter))
       .to.emit(campaign, "MaterialMarketUpdated");
-    expect(await campaign.market()).to.equal(otherMinter);
+    expect(await campaign.materialMarket()).to.equal(otherMinter);
     await campaign.connect(owner).setMaterialMarket(await minter.getAddress());
-    expect(await campaign.market()).to.equal(await minter.getAddress());
+    expect(await campaign.materialMarket()).to.equal(await minter.getAddress());
   });
 
   it("Owner can remove campaign from registry without destroying it", async () => {
@@ -1326,8 +1326,8 @@ describe("service fee is on-chain", () => {
     ).to.emit(campaign, "RevenueDeposited");
     expect(await campaign.revenuePool()).to.equal(gross - fee);
     expect(await campaign.totalPendingFee()).to.equal(fee);
-    expect(await campaign.pendingFeeOf(feeRecipient.address)).to.equal((fee * 6000n) / 10000n);
-    expect(await campaign.pendingFeeOf(carol.address)).to.equal((fee * 4000n) / 10000n);
+    expect(await campaign.pendingFee(feeRecipient.address)).to.equal((fee * 6000n) / 10000n);
+    expect(await campaign.pendingFee(carol.address)).to.equal((fee * 4000n) / 10000n);
 
     // 收款方自己来领（领取者自己付 gas，所以余额差要用 gas 还原）
     const fBefore = await ethers.provider.getBalance(feeRecipient.address);
@@ -1373,7 +1373,7 @@ describe("service fee is on-chain", () => {
     expect(await campaign.raisedBnb()).to.equal(paid);
     // 服务费相关账本全是 0：没有计提、没有待领、收益池也是空的。
     expect(await campaign.totalPendingFee()).to.equal(0n);
-    expect(await campaign.pendingFeeOf(feeRecipient.address)).to.equal(0n);
+    expect(await campaign.pendingFee(feeRecipient.address)).to.equal(0n);
     expect(await campaign.revenuePool()).to.equal(0n);
     // 收款方领不到任何东西（没有可领金额）。
     await expect(campaign.connect(feeRecipient).claimFee())

@@ -5,33 +5,24 @@ import {Ownable} from "./access/Ownable.sol";
 import {Campaign} from "./Campaign.sol";
 
 /// @title CampaignFactory — opens each crowdfunding round
-/// @notice Only the factory owner may create a round or drop a round from the list.
-///         Economic params are fixed after creation. The shared material-market address
-///         (materialMarket, the placeBid target) is immutable; a replacement market is set
-///         per round via Campaign.setMaterialMarket. The parts contract (processor) is NOT
-///         fixed here — each round MUST name it explicitly at createCampaign time, so the
-///         factory carries no "default parts" and a single factory can open rounds for any
-///         whitelisted processor (TapeOut / Behemoth). removeCampaign only edits this list
-///         and does not destroy the campaign.
-///         NOTE: tape-out (流片) and PoD mining have been removed, so the factory no longer carries
-///         pod / bem / netlist / fee-share defaults.
-///
-///         ── 元件白名单（多处理器支持）──
-///         官方材料市场同一个合约上流通着**多个处理器**的元件（主网官方两件套：
-///         TapeOut / Behemoth，各自有独立的 ERC1155 元件合约）。
-///         每一期锁定一个元件合约（Campaign.transistors 是 immutable），但**由开期时显式选择**，
-///         工厂不预设默认——否则所有期次会被锁定到同一个处理器。
-///         工厂只知道「哪些元件合约是允许的」：owner 若能把期次指向任意 ERC1155，
-///         主网上就意味着期次可能买到 MockERC1155（mint 无访问控制，任何人能无限造元件），
-///         「元件已到账」的检查会形同虚设。
-///         白名单在**部署时**写入（构造参数），owner 之后不能增删：
-///         白名单是安全边界，不是一个运营开关。
+/// @notice Only the factory owner may create a round or drop one from the list. Economic params are
+///         fixed at creation. The shared material-market address (materialMarket) is immutable; a
+///         replacement market is set per round via Campaign.setMaterialMarket.
+///         The parts contract (processor) is NOT fixed here: each round MUST name it explicitly at
+///         createCampaign time, so one factory can open rounds for any whitelisted processor
+///         (TapeOut / Behemoth) and carries no "default parts".
+///         Allowed parts are a deploy-time security boundary, not an operational switch: the official
+///         market circulates the parts of several processors, each a separate ERC1155 contract. Without
+///         the whitelist the owner could point a round at a permissionless mock (anyone can mint
+///         unlimited parts), which would make the "parts arrived" checks meaningless. The whitelist is
+///         written at construction and can never be edited afterwards.
+///         removeCampaign only edits the registry list; the Campaign itself stays callable.
 contract CampaignFactory is Ownable {
     /// @notice Material-market address (the placeBid target). Immutable.
     address public immutable materialMarket;
 
-    /// @notice 允许的元件合约白名单。createCampaign 传入的元件地址必须落在里面。
-    ///         部署时写入，之后不可增删（安全边界，不是运营开关）。
+    /// @notice Whitelist of parts contracts a round may lock. Written at construction and never
+    ///         editable afterwards (security boundary, not an operational switch).
     address[] private _allowedParts;
 
     address[] public campaigns;
@@ -73,18 +64,18 @@ contract CampaignFactory is Ownable {
         }
     }
 
-    /// @notice 白名单里的元件合约数量。
+    /// @notice Number of whitelisted parts contracts.
     function allowedPartsCount() external view returns (uint256) {
         return _allowedParts.length;
     }
 
-    /// @notice 白名单里的第 index 个元件合约。供前端渲染「本期用哪个处理器」的选项。
+    /// @notice The index-th whitelisted parts contract. Feeds the frontend's processor picker.
     function allowedPartsAt(uint256 index) external view returns (address) {
         if (index >= _allowedParts.length) revert IndexOutOfBounds();
         return _allowedParts[index];
     }
 
-    /// @notice 该元件合约是否在白名单里。
+    /// @notice True when `parts` is in the whitelist.
     function isAllowedParts(address parts) external view returns (bool) {
         return _isAllowed(parts);
     }
@@ -103,15 +94,16 @@ contract CampaignFactory is Ownable {
     /// @param fundingSeconds Funding length in seconds. Deadline = block.timestamp + fundingSeconds.
     ///        Seconds, not days: the deadline is packed into uint64 at creation, so the caller does the
     ///        unit conversion and no `× 1 days` can overflow before the narrowing cast.
-    /// @param transistors_ 元件合约（处理器）。**必选**，零地址一律 revert（工厂不再有默认元件），
-    ///        且必须在白名单内。主网上即 TapeOut / Behemoth 各自的元件合约。
+    /// @param transistors_ Parts contract (processor). REQUIRED: address(0) reverts (no factory default)
+    ///        and it must be in the whitelist. On mainnet that is the TapeOut / Behemoth parts contract.
     function createCampaign(
         uint256 sharePriceBnb,
         uint256 totalShares,
         uint64 fundingSeconds,
         address transistors_
     ) external onlyOwner returns (address campaign) {
-        // 元件合约（处理器）必选：工厂不再有「默认元件」，否则所有期次被锁定到同一处理器。
+        // The parts contract (processor) is required: no factory default, otherwise every round would
+        // be locked to the same processor.
         if (transistors_ == address(0)) revert ZeroAddress();
         if (!_isAllowed(transistors_)) revert PartsNotAllowed(transistors_);
         if (totalShares == 0 || sharePriceBnb == 0) revert ZeroCampaignParam();

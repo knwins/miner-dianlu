@@ -289,7 +289,7 @@ export default function App() {
       return { ok: false, message: "harvest / claim 是占位实现（no-op），分配合约接入前不产出发放，前端不提供调用入口。" };
     }
     if (chain.active && WRITE_METHODS.includes(method)) return chainInvoke(method, args);
-    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "transistors", "market", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf"].includes(method)) {
+    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "transistors", "market", "materialMarket", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf"].includes(method)) {
       return { ok: true, message: readCall(method, args, round, book, quote) };
     }
     if (/^market(OpenOrders|Bids|Asks|Owed)$/.test(method) || method.startsWith("simulateFill")) {

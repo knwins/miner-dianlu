@@ -135,7 +135,7 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | `campaigns(uint256 i)` | 读 | 任何人 | 第 i 期地址 |
 | `isRegistered(address)` | 读 | 任何人 | 是否仍在登记册（**O(1)**，`mapping` 实现） |
 | `allowedPartsCount()` / `allowedPartsAt(uint256)` / `isAllowedParts(address)` | 读 | 任何人 | 元件白名单 |
-| `materialMarket()` | 读 | 任何人 | 材料市场（immutable；语义对应 `Campaign.market()`） |
+| `materialMarket()` | 读 | 任何人 | 材料市场（immutable；语义对应 `Campaign.materialMarket()`） |
 | `owner` | 读 | 任何人 | Factory Owner |
 | `removeCampaign(uint256 index)` | 写 | 仅 Owner | swap-and-pop 从登记册移除。**不销毁链上 Campaign**、**索引不稳定**、**不可逆**（无恢复入口） |
 | `transferOwnership(address)` | 写 | 仅 Owner | 转让所有权（**一步到位、无 pendingOwner**） |
@@ -209,7 +209,7 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | `claimFee()` | 写 | 收款方本人 | 收款方 **pull** 领取。刻意不用 push：入账时若要推给 3 个收款方，任一拒收合约就会让**整笔入账失败**、矿池收益全卡住。pull 把失败面从「矿池」缩小到「单个收款方自己」 |
 | `serviceFeeBps` / `serviceFeeSet` | 读 | 任何人 | 费率 / 是否已设定（区分「未设过」与「设为 0」） |
 | `feeRecipientCount()` / `feeRecipientAt(uint256)` / `feeSharesBpsAt(uint256)` | 读 | 任何人 | 分成表读取 |
-| `pendingFeeOf(address)` / `totalPendingFee()` | 读 | 任何人 | 已计提未领取。**这笔钱不属于 Owner**，`recoverBnb` 扫不走 |
+| `pendingFee(address)` / `totalPendingFee()` | 读 | 任何人 | 已计提未领取。**这笔钱不属于 Owner**，`recoverBnb` 扫不走 |
 | `revenuePool()` | 读 | 任何人 | 挖矿收益池（已扣服务费的净额），owner 扫不走 |
 
 ### 4.5 产出领取（占位）
@@ -381,7 +381,7 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | 项 | 结论 |
 |---|---|
 | RPC | `bsc-dataseed.bnbchain.org` 可用且**不受 archive 限制**；`bsc-rpc.publicnode.com` 可用但 `eth_getTransactionReceipt` 一律返回 `Archive requests require a personal token`（改用 `eth_getTransactionByHash` + `eth_getBlockReceipts` 取回执）；Binance 官方 seed 全无响应 |
-| **合约创建交易** | ⚠️ **`ethers.deployContract` / `factory.deploy()` 在本项目必崩** —— hardhat-ethers 的 `formatTransactionResponse` 把 `to` 格式化为 `allowNull(getAddress, null)`，只放行 `null`/`undefined`，而合约创建交易的 `to` 是**空字符串** → `invalid value for value.to`。交易其实已广播成功，只是回读失败，极易误判成部署失败而重复部署。**用 `scripts/_deploy.js` 的 `deployContract()`**（自算 CREATE 地址 + 原始 RPC 取回执） |
+| **合约创建交易** | ⚠️ **`ethers.deployContract` / `factory.deploy()` 在本项目必崩** —— hardhat-ethers 的 `formatTransactionResponse` 把 `to` 格式化为 `allowNull(getAddress, null)`，只放行 `null`/`undefined`，而合约创建交易的 `to` 是**空字符串** → `invalid value for value.to`。注意崩溃点在 `signer.sendTransaction` 的**广播之后**（`checkTx` 回读），交易其实已经成功。**用 `scripts/_deploy.js` 的 `deployContract()`**：崩了会按 CREATE 地址在链上找回执继续，绝不重复部署 |
 | 开源验证 | **`hardhat verify` 走不通**：Sourcify API v1 已下线（插件仍在打 v1）；BscScan 路径被本机 `HTTPS_PROXY` 挡着（`api.etherscan.io` 直连返回 000，hardhat 报成 502）。**用 `node scripts/verify-sourcify.js --network bsc`** —— 走 Sourcify v2 的 metadata 端点（standard-json 端点会失败，因为 Sourcify 服务器拉不到已下架的 solc 0.8.24） |
 | `eth_getLogs` | 单窗口上限约 5 万块（10 万被拒），需分页；公共 RPC 普遍 403/限流 → 核对 ABI 只能用 `eth_call` |
 | 行情 | `api.gateio.ws/api/v4/spot/tickers?currency_pair=BNB_USDT` 可直连；binance/mexc/coinbase 空响应，coinex 503 |
@@ -427,13 +427,16 @@ cd D:/Code/miner/frontend
 npm run build
 npm run dev -- --host             # ⚠️ 必须 --host 双栈！只绑 127.0.0.1 会让预览面板走 ::1 时 500
 
-# 部署
+# 部署（⚠️ 必须走 bootstrap.js run——直接 node scripts/x.js --network 不生效，
+#  hardhat 不会解析 --network，会静默跑到内置 hardhat 网 31337 上）
 cd D:/Code/miner/contracts
-node scripts/deploy-bsc.js --network bsc          # 主网（默认只布工厂不开期）
-node scripts/deploy-bsc.js --network bscTestnet   # 测试网
-node scripts/verify-sourcify.js --network bsc     # 开源验证（**用这个**，hardhat verify 走不通，见 §7.3）
-node scripts/testnet-drill.js --network bscTestnet# 测试网完整生命周期演练（16 项断言）
+node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-bsc.js --network bsc          # 主网（默认只布工厂不开期）
+node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-bsc.js --network bscTestnet   # 测试网
+node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-sourcify.js --network bsc     # 开源验证（**用这个**，hardhat verify 走不通，见 §7.3）
+node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-drill.js --network bscTestnet# 测试网完整生命周期演练（16 项断言）
 ```
+
+> **部署脚本可能「崩在广播之后」**：hardhat-ethers 对合约创建交易的 `to=""` 回读必崩（详见 `scripts/_deploy.js` 头注释）。**交易其实已经广播成功** —— `_deploy.js` 会按 CREATE 地址在链上找回执继续；万一手动恢复，用 `eth_getTransactionByHash` + `eth_getBlockReceipts` 双路径（`eth_getTransactionReceipt` 在 publicnode 一律报 archive 限制）。**绝不重复部署。**
 
 > **端口 5173 是用户自己的 dev server，勿占用。** 探针另起端口（如 5199）且必须先 fetch `/` 校验 title 再测。
 > 测试覆盖：开期、认筹、退款、挂单、confirm、Ready 逃生、余款退回、白名单。**74 passing**。
@@ -462,9 +465,11 @@ node scripts/testnet-drill.js --network bscTestnet# 测试网完整生命周期�
 
 | 网络 | 工厂 | 说明 |
 |---|---|---|
-| BSC 主网 | `0x2a27334bca2b1a04e4cd369a4e9bd945d9afce55` | **当前版本**。构造 `[0xA6a80C19…16E4, [0xCC42ba5D…8087, 0xE2DfD802…8550c]]`，runtime 22,862 字节。部署交易 `0xa56eb6d9…28e`（块 129,171,092）。Sourcify `exact_match`。**期次 #0 = `0xb38de12D…5164e`**（TapeOut、0.07 BNB × 1 份、Funding 中 0 份已售）；⚠️ 该期 `serviceFeeSet = false`——前端发布页服务费第二笔曾被字段断链挡下（已修），`sold = 0` 仍可在 Owner 工作台补设 |
-| BSC 测试网 | `0x5edc8254f9533A6c2CD2Ec99D956b1FE0Fa3f56c` | 当前版本。已完成完整生命周期演练（开期 → 认购售罄 → 挂单成交 → 确认入池 → 份额转让 → 余款领取 → 服务费计提与领取） |
-| legacy | `0x19a47311…` / `0x638744e7…` / `0xB4315F55…` / `0x29f4A375…`（共 4 个） | 记在 `deployments/bsc.json` 的 `legacyFactories`，其期次仍可调用但不出现在新列表 |
+| BSC 主网 | `0x6bf44c46b60d631b2ebee490d6ea6fba032be399` | **当前版本**（源码清理版：注释全英、删 `NotSoldOut`/`pendingFeeOf`、`Campaign.market` → `materialMarket`）。构造 `[0xA6a80C19…16E4, [0xCC42ba5D…8087, 0xE2DfD802…8550c]]`，runtime 22,811 字节。部署交易 `0x406d1159…457c`（块 129,239,494，gasUsed 5,078,205）。Sourcify `exact_match`。已开期 **#0 `0xE92D2f94…3257`**（Behemoth、0.001 BNB × 1 份、募集 1 天，开期交易 `0x4e53a49a…f27b` 块 129,241,768）：已售罄 1/1、`raisedBnb` 0.001、scene=Executing / phase=Buying、`serviceFeeSet = true`（5% / 2 个分成地址） |
+| BSC 测试网 | `0x5edc8254f9533A6c2CD2Ec99D956b1FE0Fa3f56c` | 上一版源码（`Campaign.market()` 时代，脚本按旧名读它）。已完成完整生命周期演练（开期 → 认购售罄 → 挂单成交 → 确认入池 → 份额转让 → 余款领取 → 服务费计提与领取） |
+| legacy | `0x2a27334b…` / `0x19a47311…` / `0x638744e7…` / `0xB4315F55…` / `0x29f4A375…`（共 5 个） | 记在 `deployments/bsc.json` 的 `legacyFactories`，其期次仍可调用但不出现在新列表。`0x2a27334b…` 是清理前的主网工厂（Sourcify `exact_match`），名下两期：**#0 `0xb38de12D…5164e`**（TapeOut、0.07 BNB × 1 份、Funding 0 份已售、`serviceFeeSet = false`）与 **`0xB3b9AA36…dfE8`**（Behemoth、0.00005 BNB × 2 份、已售罄 2/2、Executing/Buying、`serviceFeeSet = false`——已有人认购，服务费表永久锁定为不收） |
+
+**源码版本 ↔ 链上的对应关系**：链上在跑的是 git tag `deployed-mainnet-v1`（commit `941906b`）的源码——那一版 `Campaign` 的 getter 是 `market()`、带 `pendingFeeOf()`。当前工作区源码（本次清理 + 改名）只被**新工厂** `0x6bf44c46…` 采用。solc 把源码内容哈希写进字节码尾部 metadata，**任何源码改动（哪怕只改注释）都会让新源码无法逐字节复现旧部署**——所以旧地址的 `exact_match` 与该 tag 绑定，不随仓库演进失效；前端 `abis.js` 同时保留 `materialMarket()` / `market()` 两个 getter，`client.js` 的 `readMaterialMarket()` 对新期次用新名、对 legacy 期次（主网两期 + 测试网全部）回退旧名。
 
 **旧工厂为何不可用**：`0x29f4A375…` 无法响应当前接口，三处不兼容**互相独立、任何一处都足以否决**：
 
