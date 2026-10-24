@@ -108,7 +108,7 @@ function contractCatalog(round, book = {}) {
         { name: "serviceFeeBps", kind: "read", caller: "任何人", signature: "serviceFeeBps() view", summary: "本期挖矿产出服务费率（基点，1/10000）。0 = 不收。链上可读，不再是前端本地记录。认筹款不收服务费。", fields: [] },
         { name: "feeRecipientCount", kind: "read", caller: "任何人", signature: "feeRecipientCount() view", summary: "挖矿产出服务费分成地址数量。", fields: [] },
         { name: "revenuePool", kind: "read", caller: "任何人", signature: "revenuePool() view", summary: "挖矿收益池（已扣服务费的净额）。owner 扫不走。装的是挖矿产出，不是认筹款。", fields: [] },
-        { name: "surplusOf", kind: "read", caller: "任何人", signature: "surplusOf(address) view", summary: "某地址当前可领取的入池余款（含尚未计提的部分）。", fields: [["account", "地址", "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"]] },
+        { name: "surplusOf", kind: "read", caller: "任何人", signature: "surplusOf(address) view", summary: "某地址当前可领取的募集款余款（含尚未计提的部分）。余款由 returnSurplus()（确认到账后提前退）或 depositToPool()（入池时自动记账）产生。", fields: [["account", "地址", "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"]] },
         { name: "sharePriceBnb", kind: "read", caller: "任何人", signature: "sharePriceBnb() view", summary: "每份价格（BNB）。", fields: [] },
         { name: "totalShares", kind: "read", caller: "任何人", signature: "totalShares() view", summary: "总份数。", fields: [] },
         { name: "estHashpower", kind: "read", caller: "任何人", signature: "estHashpower() view", summary: "预估算力（setPlan 写入；未进入挖矿时展示）。", fields: [] },
@@ -142,7 +142,7 @@ function contractCatalog(round, book = {}) {
         { name: "cancelListing", kind: "write", caller: "挂单方 / Owner", signature: "cancelListing(uint256)", summary: "撤销自己发布的挂单，释放锁定份额回到可用余额。", fields: [["listingId", "挂单 ID", "L1"]] },
         { name: "takeListing", kind: "write", caller: "任一持份用户", signature: "takeListing(uint256,uint256)", summary: "按发布价接收（买入）挂单：第 1 参挂单 ID、第 2 参接收份数。份额过户到买方，BNB 支付给卖方。不能接收自己的挂单。", fields: [["listingId", "挂单 ID", "L1"], ["shares", "份数", "1"]] },
         { name: "refund", kind: "write", caller: "持份用户 / Owner", signature: "refund()", summary: "三种本金返还：① 募集超过截止时间仍未售罄；② 待执行阶段已判失败（本金尚未支出）；③ 待挂单且池子已不足以按原价兑付（按比例退）。份额清零。与挖矿中的份额转让无关。", fields: [] },
-        { name: "claimSurplus", kind: "write", caller: "持份用户", signature: "claimSurplus()", summary: "领取入池时未花完的募集款余款（pull 模式）。入池时合约**不再遍历持份人推款**（那会因 gas 上限卡死 owner），只记录分配基准（surplusPool / surplusBase），持份人自己调这个函数按份领取。地址拒收导致领取失败时整笔回滚，金额原样保留可重试。", fields: [] },
+        { name: "claimSurplus", kind: "write", caller: "持份用户", signature: "claimSurplus()", summary: "领取你按份应得的募集款余款（pull 模式）。余款有两个记账时点：`returnSurplus()`（确认到账后提前退，本期继续）和 `depositToPool()`（入池时自动记账）。合约**不遍历持份人推款**（那会因 gas 上限卡死 owner），只记录分配基准（surplusPool / surplusBase），持份人自己调这个函数按份领取。地址拒收导致领取失败时整笔回滚，金额原样保留可重试。", fields: [] },
         { name: "claimFee", kind: "write", caller: "服务费收款方", signature: "claimFee()", summary: "服务费收款方领取自己那笔**挖矿产出**服务费（pull 模式）。矿池把挖矿收益打进来时按链上分成表计提，Owner 扫不走。与认筹款无关。", fields: [] },
         {
           name: "setServiceFee",
@@ -222,7 +222,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "setPhase(uint8)",
-          summary: "待执行时改子状态，防止元件或募集款卡在本期。不搬运代币，也不撤市场上的单。0 无，1 待挂单，2 挂单中，3 已到账。挂单中不能改，先取消或放弃。改成 1 之后才能取回元件。",
+          summary: "待执行时改子状态。不搬运代币，也不撤市场上的单。0 无，1 待挂单，2 挂单中，3 已到账。挂单中不能改，先取消或放弃。Ready 之后唯一正常出口是 returnSurplus（退余款）+ depositToPool（元件进矿池）；要结束本期必须显式改回 1（管理员逃生），之后 openRefund 才会把元件退回 Owner。",
           fields: [["next", "子状态 0–3", "1"]],
         },
         {
@@ -242,11 +242,19 @@ function contractCatalog(round, book = {}) {
           fields: [],
         },
         {
+          name: "returnSurplus",
+          kind: "write",
+          caller: "仅 Factory Owner",
+          signature: "returnSurplus()",
+          summary: "元件确认到账后，把没花完的募集款按份记账退回持份人（各自 claimSurplus 领取）。不结束本期：元件留在合约、份额不变，之后仍然可以 depositToPool。要求没有未确认卖单、市场没有欠款。调用后 openRefund / abandonOrder 关闭（本金已经退过，元件只能走挖矿）。",
+          fields: [],
+        },
+        {
           name: "openRefund",
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "openRefund()",
-          summary: "待挂单，或买单已确认且没有未确认卖单时，批量原路退款。确认后的退款会把剩余元件退回 Owner。份额已全部退完（sold == 0）时没有可退对象，会以 ZeroShares 回滚；这种情况用 recoverBnb() 扫尾差。",
+          summary: "只在待挂单（buying）时批量原路退款。元件确认到账（ready）后不可用：那个状态只能 returnSurplus 退余款、元件进矿池，元件不转给 Owner（链上 UseReturnSurplus 回滚；确要结束本期得先 setPhase 改回 buying）。份额已全部退完时没有可退对象，会以 ZeroShares 回滚，用 recoverBnb() 扫尾差。退过余款之后会以 SurplusAlreadyReturned 回滚。",
           fields: [],
         },
         {
@@ -254,7 +262,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "abandonOrder()",
-          summary: "待执行任意子态下放弃本期：撤未成交买单、撤卖单、提取市场欠款、把元件退回 Owner，再按池子批量退款。用来解开卡住的单（openRefund 在挂单中会回滚）。",
+          summary: "待执行 buying / listed 时放弃本期：撤未成交买单、撤卖单、提取市场欠款、把元件退回 Owner，再按池子批量退款。用来解开卡住的单（openRefund 在挂单中会回滚）。元件确认到账（ready）后不可用（UseReturnSurplus）：那个状态只能 returnSurplus 退余款、元件进矿池。",
           fields: [],
         },
         {
@@ -669,6 +677,10 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     return { ok: true, reason: `按 ${listing.priceBnbPerShare} BNB/份接收，份额过户、BNB 支付给卖方。` };
   }
   if (method.name === "refund") {
+    // 余款已经提前按份退回（returnSurplus）：池子是 0，这时退款只会把份额清零、白送挖矿权益。
+    if (book.scene === "executing" && Number(book.surplusBase) > 0) {
+      return { ok: false, reason: "本期余款已按份退回，本金已经回到你手里。此时退款会以 0 BNB 清掉份额（链上 SurplusAlreadyReturned 回滚）；份额请留着等入池。" };
+    }
     const fundingExpired = book.scene === "funding" && Date.now() > (book.endsAt || Infinity);
     const executeFailed = book.scene === "executing" && book.executionFailed;
     // 新逻辑：待挂单且池子不足以按原价兑付时，也可按比例退款。
@@ -706,8 +718,8 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (method.name === "claimSurplus") {
     const pending = Number(book.pendingSurplusSelf || 0);
     if (!book._chain) return { ok: false, reason: "仅链上模式可用。" };
-    if (pending <= 0) return { ok: false, reason: "当前钱包没有待领取的余款。入池时推送成功就没有余款可领。" };
-    return { ok: true, reason: `领取 ${pending.toFixed(4)} BNB：入池时因你的地址拒收而未发出的余款。` };
+    if (pending <= 0) return { ok: false, reason: "当前钱包没有待领取的余款：没花完的募集款还没记账（returnSurplus / depositToPool 二者都未发生）。" };
+    return { ok: true, reason: `领取 ${pending.toFixed(4)} BNB：按份应得、还没转到你地址的募集款余款。` };
   }
   if (method.name === "claimFee") {
     if (!book._chain) return { ok: false, reason: "仅链上模式可用。" };
@@ -825,18 +837,48 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (book.askOpen || Number(book.nandAskQty) > 0 || Number(book.latchAskQty) > 0 || Number(book.marketOwed) > 0) {
       return { ok: false, reason: "卖单还没确认，不能入池。" };
     }
-    return { ok: true, reason: "元件转入矿池，本期进入挖矿（不可逆）。" };
+    if (book.surplusExit && Number(book.bnbPool) > 0 && !(Number(book.surplusBase) > 0)) {
+      return { ok: false, reason: "入池前必须先把剩余募集款按份退回给持份人（returnSurplus）；否则持份人拿不到本金，只能看着元件进矿池。" };
+    }
+    return { ok: true, reason: "元件转入矿池，本期进入挖矿（不可逆）。没花完的募集款在入池前/入池时按份退回给持份人，元件不会转给 Owner。" };
+  }
+  if (method.name === "returnSurplus") {
+    if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
+    if (actor.role !== "owner") return { ok: false, reason: "只 Factory Owner 能 returnSurplus。" };
+    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以退余款。" };
+    if (book.executePhase !== "ready") {
+      return { ok: false, reason: "元件还没确认到账，合约会以 TransistorsNotReady 回滚。" };
+    }
+    if (book.surplusExit === false && book._chain) {
+      return { ok: false, reason: "这期是旧合约，链上没有 returnSurplus。重新部署工厂后新开的期才有。" };
+    }
+    if (Number(book.bnbPool) <= 0) return { ok: false, reason: "募集款已全部用于买元件，没有可退的余款（ZeroShares）。" };
+    if (book.askOpen || Number(book.nandAskQty) > 0 || Number(book.latchAskQty) > 0) {
+      return { ok: false, reason: "卖单还没确认，不能退余款（先把卖单确认或取消）。" };
+    }
+    if (Number(book.marketOwed) > 0) return { ok: false, reason: "材料市场还有欠款没提取，先 withdrawMarketProceeds。" };
+    if (!(outstandingOf(book) > 0)) return { ok: false, reason: "份额已全部退完，没有可退对象。" };
+    return {
+      ok: true,
+      reason: "按份退回没花完的募集款：份额不变、元件留在合约、phase 仍是 Ready，之后照样能 depositToPool。持份人各自 claimSurplus 领。",
+    };
   }
   if (method.name === "openRefund") {
     if (actor.role !== "owner") return { ok: false, reason: "只 Factory Owner 能 openRefund。" };
+    if (Number(book.surplusBase) > 0) {
+      return { ok: false, reason: "已经用 returnSurplus 退过余款；本金已退回，再退款会把份额清零、把元件交给 Owner，链上以 SurplusAlreadyReturned 回滚。之后只能 depositToPool。" };
+    }
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行可以批量退款。" };
+    if (book.executePhase === "ready" && book.surplusExit !== false) {
+      return { ok: false, reason: "元件已到账，这个状态不能原路退款（链上 UseReturnSurplus 回滚）：退款只会把剩余募集款按份退给持份人，元件必须进矿池、不能转给 Owner。用 returnSurplus()；确实要结束本期得先把子状态改回 buying（setPhase）。" };
+    }
     if (book.executePhase === "listed" || book.askOpen || Number(book.nandAskQty) > 0 || Number(book.latchAskQty) > 0) {
       return { ok: false, reason: "买单未确认，或卖单还没确认，不能退款。" };
     }
     if (book.executePhase === "ready" && book.readyExit === false) {
       return { ok: false, reason: "这期是旧合约。确认到账之后不能退款，也不能把元件单独转出，只能入池。" };
     }
-    if (book.executePhase && book.executePhase !== "buying" && book.executePhase !== "ready") {
+    if (book.executePhase && book.executePhase !== "buying") {
       return { ok: false, reason: "请先取消挂单，再 openRefund。" };
     }
     if (!(outstandingOf(book) > 0)) {
@@ -848,6 +890,9 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (actor.role !== "owner") return { ok: false, reason: "只 Factory Owner 能 abandonOrder。" };
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行可以放弃挂单并退款。" };
+    if (book.executePhase === "ready" && book.surplusExit !== false) {
+      return { ok: false, reason: "元件已到账，abandonOrder 会把元件退回 Owner，链上以 UseReturnSurplus 回滚。这个状态只能 returnSurplus（退余款）+ depositToPool（元件进矿池）。" };
+    }
     return {
       ok: true,
       reason: "撤未成交买单、撤卖单、提取市场欠款、把元件退回 Owner，再按池子退款。挂单中也能用（openRefund 会回滚）。",

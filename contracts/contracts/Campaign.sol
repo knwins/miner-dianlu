@@ -213,6 +213,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     event AskSettled(uint256 proceeds);
     /// @notice Surplus was accrued to a holder. Amount is now claimable via claimSurplus().
     event SurplusAccrued(address indexed holder, uint256 amountBnb);
+    /// @notice The unspent subscription BNB was booked for pro-rata return right after the parts were
+    ///         confirmed (returnSurplus). Holders pull their cut via claimSurplus(); the round keeps going.
+    event SurplusReturned(uint256 amountBnb, uint256 baseShares);
     /// @notice Service-fee configuration was set. Only settable while nobody has subscribed yet.
     event ServiceFeeSet(uint16 feeBps, address[] recipients, uint16[] sharesBps);
     /// @notice A service-fee share was accrued to a recipient. The recipient pulls it via claimFee().
@@ -249,6 +252,12 @@ contract Campaign is Ownable, ReentrancyGuard {
     error InsufficientParts();
     error PoolNotSet();
     error AlreadyPooled();
+    /// @notice returnSurplus() already booked the unspent principal for pro-rata return. refund / abandon
+    ///         would zero the shares for 0 BNB while the parts went back to the owner, so they are closed.
+    error SurplusAlreadyReturned();
+    /// @notice The parts are confirmed (Ready): the only refund there is the unspent BNB, and it must not
+    ///         touch the parts. Use returnSurplus() instead of openRefund / abandonOrder.
+    error UseReturnSurplus();
     /// @notice The transistors argument does not match the parts contract locked at creation.
     error WrongTransistors();
     /// @notice Service-fee configuration is invalid (bps over the hard ceiling, mismatched table
@@ -507,6 +516,10 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         open (README §8 rule 6); the owner's ordering gate reads the monotonic `sold` instead
     ///         (rule 5), so refunds never revoke it.
     function refund() external nonReentrant {
+        // Principal already returned early (returnSurplus in Ready): the pool is 0, so this call would
+        // zero the shares for 0 BNB and burn the holder's mining entitlement. Refuse instead.
+        // Mining keeps its own RefundNotAvailable (pooled is irreversible), so the message stays accurate.
+        if (scene == Scene.Executing && surplusBase != 0) revert SurplusAlreadyReturned();
         bool execFailed = scene == Scene.Executing && executionFailed;
         bool short = scene == Scene.Executing && phase == Phase.Buying && _shortfall();
         // Never-sold-out rounds keep exactly one principal exit: Funding past its deadline.
@@ -680,31 +693,57 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit TransistorOrderPlaced(nandQty_ + latchQty_, cost);
     }
 
-    /// @notice Owner refunds every holder. Allowed in Buying, and in Ready once no ask is open.
-    ///         Ready with a settled ask must confirmSale first (that pulls proceeds and returns to Buying).
-    ///         Parts still held in Ready go back to the owner so a refund cannot strand them.
+    /// @notice Return the unspent subscription BNB to holders as soon as the parts are confirmed, WITHOUT
+    ///         ending the round. Parts stay in the campaign, `phase` stays Ready and `depositToPool()` is
+    ///         still available afterwards — the money and the mining path are independent.
+    ///         The amount is booked into the same pull ledger the pool-time surplus uses: no holder loop,
+    ///         no push transfer. Each holder takes their cut with claimSurplus() (pro-rata by shares).
+    ///         Requires a settled market (no open ask / no ask pending confirmation / nothing owed), so
+    ///         sale proceeds can never be mixed into a principal return.
+    ///         After this call openRefund / abandonOrder are closed: holders already got their principal
+    ///         back, so the parts must follow the mining path instead of being swept to the owner.
+    function returnSurplus() external onlyOwner nonReentrant {
+        _requireExecuting();
+        if (pooled) revert AlreadyPooled();
+        if (phase != Phase.Ready) revert TransistorsNotReady();
+        if (_askOpen() || _askRecorded() || _owed() > 0) revert AlreadyAsked();
+        if (outstandingShares == 0) revert ZeroShares();
+        if (raisedBnb == 0) revert ZeroShares();
+        _returnSurplus();
+        emit SurplusReturned(surplusPool, surplusBase);
+    }
+
+    /// @notice Owner refunds every holder. Only from Buying: once the parts are confirmed (Ready) the
+    ///         refund is the leftover money alone and the parts must follow the mining path, so
+    ///         returnSurplus() replaces this call there and openRefund reverts with UseReturnSurplus().
+    ///         Ready → Buying is still possible via setPhase for an admin recovery (that is an explicit
+    ///         "this round goes back to Buying" statement, not the normal exit).
+    ///         Closed once returnSurplus() already paid the principal out: refunding then would zero the
+    ///         shares at 0 BNB each while the parts stayed in the campaign.
     function openRefund() external onlyOwner nonReentrant {
         _requireExecuting();
+        if (surplusBase != 0) revert SurplusAlreadyReturned();
+        if (phase == Phase.Ready) revert UseReturnSurplus();
         // outstandingShares == 0 means every share already left: there is nobody left to refund. Revert instead of
         // mining a no-op transaction that emits nothing (the leftover dust is swept with recoverBnb).
         if (outstandingShares == 0) revert ZeroShares();
         if (phase == Phase.Listed) revert AlreadyListed();
-        if (phase != Phase.Buying && phase != Phase.Ready) revert WrongScene();
-        if (phase == Phase.Ready) {
-            if (_askOpen() || _askRecorded() || _owed() > 0) revert AlreadyAsked();
-            _returnHeldParts();
-        } else {
-            _purgeFilledAsk();
-            if (_askOpen() || _owed() > 0) revert AlreadyAsked();
-        }
+        if (phase != Phase.Buying) revert WrongScene();
+        _purgeFilledAsk();
+        if (_askOpen() || _owed() > 0) revert AlreadyAsked();
         markFailed();
         _refundAll();
     }
 
-    /// @notice Owner only. Give up on this round from Buying, Listed, or Ready: cancel the rest of the bid,
+    /// @notice Owner only. Give up on this round from Buying or Listed: cancel the rest of the bid,
     ///         cancel open asks, return parts still held here, withdraw what the market owes, and refund holders.
+    ///         Refused in Ready: there the parts must not go back to the owner, only the unspent BNB goes to
+    ///         holders (returnSurplus) and the parts go to the pool.
+    ///         Closed once returnSurplus() already paid the principal out (same reason as openRefund).
     function abandonOrder() external onlyOwner nonReentrant {
         _requireExecuting();
+        if (surplusBase != 0) revert SurplusAlreadyReturned();
+        if (phase == Phase.Ready) revert UseReturnSurplus();
         if (phase == Phase.Listed) {
             _cancelOpenLeg(nandBidId, nandQty);
             _cancelOpenLeg(latchBidId, latchQty);
@@ -754,6 +793,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         never orders after selling out is not killed instantly.
     function markFailed() public {
         if (scene != Scene.Executing || executionFailed) return;
+        // Principal already went back to holders (returnSurplus): there is nothing left to refund, and
+        // flagging the round as failed would advertise a refund that would burn shares for 0 BNB.
+        if (surplusBase != 0) revert SurplusAlreadyReturned();
         uint256 graceBase = uint256(lastOrderAt) > uint256(soldOutAt) ? uint256(lastOrderAt) : uint256(soldOutAt);
         if (msg.sender != owner && block.timestamp < graceBase + FAIL_GRACE) {
             revert RefundNotAvailable();
@@ -865,14 +907,16 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Commit the round's transistors to the mining pool. IRREVERSIBLE.
     ///         Owner only, callable once the order is filled and the parts are on hand (phase Ready).
-    ///         1. Transfers every held ERC1155 part (NAND id 0, LATCH id 1) to `miningPool`.
-    ///         2. Books any unspent subscription BNB as a pro-rata surplus pool (shares are kept), so the owner
-    ///            cannot later sweep holder surplus via recoverBnb.
+    ///         1. Books any unspent subscription BNB as a pro-rata surplus pool (shares are kept) BEFORE the
+    ///            parts leave, so the leftover money always belongs to the holders and the owner can never
+    ///            sweep it via recoverBnb. Idempotent: `returnSurplus()` may already have booked it, in which
+    ///            case only newly arrived BNB is added.
+    ///         2. Transfers every held ERC1155 part (NAND id 0, LATCH id 1) to `miningPool`.
     ///         3. Sets `pooled = true` and moves the round into the Mining scene.
     ///         After this, recoverTransistors / refund / abandon / markFailed all revert (parts are gone and
     ///         the round is committed); the Mining scene is now reachable for the harvest() / claim() shells.
     ///         The pool contract must implement onERC1155Received; a failing receive reverts the whole tx.
-    ///         Gas note: step 2 books two numbers (pool + base) and each holder pulls via claimSurplus(),
+    ///         Gas note: step 1 books two numbers (pool + base) and each holder pulls via claimSurplus(),
     ///         so the cost does not grow with the holder count.
     function depositToPool() external onlyOwner nonReentrant {
         if (pooled) revert AlreadyPooled();
@@ -881,6 +925,9 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (miningPool == address(0)) revert PoolNotSet();
         if (!orderFilled() || !_partsOnHand()) revert TransistorsNotReady();
 
+        // Before the parts go: the leftover subscription BNB becomes the holders' pull-claimable surplus.
+        _returnSurplus();
+
         IERC1155 token = IERC1155(transistors);
         uint256 nandAmt = token.balanceOf(address(this), 0);
         uint256 latchAmt = token.balanceOf(address(this), 1);
@@ -888,7 +935,6 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (latchAmt > 0) token.safeTransferFrom(address(this), miningPool, 1, latchAmt, "");
 
         pooled = true;
-        _returnSurplus();
         scene = Scene.Mining;
         emit DepositedToPool(miningPool, nandAmt, latchAmt);
     }
@@ -976,11 +1022,20 @@ contract Campaign is Ownable, ReentrancyGuard {
     function _returnSurplus() internal {
         uint256 pool = raisedBnb;
         if (pool == 0) return;
-        surplusPool = pool;
-        surplusBase = outstandingShares;
-        surplusClaimedShares = 0;
-        surplusAllocated = 0;
-        surplusPaid = 0;
+        // Nobody left to pay: keep the money in raisedBnb so recoverBnb can still see it, instead of
+        // booking a pool that no share can ever claim (surplusBase would be 0).
+        if (outstandingShares == 0) return;
+        if (surplusBase == 0) {
+            surplusPool = pool;
+            surplusBase = outstandingShares;
+            surplusClaimedShares = 0;
+            surplusAllocated = 0;
+            surplusPaid = 0;
+        } else {
+            // Already booked by returnSurplus() in Ready and more BNB arrived afterwards (e.g. a sale
+            // settlement): top the same pool up. Resetting the counters here would pay early claimants twice.
+            surplusPool += pool;
+        }
         // The principal pool is zeroed: the money is now tracked by surplusPool and distributed by
         // claimSurplus(). recoverBnb's reserved amount covers surplusPool − surplusPaid, so the owner
         // cannot sweep it.

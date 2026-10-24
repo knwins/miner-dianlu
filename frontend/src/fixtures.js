@@ -1047,6 +1047,9 @@ export function applyOpenRefund(round, book, actor = null) {
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行可以由 Owner 发起退款。" };
   }
+  if (book.executePhase === "ready") {
+    return { ok: false, message: "元件已确认到账：这个状态不能退款结束本期（元件只能进矿池）。用「退回剩余募集款」把没花完的 BNB 按份退给持份人。" };
+  }
   if (book.executePhase && book.executePhase !== "buying") {
     return { ok: false, message: "请先取消挂单，再发起退款。" };
   }

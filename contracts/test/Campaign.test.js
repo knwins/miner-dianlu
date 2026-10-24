@@ -899,16 +899,41 @@ describe("transistor order + deposit to pool", () => {
     expect(await campaign.scene()).to.equal(SCENE.Mining);
   });
 
-  it("Ready refund returns the parts and does not wait on a sale", async () => {
+  it("Ready refund never hands the parts to the owner: only the leftover BNB goes to holders", async () => {
     const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
     await campaign.connect(owner).setPlan(408n);
     await place(campaign, owner, 4n, UNIT);
     await fillAndConfirm(campaign, minter);
-    await expect(campaign.connect(owner).openRefund()).to.emit(campaign, "Refunded");
-    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
-    expect(await parts.balanceOf(owner.address, 0)).to.equal(4n);
-    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+
+    // 元件已确认到账：退款不再允许（那会把元件转给 Owner、份额清零、结束本期）
+    await expect(campaign.connect(owner).openRefund())
+      .to.be.revertedWithCustomError(campaign, "UseReturnSurplus");
+    await expect(campaign.connect(owner).abandonOrder())
+      .to.be.revertedWithCustomError(campaign, "UseReturnSurplus");
+
+    // 正确的出口：只把没花完的募集款按份退给持份人
+    const leftover = SHARE_PRICE * 100n - UNIT * 4n;
+    await expect(campaign.connect(owner).returnSurplus()).to.emit(campaign, "SurplusReturned");
+    expect(await campaign.surplusPool()).to.equal(leftover);
+    expect(await campaign.surplusBase()).to.equal(100n);
+    // 份额、元件、阶段都不动
+    expect(await campaign.sharesOf(alice.address)).to.equal(100n);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(4n);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(0n);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    expect(await campaign.executionFailed()).to.equal(false);
+
+    // 持份人自己领
+    await expect(campaign.connect(alice).claimSurplus()).to.emit(campaign, "Refunded");
+    // 领完余款后元件和份额仍然要能入池
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
+    expect(await parts.balanceOf(await pool.getAddress(), 0)).to.equal(4n);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(0n);
   });
 
   it("setPlan blocked after listed / mining", async () => {
@@ -1227,6 +1252,120 @@ describe("C-4 surplus is pulled, not pushed", () => {
     await expect(campaign.connect(owner).recoverBnb())
       .to.be.revertedWithCustomError(campaign, "ZeroShares");
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.be.gt(0n);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 确认到账后立刻退回剩余募集款（不入池、不退本期）
+// ─────────────────────────────────────────────────────────────────────────────
+describe("returnSurplus: unspent principal goes back right after confirmation", () => {
+  /** 认购满 100 份 → 挂 100 颗 @ UNIT → 成交确认，停在 Ready，池子还剩 100 × (SHARE_PRICE − UNIT)。 */
+  async function readyFixture() {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, bob, minter } = ctx;
+    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
+    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    return ctx;
+  }
+
+  it("returns the leftover pro-rata while the round stays in Ready", async () => {
+    const { campaign, owner, alice, bob } = await readyFixture();
+    const leftover = 100n * SHARE_PRICE - 100n * UNIT;
+    expect(await campaign.raisedBnb()).to.equal(leftover);
+
+    await expect(campaign.connect(owner).returnSurplus())
+      .to.emit(campaign, "SurplusReturned")
+      .withArgs(leftover, 100n);
+
+    // 账本：本金池清零，改成 pull 的 surplus；期次没结束、阶段没变
+    expect(await campaign.raisedBnb()).to.equal(0n);
+    expect(await campaign.surplusPool()).to.equal(leftover);
+    expect(await campaign.surplusBase()).to.equal(100n);
+    expect(await campaign.scene()).to.equal(SCENE.Executing);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    expect(await campaign.executionFailed()).to.equal(false);
+    // 元件没动，份额没动
+    expect(await campaign.outstandingShares()).to.equal(100n);
+    expect(await campaign.orderFilled()).to.equal(true);
+
+    // 60 / 40 按份领
+    const aBefore = await ethers.provider.getBalance(alice.address);
+    const atx = await campaign.connect(alice).claimSurplus();
+    const ar = await atx.wait();
+    expect(await ethers.provider.getBalance(alice.address) + ar.gasUsed * ar.gasPrice - aBefore)
+      .to.equal((leftover * 60n) / 100n);
+
+    const bBefore = await ethers.provider.getBalance(bob.address);
+    const btx = await campaign.connect(bob).claimSurplus();
+    const br = await btx.wait();
+    expect(await ethers.provider.getBalance(bob.address) + br.gasUsed * br.gasPrice - bBefore)
+      .to.equal((leftover * 40n) / 100n);
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+  });
+
+  it("does not block depositToPool, and pooling keeps the booked surplus claimable", async () => {
+    const { campaign, owner, alice, bob } = await readyFixture();
+    await campaign.connect(owner).returnSurplus();
+
+    const pool = await ethers.deployContract("MockERC1155");
+    await pool.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await pool.getAddress());
+    // 入池照样能进：入池时的 _returnSurplus 看到 raisedBnb == 0，不会覆盖已记账的余款
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    expect(await campaign.surplusBase()).to.equal(100n);
+
+    // 入池后仍然能领（没被重复记账、也没被清零）
+    await campaign.connect(alice).claimSurplus();
+    await campaign.connect(bob).claimSurplus();
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+  });
+
+  it("is owner-only and refuses to end the round by refund afterwards", async () => {
+    const { campaign, owner, alice } = await readyFixture();
+    await expect(campaign.connect(alice).returnSurplus())
+      .to.be.revertedWithCustomError(campaign, "NotOwner");
+
+    await campaign.connect(owner).returnSurplus();
+    // 本金已经发回给持份人：再退款就是把份额清零、把元件交回 Owner
+    await expect(campaign.connect(owner).openRefund())
+      .to.be.revertedWithCustomError(campaign, "SurplusAlreadyReturned");
+    await expect(campaign.connect(owner).abandonOrder())
+      .to.be.revertedWithCustomError(campaign, "SurplusAlreadyReturned");
+    // 持份人自己也不该能 0 BNB 清掉份额（那等于白送挖矿权益）
+    await expect(campaign.connect(alice).refund())
+      .to.be.revertedWithCustomError(campaign, "SurplusAlreadyReturned");
+    // 也不该再把本期标成「执行失败」——那会给持份人一个注定失败的退款入口
+    await expect(campaign.connect(owner).markFailed())
+      .to.be.revertedWithCustomError(campaign, "SurplusAlreadyReturned");
+  });
+
+  it("cannot run before the parts are confirmed or with no leftover", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+
+    // Buying：元件还没到手
+    await expect(campaign.connect(owner).returnSurplus())
+      .to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
+
+    // 把全部募集款花在元件上 → 没有余数可退
+    await place(campaign, owner, 100n, SHARE_PRICE);
+    await fillAndConfirm(campaign, minter);
+    expect(await campaign.raisedBnb()).to.equal(0n);
+    await expect(campaign.connect(owner).returnSurplus())
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
+  });
+
+  it("a second call cannot re-book the same money", async () => {
+    const { campaign, owner } = await readyFixture();
+    await campaign.connect(owner).returnSurplus();
+    await expect(campaign.connect(owner).returnSurplus())
+      .to.be.revertedWithCustomError(campaign, "ZeroShares");
   });
 });
 

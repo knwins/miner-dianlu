@@ -40,7 +40,7 @@ executing（待执行）  buying ──place──► listed ──confirm──
     │                    └──── 买不起 → executionFailed    │
     │                                                     │
     │ 超时未售罄 ──► refund ◄──────────────────────────────┘
-    │                openRefund / abandonOrder / markFailed
+    │                openRefund / abandonOrder / markFailed / returnSurplus（仅退余款，本期继续）
     ▼
 mining（矿池）  ready ──depositToPool──► mining（晶体管已打入，不可逆）
                                     harvest()/claim() 是占位空实现
@@ -53,8 +53,8 @@ mining（矿池）  ready ──depositToPool──► mining（晶体管已打�
 
 | 规则 | 说明 |
 |---|---|
-| 退出路径 | **被动**：募集超时 / 买料失败时 `refund`；Owner 可 `openRefund` / `abandonOrder` 批量退（仅 Executing，入池后封锁）。**没有挖矿中赎回** |
-| 矿池 | `Ready` 态 `depositToPool()` 把晶体管**不可逆**转入 `miningPool`，按份退回余量 BNB（份额保留） |
+| 退出路径 | **被动**：募集超时 / 买料失败时 `refund`；Owner 可 `openRefund` / `abandonOrder` 批量退（仅 `buying`/`listed`，`ready` 与入池后封锁）。**元件确认到账后不再有「元件退回 Owner」的退款**。**没有挖矿中赎回** |
+| 矿池 | `Ready` 态必须先把没花完的募集款按份退回持份人（`returnSurplus()`；`depositToPool()` 内部也兜底、且排在元件转移之前），再把晶体管**不可逆**转入 `miningPool`（份额保留）。**不结束本期、不影响入池** |
 | 份额转让 | **仅 Mining 开放**：持份人发布出售挂单（份额立即锁定）→ 他人接收（BNB 原子付卖方） |
 | 不提供 | 挖矿中赎回、**挖矿产出分配**（`harvest`/`claim` 是 no-op） |
 | 资金 | 认筹进 `raisedBnb`；份额转让 BNB 直付卖方；`receive()` 仅 `market` 可入账 |
@@ -161,8 +161,10 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | `subscribe(uint256 count)` | 写 payable | `funding`；截止前；`msg.value == count × sharePriceBnb` | 认筹整数份；售罄 → `executing` + `buying`，记 `soldOutAt` |
 | `refund()` | 写 | ① `funding` 且超时未售罄；或 ② `executing` + `executionFailed`；或 ③ `executing`+`buying` 且池子已不足以按原价兑付 | 本钱包本金原路退、份额清零；有 escrow 锁定时跳过 |
 | `markFailed()` | 写 | 任何人，但非 Owner 须在售罄满 `FAIL_GRACE`(3 天) 后；Owner 随时 | 先撤未成交买单（押金退回），再置 `executionFailed`，为所有持有人打开 `refund()`。撤单被市场拒绝时整笔回滚、可稍后重试 |
-| `openRefund()` | 写 | Owner；`buying`，或 `ready` 且无未确认卖单；且 `sold > 0` | 批量退款，把合约里的元件退回 Owner。份额全退完（`sold == 0`）时 `ZeroShares` 回滚，用 `recoverBnb()` 扫尾差 |
-| `abandonOrder()` | 写 | Owner；`executing`，含 `ready` | 撤未成交买单、撤卖单、提取卖出款、退回元件、按池子退款 |
+| `openRefund()` | 写 | Owner；仅 `buying`；且 `sold > 0`；且还没 `returnSurplus` | 批量退款，把合约里残留的元件退回 Owner。`ready` 用 `UseReturnSurplus` 拒绝：元件已确认到账，只能 `returnSurplus` 退余款 + 入池，元件不转给 Owner（确要结束本期须先 `setPhase(1)`，属管理员逃生）。份额全退完（`sold == 0`）时 `ZeroShares` 回滚，用 `recoverBnb()` 扫尾差。退过余款后 `SurplusAlreadyReturned` 回滚 |
+| `returnSurplus()` | 写 | Owner；`ready` 且无未确认卖单 / 无市场欠款；`raisedBnb > 0` | **不结束本期**：把没花完的募集款按份记账退回持份人（各 `claimSurplus()` 自领）。份额不变、元件留在合约、`phase` 仍是 `ready`，之后照常 `depositToPool()`。零持仓循环，成本不随持份人数增长。**入池前的必做步骤**（`depositToPool` 内部也会兜底记账） |
+| `abandonOrder()` | 写 | Owner；仅 `executing` + `buying` / `listed`；且还没 `returnSurplus` | 撤未成交买单、撤卖单、提取卖出款、退回元件、按池子退款。`ready` 用 `UseReturnSurplus` 拒绝（同上） |
+| `depositToPool()` | 写 | Owner；`ready` + 元件在手 + 已设矿池 | **先把 `raisedBnb` 按份记账给持份人（`_returnSurplus`），再把元件转进矿池**，然后 `scene = mining`。顺序保证「钱先归持份人、元件才离开」，owner 无法扫走 |
 | `claimSurplus()` | 写 | 有 pending 余款者 | 领取余款（pull 模式，见 §5.3） |
 
 > ⚠️ **`neverSoldOut` 出口必须保留**：`refund()` 里「**一份未卖 + 已过募资截止**」这条路径是 Funding 超时期次**唯一的**退款出口。封掉会造成 Critical 级本金锁死。
@@ -192,7 +194,7 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | `withdrawMarketProceeds()` | 写 | 任何人 | 从市场提取卖出/退回款（走 `receive()`） |
 | `setMaterialMarket(address)` | 写 | 仅 Owner | 换本期材料市场（原 `setMinter`） |
 | `setMiningPool(address)` | 写 | 仅 Owner；入池前 | 设矿池地址；入池后 `AlreadyPooled`、零地址 `ZeroAddress` |
-| `depositToPool()` | 写 | 仅 Owner；`ready` | **不可逆**：把本期全部晶体管转入 `miningPool`，按份退回余量 BNB（份额保留），置 `pooled=true` 进入 `Mining`。未设池则 `PoolNotSet` |
+| `depositToPool()` | 写 | 仅 Owner；`ready` | **不可逆**：先把余量 BNB 按份记账给持份人（`_returnSurplus`，份额保留），再把本期全部晶体管转入 `miningPool`，置 `pooled=true` 进入 `Mining`。未设池则 `PoolNotSet` |
 | `recoverBnb()` | 写 | 仅 Owner | 测试救援。一次扫走所有可动 BNB：募集/待执行只转出超过 `raisedBnb` 的多余余额；`sold == 0` 时转出整池剩余并清零。**`surplusPool - surplusPaid` 与 `totalPendingFee` 已预留，扫不走** |
 | `recoverTransistors(address token, uint256 id, uint256 amount)` | 写 | 仅 Owner；只禁止 `listed`；入池后禁止 | 把持有的 ERC1155 元件转给 Owner（救援，**不触发流片**）；`pooled` 后 `AlreadyPooled` |
 | `transferOwnership(address)` | 写 | 仅 Owner | 转让本期 Owner |
@@ -292,6 +294,17 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 > ⚠️ **余款必须保持 pull 模式**：持有人可达数千，一次遍历分发会 Gas DoS 触顶，且某个拒收地址会让整批余款永久锁死。
 > `recoverBnb` 两个分支都必须为 `surplusPool - surplusPaid` 预留 —— `totalPendingSurplus` 是其子集，**不可重复加**。
 
+**记提时机有两个，走同一套账本：**
+
+| 触发 | 时机 | 结果 |
+|---|---|---|
+| `returnSurplus()` | `ready`（元件已确认到账），**不结束本期** | 余款立刻按份记提，持份人可立即 `claimSurplus()`；份额不变、元件在合约里，随后仍能 `depositToPool()` |
+| `depositToPool()` 内部 `_returnSurplus()` | 入池瞬间 | 老合约/没提前退的期次走这条：入池时记提，入池后 `claimSurplus()` 随时领 |
+
+> `_returnSurplus` 是**可累加**的：`surplusBase == 0` 时建账（分子/分母/游标一起写入），已经有账时只把新到的 BNB 加到 `surplusPool`（例：提前退余款之后又有卖单成交款进池，再入池）。**绝不能重置 `surplusClaimedShares` / `surplusAllocated` / `surplusPaid`**，否则早期已领的人会被重复记账。
+> 累加会带来一点排序效应：后补的那笔钱只由**尚未领取**的人分，最后一位领完的人拿走全部余数 —— 总额永远不多不少、不会重复发放，但先后领的人分到的比例会有微小差异。想要严格按最终池子比例，就等余款定型（不再有市场回款）后再统一记账。
+> `outstandingShares == 0` 时 `_returnSurplus` 直接返回：没有人可以领，钱留在 `raisedBnb` 里由 `recoverBnb` 处理，而不是落进一个永远分不出去的池子。
+
 ### 5.4 份额与元件
 
 - **份额**：`subscribe` 产生，不可分割记账，可经 `listShares`/`takeListing` 转让（BNB 直付卖方）。
@@ -305,7 +318,7 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | 角色 | 场景 | 写入口 |
 |---|---|---|
 | Factory Owner | 工厂 | `createCampaign`；`removeCampaign`；`transferOwnership` |
-| Campaign Owner | 本期 | `setPlan` → `placeTransistorOrder` → `confirmTransistors` / `cancelTransistorOrder` → `setMiningPool` → `depositToPool`；`openRefund` / `abandonOrder` / `markFailed` / `recoverBnb` / `recoverTransistors` / `setMaterialMarket` / `setServiceFee` / `setPhase` / `transferOwnership` |
+| Campaign Owner | 本期 | `setPlan` → `placeTransistorOrder` → `confirmTransistors` / `cancelTransistorOrder` → `returnSurplus`（可选，退余款不结束本期）/ `setMiningPool` → `depositToPool`；`openRefund` / `abandonOrder` / `markFailed` / `recoverBnb` / `recoverTransistors` / `setMaterialMarket` / `setServiceFee` / `setPhase` / `transferOwnership` |
 | 任何人 | mining | `takeListing`（接收他人挂单，接收后成为持份人）；`markFailed`（3 天宽限期后）；`confirmTransistors`（permissionless）；`harvest`/`claim`（占位） |
 | 认筹用户 | funding | `subscribe`；超时未售罄 `refund` |
 | 持份用户 | mining | `listShares`；`cancelListing`（自己的）；`claimSurplus` / `claimFee` |
@@ -458,7 +471,7 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-drill.
 > **部署脚本可能「崩在广播之后」**：hardhat-ethers 对合约创建交易的 `to=""` 回读必崩（详见 `scripts/_deploy.js` 头注释）。**交易其实已经广播成功** —— `_deploy.js` 会按 CREATE 地址在链上找回执继续；万一手动恢复，用 `eth_getTransactionByHash` + `eth_getBlockReceipts` 双路径（`eth_getTransactionReceipt` 在 publicnode 一律报 archive 限制）。**绝不重复部署。**
 
 > **端口 5173 是用户自己的 dev server，勿占用。** 探针另起端口（如 5199）且必须先 fetch `/` 校验 title 再测。
-> 测试覆盖：开期、认筹、退款、挂单、confirm、Ready 逃生、余款退回、白名单。**74 passing**。
+> 测试覆盖：开期、认筹、退款、挂单、confirm、Ready 逃生、余款退回（含提前 returnSurplus）、白名单。**79 passing**。
 
 ### 9.2 主网部署前置
 

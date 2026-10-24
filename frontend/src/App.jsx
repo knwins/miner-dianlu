@@ -279,7 +279,7 @@ export default function App() {
     const WRITE_METHODS = [
       "subscribe", "listShares", "cancelListing", "takeListing", "refund", "claimSurplus",
       "placeTransistorOrder", "cancelTransistorOrder", "placeTransistorAsk", "cancelTransistorAsk", "confirmSale", "setPhase",
-      "withdrawMarketProceeds", "confirmTransistors", "setPlan", "setMiningPool", "depositToPool",
+      "withdrawMarketProceeds", "confirmTransistors", "setPlan", "setMiningPool", "depositToPool", "returnSurplus",
       "simulateFillBid", "simulateFillAsk", "simulateFillCampaignBids", "simulateFillCampaignAsks",
       "createCampaign", "openRefund", "abandonOrder", "markFailed", "removeCampaign", "removeCampaignAt",
       "setMaterialMarket", "recoverBnb", "recoverTransistors", "transferOwnership",
@@ -313,6 +313,21 @@ export default function App() {
     }
     else if (method === "setPlan") result = { ok: true, message: "模拟：预估算力与元件数已写入" };
     else if (method === "placeTransistorOrder") result = applyPlaceTransistorOrder(round, book, actor, args);
+    else if (method === "returnSurplus") {
+      // 模拟模式：把钱从募集池挪到「待领余款」，期次、份额、元件都不动 —— 与链上 returnSurplus 同口径。
+      result = book.executePhase === "ready" && Number(book.bnbPool) > 0
+        ? {
+            ok: true,
+            message: `模拟：${round4(book.bnbPool)} BNB 余款已按份记账，持份人各自领取；本期继续，仍可入池`,
+            book: {
+              ...book,
+              surplusOutstanding: Number(book.surplusOutstanding || 0) + Number(book.bnbPool || 0),
+              surplusBase: book.outstandingShares ?? book.sold,
+              bnbPool: 0,
+            },
+          }
+        : { ok: false, message: "只有元件确认到账、且募集池还有余款时才能退" };
+    }
     else if (method === "openRefund" || method === "abandonOrder") result = applyOpenRefund(round, book, actor);
     else if (method === "markFailed") {
       result = book.executionFailed
@@ -489,8 +504,10 @@ export default function App() {
         }
         setNotice(method === "openRefund"
           ? "链上已退款。认筹 BNB 已按认筹地址原路退回。"
+          : method === "returnSurplus"
+            ? "剩余募集款已按份记账：持份人各自 claimSurplus 领取，本期继续，元件仍在合约里、可以照常入池。"
           : method === "claimSurplus"
-            ? "已领取入池时应得但没发出去的余款，BNB 已到账。"
+            ? "已领取你应得的余款（提前退回或入池记账），BNB 已到账。"
           : method === "recoverBnb"
             ? "已把本期可动 BNB 一次性转给 Owner（多余余额，或无人可退时的整池剩余）。"
           : method === "abandonOrder"
@@ -793,6 +810,9 @@ export default function App() {
       }
       case "depositToPool":
         return chainTx.depositToPool(signer);
+      case "returnSurplus":
+        // 无参：把当前 raisedBnb 按份记账退回持份人，期次继续、仍然可以入池。
+        return chainTx.returnSurplus(signer);
       case "setMaterialMarket": return chainTx.setMaterialMarket(signer, args.materialMarket);
       case "setPhase": {
         const next = Number(args?.next);
@@ -1332,6 +1352,7 @@ export default function App() {
             onSetPlan={() => act("setPlan")}
             onSetMiningPool={(args) => act("setMiningPool", args)}
             onDepositToPool={() => act("depositToPool")}
+            onReturnSurplus={() => act("returnSurplus")}
             onRemoveCampaign={(address) => act("removeCampaign", { campaign: address })}
             onOpenRound={() => openPage("round")}
             onOpenAssets={() => openPage("assets")}
@@ -1596,7 +1617,7 @@ function RoundHub({
             phase={ended ? "已结束" : "待执行"}
             lead={ended
               ? "本期已结束。执行失败，认筹 BNB 已按认筹地址原路退回。"
-              : "晶体管到账后即可投入矿池。Owner 也可以直接发起退款，认筹 BNB 会按认筹地址原路退回。"}
+              : "晶体管到账后即可投入矿池。入池前会先把没花完的募集款按份退回给持份人（元件不转给 Owner、份额不变），然后再把元件投入矿池；持份人在「我的资产」领取。"}
             badge={ended ? "已结束" : copy.badge}
             tone={ended ? "done" : copy.tone}
             deal={dealStatus(book)}
@@ -1652,7 +1673,7 @@ function RoundHub({
                       ? "执行失败，本金未支出。可到「我的资产」原路退还；Owner 也可降价重挂或批量退款剩余。"
                       : book.refundShort
                         ? `托管池已不足以按原价兑付（约 ${Number(book.refundRatio || 0).toFixed(4)} BNB/份），合约允许持份人按比例退款。`
-                        : "入池后未花完的募集款按份退回。"}
+                        : "没花完的募集款按份退回给持份人：入池前先记账（本期继续、元件留在合约、之后照样能入池），入池那一刻也会自动记账；两种都由持份人自己 claimSurplus 领取。"}
               </p>
               <div className="actions">
                 {isOwner && book.executePhase === "buying" && (
@@ -1669,7 +1690,7 @@ function RoundHub({
                     )}
                     {outstandingOf(book) > 0 ? (
                       <button
-                        className="btn btn-inline"
+                        className="btn btn-outline btn-inline"
                         type="button"
                         disabled={Boolean(pending)}
                         onClick={onAbort}
@@ -1680,7 +1701,7 @@ function RoundHub({
                       // 份额已全部退完（sold == 0）：openRefund 没有可退对象，链上会 ZeroShares 回滚。
                       // 该状态下唯一能动的就是池子里的尾差/溢价，用 recoverBnb 一次扫给 Owner。
                       <button
-                        className="btn btn-inline"
+                        className="btn btn-outline btn-inline"
                         type="button"
                         disabled={Boolean(pending)}
                         onClick={() => onRecoverBnb()}
@@ -1702,7 +1723,7 @@ function RoundHub({
                 )}
                 {!book.executionFailed && book.markFailedAt && Date.now() >= book.markFailedAt && (
                   <button
-                    className="btn btn-inline"
+                    className="btn btn-outline btn-inline"
                     type="button"
                     disabled={Boolean(pending)}
                     onClick={onMarkFailed}
@@ -1720,12 +1741,12 @@ function RoundHub({
                   </p>
                 )}
                 {(book.executionFailed || (book.scene === "funding" && book.endsAt && Date.now() > book.endsAt)) && (
-                  <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
+                  <button className="btn btn-outline btn-inline" type="button" onClick={onOpenAssets}>
                     我的资产 · 退款
                   </button>
                 )}
                 {!(book.executionFailed || (book.scene === "funding" && book.endsAt && Date.now() > book.endsAt)) && (
-                  <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
+                  <button className="btn btn-outline btn-inline" type="button" onClick={onOpenAssets}>
                     我的资产
                   </button>
                 )}
@@ -1767,57 +1788,98 @@ function RoundHub({
         </section>
       )}
 
-      {book.scene === "mining" && (
-        <section>
-          <RoundTitle
-            id={round.id}
-            phase="挖矿中"
-            lead="元件已投入矿池，本期进入挖矿（不可逆）。BEM 分配合约接入前 harvest / claim 为占位空实现，不产出发放；退出只能走「资产转让」。"
-            badge={copy.badge}
-            tone={copy.tone}
-            deal={dealStatus(book)}
-            periods={periods}
-            onSwitchPeriod={onSwitchPeriod}
-            processor={round.processorId || "未记录"}
-          />
-          <div className="stat-grid">
-            <article className="stat-card accent">
-              <div className="stat-label">入池元件</div>
-              <div className="stat-value">{Number(book.transistorCount) || 0} 颗</div>
-              <div className="stat-note">成交到账的 NAND + LATCH，已转入矿池</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-label">预估算力（setPlan）</div>
-              <div className="stat-value">{Number(book.estHashpower || 0).toLocaleString("zh-CN")} H</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-label">我的份数</div>
-              <div className="stat-value">{book.mine || 0} / {round.totalShares} 份</div>
-            </article>
-            <article className="stat-card">
-              <div className="stat-label">本期状态</div>
-              <div className="stat-value">已入池 · 不可逆</div>
-            </article>
-          </div>
-          <article className="card claim-card">
-            <div className="card-header">挖矿状态</div>
-            <div className="card-body">
-              <p className="fine claim-fine">
-                元件已投入矿池，不可撤出。分配合约接入前 harvest / claim 是占位空实现，暂不产出发放；
-                合约不提供本金赎回，退出只能把份额挂到转让市场，由其他持份人接收。
-              </p>
-              <div className="claim-actions">
-                <button className="btn btn-primary" type="button" onClick={onOpenTransfer}>
-                  资产转让
-                </button>
-                <button className="btn btn-inline" type="button" onClick={onOpenAssets}>
-                  我的资产
-                </button>
-              </div>
+      {book.scene === "mining" && (() => {
+        /**
+         * 挖矿中的四个指标共用一套版式：标签 / 数值 + 单位 / 说明。
+         * 数值统一 20px、单位降级到 13px；「已入池 · 不可逆」这类长文案改用胶囊，
+         * 不再和数字抢同一档字号。说明行贴底，四张卡的说明落在同一条基线上。
+         */
+        const pooledParts = Number(book.transistorCount) || 0;
+        const hashpower = Number(book.estHashpower || 0);
+        const mine = Number(book.mine || 0);
+        const totalShares = Number(round.totalShares) || 0;
+        const sharePercent = totalShares > 0 ? (mine / totalShares) * 100 : 0;
+        return (
+          <section className="mining-desk">
+            <RoundTitle
+              id={round.id}
+              phase="挖矿中"
+              lead="元件已投入矿池，本期进入挖矿（不可逆）。退出只能走「资产转让」。"
+              badge={copy.badge}
+              tone={copy.tone}
+              deal={dealStatus(book)}
+              periods={periods}
+              onSwitchPeriod={onSwitchPeriod}
+              processor={round.processorId || "未记录"}
+            />
+            <div className="mining-stats">
+              <article className="mining-stat is-accent">
+                <p className="mining-stat-label">入池元件</p>
+                <p className="mining-stat-value">
+                  {pooledParts.toLocaleString("zh-CN")}
+                  <span className="mining-stat-unit">颗</span>
+                </p>
+                <p className="mining-stat-note">成交到账的 NAND + LATCH，已转入矿池</p>
+              </article>
+              <article className="mining-stat">
+                <p className="mining-stat-label">预估算力</p>
+                <p className="mining-stat-value">
+                  {hashpower.toLocaleString("zh-CN")}
+                  <span className="mining-stat-unit">H</span>
+                </p>
+                <p className="mining-stat-note">setPlan 写入的估算值，不是实测产出</p>
+              </article>
+              <article className="mining-stat">
+                <p className="mining-stat-label">我的份数</p>
+                <p className="mining-stat-value">
+                  {mine.toLocaleString("zh-CN")}
+                  <span className="mining-stat-unit">/ {totalShares.toLocaleString("zh-CN")} 份</span>
+                </p>
+                <p className="mining-stat-note">
+                  {mine > 0 ? `占本期 ${sharePercent % 1 === 0 ? sharePercent : sharePercent.toFixed(2)}%` : "当前钱包未持有本期份额"}
+                </p>
+              </article>
+              <article className="mining-stat">
+                <p className="mining-stat-label">本期状态</p>
+                <p className="mining-stat-value is-text">
+                  <span className="mining-pill">已入池 · 不可逆</span>
+                </p>
+                <p className="mining-stat-note">元件已交给矿池，合约无法再取回</p>
+              </article>
             </div>
-          </article>
-        </section>
-      )}
+            <article className="card mining-card">
+              <div className="card-header">
+                <span>挖矿状态</span>
+                <span className="mining-chip">元件已入池</span>
+              </div>
+              <div className="card-body">
+                <dl className="mining-facts">
+                  <div className="mining-fact">
+                    <dt>元件去向</dt>
+                    <dd>已转入矿池，合约无法再取回</dd>
+                  </div>
+                  <div className="mining-fact">
+                    <dt>产出发放</dt>
+                    <dd>分配合约接入前，harvest / claim 为占位空实现，暂不发放</dd>
+                  </div>
+                  <div className="mining-fact">
+                    <dt>退出方式</dt>
+                    <dd>只能把份额挂到转让市场，由其他持份人接收；没有本金赎回</dd>
+                  </div>
+                </dl>
+                <div className="mining-actions">
+                  <button className="btn btn-primary" type="button" onClick={onOpenTransfer}>
+                    资产转让
+                  </button>
+                  <button className="btn btn-outline" type="button" onClick={onOpenAssets}>
+                    我的资产
+                  </button>
+                </div>
+              </div>
+            </article>
+          </section>
+        );
+      })()}
     </>
   );
 }
@@ -1991,11 +2053,13 @@ function AssetsHub({
                       <td>第 {row.id} 期</td>
                       <td className="asset-status-cell">
                         <div className={`asset-status tone-${tone}`}>
-                          <strong>{ended ? "已结束" : row.sceneLabel}</strong>
-                          {sub ? <span>{sub}</span> : null}
-                          {deal.key === "none" ? null : (
-                            <span className={`deal-badge ${deal.cls}`}>{deal.label}</span>
-                          )}
+                          <div className="asset-status-head">
+                            <strong>{ended ? "已结束" : row.sceneLabel}</strong>
+                            {deal.key === "none" ? null : (
+                              <span className={`deal-badge ${deal.cls}`}>{deal.label}</span>
+                            )}
+                          </div>
+                          {sub ? <p className="asset-status-sub">{sub}</p> : null}
                         </div>
                       </td>
                       <td>{row.totalShares ? `${outstandingOf(row)}/${row.totalShares}` : "—"}</td>
@@ -2036,7 +2100,7 @@ function AssetsHub({
                               type="button"
                               disabled={Boolean(pending)}
                               onClick={() => onClaimSurplus(row.address)}
-                              title="入池时应得但未发出的余款：你的地址拒收 BNB 导致，领取后到账"
+                              title="按份应得、还没转到你地址的余款（提前退余款或入池记账后产生）；领取后到账"
                             >
                               {pending === "claimSurplus" ? "领取中…" : `领取 ${round4(row.pendingSurplusBnb)} BNB`}
                             </button>
@@ -2067,7 +2131,7 @@ function OwnerDesk({
    * 之前漏了这两个，OwnerOverview 里的按钮走 `onXxx?.()` 可选调用，
    * 于是点了**完全没有反应**（连报错都没有）：这种静默失败最难查。
    */
-  onSetMiningPool, onDepositToPool,
+  onSetMiningPool, onDepositToPool, onReturnSurplus,
   onRemoveCampaign, onOpenRound, onOpenAssets,
   onCreate, onConnect, onInvoke,
 }) {
@@ -2121,6 +2185,7 @@ function OwnerDesk({
           onSetPlan={onSetPlan}
           onSetMiningPool={onSetMiningPool}
           onDepositToPool={onDepositToPool}
+          onReturnSurplus={onReturnSurplus}
           onRemoveCampaign={onRemoveCampaign}
           onOpenRound={onOpenRound}
           onOpenAssets={onOpenAssets}
@@ -2721,20 +2786,36 @@ function ListingRow({ listing, account, pending, disabled = false, onTake, onCan
   const status = listing.status || (listing.open === false ? "cancelled" : "open");
   const maxQty = Math.max(1, listing.shares || 1);
   const take = Math.min(Math.max(1, qty), maxQty);
+  /**
+   * 合约只存剩余份数（成交后减到 0），所以「挂了 1 份并全部成交」这条在链上
+   * 只剩 shares=0 —— 直接拿它当份数会显示成「— / 合计 0.0000 BNB」。
+   * listedShares 来自 Listed 事件；读不到时退回剩余份数，宁可显示剩余也不编造 0。
+   */
+  const listed = Number(listing.listedShares) || 0;
+  const remaining = Number(listing.shares) || 0;
+  const taken = Number(listing.takenShares) || 0;
+  const shown = listed > 0 ? listed : remaining;
+  // 部分成交：开放中提示还能买多少；已撤单提示撤之前成交了多少
+  const note = taken > 0 && listed > 0
+    ? (status === "open" ? `剩 ${remaining} 份` : status === "cancelled" ? `成交 ${taken} 份` : "")
+    : "";
   return (
     <li className={`listing-row is-${status}`}>
       <span className="listing-seller">
         {shortAddress(listing.seller)}
         {isMine ? <em>我的</em> : null}
       </span>
-      <span className="listing-shares">{listing.shares > 0 ? `${listing.shares} 份` : "—"}</span>
+      <span className="listing-shares">
+        <span className="listing-shares-main">{shown > 0 ? `${shown} 份` : "—"}</span>
+        {note ? <span className="listing-shares-note">{note}</span> : null}
+      </span>
       <span className="listing-price">{listing.priceBnbPerShare.toFixed(4)} BNB / 份</span>
-      <span className="listing-sum">{listing.totalBnb.toFixed(4)} BNB</span>
+      <span className="listing-sum">{shown > 0 ? `${listing.totalBnb.toFixed(4)} BNB` : "—"}</span>
       <div className="listing-actions">
         {status === "done" && <span className="listing-status is-done">完成</span>}
         {status === "cancelled" && <span className="listing-status is-cancelled">已撤单</span>}
         {status === "open" && isMine && (
-          <button className="btn btn-inline" type="button" disabled={disabled || Boolean(pending)} onClick={() => onCancel(listing.id)}>
+          <button className="btn btn-outline btn-inline" type="button" disabled={disabled || Boolean(pending)} onClick={() => onCancel(listing.id)}>
             撤单
           </button>
         )}
@@ -2817,6 +2898,7 @@ function RulesPage({ campaigns = [] }) {
   ];
   const exits = [
     { title: "被动 · 退款", body: "募集超时未售罄，或执行失败且本金未支出。按认筹价原路退回，份额清零。" },
+    { title: "确认到账 · 退余款", body: "元件到账后，没花完的募集款按份退回认筹地址（各自领取）。不结束本期、元件留在合约，之后照常入池——元件不会转给 Owner。" },
     { title: "主动 · 挖矿份额转让", body: "仅挖矿中。在「资产转让」页发布出售挂单，份额立即锁定；成交时买方 BNB 直接付给卖方。" },
   ];
   const roles = [
@@ -2903,7 +2985,7 @@ function RulesPage({ campaigns = [] }) {
           </div>
         </div>
         <p className="round-hero-lead">
-          认筹款先托管，售罄后才买元件。没有本金赎回，退出只有退款和挖矿份额转让。
+          认筹款先托管，售罄后才买元件。没花完的本金会按份退回；没有挖矿中赎回，退出只有退款和挖矿份额转让。
           元件到账后由 Owner 投入矿池，本期进入挖矿（不可逆）。
         </p>
       </header>
@@ -2930,7 +3012,7 @@ function RulesPage({ campaigns = [] }) {
         <section className="rules-block">
           <div className="rules-block-head">
             <h2>退出</h2>
-            <p>两条路径互不交叉。募集中和待执行不能发布转让挂单。</p>
+            <p>三条路径互不交叉。募集中和待执行不能发布转让挂单；退余款只动钱，不动元件。</p>
           </div>
           <div className="rules-exit-list">
             {exits.map((item) => (
@@ -2952,7 +3034,7 @@ function RulesPage({ campaigns = [] }) {
            * 完整调用顺序在下方「入池条件」里已经是权威的一处，再列一遍只是同一流程换个粒度。
            */}
           <p className="rules-note">
-            入池前本金不动，持份人可原路退款，Owner 也可改价重挂。完整调用顺序见下方「入池条件」。
+            元件确认到账后，没花完的募集款按份退给持份人（不结束本期、元件不转给 Owner），然后才把元件投入矿池。完整调用顺序见下方「入池条件」。
           </p>
         </section>
       </div>
@@ -2964,7 +3046,7 @@ function RulesPage({ campaigns = [] }) {
         </div>
         <div className="rules-formula">
           <span>入池条件</span>
-          <strong>份额售罄 → 买入 NAND / LATCH → 确认到账 → setPlan → setMiningPool → depositToPool</strong>
+          <strong>份额售罄 → 买入 NAND / LATCH → 确认到账 → setPlan → returnSurplus（按份退余款）→ setMiningPool → depositToPool</strong>
         </div>
         <p className="rules-note">
           元件入池后不可撤出；挖矿中的退出只有挖矿份额转让，合约不提供本金赎回。

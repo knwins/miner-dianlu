@@ -1103,7 +1103,7 @@ h1, h2, h3, p { margin: 0; }
 .listing-head,
 .listing-row {
   display: grid;
-  grid-template-columns: minmax(96px, 1.1fr) 64px minmax(108px, 1.2fr) 92px minmax(150px, auto);
+  grid-template-columns: minmax(96px, 1.1fr) 78px minmax(108px, 1.2fr) 92px minmax(150px, auto);
   align-items: center;
   gap: 8px;
   white-space: nowrap;
@@ -1117,6 +1117,8 @@ h1, h2, h3, p { margin: 0; }
 }
 .listing-row {
   padding: 10px 0;
+  /* 行内可能出现两行内容（份数 + 副注），固定最小高度让整表行距一致 */
+  min-height: 58px;
   border-top: 1px solid var(--color-border);
 }
 .listing-row.is-done { color: var(--color-text-secondary); }
@@ -1141,6 +1143,21 @@ h1, h2, h3, p { margin: 0; }
   font-size: 14px;
   line-height: 32px;
 }
+/* 份数格可带一行副注（剩 N 份 / 成交 N 份）：两行合计高度与单行的相邻格一致 */
+.listing-shares {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  min-width: 0;
+}
+.listing-shares-main { line-height: 20px; }
+.listing-shares-note {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+}
 .listing-seller { font-weight: 600; }
 .listing-seller em {
   margin-left: 6px;
@@ -1156,10 +1173,22 @@ h1, h2, h3, p { margin: 0; }
   flex: none;
   flex-wrap: nowrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
 }
+/* 操作列表头跟着按钮一起右对齐，否则「操作」悬在列中、按钮贴右，看着是两列 */
+.listing-head > :last-child { text-align: right; }
+/* 操作列：两种按钮同高同宽，行内不会出现「一个实心块 + 一段裸文字」的落差 */
 .listing-actions .btn-primary,
-.listing-actions .btn-inline { width: auto; margin-top: 0; min-height: 32px; white-space: nowrap; }
+.listing-actions .btn-inline {
+  width: auto;
+  margin-top: 0;
+  min-width: 64px;
+  min-height: 34px;
+  padding: 0 14px;
+  font-size: 13px;
+  white-space: nowrap;
+}
 .qty-input {
   width: 64px;
   min-height: 32px;
@@ -1321,6 +1350,24 @@ h1, h2, h3, p { margin: 0; }
 .btn-primary:hover:not(:disabled) { background: var(--color-primary-hover); border-color: var(--color-primary-hover); }
 .btn-primary:disabled { opacity: 0.55; cursor: default; }
 .sidebar-footer .btn-primary { margin-top: 0; }
+/*
+ * 次级按钮（描边款）。
+ * .btn 的边框默认是 transparent，等于「只有文字的裸按钮」——放在表格行、
+ * 卡片动作区这类没有底色的位置，会被读成一行说明文字，而不是可点的操作。
+ * 凡是在行内出现的次级操作，都用这套描边样式，保证「看得见是个按钮」。
+ */
+.btn-outline {
+  border-color: var(--color-border-secondary);
+  background: #fff;
+  color: var(--color-text-secondary);
+  font-weight: 500;
+}
+.btn-outline:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+.btn-outline:disabled { opacity: 0.5; cursor: default; }
 
 .holding-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .holding-grid + .card { margin-top: 16px; }
@@ -1396,16 +1443,34 @@ h1, h2, h3, p { margin: 0; }
 /* 转让区说明文字行距放宽，避免拥挤 */
 .transfer-desk .fine { line-height: 1.8; }
 .transfer-desk .fine + .fine { margin-top: 12px; }
-.asset-status-cell { white-space: normal; }
-.asset-status .deal-badge { margin-top: 4px; }
+/*
+ * 「状态」列：阶段色条 + 主状态 + 认筹徽标 + 一行副状态。
+ * 旧实现的三个问题（截图里都能看到）：
+ *   1) 色条画在 td 的 8px 内边距里，标题因此比表头「状态」右移 10px，整列不对齐；
+ *   2) `.asset-status span` 通配到了 .deal-badge，把已售罄的绿色覆盖成灰色；
+ *   3) 徽标独占第三行，一行状态撑到 3 行，行高被拉高且与右侧「打开」按钮不居中。
+ * 现在色条贴单元格左缘、文字退回 8px（与表头同一条竖线），徽标并到标题右侧，
+ * 整块压回两行。
+ */
+.asset-status-cell {
+  white-space: normal;
+  padding-left: 0;
+}
 .asset-status {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 2px;
-  min-width: 108px;
-  padding: 2px 0 2px 10px;
+  gap: 4px;
+  min-width: 0;
+  padding-left: 6px;
   border-left: 2px solid var(--color-border-secondary);
+}
+.asset-status-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-height: 20px;
 }
 .asset-status strong {
   font-size: 14px;
@@ -1413,10 +1478,19 @@ h1, h2, h3, p { margin: 0; }
   line-height: 20px;
   color: var(--color-text);
 }
-.asset-status span {
+.asset-status-sub {
+  margin: 0;
   font-size: 12px;
   line-height: 18px;
   color: var(--color-text-tertiary);
+}
+/* 徽标与标题同行：去掉原先为「独占一行」预留的上外边距，
+   并把行高压到 18px，避免整块被徽标的 24px 撑高 */
+.asset-status .deal-badge {
+  margin-top: 0;
+  line-height: 18px;
+  padding-top: 1px;
+  padding-bottom: 1px;
 }
 .asset-status.tone-live { border-left-color: var(--color-success); }
 .asset-status.tone-live strong { color: var(--color-success); }
@@ -1429,19 +1503,29 @@ h1, h2, h3, p { margin: 0; }
 .asset-status.tone-mine { border-left-color: var(--color-primary); }
 .asset-status.tone-mine strong { color: var(--color-primary); }
 .assets-actions { margin-top: 0; flex-wrap: nowrap; }
-.assets-actions .btn {
+/* 只给次级按钮描边；主 CTA（原路退还 / 领取余款）必须保留实心底色，
+   否则 .assets-actions .btn 的优先级会盖掉 .btn-primary 的白字青底。 */
+.assets-actions .btn:not(.btn-primary) {
   width: auto;
-  min-height: 32px;
+  min-height: 34px;
   margin-top: 0;
-  padding: 0 12px;
+  padding: 0 14px;
   font-size: 13px;
   border: 1px solid var(--color-border-secondary);
   background: #fff;
-  color: var(--color-text);
+  color: var(--color-text-secondary);
   cursor: pointer;
   white-space: nowrap;
 }
-.assets-actions .btn:hover:not(:disabled) {
+.assets-actions .btn-primary {
+  width: auto;
+  min-height: 34px;
+  margin-top: 0;
+  padding: 0 14px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.assets-actions .btn:not(.btn-primary):hover:not(:disabled) {
   border-color: var(--color-primary);
   color: var(--color-primary);
 }
@@ -2768,24 +2852,6 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 .check-ok { margin-top: 16px; color: var(--color-success); }
 
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.claim-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-}
-.claim-actions .btn-primary {
-  width: auto;
-  flex: 1 1 168px;
-  margin-top: 0;
-  min-height: 40px;
-}
-.claim-actions .btn-inline {
-  flex: none;
-  min-height: 40px;
-  padding: 0 14px;
-}
-.claim-fine { margin-top: 12px; }
 .progress-card { margin-top: 16px; }
 .progress-card .pipeline { margin: 0 0 12px; }
 .progress-card .bill {
@@ -3515,3 +3581,165 @@ input[readonly] {
   .campaign-link { min-height: 36px; }
 }
 
+
+/* ── 挖矿中：状态看板 ────────────────────────────────────────────────
+ * 四张指标卡共用「标签 / 数值+单位 / 说明」三段结构：
+ *   · 数值字号统一 20px，单位单独降级到 13px，长文案（已入池·不可逆）改用胶囊，
+ *     避免某个值比同行高出一截、把基线拉歪；
+ *   · 说明行贴底（margin-top:auto）且固定两行(36px)高度，四张卡等高、说明首行对齐；
+ *   · 标签单行省略，宁可截断也不换行 —— 换行会把同一行的数值推到不同高度。
+ */
+.mining-desk > .round-hero { margin-bottom: 24px; }
+
+.mining-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.mining-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 16px 18px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: #fff;
+  box-shadow: var(--shadow-card);
+}
+/* 只有第一张带主色描边：强调「本期真的拿到了多少元件」。
+   用 3px 左边框时把左内边距减 2px，保证四张卡的文字左边界仍在同一条竖线上。 */
+.mining-stat.is-accent { border-left: 3px solid var(--color-primary); padding-left: 16px; }
+
+.mining-stat-label {
+  color: var(--color-text-tertiary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mining-stat-value {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-height: 28px;
+  color: var(--color-text);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+/* 长文案槽位：与数字同高，但不参与数字的字号规则 */
+.mining-stat-value.is-text { align-items: center; }
+.mining-stat-unit {
+  color: var(--color-text-quaternary);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
+.mining-stat-note {
+  /* 说明贴底：卡片被同行拉高时，四行说明仍落在同一条基线 */
+  margin-top: auto;
+  color: var(--color-text-tertiary);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* 状态胶囊：与 .transfer-gate 同一套视觉语言，但更紧凑（放在数值槽位里） */
+.mining-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--color-success-light);
+  color: var(--color-success);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1;
+  white-space: nowrap;
+}
+.mining-pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+/* 卡片头右侧的弱化标记：只作说明，不做第二个胶囊，免得与数值槽位抢注意力 */
+.mining-chip {
+  color: var(--color-text-tertiary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.mining-card .card-body { padding: 6px 20px 20px; }
+/* 键值明细：标签列定宽，右侧说明的左边界才严格对齐（换行也从同一条竖线开始） */
+.mining-facts {
+  margin: 0;
+  padding: 0;
+}
+.mining-fact {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.mining-fact:last-child { border-bottom: 0; }
+.mining-fact dt {
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+.mining-fact dd {
+  margin: 0;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* 动作区：按钮按内容宽度、同一高度。
+ * 旧写法把 .btn-primary 拉满（flex:1 1 168px）而次级按钮 flex:none，
+ * 于是出现「一个 800px 长条 + 一个被挤成两行的窄块」。
+ */
+.mining-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+.mining-actions .btn {
+  width: auto;
+  min-width: 112px;
+  min-height: 38px;
+  margin-top: 0;
+  padding: 0 20px;
+  font-size: 14px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+@media (max-width: 1040px) {
+  .mining-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .mining-stats { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .mining-fact { grid-template-columns: 76px minmax(0, 1fr); gap: 10px; }
+  .mining-actions { flex-direction: column; align-items: stretch; }
+  .mining-actions .btn { width: 100%; min-height: 42px; }
+}

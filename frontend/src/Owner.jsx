@@ -96,7 +96,7 @@ export function OwnerOverview({
   round, book, copy, pending, pendingTarget = "", actor, executeWait, history,
   onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onRecoverBnb, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
   onPlaceTransistorAsk, onCancelTransistorAsk, onConfirmSale, onWithdrawMarketProceeds,
-  onDepositToPool, onSetMiningPool, onSetPlan,   onRemoveCampaign, onOpenRound, onOpenAssets,
+  onDepositToPool, onSetMiningPool, onSetPlan, onReturnSurplus,   onRemoveCampaign, onOpenRound, onOpenAssets,
   account = "", connected = false, signer = null, chainHolders = null, holdersCampaign = "", quote, onInvoke,
   transistorUnitPrice = null,
   official = null,
@@ -370,6 +370,8 @@ export function OwnerOverview({
 
   const submitMiningPool = requireOps("setMiningPool", onSetMiningPool);
   const submitDepositToPool = requireOps("depositToPool", onDepositToPool);
+  /** 退余款也必须显式接线：可选调用会让按钮点了没反应。 */
+  const submitReturnSurplus = requireOps("returnSurplus", onReturnSurplus);
 
   function renderOps() {
     // 订单/结算状态一变就重读市场流水（挂单、成交、确认到账、提取卖出款）。
@@ -457,7 +459,16 @@ export function OwnerOverview({
                   // （placeAsk / asks / nextAskId / cancelAsk / fillAsk 都不存在），
                   // 这时 placeTransistorAsk 在链上必然 revert，前端不能给入口。
                   const canSell = Boolean(book.marketAskSide) && (heldNand > 0 || heldLatch > 0) && ready && !legacyReady && !askOpen && !saleSettled;
-                  const side = buyOpen ? "buy" : askOpen || canSell || saleSettled ? "sell" : "buy";
+                  /**
+                   * 空闲时表单方向只看阶段：Buying 挂买单，Ready 之后一律是卖单侧。
+                   *
+                   * 旧写法 `askOpen || canSell || saleSettled ? "sell" : "buy"` 把「不能卖」
+                   * 退回买侧：主网 Ready（官方市场没有卖单侧 → canSell=false）时会渲染成
+                   * 「挂买中 · 当前不能挂买单」，既解释不了为什么不能卖，也和上方的
+                   * 「下一步：可以挂卖」互相打脸。现在 Ready 走卖侧，卖不了时由下面的
+                   * 空态说明原因（市场没有卖单侧）。
+                   */
+                  const side = buyOpen || !ready ? "buy" : "sell";
                   /** 入池只要求手里有元件，不再比对推算出来的配比 */
                   const partsEnough = heldNand + heldLatch > 0;
                   // 合约 confirmTransistors() 要求两条腿 remaining 全为 0 **并且** 本期真的持有对应数量的元件。
@@ -518,14 +529,39 @@ export function OwnerOverview({
                   const canConfirmSale = isOwner && saleSettled;
                   const canRefund = isOwner && !askOpen && !saleSettled && marketOwed <= 0
                     && outstanding > 0
-                    && (book.executePhase === "buying" || (ready && !legacyReady));
+                    && book.executePhase === "buying";
                   const dustOnly = isOwner && outstanding === 0 && Number(book.bnbPool || 0) > 0;
-                  const refundHint = askOpen
-                    ? "卖单还挂着，不能退款"
-                    : saleSettled
-                      ? "先确认卖出，再退款"
-                      : legacyReady
-                        ? "这期确认到账后不能退款，只能入池"
+                  /**
+                   * 确认到账后把没花完的募集款按份退回：不结束本期、元件留在合约、之后仍能入池。
+                   * 只有带 returnSurplus() 的新合约才有这个入口；老期次（含当前主网这期）
+                   * 只能在 depositToPool 时把余款记账，再由持份人 claimSurplus 领取。
+                   */
+                  const hasReturnSurplus = Boolean(book.surplusExit) || !book._chain;
+                  const canReturnSurplus = isOwner && ready && !legacyReady && hasReturnSurplus
+                    && raised > 0 && !askOpen && !saleSettled && marketOwed <= 0 && outstanding > 0;
+                  const surplusBooked = Number(book.surplusOutstanding || 0) > 0;
+                  /**
+                   * 入池前必须先把余款按份退回（余额=0 时无需退）。
+                   * 已记账（surplusBase > 0）或这期合约没有 returnSurplus（只能入池时自动记账）都算满足。
+                   */
+                  const surplusBeforePool = raised <= 0
+                    || !hasReturnSurplus
+                    || Number(book.surplusBase || 0) > 0;
+                  const surplusReturnHint = !hasReturnSurplus
+                    ? "这期合约没有 returnSurplus。余款在 depositToPool 时按份记账，持份人用 claimSurplus 领；不会因为入池而消失。"
+                    : askOpen
+                      ? "卖单还挂着，先确认或取消，再退剩余募集款"
+                      : saleSettled
+                        ? "先确认卖出，再退剩余募集款"
+                        : raised <= 0
+                          ? "募集款已全部用于买元件，没有可退的余款"
+                          : undefined;
+                  const refundHint = ready || legacyReady
+                    ? "元件确认到账后不再走「原路退款」：退款只会把没花完的募集款按份退给持份人，元件留在合约里等入池（用「退回剩余募集款」）。要结束本期必须先把子状态改回待挂单（setPhase）。"
+                    : askOpen
+                      ? "卖单还挂着，不能退款"
+                      : saleSettled
+                        ? "先确认卖出，再退款"
                         : outstanding === 0
                           ? "份额已全部退完，没有可退对象；池子里的尾差用「取回剩余 BNB」扫出"
                           : undefined;
@@ -533,17 +569,23 @@ export function OwnerOverview({
                   // 成交的部分已上链不可撤；只有还剩未成交时才允许放弃。
                   const hasOpenLeg = [book.nandRemaining, book.latchRemaining, book.nandAskRemaining, book.latchAskRemaining]
                     .some((remaining) => remaining == null || Number(remaining) > 0);
-                  const canAbandon = isOwner && ((buyOpen && hasOpenLeg) || askOpen);
+                  // 元件事先确认到账（Ready）后 abandonOrder 会以 UseReturnSurplus 回滚：
+                  // 那个状态只允许「退余款 + 入池」，元件不能被退回 Owner。
+                  const canAbandon = isOwner && !ready && ((buyOpen && hasOpenLeg) || askOpen);
                   const nextHint = saleSettled
                     ? "卖单已成交。点「确认卖出」收到 BNB 并回到待挂单，之后才能再挂买单或退款。"
                     : askOpen
                       ? "卖单挂着。全部成交后确认；还没卖完可以取消剩余。"
                     : legacyReady
-                      ? "这期是已上线的旧合约。确认到账之后只能入池，不能单独取出元件，也不能挂卖或退款。"
+                      ? "这期是已上线的旧合约：没有提前退余款的入口，也不能再走「原路退款」——余款会在 depositToPool 入池那一刻按份记账，持份人用 claimSurplus 领，元件只会进矿池。"
                     : ready
                       ? (partsEnough
-                        ? "买单已确认。可以挂卖、退款，或取出元件；也可直接 depositToPool 投入矿池。"
-                        : "手里还没有元件，不能入池。先挂买单买入并确认到账，或退款。")
+                        ? (book.surplusExit
+                          ? (book.marketAskSide === false
+                            ? "买单已确认，元件在合约里，当前材料市场没有卖单侧（挂卖会 revert）。入池前先点「退回剩余募集款」把没花完的 BNB 按份退给持份人（本金立刻变成可领，本期继续、元件不动），然后设矿池地址 → depositToPool 入池（不可逆）。"
+                            : "买单已确认，元件在合约里。入池前先点「退回剩余募集款」把没花完的 BNB 按份退给持份人（本期继续、元件不动）；也可以先挂卖。之后设矿池地址 → depositToPool 入池（不可逆）。")
+                          : "买单已确认，元件在合约里。这期合约没有提前退余款的入口，余款会在 depositToPool 入池那一刻按份记账（持份人用 claimSurplus 领），元件只会进矿池。设好矿池地址后 depositToPool 入池（不可逆）。")
+                        : "手里还没有元件，不能入池。先挂买单买入并确认到账。")
                       : outstanding === 0
                         ? "已全部退款（份数归零），池子里若还有卖单溢价，Owner 可用「取回 BNB」扫出。"
                         : buyOpen
@@ -735,7 +777,8 @@ export function OwnerOverview({
                                 {buyOpen ? "当前买单"
                                   : askOpen ? "当前卖单"
                                     : saleSettled ? "卖单待确认"
-                                      : side === "sell" ? "挂卖中" : "挂买中"}
+                                      // 卖不了时不要写「挂卖中」——下面空态会说明为什么卖不了
+                                      : side === "sell" ? (canSell ? "挂卖中" : "卖出") : "挂买中"}
                               </h3>
                             </div>
                           </div>
@@ -885,7 +928,9 @@ export function OwnerOverview({
                                       ? "当前材料市场没有卖单侧（官方市场只有买单），挂卖单链上会直接 revert。元件到账后直接入池即可。"
                                       : !book.marketAsks
                                         ? "这期合约无卖单接口，需重新部署后开新期。"
-                                        : "确认买单到账后才能挂卖单。"}
+                                        : heldNand + heldLatch === 0
+                                          ? "手里没有可卖的元件，先挂买单买入并确认到账。"
+                                          : "确认买单到账后才能挂卖单。"}
                                   </p>
                                 ))}
                               </>
@@ -896,15 +941,37 @@ export function OwnerOverview({
 
                       {(book.executePhase === "buying" || book.executePhase === "listed" || ready || askOpen) && (
                         <div className="flow-tools">
-                          <button
-                            className="btn btn-inline"
-                            type="button"
-                            disabled={!canRefund || Boolean(pending)}
-                            onClick={onOpenRefund}
-                            title={refundHint}
-                          >
-                            {pending === "openRefund" ? "退款中…" : (book.executionFailed ? "退款剩余" : "原路退款")}
-                          </button>
+                          {/*
+                           * 退余款不是退款：钱按份退回持份人（pull，各自 claimSurplus 领），
+                           * 元件留在合约、份额不变、phase 仍是 Ready，之后照样能 depositToPool。
+                           * 所以它独立成一个按钮，和「原路退款」（结束本期、元件归 Owner）并排说清区别。
+                           */}
+                          {ready && !legacyReady && (
+                            <button
+                              className="btn btn-inline"
+                              type="button"
+                              disabled={!canReturnSurplus || Boolean(pending)}
+                              onClick={submitReturnSurplus}
+                              title={surplusReturnHint}
+                            >
+                              {pending === "returnSurplus"
+                                ? "记账中…"
+                                : surplusBooked
+                                  ? `已按份退回 ${round4(Number(book.surplusOutstanding || 0))} BNB（持份人自领）`
+                                  : `退回剩余募集款 ${round4(raised)} BNB`}
+                            </button>
+                          )}
+                          {!ready && (
+                            <button
+                              className="btn btn-inline"
+                              type="button"
+                              disabled={!canRefund || Boolean(pending)}
+                              onClick={onOpenRefund}
+                              title={refundHint}
+                            >
+                              {pending === "openRefund" ? "退款中…" : (book.executionFailed ? "退款剩余" : "原路退款")}
+                            </button>
+                          )}
                           {dustOnly && (
                             <button
                               className="btn btn-inline"
@@ -937,7 +1004,11 @@ export function OwnerOverview({
                           <div className="flow-panel-head">
                             <div>
                               <h3>进入挖矿</h3>
-                              <p>晶体管已确认到账。先设置矿池地址，再把晶体管投入矿池，进入挖矿阶段。入池不可逆，剩余募集款不再退回。</p>
+                              <p>
+                                {hasReturnSurplus
+                                  ? "晶体管已确认到账。入池前必须先把没花完的募集款按份退回给持份人（「退回剩余募集款」；元件不会转给 Owner、份额也不变），然后设置矿池地址 → depositToPool，元件才转入矿池（不可逆）。"
+                                  : "晶体管已确认到账。这期合约没有提前退余款的入口：depositToPool 会先把没花完的募集款按份记账给持份人，再把元件转入矿池（不可逆）。元件不会转给 Owner。"}
+                              </p>
                             </div>
                           </div>
                           <div className="flow-panel-body">
@@ -983,8 +1054,14 @@ export function OwnerOverview({
                               <button
                                 className="btn btn-primary"
                                 type="button"
-                                disabled={!isOwner || Boolean(pending) || !hasPoolOnChain}
-                                title={hasPoolOnChain ? undefined : "请先设置矿池地址（链上 depositToPool 要求 miningPool 非零）"}
+                                disabled={!isOwner || Boolean(pending) || !hasPoolOnChain || !surplusBeforePool}
+                                title={
+                                  !hasPoolOnChain
+                                    ? "请先设置矿池地址（链上 depositToPool 要求 miningPool 非零）"
+                                    : !surplusBeforePool
+                                      ? "入池前必须先把剩余募集款按份退回给持份人：先点上面的「退回剩余募集款」"
+                                      : undefined
+                                }
                                 onClick={() => submitDepositToPool()}
                               >
                                 {pending === "depositToPool" ? "投入中…" : "depositToPool 进入挖矿"}

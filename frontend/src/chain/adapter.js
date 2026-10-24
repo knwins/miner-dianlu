@@ -104,12 +104,25 @@ export function bookFromState(state, account, extra = {}) {
     const remain = Number(l.shares);
     // 成交会把剩余份数减到 0 并关单；撤单则留下未成交份数。用合约字段区分，不扫 ListingTaken 日志。
     const status = l.open ? "open" : (remain === 0 ? "done" : "cancelled");
-    const shares = remain;
-    const totalWei = l.priceBnbPerShare * BigInt(shares);
+    /**
+     * `shares` 是**剩余可买**份数（takeListing 的额度），合约里就这一份数据。
+     * 展示「挂了多少份」必须用 Listed 事件还原的原始份数：
+     * 全部成交后剩余会被减到 0，只看它就会把「挂了 1 份」显示成「— / 合计 0」。
+     * listedShares 读不到（节点不给历史事件）时为 null，展示层退回剩余份数。
+     */
+    const listed = Number.isFinite(Number(l.listedShares)) && Number(l.listedShares) > 0
+      ? Number(l.listedShares)
+      : null;
+    const taken = Number(l.takenShares) || 0;
+    const shownShares = listed ?? remain;
+    const totalWei = l.priceBnbPerShare * BigInt(shownShares);
     return {
       id: l.id,
       seller: l.seller,
-      shares,
+      shares: remain,
+      listedShares: listed,
+      takenShares: taken,
+      remainingShares: remain,
       priceBnbPerShare: bem(l.priceBnbPerShare),
       _priceWei: l.priceBnbPerShare,
       totalBnb: bem(totalWei),
@@ -201,6 +214,11 @@ export function bookFromState(state, account, extra = {}) {
     marketAsks: Boolean(state.marketAsks),
     marketOwed: bem(state.marketOwed || 0),
     readyExit: state.readyExit !== false,
+    /** 这期合约有 returnSurplus()：确认到账后可提前把剩余募集款按份退回，且不影响入池。 */
+    surplusExit: Boolean(state.surplusExit),
+    /** 已记账、尚未发到持有人手里的余款（BNB）。 */
+    surplusOutstanding: bem(state.surplusOutstanding || 0),
+    surplusBase: Number(state.surplusBase || 0),
     partsNand: Number(state.partsNand || 0),
     partsLatch: Number(state.partsLatch || 0),
     /** 元件是否已投入矿池（不可逆）。入池后合约余额归 0，展示要用 transistorCount。 */

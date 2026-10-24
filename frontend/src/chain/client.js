@@ -21,6 +21,20 @@ const isAddr = (a) => typeof a === "string" && /^0x[0-9a-fA-F]{40}$/.test(a);
 /** 与 Campaign.FAIL_GRACE 保持一致：非 Owner 须在售罄满 3 天后才能 markFailed。 */
 export const FAIL_GRACE_SECONDS = 3 * 86_400;
 
+/**
+ * 非 Owner 能 markFailed 的时间戳（毫秒）。
+ *
+ * 合约口径是 `max(soldOutAt, lastOrderAt) + FAIL_GRACE`（Campaign.sol:757-758），
+ * 不是「售罄满 3 天」：每次挂单都会把宽限期往前推，防止 Owner 用
+ * 售罄后立刻重挂单把逃生口按回去，也让「售罄后一直没挂单」的期次不被瞬间判死。
+ * 只按 soldOutAt 算会读早（本期实际 10-27 10:15，少算 25 小时），
+ * 页面就会显示一个还没到的「逃生口打开」时间。
+ */
+export function graceEndsAtMs(soldOutAt, lastOrderAt) {
+  const base = Math.max(Number(soldOutAt) || 0, Number(lastOrderAt) || 0);
+  return base > 0 ? (base + FAIL_GRACE_SECONDS) * 1000 : null;
+}
+
 let _browser = null;
 let _rawProvider = null;
 let _readProvider = null;
@@ -481,6 +495,11 @@ export async function readState(account, campaignAddr = getCampaignAddress()) {
 
 async function readStateOn(runner, account, campaignAddr) {
   const c = campaignContract(runner, campaignAddr);
+  /**
+   * 合约字节码只取一次：readyExit / surplusExit 都要靠它判断这期合约有没有某个函数，
+   * 同时挂单/成交那些路径本来就与字节码无关，取失败按空串处理（两个能力都判 false）。
+   */
+  const campaignCode = await runner.getCode(campaignAddr).then((code) => (code || "").toLowerCase()).catch(() => "");
   // 旧版已部署的 Campaign 没有 pooled / miningPool（这两个随矿池功能新增）。
   // Promise.all 里任何一项 revert 都会让整次读链失败、页面报「链上读取失败」，
   // 所以新增 getter 一律用 withDefault 降级，缺失时按「未入池」处理。
@@ -503,7 +522,7 @@ async function readStateOn(runner, account, campaignAddr) {
     fundingDeadline, transistorsAddr, marketAddr, factoryAddr, owner, pooled, miningPool,
     listingCount, totalPendingSurplus, orderFilled,
     outstandingShares, serviceFeeBps, serviceFeeSet, feeRecipientCount,
-    revenuePool, surplusPool,
+    revenuePool, surplusPool, lastOrderAt, surplusBase, surplusPaid,
   ] = await Promise.all([
     c.scene(), c.phase(), soldPromise, c.totalShares(), c.sharePriceBnb(),
     withDefault(c.estHashpower(), 0n),
@@ -528,6 +547,11 @@ async function readStateOn(runner, account, campaignAddr) {
     withDefault(c.feeRecipientCount ? c.feeRecipientCount() : Promise.resolve(0n), 0n),
     withDefault(c.revenuePool ? c.revenuePool() : Promise.resolve(0n), 0n),
     withDefault(c.surplusPool ? c.surplusPool() : Promise.resolve(0n), 0n),
+    // 旧期次没有这个 getter → 按 0 处理，宽限期退回只按 soldOutAt 算。
+    withDefault(c.lastOrderAt ? c.lastOrderAt() : Promise.resolve(0n), 0n),
+    // 余款的分子/分母与「已实付」：surplusPool − surplusPaid 才是还没发到持有人手里的部分。
+    withDefault(c.surplusBase ? c.surplusBase() : Promise.resolve(0n), 0n),
+    withDefault(c.surplusPaid ? c.surplusPaid() : Promise.resolve(0n), 0n),
   ]);
   const order = await readMarketOrder(c);
 
@@ -538,6 +562,16 @@ async function readStateOn(runner, account, campaignAddr) {
         Array.from({ length: n }, (_, i) => c.getListing(i).catch(() => null)),
       )
     : [];
+  /**
+   * 挂单的「原始份数 / 已成交份数」不在 storage 里：takeListing 直接把
+   * `Listing.shares` 减到 0，全成交后只剩 0 + open=false（Campaign.sol:637-638）。
+   * 单看 getListing 无法区分「挂了 1 份并成交」和「挂了 0 份」，于是列表里
+   * 已成交的挂单会显示「份数 —、合计 0.0000 BNB」——链上明明付过钱。
+   * 这里用事件把原始份数补回来：Listed 给挂单量，ListingTaken 累计成交，
+   * ListingCancelled 给撤单时释放的量。读不到事件（节点限制）就留空，
+   * 展示层退回「剩余份数」，绝不把「未知」画成 0。
+   */
+  const listingMeta = n > 0 ? await readListingMeta(runner, campaignAddr).catch(() => null) : null;
   const listings = rawListings
     .map((l, i) => l && ({
       id: i,
@@ -545,6 +579,7 @@ async function readStateOn(runner, account, campaignAddr) {
       shares: l.shares,
       priceBnbPerShare: l.priceBnbPerShare,
       open: l.open,
+      ...(listingMeta?.get(i) || {}),
     }))
     .filter(Boolean);
 
@@ -564,9 +599,8 @@ async function readStateOn(runner, account, campaignAddr) {
   }
 
   // 新逻辑：markFailed 打开持有人退款逃生口；executing+buying 且池子不足以按原价兑付时也可退款。
-  const markFailedAt = Number(soldOutAt) > 0
-    ? (Number(soldOutAt) + FAIL_GRACE_SECONDS) * 1000
-    : null;
+  // 宽限期基准是 max(soldOutAt, lastOrderAt)：每次挂单都会把它往后推（合约 Campaign.sol:757）。
+  const markFailedAt = graceEndsAtMs(soldOutAt, lastOrderAt);
   const refundShort = Number(scene) === 1
     && Number(phase) === 1
     && raisedBnb < outstandingShares * sharePriceBnb;
@@ -625,7 +659,16 @@ async function readStateOn(runner, account, campaignAddr) {
       ? Number(formatEther(raisedBnb)) / Number(outstandingShares)
       : null,
     retired,
-    readyExit: (await runner.getCode(campaignAddr)).toLowerCase().includes(id("confirmSale()").slice(2, 10)),
+    readyExit: campaignCode.includes(id("confirmSale()").slice(2, 10)),
+    /**
+     * 这期合约有没有「确认到账后立刻退回剩余募集款」的入口（returnSurplus）。
+     * 用字节码 selector 判定：老期次（含当前主网这期）没有这个函数，
+     * 它们只能在 depositToPool 时把余款记账，再由持份人 claimSurplus 领取。
+     */
+    surplusExit: campaignCode.includes(id("returnSurplus()").slice(2, 10)),
+    /** 已记账、还没发到持有人手里的余款（wei 换算成 BNB 由适配层做）。 */
+    surplusOutstanding: surplusPool > surplusPaid ? surplusPool - surplusPaid : 0n,
+    surplusBase,
     feeShares,
     netWeightVerified: 0, netWeightUnverified: 0,
     account: account || null,
@@ -837,6 +880,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
       }
       const res = await Promise.all(base);
       const soldOutAt = await c.soldOutAt().catch(() => 0n);
+      const lastOrderAt = await (c.lastOrderAt ? c.lastOrderAt() : Promise.resolve(0n)).catch(() => 0n);
       const scene = Number(res[0]);
       const phaseN = Number(res[6]);
       rows.push({
@@ -853,7 +897,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         fundingDeadline: Number(res[5]),
         raisedBnb: Number(formatEther(res[7])),
         soldOutAt: Number(soldOutAt),
-        markFailedAt: Number(soldOutAt) > 0 ? (Number(soldOutAt) + FAIL_GRACE_SECONDS) * 1000 : null,
+        markFailedAt: graceEndsAtMs(soldOutAt, lastOrderAt),
         shares: account ? Number(res[9]) : null,
         escrow: account ? Number(res[10]) : 0,
         refundedBnb: account ? Number(formatEther(res[11])) : 0,
@@ -1001,20 +1045,37 @@ async function readMarketAsk(c, marketAddr, transistors) {
  * placeAsk / asks / nextAskId / cancelAsk / fillAsk 全部不存在。
  * 合约的 placeTransistorAsk / cancelTransistorAsk / confirmSale 在主网上必然 revert。
  *
- * 判定方式：直接读市场合约字节码里有没有 placeAsk 的 4 字节 selector。
- * 比 try/call 更可靠——代理合约的 fallback 会让所有调用都 revert，无法区分「不存在」与「存在但报错」。
+ * 判定方式：读字节码里有没有 placeAsk / asks 的 4 字节 selector ——
+ * 代理合约的 fallback 会把未知 selector 都吃掉（missing revert data），
+ * try/call 分不清「不存在」和「存在但报错」，所以不看调用结果。
+ *
+ * 注意：官方市场是 **EIP-1967 代理**，代理自身的 runtime 只有一百多字节，
+ * selector 全在实现合约里。只扫代理地址会对任何市场都判 false（连 placeBid 都找不到），
+ * 所以要先读实现槽再扫实现合约的字节码 —— 否则以后市场真的加上卖单侧，前端也永远不会放开挂卖。
  */
+const EIP1967_IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+
 async function marketHasAskSide(runner, marketAddr) {
   if (!marketAddr || marketAddr === ZeroAddress) return false;
-  try {
-    const code = (await runner.getCode(marketAddr)).toLowerCase();
+  // placeAsk(address,uint8,uint96,uint256) 是本仓库 IMaterialMarket 的签名；
+  // placeAsk(address,uint96,address,uint8,uint256) 是官方接口注释里记的旧签名，两个都认。
+  const askSelectors = [
+    id("placeAsk(address,uint8,uint96,uint256)").slice(2, 10),
+    id("placeAsk(address,uint96,address,uint8,uint256)").slice(2, 10),
+    id("asks(uint256)").slice(2, 10),
+  ];
+  const hasAskSelector = async (addr) => {
+    const code = (await runner.getCode(addr)).toLowerCase();
     if (!code || code === "0x") return false;
-    // placeAsk(address,uint96,address,uint8,uint256) —— 官方接口注释里记的签名
-    const sel = id("placeAsk(address,uint96,address,uint8,uint256)").slice(2, 10);
-    if (code.includes(sel)) return true;
-    // 兜底：只要有 asks(uint256) 也算有卖单侧
-    const selAsks = id("asks(uint256)").slice(2, 10);
-    return code.includes(selAsks);
+    return askSelectors.some((sel) => code.includes(sel));
+  };
+  try {
+    if (await hasAskSelector(marketAddr)) return true;
+    // 代理：继续扫实现合约（marketAddr 本身是直接部署的市场时，实现槽为 0，直接返回 false）
+    const raw = await runner.getStorage(marketAddr, EIP1967_IMPL_SLOT);
+    const impl = "0x" + String(raw || "").slice(-40);
+    if (!isAddr(impl) || /^0x0{40}$/.test(impl)) return false;
+    return await hasAskSelector(impl);
   } catch {
     return false;
   }
@@ -1917,6 +1978,56 @@ async function readCampaignLogs(runner, campaignAddr, latest, topics, kind = "re
 }
 
 /**
+ * 挂单的原始份数 / 已成交份数（Map<id, {listedShares, takenShares, cancelledShares}>）。
+ *
+ * `getListing` 只给剩余份数：takeListing 成交后把它减到 0 并关单
+ * （Campaign.sol:637-638），所以「挂 1 份、成交 1 份」和「挂 0 份」在 storage 里
+ * 长得一模一样。事件是唯一能还原原始挂单量的来源：
+ *   Listed(id, seller, count, price)            挂单时的份数
+ *   ListingTaken(id, buyer, seller, count, paid) 每次成交的份数
+ *   ListingCancelled(id, seller, count)          撤单释放的份数
+ * 读不到事件时返回空 Map，展示层退回剩余份数（不把未知画成 0）。
+ */
+async function readListingMeta(runner, campaignAddr) {
+  const iface = new Interface(CAMPAIGN_ABI);
+  const latest = await runner.getBlockNumber();
+  const raw = await readCampaignLogs(
+    runner,
+    campaignAddr,
+    latest,
+    [[
+      iface.getEvent("Listed").topicHash,
+      iface.getEvent("ListingTaken").topicHash,
+      iface.getEvent("ListingCancelled").topicHash,
+    ]],
+    "listing",
+  );
+  const meta = new Map();
+  const slot = (id) => {
+    const key = Number(id);
+    if (!meta.has(key)) meta.set(key, { listedShares: 0, takenShares: 0, cancelledShares: 0 });
+    return meta.get(key);
+  };
+  for (const log of raw || []) {
+    let evt;
+    try {
+      evt = iface.parseLog({ topics: log.topics, data: log.data });
+    } catch {
+      continue;
+    }
+    if (!evt) continue;
+    if (evt.name === "Listed") {
+      slot(evt.args.id).listedShares += Number(evt.args.count);
+    } else if (evt.name === "ListingTaken") {
+      slot(evt.args.id).takenShares += Number(evt.args.count);
+    } else if (evt.name === "ListingCancelled") {
+      slot(evt.args.id).cancelledShares += Number(evt.args.count);
+    }
+  }
+  return meta;
+}
+
+/**
  * 原路退款记录：本期 Refunded 事件（谁、退了多少、时间、tx）+ 汇总。
  * 合约剩余池与累计已退从链上读，不信任列表里的缓存。
  */
@@ -2205,6 +2316,16 @@ export const tx = {
     const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
     if (code.includes(id("openRefund()").slice(2, 10))) return c.openRefund();
     throw new Error("这期是旧合约，链上没有 Owner 直接退款。重新部署工厂后，新开的期才能退款。");
+  },
+  /**
+   * 确认到账后立刻把没花完的募集款按份退回（不结束本期、元件留在合约、之后仍可 depositToPool）。
+   * 老期次合约没有这个函数：它们只能在入池时把余款记账，由持份人 claimSurplus 领。
+   */
+  returnSurplus: async (signer) => {
+    const c = signerOrThrow(signer);
+    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
+    if (code.includes(id("returnSurplus()").slice(2, 10))) return c.returnSurplus();
+    throw new Error("这期是旧合约，链上没有提前退回剩余募集款。重新部署工厂后新开的期才有；这期的余款在 depositToPool 时记账，持份人用 claimSurplus 领取。");
   },
   abandonOrder: async (signer) => {
     const c = signerOrThrow(signer);
