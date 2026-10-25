@@ -1,10 +1,10 @@
 /**
- * 探针：验证「合约操作」弹窗的新版 UI + 官方元件市价。
+ * 探针：验证「合约操作」弹窗的新版 UI + 官方晶体管市价。
  *
  * 检查项：
  *   1. 弹窗能打开，顶部有四个标签页（合约操作 / 份额明细 / 合约调用 / 链上调试）
- *   2. 链上参数区不再出现假值：「服务费分成 … 100%」「本期元件 68 颗」「预估算力 0 H」
- *   3. 弹窗内**不再**出现官方元件最新价面板（市价统一在「材料市场」页，见 273aaf6）
+ *   2. 链上参数区不再出现假值：「服务费分成 … 100%」「本期晶体管 68 颗」「预估算力 0 H」
+ *   3. 弹窗内**不再**出现官方晶体管最新价面板（市价统一在「晶体管市场」页，见 273aaf6）
  *   4. 切到其它标签页能正常渲染
  */
 import { createRequire } from "module";
@@ -62,10 +62,10 @@ console.log("\n=== 链上参数（本期）===\n" + params);
 const summary = await page.locator(".sheet .detail-summary").first().innerText().catch(() => "");
 console.log("\n=== 顶部概览 ===\n" + summary);
 
-// 3) 官方价格面板：已从弹窗移除（市价统一在材料市场页）
+// 3) 官方价格面板：已从弹窗移除（市价统一在晶体管市场页）
 const priceCard = page.locator(".official-price-card").first();
 const priceCardCount = await priceCard.count();
-console.log(`${priceCardCount === 0 ? "ok  " : "FAIL"} 弹窗内无官方元件最新价面板${priceCardCount ? ` （仍有 ${priceCardCount} 个）` : ""}`);
+console.log(`${priceCardCount === 0 ? "ok  " : "FAIL"} 弹窗内无官方晶体管最新价面板${priceCardCount ? ` （仍有 ${priceCardCount} 个）` : ""}`);
 
 // 4) 切标签
 for (const t of ["份额明细", "合约调用", "链上调试", "合约操作"]) {

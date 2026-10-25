@@ -71,7 +71,7 @@ page.on("request", (r) => {
 await page.goto(BASE, { waitUntil: "domcontentloaded" });
 await page.waitForTimeout(3000);
 // 官方价面板（全量卡片形态）在市场页
-await page.locator(".nav-link-main").filter({ hasText: "材料市场" }).first().click().catch(() => {});
+await page.locator(".nav-link-main").filter({ hasText: "晶体管市场" }).first().click().catch(() => {});
 await page.waitForTimeout(1500);
 await page.waitForSelector(".official-price-group", { timeout: 30000 }).catch(() => {});
 await page.waitForTimeout(9000);
@@ -120,7 +120,7 @@ else {
     fail.push(`市价来源不是挂单（source=${direct.source}）—— 退回扫成交日志了`);
   }
   if (Object.keys(direct.rows || {}).length < 4) {
-    fail.push(`只拿到 ${Object.keys(direct.rows || {}).length} 个元件的价（应为 4）`);
+    fail.push(`只拿到 ${Object.keys(direct.rows || {}).length} 个晶体管的价（应为 4）`);
   }
 }
 
@@ -128,7 +128,7 @@ console.log(
   `价面板=${view.groups} 单价=${JSON.stringify(view.prices)} eth_call=${ethCalls}` +
     ` eth_getLogs=${logCalls} 占位=${view.hasPlaceholder ? "有" : "无"} 失败提示=${view.failNotice ? "有" : "无"}`,
 );
-console.log(`模块直调：source=${direct.source} 元件=${JSON.stringify(direct.rows)}`);
+console.log(`模块直调：source=${direct.source} 晶体管=${JSON.stringify(direct.rows)}`);
 console.log("面板文本：" + view.firstText.replace(/\n+/g, " | ").slice(0, 260));
 fail.push(...errors);
 await browser.close();

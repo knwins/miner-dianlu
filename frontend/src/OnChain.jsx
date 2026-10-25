@@ -112,7 +112,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
   // 与合约一致：成交部分上链不可撤，全部成交后不再显示「取消挂单」。
   const cancelBlockedByFill = Boolean(s?.orderFilled)
     && [s?.nandRemaining, s?.latchRemaining].every((remaining) => remaining != null && Number(remaining) === 0);
-  // confirmTransistors 还要求本期合约真的持有元件；只成交不发货时链上会 TransistorsNotReady。
+  // confirmTransistors 还要求本期合约真的持有晶体管；只成交不发货时链上会 TransistorsNotReady。
   const partsShort = Boolean(s) && (
     Number(s.partsNand || 0) < Number(s.nandQty || 0) || Number(s.partsLatch || 0) < Number(s.latchQty || 0)
   );
@@ -211,13 +211,13 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                   {s.phase === 1 && Number(s.raisedBnb) < Number(s.sold) * Number(s.sharePriceBnb) && (
                     <p className="fine chain-warn">池子已低于按份全退所需，持份人现在可按比例退款；卖单成交款提取进池可补回一部分。</p>
                   )}
-                  {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降价重挂，或原路退款；勿在锁价/元件数为 0 时 depositToPool。</p>}
+                  {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降价重挂，或原路退款；勿在锁价/晶体管数为 0 时 depositToPool。</p>}
                   {isOwner && (
                     <div className="chain-actions">
                       {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est || "0")))}>写入预估算力</button>}
                       {s.phase === 1 && (
                         <div className="buy-debug">
-                          <p className="fine">挂买单买元件（placeTransistorOrder）：元件合约用本期锁定的 {short(s.transistors)}，不用手填。两条腿各自填数量与单价；托管 = 单价 × 数量，合计不可超过募集余额，否则链上会判执行失败、不挂单。</p>
+                          <p className="fine">挂买单买晶体管（placeTransistorOrder）：晶体管合约在开期已锁定（{short(s.transistors)}），不是本次参数。两条腿各自填数量与单价；托管 = 单价 × 数量，合计不可超过募集余额，否则链上会判执行失败、不挂单。</p>
                           <div className="form-grid cols-2">
                             <label className="field"><span>NAND 数量</span><input inputMode="numeric" value={form.nandQty} onChange={(e) => setForm({ ...form, nandQty: e.target.value })} /></label>
                             <label className="field"><span>NAND 买价 BNB</span><input inputMode="decimal" step="0.00001" value={form.nandPrice} onChange={(e) => setForm({ ...form, nandPrice: e.target.value })} /></label>
@@ -234,7 +234,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                             disabled={busy || !canPlaceBuy}
                             title={!isOwner ? "仅 Factory Owner 可挂买单" : !buyHasLeg ? "至少填一条腿的数量" : !buyLegOk ? "有数量的腿必须填单价" : buyOverBudget ? "托管超过募集余额，链上不会挂出" : undefined}
                             onClick={() => run("挂买单", (sg) => tx.placeTransistorOrder(
-                              sg, s.transistors,
+                              sg,
                               BigInt(buyNandN), buyNandN > 0 ? parseBnb(form.nandPrice) : 0n,
                               BigInt(buyLatchN), buyLatchN > 0 ? parseBnb(form.latchPrice) : 0n,
                             ))}>挂买单</button>
@@ -268,10 +268,10 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                           className={partsShort ? "btn btn-inline" : "btn btn-primary"}
                           type="button"
                           disabled={busy || partsShort}
-                          title={partsShort ? "买单已成交，但元件还没进本期合约（NAND / LATCH 余额不足），链上会 TransistorsNotReady" : undefined}
+                          title={partsShort ? "买单已成交，但晶体管还没进本期合约（NAND / LATCH 余额不足），链上会 TransistorsNotReady" : undefined}
                           onClick={() => run("同步成交", (sg) => tx.confirmTransistors(sg))}
                         >
-                          {partsShort ? "同步官方成交（等待元件到账）" : "同步官方成交"}
+                          {partsShort ? "同步官方成交（等待晶体管到账）" : "同步官方成交"}
                         </button>
                       )}
                       {s.phase === 2 && !cancelBlockedByFill && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("取消挂单", (sg) => tx.cancelTransistorOrder(sg))}>取消挂单</button>}
@@ -291,7 +291,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
               {s.scene === 2 && (
                 <div>
                   <p className="fine">
-                    元件已入池，本期进入挖矿（不可逆）。harvest / claim 为占位空实现，不产出发放；
+                    晶体管已入池，本期进入挖矿（不可逆）。harvest / claim 为占位空实现，不产出发放；
                     持份用户退出只能通过「发布转让挂单」走份额转让。
                   </p>
                 </div>

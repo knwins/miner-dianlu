@@ -1,8 +1,8 @@
 /**
- * 官方元件市价。
+ * 官方晶体管市价。
  *
  * ════════════════════════════════════════════════════════════════
- * 主源：链上官方市场的**未成交买单**（`nextBidId()` + `bids(id)`，纯 eth_call）。
+ * 主源：链上晶体管市场的**未成交买单**（`nextBidId()` + `bids(id)`，纯 eth_call）。
  * 兜底：链上成交事件（单窗口 getLogs）→ 官方站点 market.json（同源反代 /tt-api）
  *      → 静态基准。
  * ════════════════════════════════════════════════════════════════
@@ -10,11 +10,11 @@
  * 为什么主源走链上、而不是只拉 market.json：
  *   - market.json 经 Vite 代理 /tt-api 转发，但 vite build 产物不含该代理，
  *     生产静态托管时若没配反代，/tt-api/* 直接 404（M-2 已知风险）。
- *   - 官方市场本身是公开的：买单挂在链上，`bids(id)` 就能读到「元件合约 +
+ *   - 晶体管市场本身是公开的：买单挂在链上，`bids(id)` 就能读到「晶体管合约 +
  *     tokenId + 单价 + 剩余量」，不需要任何索引服务。
  *
  * 为什么读挂单、而不是扫成交事件（2026-10-23 改）：
- *   - 官方市场**只有买单侧**（`nextAskId()` 直接 revert），Owner 是卖方，
+ *   - 晶体管市场**只有买单侧**（`nextAskId()` 直接 revert），Owner 是卖方，
  *     他要卖就得吃别人的买单 —— 所以真正相关的价是「当前最高的未成交买价」，
  *     而不是稀疏的历史成交价。
  *   - 成交极稀疏：实测最近 2000 / 5000 块**一条成交都没有**，20000 块才有
@@ -22,18 +22,18 @@
  *     请求 403（publicnode）、要不限制跨度（drpc 10000），只剩 nodereal 一个
  *     能用，量大就限流。
  *   - 而挂单是**当前状态**：`nextBidId()` 拿总数、往回读几十笔 `bids(id)` 即可
- *     覆盖全部四种元件（实测最近 60 笔全覆盖），一次 eth_getLogs 都不发。
+ *     覆盖全部四种晶体管（实测最近 60 笔全覆盖），一次 eth_getLogs 都不发。
  *     eth_call 读最新状态不需要 archive 数据，任何公共节点都能答。
  *
- * 官方市场 bids(uint256) 的返回布局（2026-10-23 实测，实现合约未开源）：
- *   word0 = buyer        word1 = transistors（元件合约）
+ * 晶体管市场 bids(uint256) 的返回布局（2026-10-23 实测，实现合约未开源）：
+ *   word0 = buyer        word1 = transistors（晶体管合约）
  *   word2 = price(wei)   word3 = tokenId（0 = NAND, 1 = LATCH）
  *   word4 = feeBps(100)  word5 = remaining（剩余未成交量，> 0 才是活跃挂单）
  * 注意这与 ABI 里声明的打包形态不同（官方 price 是 uint256，不参与打包），
  * 所以这里**手工解码原始返回**，不走 ethers 的 ABI 解码。
  *
  * ── 边界 ──
- *   - 只回溯最近 120 笔买单。若某个元件刚好在这段里没有活跃挂单，就取不到价，
+ *   - 只回溯最近 120 笔买单。若某个晶体管刚好在这段里没有活跃挂单，就取不到价，
  *     交给成交事件 / market.json / 静态基准补。
  *   - 官方实现合约闭源，结构体布局是实测反推的；官方升级合约可能失效，
  *     解码函数带合理性校验，解出垃圾价就当没读到（不会显示错误数字）。
@@ -51,7 +51,7 @@ import {
   withReadProvider,
 } from "./chain/client.js";
 
-/** 官方市场快照（兜底来源，经 Vite 代理转发，绕开 tapeout.net 不发 CORS 头的问题） */
+/** 晶体管市场快照（兜底来源，经 Vite 代理转发，绕开 tapeout.net 不发 CORS 头的问题） */
 export const OFFICIAL_MARKET_URL = "/tt-api/market.json";
 
 /** 链上成交事件的 topic0（反推，官方实现合约未开源）。 */
@@ -79,7 +79,7 @@ const MAX_PLAUSIBLE_WEI = 10n ** 24n;
 /**
  * 解码一笔买单的原始返回。
  *
- * 官方市场返回六个独立 word，与 ABI 里声明的打包形态不同（官方 price 是
+ * 晶体管市场返回六个独立 word，与 ABI 里声明的打包形态不同（官方 price 是
  * uint256，不参与打包），所以这里手工解码，不走 ethers 的 ABI 解码。
  *
  * @returns {{ parts: string, tokenId: number, price: bigint, remaining: number }|null}
@@ -95,7 +95,7 @@ function decodeBid(raw) {
   let tokenId;
   let remaining;
   if (words >= 6) {
-    // 官方市场（主网）：price / tokenId / feeBps / remaining 各占一个 word
+    // 晶体管市场（主网）：price / tokenId / feeBps / remaining 各占一个 word
     price = w(2);
     tokenId = Number(w(3));
     remaining = w(5);
@@ -115,20 +115,20 @@ function decodeBid(raw) {
 }
 
 /**
- * 主源：读官方市场最近若干笔买单，取本项目每种元件的「最高未成交买价」。
+ * 主源：读晶体管市场最近若干笔买单，取本项目每种晶体管的「最高未成交买价」。
  *
- * 官方市场只有买单侧（`nextAskId()` 直接 revert），本项目 Owner 是卖方，要卖
+ * 晶体管市场只有买单侧（`nextAskId()` 直接 revert），本项目 Owner 是卖方，要卖
  * 就得吃别人的买单 —— 所以真正相关的价是**当前最高出价**，不是稀疏的历史成交价。
  *
  * 全程 eth_call（读最新状态，不需要 archive 数据，任何公共节点都能答），
- * 一次 eth_getLogs 都不发。实测最近 60 笔即可覆盖四种官方元件。
+ * 一次 eth_getLogs 都不发。实测最近 60 笔即可覆盖四种官方晶体管。
  *
  * 返回形状与 parseOfficialMarket 一致，下游 officialQuote 无需改动。
  */
 async function fetchOnChainBids() {
   const market = MATERIAL_MARKET_ADDRESS;
   if (!market || !/^0x[0-9a-fA-F]{40}$/.test(market)) {
-    return { prices: {}, error: "未配置官方市场地址" };
+    return { prices: {}, error: "未配置晶体管市场地址" };
   }
 
   let nextId;
@@ -147,7 +147,7 @@ async function fetchOnChainBids() {
     return { prices: {}, error: "市场订单总数异常" };
   }
 
-  const best = new Map(); // 元件 id → { bid, bidQty }
+  const best = new Map(); // 晶体管 id → { bid, bidQty }
   let scanned = 0;
   let roundsDone = 0;
 
@@ -180,7 +180,7 @@ async function fetchOnChainBids() {
       const bid = decodeBid(raw);
       if (!bid) continue;
       const id = OFFICIAL_KEY_MAP.get(`${bid.parts}-${bid.tokenId}`);
-      if (!id) continue; // 不是本项目的官方元件
+      if (!id) continue; // 不是本项目的官方晶体管
       const price = Number(bid.price) / 1e18;
       if (!(price > 0)) continue;
       const row = best.get(id);
@@ -198,7 +198,7 @@ async function fetchOnChainBids() {
     return {
       prices: {},
       lastBlock: latest,
-      error: `回看最近 ${scanned} 笔买单，无本项目元件的活跃挂单`,
+      error: `回看最近 ${scanned} 笔买单，无本项目晶体管的活跃挂单`,
     };
   }
 
@@ -210,12 +210,12 @@ async function fetchOnChainBids() {
 }
 
 /**
- * 把一批成交日志里的单价归位到元件 id（同元件取区块最高的那笔 = 最近成交）。
+ * 把一批成交日志里的单价归位到晶体管 id（同晶体管取区块最高的那笔 = 最近成交）。
  * 只写链上成交价，bid 恒为 null —— 买价由 fetchOnChainBids 从挂单读。
  */
 function collectTradePrices(prices, logs) {
   for (const log of logs) {
-    // topics[3] = 元件合约地址（零填充的 32 字节 topic，低 20 字节是地址）
+    // topics[3] = 晶体管合约地址（零填充的 32 字节 topic，低 20 字节是地址）
     const t3 = log.topics && log.topics[3];
     if (!t3) continue;
     const comp = t3.startsWith("0x000000000000000000000000")
@@ -241,14 +241,14 @@ function collectTradePrices(prices, logs) {
 }
 
 /**
- * 补位源：扫最近一个窗口的成交事件，给挂单没覆盖到的元件补「最近成交价」。
+ * 补位源：扫最近一个窗口的成交事件，给挂单没覆盖到的晶体管补「最近成交价」。
  *
  * 只在挂单没收齐时才跑。成交极稀疏（实测 2000 / 5000 块窗口一条都没有），
  * 为此翻十几万块不值当；主源已经是挂单状态，这里只做一次单窗口尝试。
  */
 async function fetchOnChainTrades() {
   const market = MATERIAL_MARKET_ADDRESS;
-  if (!market || !/^0x[0-9a-fA-F]{40}$/.test(market)) return { prices: {}, error: "未配置官方市场地址" };
+  if (!market || !/^0x[0-9a-fA-F]{40}$/.test(market)) return { prices: {}, error: "未配置晶体管市场地址" };
 
   let latest;
   try {
@@ -274,7 +274,7 @@ async function fetchOnChainTrades() {
   const prices = {};
   if (logs.length) collectTradePrices(prices, logs);
   if (!Object.keys(prices).length) {
-    return { prices: {}, error: `回看 ${ONCHAIN_LOG_SPAN} 块内无官方市场成交` };
+    return { prices: {}, error: `回看 ${ONCHAIN_LOG_SPAN} 块内无晶体管市场成交` };
   }
   return { prices, generatedAt: "onchain", lastBlock: latest };
 }
@@ -286,7 +286,7 @@ let _cache = null;
 let _cacheAt = 0;
 let _inflight = null;
 
-/** 官方元件合约 + tokenId → 本项目 TRANSISTORS 里的 id */
+/** 官方晶体管合约 + tokenId → 本项目 TRANSISTORS 里的 id */
 const OFFICIAL_KEY_MAP = (() => {
   const map = new Map();
   for (const t of TRANSISTORS) {
@@ -303,7 +303,7 @@ function toBnb(wei) {
 }
 
 /**
- * 把官方 market.json 解析成「按元件 id 归位」的市价表。
+ * 把官方 market.json 解析成「按晶体管 id 归位」的市价表。
  *
  * @returns {{
  *   prices: Record<string, { bid: number|null, last: number|null, bidQty: number, lastTs: number }>,
@@ -384,7 +384,7 @@ export async function fetchOfficialPrices({ force = false } = {}) {
       onchainError = e?.message || "链上读取异常";
     }
 
-    // ② 补位：挂单没凑齐的元件，扫一个窗口的成交事件补「最近成交价」。
+    // ② 补位：挂单没凑齐的晶体管，扫一个窗口的成交事件补「最近成交价」。
     //    常态下挂单就能凑齐，这一步不跑，也就不会去翻几万块日志。
     if (Object.keys(prices).length < OFFICIAL_KEY_MAP.size) {
       try {
@@ -407,7 +407,7 @@ export async function fetchOfficialPrices({ force = false } = {}) {
       }
     }
 
-    // ② 兜底：官方 market.json（同源反代 /tt-api）。只补链上没覆盖到的元件，
+    // ② 兜底：官方 market.json（同源反代 /tt-api）。只补链上没覆盖到的晶体管，
     //    链上已拿到的不覆盖（链上更新鲜）。market.json 失败（含生产 404）只记错，
     //    不阻断——链上/静态仍能兜底。
     try {
@@ -416,7 +416,7 @@ export async function fetchOfficialPrices({ force = false } = {}) {
         // OFFICIAL_MARKET_URL 是同源反代路径（/tt-api/...），不是官方站点直连。
         // 生产托管时若该路径 404，几乎一定是生产 Web 服务器没配 /tt-api → tapeout.net
         // 的反代（dev/preview 的 vite 代理不进 vite build 产物，见 MEMORY.md M-2）。
-        // 不要把锅甩给「官方市场」，否则下次还会误判。
+        // 不要把锅甩给「晶体管市场」，否则下次还会误判。
         const hint =
           res.status === 404
             ? "（同源 /tt-api 路径 404：生产环境未配置指向 tapeout.net 的反代，见部署文档 §9.2 / frontend/tt-api.nginx.conf）"
@@ -466,11 +466,11 @@ export async function fetchOfficialPrices({ force = false } = {}) {
 /**
  * 官方市价 → 本项目 quote 形状。
  *
- * 只覆盖**官方元件**（TapeOut / Behemoth 的 NAND 与 LATCH）的价格，
- * 其余元件保留静态基准价。`source` 标成 "official"，
+ * 只覆盖**官方晶体管**（TapeOut / Behemoth 的 NAND 与 LATCH）的价格，
+ * 其余晶体管保留静态基准价。`source` 标成 "official"，
  * 这样页面上能明确区分「官方市价」与「静态基准」。
  *
- * 键表由 TRANSISTORS 自动生成（合约地址 + tokenId → 元件 id），
+ * 键表由 TRANSISTORS 自动生成（合约地址 + tokenId → 晶体管 id），
  * 所以新增官方处理器后这里无需改动即可自动接入市价。
  */
 export function officialQuote(baseQuote, official) {

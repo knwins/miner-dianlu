@@ -13,7 +13,7 @@ interface IMockPartsMint {
 ///         placeBid escrows BNB. cancelBid refunds the unfilled part to the buyer.
 ///         fillBid only decreases remaining (simulates a seller fill; tests mint parts separately).
 ///         deliverBid / deliverBidAll also hand the parts to the buyer, so a debug session can walk
-///         Buying -> Listed -> Ready -> execute without a separate mint transaction.
+///         Buying -> Listed -> Ready -> depositToPool without a separate mint transaction.
 ///         placeAsk pulls ERC1155 from the seller. fillAsk pays the seller and moves parts to the buyer.
 ///         cancelAsk returns unsold parts. owed + withdraw cover ask proceeds that land after fill.
 contract MockMaterialMarket is IMaterialMarket {
@@ -37,7 +37,7 @@ contract MockMaterialMarket is IMaterialMarket {
     uint256 public nextBidId = 1;
     uint256 public nextAskId = 1;
 
-    // ── 交易记录：前端按这些事件还原订单流水（成交数量、时间、tx） ──
+    // ── Trade log: the frontend replays these events into the order history (qty, time, tx) ──
     event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint96 price, uint256 quantity);
     event BidFilled(uint256 indexed id, uint256 quantity, uint256 remaining);
     event BidCancelled(uint256 indexed id, uint256 refund);
@@ -62,16 +62,14 @@ contract MockMaterialMarket is IMaterialMarket {
     error MockOnMainnet();
 
     constructor() {
-        // 最后一道防线：测试替身绝不能出现在 BSC 主网（chainId 56）。
-        //
-        // 这个 mock 暴露了一堆无鉴权的测试开关（setBlockCancel / setReturnZeroId /
-        // setOrderVault …）。一旦它成为某期的 market，任何人都能让 cancelBid 永久 revert
-        // ——那等于把该期锁在市场 escrow 里取不回来。
-        // 部署到主网时直接失败并烧掉 gas。
+        // Last line of defence: this test double must never exist on BSC mainnet (chainId 56).
+        // It exposes unauthenticated test switches (setBlockCancel / setReturnZeroId / setOrderVault):
+        // as a round's market, anyone could make cancelBid revert forever and strand that round's
+        // escrow. Reverting here burns gas but is the safe failure mode.
         if (block.chainid == 56) revert MockOnMainnet();
     }
 
-    /// @dev Test switch: when off, callers that need seller-side market calls (the OrderVault) see BadBid.
+    /// @dev Test switch: when off, seller-side calls (fillBid / fillAsk) see BadBid.
     bool public orderVault = true;
 
     function setOrderVault(bool on) external {
@@ -235,7 +233,23 @@ contract MockMaterialMarket is IMaterialMarket {
         return _owed[account];
     }
 
+    /// @dev Test hook: credit `account` with proceeds this market already holds, so a Campaign can be
+    ///      exercised against a settlement that only lands after pooling.
+    function creditOwed(address account, uint256 amount) external payable {
+        if (msg.value != amount) revert BadAsk();
+        _owed[account] += amount;
+    }
+
+    /// @dev Test switch: makes withdraw() revert, so the Campaign's "drain before swapping" path can be
+    ///      exercised against a market that owes BNB but cannot release it.
+    bool public blockWithdraw;
+
+    function setBlockWithdraw(bool on) external {
+        blockWithdraw = on;
+    }
+
     function withdraw() external {
+        if (blockWithdraw) revert BadAsk();
         uint256 amount = _owed[msg.sender];
         if (amount == 0) revert NothingOwed();
         _owed[msg.sender] = 0;

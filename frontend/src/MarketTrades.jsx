@@ -24,7 +24,7 @@ function tradeStatusOf(side, qty, remaining, owed) {
   return "filled";
 }
 
-/** 挂单成交状态：用于「元件数」项（挂出 / 成交两列）的视觉区分。
+/** 挂单成交状态：用于「晶体管数」项（挂出 / 成交两列）的视觉区分。
  *  - wait     等待成交（挂单中 / 部分成交，仍未全部吃完）
  *  - done     已成交（全部成交 / 待结算）
  *  - partial  部分成交（仍属等待成交，但已吃了一部分）
@@ -165,7 +165,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
   return (
     <article className="card market-card">
       <div className="card-header">
-        <span>材料市场交易记录</span>
+        <span>晶体管市场交易记录</span>
         {marketAddr ? (
           <a className="market-link" href={explorerAddress(marketAddr)} target="_blank" rel="noreferrer">
             {shortAddress(marketAddr)} ↗
@@ -187,7 +187,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
             <small>回款 {round4(totals.sellProceeds)} BNB</small>
           </li>
           <li>
-            <span>元件在手</span>
+            <span>晶体管在手</span>
             <strong>{partsOnHand} 颗</strong>
             <small>{data ? `NAND ${totals.partsNand} · LATCH ${totals.partsLatch}` : "读取中…"}</small>
           </li>
@@ -205,7 +205,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
             <thead>
               <tr>
                 <th>方向</th>
-                <th>元件</th>
+                <th>晶体管</th>
                 <th>单号</th>
                 <th>挂价</th>
                 <th>挂出</th>
@@ -226,11 +226,11 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
                   <td>{leg.part}</td>
                   <td className="mono">#{leg.orderId}</td>
                   <td>{round4(leg.price)} BNB</td>
-                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="挂出元件数">
+                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="挂出晶体管数">
                     <span className="qty-dot" aria-hidden="true" />
                     {leg.orderQty == null ? "—" : `${leg.orderQty} 颗`}
                   </td>
-                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="成交元件数">
+                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="成交晶体管数">
                     <span className="qty-dot" aria-hidden="true" />
                     {leg.filled == null ? "—" : `${leg.filled} 颗`}
                   </td>
@@ -255,7 +255,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
             </tbody>
           </table>
         ) : (
-          <p className="fine">还没有向材料市场挂过单。Owner 挂出买单后，这里会显示挂价与成交进度。</p>
+          <p className="fine">还没有向晶体管市场挂过单。Owner 挂出买单后，这里会显示挂价与成交进度。</p>
         )}
 
         {events && events.length > 0 && (
@@ -278,7 +278,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
         <p className="fine">
           {failed
             ? "读取市场失败：节点暂不可用，先按本地状态展示。"
-            : "成交进度读材料市场的 bids / asks / owed；挂单、成交与撤单时间取市场合约的链上事件。"}
+            : "成交进度读晶体管市场的 bids / asks / owed；挂单、成交与撤单时间取市场合约的链上事件。"}
         </p>
       </div>
     </article>
@@ -300,7 +300,7 @@ function eventText(evt) {
  * 记录**只来自市场合约的链上事件**（挂单 / 成交 / 撤单），不再按订单状态反推：
  * 状态能说「现在成交了几颗」，说不出「什么时候挂的、哪一笔成交的」。
  */
-export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase, title = "历史交易记录" }) {
+export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title = "历史交易记录" }) {
   const { data, failed } = useMarketTrades(campaignAddr, refreshKey);
   const legs = data?.legs?.length ? data.legs : fallbackTradeLegs(fallbackRows);
   const totals = totalsOf(data, legs, fallbackRows);
@@ -329,18 +329,17 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
   const records = allRecords.slice(0, MARKET_TRADE_LIMIT);
 
   const partsOnHand = Number(fallbackRows.partsNand || 0) + Number(fallbackRows.partsLatch || 0);
-  const stage = phase === "ready"
-    ? "已到账 · 待入池"
-    : phase === "listed"
-      ? "挂单中 · 待成交"
-      : totals.buyQty > 0 || totals.sellQty > 0
-        ? "已挂单 · 待成交"
-        : "未挂单";
+  /*
+   * 这里原本还有一行 stage（「挂单中 · 待成交」/「已到账 · 待入池」/「未挂单」）。
+   * 那是子状态，生命周期条已经在当前步下面写过一次；同一屏两处讲同一件事，
+   * 措辞还不一样（这里写「挂单中 · 待成交」，那边写「挂单中」）。
+   * 面板自己的数字（买单 filled/qty、卖出、欠款）已经能说明进度，这一行删掉。
+   */
 
   return (
     <article className="card trade-panel">
       <div className="card-header">
-        <span>{title}<em className="fine trade-panel-sub">· 材料市场</em></span>
+        <span>{title}<em className="fine trade-panel-sub">· 晶体管市场</em></span>
         {marketAddr ? (
           <a className="market-link" href={explorerAddress(marketAddr)} target="_blank" rel="noreferrer">
             {shortAddress(marketAddr)} ↗
@@ -362,7 +361,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
             <small>{round4(totals.sellProceeds)} BNB</small>
           </div>
           <div>
-            <span>元件</span>
+            <span>晶体管</span>
             <strong>{partsOnHand}</strong>
             <small>颗在手</small>
           </div>
@@ -374,10 +373,6 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
             <small>BNB</small>
           </div>
         </div>
-        <p className="trade-panel-stage">
-          <span className="trade-panel-dot" aria-hidden="true" />
-          {stage}
-        </p>
 
         {records.length ? (
           <ol className="trade-feed">
@@ -426,7 +421,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, phase
 
         {/*
          * 只在真的异常时说话。
-         * 正常态原本还有一句「读材料市场 bids / asks / owed，与确认到账、提取卖出款
+         * 正常态原本还有一句「读晶体管市场 bids / asks / owed，与确认到账、提取卖出款
          * 同一份状态」—— 那是实现说明，对 Owner 没有任何可操作信息，删掉。
          */}
         {failed ? (

@@ -1,5 +1,5 @@
 /**
- * H-5 续：官方材料市场的 placeBid 计价语义 + 卖单侧可用性。
+ * H-5 续：官方晶体管市场的 placeBid 计价语义 + 卖单侧可用性。
  *
  * 已知（probe-market-abi.mjs 结论）：
  *   - bids(id) 返回 6 元组 (buyer, transistors, price, tokenId, feeBps, remaining)  ← 与合约假设一致
@@ -11,8 +11,8 @@
  *   1. placeBid 的 msg.value 到底是 price×quantity，还是 price×quantity×(1+feeBps/10000)？
  *      若需含手续费，Campaign 现在的 `raisedBnb -= qty*price` 就会少付 → placeBid revert。
  *   2. 官方市场是否暴露 placeAsk / cancelAsk / fillAsk？
- *      Campaign 的「元件到账后回市场挂卖单」路径（placeTransistorAsk）依赖它们。
- *   3. 官方市场是否有 fillBid（由卖家主动成交）？Campaign 依赖它把元件买回来。
+ *      Campaign 的「晶体管到账后回市场挂卖单」路径（placeTransistorAsk）依赖它们。
+ *   3. 官方市场是否有 fillBid（由卖家主动成交）？Campaign 依赖它把晶体管买回来。
  *
  * 全部用 eth_call（只读模拟，不落链、不花真钱）。
  *

@@ -2,6 +2,7 @@ import {
   NETWORK_WEIGHT,
   poolDailyYield,
 } from "./emission.js";
+import { SCENE } from "./roundState.js";
 
 import {
   DEFAULT_TRANSISTOR,
@@ -45,7 +46,7 @@ export const ROUND = {
    *
    * 募集直接以 BNB 计价，不再经 USDT 中转：
    * 募资总额 BNB = 份数 × 每份BNB，
-   * 而元件成本本来就是 BNB 计价，两者可直接比较，无需换算。
+   * 而晶体管成本本来就是 BNB 计价，两者可直接比较，无需换算。
    *
    * 份数在开期时写死，用户只能买整数份。
    */
@@ -71,17 +72,17 @@ export const ROUND = {
   miningDays: MINING_DAYS,
   /**
    * 售罄到可执行之间的观察期（小时）。
-   * 换币流片会把全部募集款换成 BNB 并烧掉元件，不可逆。
+   * 换币流片会把全部募集款换成 BNB 并烧掉晶体管，不可逆。
    * 给用户这段时间核对网表哈希与报价快照。
    */
   executeDelayHours: 48,
-  /** 挖矿用元件组合（处理器 × 元件），见 prices.js 的 TRANSISTORS */
+  /** 挖矿用晶体管组合（处理器 × 晶体管），见 prices.js 的 TRANSISTORS */
   transistorId: DEFAULT_TRANSISTOR,
   /**
-   * 本期要烧的元件总数（NAND + LATCH），即链上 placeTransistorOrder 的数量。
+   * 本期要烧的晶体管总数（NAND + LATCH），即链上 placeTransistorOrder 的数量。
    *
-   * 元件数由本期募资总额按理想成本占比派生，不由人工填写，
-   * 权重 H = 元件数 × 处理器每颗算力（默认 Behemoth P=6 → 68 × 6 = 408）。
+   * 晶体管数由本期募资总额按理想成本占比派生，不由人工填写，
+   * 权重 H = 晶体管数 × 处理器每颗算力（默认 Behemoth P=6 → 68 × 6 = 408）。
    * 68 是基准期次规模下的示例值，实际开期一律由当期募资总额反推。
    */
   partCount: 68,
@@ -166,33 +167,37 @@ export function executeUnlockIn() {
 }
 
 
-/** 预览用的场景，用户可在顶栏切换观察各阶段表现。 */
+/** 预览用的场景，用户可在顶栏切换观察各阶段表现。（标签取自 ./roundState.js，不另写一份） */
 export const SCENES = [
-  { id: "funding", label: "募集中" },
-  { id: "executing", label: "待执行" },
-  { id: "mining", label: "挖矿中" },
+  { id: "funding", label: SCENE.funding.label },
+  { id: "executing", label: SCENE.executing.label },
+  { id: "mining", label: SCENE.mining.label },
 ];
 
 /**
  * 场景文案。
  * 退出只通过「份额转让」实现：持份人把份额挂到转让市场卖给其他持份人，
  * 没有合约统一的退款/结算终态，也没有 exit 赎回操作。
+ *
+ * 这里只保留**说明性正文**（lead）；badge / tone 一律引用 ./roundState.js。
+ * 旧版这里还有一份 badge 表，与 adapter、App、Owner 的表各说各话
+ * （例如 mining 的 tone 这里是 done、那边是 mine）。
  */
 export const SCENE_COPY = {
   funding: {
-    badge: "募集中",
-    tone: "live",
-    lead: "本期开放认筹，份额售罄后由 Owner 买入元件并投入矿池。募集到期仍未满时，由认筹地址自己点退回，只退该钱包的本金。",
+    badge: SCENE.funding.label,
+    tone: SCENE.funding.tone,
+    lead: "本期开放认筹，份额售罄后由 Owner 买入晶体管并投入矿池。",
   },
   executing: {
-    badge: "待执行",
-    tone: "wait",
-    lead: "本期份数已售完。Owner 在材料市场挂单买入元件、确认到账后投入矿池；入池前本金不动，持份人可原路退还，Owner 也可改价重挂。",
+    badge: SCENE.executing.label,
+    tone: SCENE.executing.tone,
+    lead: "本期份数已售完。Owner 在晶体管市场挂单买入晶体管、确认到账后投入矿池；入池前本金不动，持份人可原路退还，Owner 也可改价重挂。",
   },
   mining: {
-    badge: "挖矿中",
-    tone: "done",
-    lead: "元件已投入矿池，本期进入挖矿（不可逆）。BEM 分配合约接入前不产出发放；退出只能把份额挂到转让市场。",
+    badge: SCENE.mining.label,
+    tone: SCENE.mining.tone,
+    lead: "晶体管已投入矿池，本期进入挖矿（不可逆）。BEM 分配合约接入前不产出发放；退出只能把份额挂到转让市场。",
   },
 };
 
@@ -224,8 +229,8 @@ export function feeRate(round) {
 }
 
 /**
- * 元件数派生：按募资总额的理想成本占比反推能买多少颗元件。
- * 元件数不再是开期参数，只由规模决定（权重 H = 元件数 × P 仍成立）。
+ * 晶体管数派生：按募资总额的理想成本占比反推能买多少颗晶体管。
+ * 晶体管数不再是开期参数，只由规模决定（权重 H = 晶体管数 × P 仍成立）。
  */
 export function derivePartCount({ hardCapBnb, transistorId, snapshot }) {
   const cap = Number(hardCapBnb);
@@ -255,7 +260,7 @@ export function round4(value) {
 }
 
 /**
- * 五位小数：元件挂单价。挂单允许填 0.00001 BNB 级别，
+ * 五位小数：晶体管挂单价。挂单允许填 0.00001 BNB 级别，
  * 用四位会把用户输入静默改小，所以输入框与挂单价展示统一走这里。
  */
 export function round5(value) {
@@ -278,8 +283,8 @@ export function clampPriceInput(raw) {
 
 /**
  * 从链上 / 本地期次字段解析「目标处理器」。
- * - 处理器：新工厂开期写入 transistors（元件合约地址）；旧期次可用 setPlan 的
- *   estHashpower / transistorCount（或执行后 hashpower）反推 P≈H/元件数
+ * - 处理器：新工厂开期写入 transistors（晶体管合约地址）；旧期次可用 setPlan 的
+ *   estHashpower / transistorCount（或执行后 hashpower）反推 P≈H/晶体管数
  */
 export function resolveCampaignDesign(round, book = null) {
   const chain = Boolean(book?._chain);
@@ -299,7 +304,7 @@ export function resolveCampaignDesign(round, book = null) {
     if (fromTr && PROCESSOR_IDS.includes(fromTr)) processorId = fromTr;
   }
   if (!processorId && hp > 0) {
-    // 旧期次没记处理器地址：用 H ÷ 元件数反推规模（P≈H/元件数），取标度最接近的处理器。
+    // 旧期次没记处理器地址：用 H ÷ 晶体管数反推规模（P≈H/晶体管数），取标度最接近的处理器。
     // 数据驱动：按标度查表匹配，不会把某个处理器误认成 Behemoth 或 TapeOut。
     if (parts > 0) {
       const scale = hp / parts;
@@ -322,7 +327,7 @@ export function resolveCampaignDesign(round, book = null) {
     processor: processorId,
     processorScale: processorId ? processorScale(processorId) : null,
     transistorId,
-    /** 链上 setPlan / execute 写入了算力，处理器由 H÷元件数反推 */
+    /** 链上 setPlan / execute 写入了算力，处理器由 H÷晶体管数反推 */
     processorInferred: chain ? hp > 0 && Boolean(processorId) : hp > 0,
     processorKnown: Boolean(processorId),
     chainHashpower: hp,
@@ -366,11 +371,11 @@ export const PAST_ROUNDS = [
 /**
  * 募集期的预估分配权重。
  *
- * 权重只由「本期烧多少元件」决定：
- *   募资总额 BNB → ÷ 元件实时单价 → 能买多少元件；H = 元件数 × P
+ * 权重只由「本期烧多少晶体管」决定：
+ *   募资总额 BNB → ÷ 晶体管实时单价 → 能买多少晶体管；H = 晶体管数 × P
  *
- * 元件数由本期募资总额派生（round.partCount），开期后不可改，所以权重是确定的。
- * 实际入池数量以 Owner 在材料市场买入并确认到账的元件为准（买多少算多少），
+ * 晶体管数由本期募资总额派生（round.partCount），开期后不可改，所以权重是确定的。
+ * 实际入池数量以 Owner 在晶体管市场买入并确认到账的晶体管为准（买多少算多少），
  * 不再推算「需要几个」「募资总额够买几个」。
  *
  * 报价来自实时价格源（`prices.js`），同一期在不同时刻结果不同。
@@ -383,12 +388,12 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
   const bnbUsdt = quote.bnbUsdt || MARKET.bnbUsdt;
 
   /**
-   * 选元件型号：优先用期次上直接记的 transistorId；
+   * 选晶体管型号：优先用期次上直接记的 transistorId；
    * 否则按 processorId 查该处理器的代表型号（NAND）。
    *
    * ⚠️ 必须查表，不能写成 `processorId === "TapeOut" ? ... : "BEHEMOTH_NAND"`：
    * 那种二元写法在处理器数量变化后会让新处理器落到 Behemoth 的型号上
-   * （元件价差可达数千倍），且 processorScale 取错，算出「有产出」的假象。
+   * （晶体管价差可达数千倍），且 processorScale 取错，算出「有产出」的假象。
    */
   const chosenTransistor =
     round.transistorId ||
@@ -399,14 +404,14 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
   const priceBnb = quote.prices?.[model.id] ?? model.priceBnb;
   const P = processorScale(model.processor);
 
-  // 本期元件数：由募资总额反推，缺省按 1 个兜底
+  // 本期晶体管数：由募资总额反推，缺省按 1 个兜底
   const actual = planTask({
     parts: round.partCount ?? 1,
     transistorId: model.id,
     snapshot: quote,
   });
 
-  // 元件数由募资总额反推，成本 = 元件数 × 报价（采购价随市场浮动，不反推需求）
+  // 晶体管数由募资总额反推，成本 = 晶体管数 × 报价（采购价随市场浮动，不反推需求）
   const usedParts = actual.totalParts;
   const needBnb = actual.partsCost;
 
@@ -426,7 +431,7 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
     processorScale: chosenTransistor ? P : null,
     partType: model.part,
     priceBnb,
-    /** 本期元件数 —— 由募资总额反推，不再拆 NAND / LATCH 配比 */
+    /** 本期晶体管数 —— 由募资总额反推，不再拆 NAND / LATCH 配比 */
     usedParts,
     hashpower: actual.hashpower || 0,
     /**
@@ -434,7 +439,7 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
      * createScene 靠它决定 pool 归属，缺了会让超限期次按已验证池算收益，必须带上。
      */
     capped: actual.capped === true,
-    /** 预估采购成本（BNB）= 元件数 × 报价 */
+    /** 预估采购成本（BNB）= 晶体管数 × 报价 */
     needBnb: round4(needBnb),
     dailyBem,
     totalNet: round4(dailyBem * round.miningDays * (1 - feeRate(round))),
@@ -534,7 +539,7 @@ const SCENE_SEED = {
   funding: { sold: 22, mine: 3, harvestCount: 0, claimed: 0, executed: false, circuitId: "—", offset: 0, soldOutAgoHours: null },
   // 售罄 12 小时前 —— 观察期未满，任何人都还不能 execute
   executing: { sold: 100, mine: 13, harvestCount: 0, claimed: 0, executed: false, circuitId: "待流片", offset: 0, soldOutAgoHours: 12 },
-  // 执行时元件涨到 1.5x：权重由实际买入的元件数决定，与报价无关
+  // 执行时晶体管涨到 1.5x：权重由实际买入的晶体管数决定，与报价无关
   mining: { sold: 100, mine: 13, harvestCount: 12, claimedRatio: 0.72, executed: true, quoteMult: 1.5, circuitId: "#58241", offset: 1, soldOutAgoHours: 200 },
 };
 
@@ -546,7 +551,7 @@ export function createScene(id, round = ROUND, phase = null, expired = false, ex
   // executing 的 endsAt 不用于展示（倒计时显示「—」），保留 fundingEnd 占位无害。
   const endsAt = id === "mining" ? undefined : (expired && id === "funding" ? Date.now() - 86400_000 : fundingEnd);
 
-  // 预估算力按基准单价；实际权重按执行时成交价（元件涨价不影响权重，只影响买不买得起）
+  // 预估算力按基准单价；实际权重按执行时成交价（晶体管涨价不影响权重，只影响买不买得起）
   const est = estimateHashpower(round, QUOTE, seed.sold);
   const model = findTransistor(round.transistorId || DEFAULT_TRANSISTOR);
   const actualQuote = {
@@ -575,8 +580,8 @@ export function createScene(id, round = ROUND, phase = null, expired = false, ex
   return {
     scene: id,
     /**
-     * 待执行子状态：晶体管来自二级市场，须由 Owner 钱包发起链上交易去挂单买入并确认到账，
-     * 不能指望合约自动去二级市场操作——合约无法替人工下单。
+     * 待执行子状态：晶体管来自晶体管市场，须由 Owner 钱包发起链上交易去挂单买入并确认到账，
+     * 不能指望合约自动去晶体管市场操作——合约无法替人工下单。
      * buying = 待挂单；listed = 挂单中（可取消）；ready = 晶体管已到账，待 execute 流片开矿。
      * 其他场景无意义，置 undefined。
      */
@@ -726,7 +731,7 @@ export function seedCalls(round = ROUND) {
     { time: now - 26 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，挖矿产出服务费 ${formatBem(h.fee)} BEM` },
     { time: now - 3 * 86400_000, method: "claim", ok: true, message: `${shortAddress(WALLET)} 领取 ${formatBem(book.claimable)} BEM` },
     { time: now - 5 * 86400_000, method: "claim", ok: true, message: "0x8b21…B21A 领取 18.60 BEM" },
-    { time: now - 12 * 86400_000, method: "execute", ok: true, message: `购入元件完成流片，权重 ${book.hashpower}，电路 ${book.circuitId}` },
+    { time: now - 12 * 86400_000, method: "execute", ok: true, message: `购入晶体管完成流片，权重 ${book.hashpower}，电路 ${book.circuitId}` },
     { time: now - 13 * 86400_000, method: "subscribe", ok: true, message: `0x8b21…B21A 认筹 6 份，支付 ${(6 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000, method: "subscribe", ok: true, message: `${shortAddress(WALLET)} 认筹 4 份，支付 ${(4 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000 - 3600_000, method: "createCampaign", ok: true, message: `第 ${round.id} 期创建，${round.totalShares} 份 × ${round.sharePriceBnb} BNB，挖矿产出服务费 ${feePercentOf(round)}%` },
@@ -760,7 +765,7 @@ export function applySubscribe(round, book, shares) {
       picked: 1,
       scene: filled ? "executing" : book.scene,
       // 问题①修复：自然售罄进入 executing 也补 executePhase="buying"，
-      // 迫使必须先去二级市场买入晶体管并确认到账，否则 applyExecute 会拒。
+      // 迫使必须先去晶体管市场买入晶体管并确认到账，否则 applyExecute 会拒。
       executePhase: filled ? "buying" : book.executePhase,
       approved: true,
       // 售罄即启动 execute 观察期倒计时
@@ -971,7 +976,7 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
 /**
  * Owner 调用 tapeout.net 晶体管挂单逻辑（链上交易）。
  *
- * 晶体管来自 tapeout.net 二级市场，但合约无法替人工去平台操作，所以由 Owner（或 keeper）
+ * 晶体管来自 tapeout.net 晶体管市场，但合约无法替人工去平台操作，所以由 Owner（或 keeper）
  * 手动调用本函数发起链上交易：先 placeTransistorOrder 进入「挂单中」，成交后 confirmTransistors 确认到账。
  * 仅 Factory Owner 可调，避免状态竞争；非 Owner 或已挂单/已到账均拒绝。
  */
@@ -989,9 +994,9 @@ export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) 
   if (book.executePhase === "listed") {
     return { ok: false, message: "已经调用挂单逻辑，待成交或取消。" };
   }
-  // 退款后可改价重挂；若已退光本金则不可再挂（对齐合约）
-  if (book.executionFailed && (book.sold < round.totalShares || (book.bnbPool || 0) <= 0)) {
-    return { ok: false, message: "本金已退或份数已回退，不能再挂单。" };
+  // 退款后可改价重挂；若已退光本金则不可再挂（对齐合约：executionFailed && raisedBnb == 0）
+  if (book.executionFailed && (book.bnbPool || 0) <= 0) {
+    return { ok: false, message: "本金已退光，不能再挂单。" };
   }
   const nand = Math.floor(Number(args.nandQty) || 0);
   const latch = Math.floor(Number(args.latchQty) || 0);
@@ -1026,7 +1031,7 @@ export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) 
 }
 
 /**
- * 挂单价缺省值：取报价里的元件单价，不写死常数。
+ * 挂单价缺省值：取报价里的晶体管单价，不写死常数。
  * 报价缺失时返回 0 —— 由调用方报「挂单单价须大于 0」，让用户自己填。
  */
 function quoteUnitFallback(book) {
@@ -1048,7 +1053,7 @@ export function applyOpenRefund(round, book, actor = null) {
     return { ok: false, message: "只有待执行可以由 Owner 发起退款。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "元件已确认到账：这个状态不能退款结束本期（元件只能进矿池）。用「退回剩余募集款」把没花完的 BNB 按份退给持份人。" };
+    return { ok: false, message: "晶体管已确认到账：这个状态不能退款结束本期（晶体管只能进矿池）。用「退回剩余募集款」把没花完的 BNB 按份退给持份人。" };
   }
   if (book.executePhase && book.executePhase !== "buying") {
     return { ok: false, message: "请先取消挂单，再发起退款。" };
@@ -1152,9 +1157,9 @@ export function applyConfirmTransistors(round, book, actor = null) {
  * 执行换币 + 流片。这是「预估」变成「实际」的唯一地方。
  *
  * 权限：仅 Factory Owner。晶体管到账后即可执行，不再等待观察期。
- * 执行逻辑：直接按 Owner 在材料市场实际买入并确认到账的元件数量入池开矿。
- *          元件数不再由图纸推算、也不与募资总额做「买不买得起」的比较——
- *          买多少算多少，H = 实买元件数 × P。采购款之外的余量按份退回。
+ * 执行逻辑：直接按 Owner 在晶体管市场实际买入并确认到账的晶体管数量入池开矿。
+ *          晶体管数不再由图纸推算、也不与募资总额做「买不买得起」的比较——
+ *          买多少算多少，H = 实买晶体管数 × P。采购款之外的余量按份退回。
  */
 export function applyExecute(round, book, quote = MARKET, actor = null) {
   if (book.scene !== "executing") return { ok: false, message: "只有售罄后的待执行状态可以 execute。" };
@@ -1180,7 +1185,7 @@ export function applyExecute(round, book, quote = MARKET, actor = null) {
   const lockUsed = book.priceLock || quote;
   const est = estimateHashpower(round, lockUsed, book.sold);
   /**
-   * 入池元件数 = Owner 在材料市场实际买入并确认到账的数量（nandQty + latchQty）。
+   * 入池晶体管数 = Owner 在晶体管市场实际买入并确认到账的数量（nandQty + latchQty）。
    * 不再拿它跟任何推算出来的需求配比或「募资总额能买几个」比较——买多少算多少。
    */
   const bought = Math.max(0, Math.floor(Number(book.transistorCount) || 0));
@@ -1303,8 +1308,8 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
     ...round,
     id: nextId,
     /**
-     * 本期要烧的元件总数（NAND + LATCH），开期后不可改。
-     * 权重 H = 元件数 × P，所以这就是算力的唯一来源。
+     * 本期要烧的晶体管总数（NAND + LATCH），开期后不可改。
+     * 权重 H = 晶体管数 × P，所以这就是算力的唯一来源。
      * 不再是开期参数：由本期募资总额按理想成本占比反推。
      */
     partCount: derivePartCount({
@@ -1333,7 +1338,7 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
   };
   return {
     ok: true,
-    message: `第 ${nextId} 期开始募集：${model.name}，募资 ${review.hardCapBnb} BNB，本期 ${review.needParts} 元件，权重 ${review.hashpower}`,
+    message: `第 ${nextId} 期开始募集：${model.name}，募资 ${review.hardCapBnb} BNB，本期 ${review.needParts} 晶体管，权重 ${review.hashpower}`,
     round: nextRound,
     book: createScene("funding", nextRound),
   };
@@ -1348,8 +1353,8 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
  *
  * 兼容旧调用：若不传 `hardCapBnb`，则沿用「每份 × 份数」推算募资总额。
  *
- * 元件数只由募资总额反推（不再拆 NAND / LATCH 配比），校验只管发行参数本身：
- * 募资总额、总份数、服务费与分成地址。元件在材料市场自由买卖，不再校验买不买得起。
+ * 晶体管数只由募资总额反推（不再拆 NAND / LATCH 配比），校验只管发行参数本身：
+ * 募资总额、总份数、服务费与分成地址。晶体管在晶体管市场自由买卖，不再校验买不买得起。
  */
 export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
   const totalShares = Number(draft.totalShares);
@@ -1372,7 +1377,7 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
   }
 
   /**
-   * 本期元件数由募资总额反推，权重 H = 元件数 × P。
+   * 本期晶体管数由募资总额反推，权重 H = 晶体管数 × P。
    * 口径必须跟 applyCreate 一致（都用本次表单算出来的募资总额），
    * 否则「预览 567 颗 / 实际写入 621 颗」会对不上。
    */
@@ -1470,14 +1475,14 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
     model,
     /** 兼容旧字段：等于该型号自身的价 */
     priceBnb,
-    /** 元件数只由募资总额派生，不再拆 NAND / LATCH 配比 */
+    /** 晶体管数只由募资总额派生，不再拆 NAND / LATCH 配比 */
     needParts: actual.totalParts,
     /** 是否被挖矿闸门拦住（只能进未验证池） */
     capped: actual.capped,
     bnbUsdt,
     /** 日产：已含闸门判定（capped → 未验证池） */
     dailyBem: bemRate(actual.hashpower, { pool: actual.capped ? "unverified" : "verified" }),
-    /** 权重 H = 元件数 × 每颗算力 */
+    /** 权重 H = 晶体管数 × 每颗算力 */
     hashpower: actual.hashpower,
     processorScale: actual.processorScale,
     /** 阻断性问题：不改就不能提交 */

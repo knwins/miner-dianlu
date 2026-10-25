@@ -1,11 +1,11 @@
 /**
- * 探针：验证发布页（OwnerCreate）与材料市场页的结构约束，且各页签不白屏。
+ * 探针：验证发布页（OwnerCreate）与晶体管市场页的结构约束，且各页签不白屏。
  *
  * 覆盖的业务事实：
  *   1. 「创建」页签不白屏 —— 自由变量 / TDZ / undefined 访问这三类运行时错误
  *      vite build 都抓不到，只有真跑页面才会暴露。
- *   2. 工厂无默认元件 → 发布表单必须有「本期处理器」必选下拉。
- *   3. 材料市场面板只剩 TapeOut / Behemoth 两个处理器分组，
+ *   2. 工厂无默认晶体管 → 发布表单必须有「本期处理器」必选下拉。
+ *   3. 晶体管市场面板只剩 TapeOut / Behemoth 两个处理器分组，
  *      且**不得**出现 Genesis 或「无挖矿产出」误标。
  *
  * 运行：node scripts/probe-create-page.mjs [port]
@@ -56,9 +56,9 @@ async function probe(port) {
 
   const bodyText = () => page.evaluate(() => document.body.innerText);
 
-  // ── 0. 认购页（BEM众筹挖矿）不再有官方元件最新价模块 ──
-  // T-62：认购页删除官方元件最新价模块。市价信息统一在「材料市场」页的
-  // 「官方处理器与元件市价」单一模块里查，认购页只留认购本身需要的信息。
+  // ── 0. 认购页（BEM众筹挖矿）不再有官方晶体管最新价模块 ──
+  // T-62：认购页删除官方晶体管最新价模块。市价信息统一在「晶体管市场」页的
+  // 「官方处理器与晶体管市价」单一模块里查，认购页只留认购本身需要的信息。
   const roundPanel = await page.evaluate(() => {
     const el = document.querySelector(".official-price-card");
     if (!el) return null;
@@ -72,7 +72,7 @@ async function probe(port) {
   console.log("  认购页面板：", JSON.stringify(roundPanel));
   const roundPanelOk = roundPanel === null;
   console.log(
-    `${roundPanelOk ? "ok  " : "FAIL"} 认购页已无官方元件最新价模块${roundPanelOk ? "" : ` （仍存在：${JSON.stringify(roundPanel)}）`}`,
+    `${roundPanelOk ? "ok  " : "FAIL"} 认购页已无官方晶体管最新价模块${roundPanelOk ? "" : ` （仍存在：${JSON.stringify(roundPanel)}）`}`,
   );
 
   // ── 1. 侧边栏能进 Owner 工作台 ──
@@ -115,9 +115,9 @@ async function probe(port) {
     return { ok: false, reason: "create-crash", pageErrors };
   }
 
-  // ── 3. 工厂无默认元件：发布期**必须**显式选处理器，卡片要存在 ──
-  const hasProcessorCard = /处理器（元件合约）/.test(afterCreate);
-  console.log(`${hasProcessorCard ? "ok  " : "FAIL"} 「创建」页含处理器选择卡片（工厂无默认元件，开期必选）`);
+  // ── 3. 工厂无默认晶体管：发布期**必须**显式选处理器，卡片要存在 ──
+  const hasProcessorCard = /处理器（晶体管合约）/.test(afterCreate);
+  console.log(`${hasProcessorCard ? "ok  " : "FAIL"} 「创建」页含处理器选择卡片（工厂无默认晶体管，开期必选）`);
 
   // ── 4. 服务费口径文案（挖矿产出）──
   const feeWording = /服务费（挖矿产出）|挖矿产出奖励的服务费|挖矿产出服务费/.test(afterCreate);
@@ -125,27 +125,27 @@ async function probe(port) {
 
   await page.screenshot({ path: join(SHOT_DIR, "shot-create.png"), fullPage: false });
 
-  // ── 5. 材料市场页：全部官方处理器必须同时出现（合并后的单一模块）──
+  // ── 5. 晶体管市场页：全部官方处理器必须同时出现（合并后的单一模块）──
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
   await page.waitForTimeout(800);
   const marketNav = await page.evaluate(() =>
     Array.from(document.querySelectorAll("button, a")).map((el) => (el.textContent || "").trim()),
   );
-  const marketEntry = marketNav.find((t) => t.includes("材料市场"));
+  const marketEntry = marketNav.find((t) => t.includes("晶体管市场"));
   if (!marketEntry) {
-    console.log("FAIL 未找到「材料市场」导航项");
+    console.log("FAIL 未找到「晶体管市场」导航项");
     console.log("  可见导航：", marketNav.filter(Boolean).slice(0, 30));
     await browser.close();
     return { ok: false, reason: "no-market-nav" };
   }
-  await page.getByText("材料市场", { exact: false }).first().click();
+  await page.getByText("晶体管市场", { exact: false }).first().click();
   // 链上成交价是异步取的：等太短会把「读取中 / —」当成取价失败。
   await page.waitForTimeout(4500);
   const marketText = await bodyText();
 
   const marketCrashed = pageErrors.some((m) => /is not defined|Cannot read/i.test(m));
   if (marketCrashed) {
-    console.log("FAIL 「材料市场」页崩溃");
+    console.log("FAIL 「晶体管市场」页崩溃");
     console.log("  pageError:", pageErrors.slice(0, 5));
     await browser.close();
     return { ok: false, reason: "market-crash", pageErrors };
@@ -153,20 +153,20 @@ async function probe(port) {
 
   const tapeout = /TapeOut/.test(marketText);
   const behemoth = /Behemoth/.test(marketText);
-  console.log(`${tapeout ? "ok  " : "FAIL"} 材料市场 TapeOut${tapeout ? "" : " 缺失"}`);
-  console.log(`${behemoth ? "ok  " : "FAIL"} 材料市场 Behemoth${behemoth ? "" : " 缺失"}`);
+  console.log(`${tapeout ? "ok  " : "FAIL"} 晶体管市场 TapeOut${tapeout ? "" : " 缺失"}`);
+  console.log(`${behemoth ? "ok  " : "FAIL"} 晶体管市场 Behemoth${behemoth ? "" : " 缺失"}`);
 
-  // T-59：Genesis CPU 已整体移除，材料市场页**不得**再出现它
+  // T-59：Genesis CPU 已整体移除，晶体管市场页**不得**再出现它
   const genesis = /Genesis/.test(marketText);
-  console.log(`${genesis ? "FAIL" : "ok  "} 材料市场已无 Genesis${genesis ? " 仍残留" : ""}`);
+  console.log(`${genesis ? "FAIL" : "ok  "} 晶体管市场已无 Genesis${genesis ? " 仍残留" : ""}`);
 
   // 当前只剩两个处理器，且都有挖矿产出资格，页面上不应出现「无挖矿产出」标记
   const noMineWarn = /无挖矿产出|无产出/.test(marketText);
   console.log(`${noMineWarn ? "FAIL" : "ok  "} 无「无挖矿产出」误标${noMineWarn ? " 误标残留" : ""}`);
 
   // 两个处理器各自的 NAND / LATCH 单价都应渲染成行情卡里的价格格。
-  // ⚠️ 选择器必须精确到「官方元件市价」卡片（.official-price-card）：
-  //   - 「各期锁定的元件合约」卡片里也有表格；
+  // ⚠️ 选择器必须精确到「官方晶体管市价」卡片（.official-price-card）：
+  //   - 「各期锁定的晶体管合约」卡片里也有表格；
   //   - compact 模式的市价面板（开期表单 / Owner 弹窗）也是同一个 class 前缀。
   const priceRows = await page.evaluate(() =>
     Array.from(document.querySelectorAll(".market-page .official-price-card .official-price-group")).map(
@@ -182,7 +182,7 @@ async function probe(port) {
   );
   console.log("  处理器分组：", JSON.stringify(priceRows));
   console.log("  截图目录：", SHOT_DIR);
-  // 行情看板形态：每个处理器一张卡 = NAND / LATCH 两个价格格 + 3 条事实（CPU / 元件合约 / 白名单）。
+  // 行情看板形态：每个处理器一张卡 = NAND / LATCH 两个价格格 + 3 条事实（CPU / 晶体管合约 / 白名单）。
   // 价格必须是有值的数字，不能被兜底成「—」—— 那说明市价没取到。
   const groupsOk =
     priceRows.length === 2 &&
@@ -194,12 +194,12 @@ async function probe(port) {
     );
   console.log(`${groupsOk ? "ok  " : "FAIL"} 行情看板：两个处理器 × (NAND/LATCH 单价 + 3 条事实)`);
 
-  // 整合后必须**只剩一个**市价卡片（原先有「官方元件最新价」+「官方处理器对照」两个）
+  // 整合后必须**只剩一个**市价卡片（原先有「官方晶体管最新价」+「官方处理器对照」两个）
   const cardCount = await page.evaluate(
     () => document.querySelectorAll(".market-page .official-price-card").length,
   );
   const oneCard = cardCount === 1;
-  console.log(`${oneCard ? "ok  " : "FAIL"} 材料市场页只有 1 个市价卡片${oneCard ? "" : ` （实际 ${cardCount} 个）`}`);
+  console.log(`${oneCard ? "ok  " : "FAIL"} 晶体管市场页只有 1 个市价卡片${oneCard ? "" : ` （实际 ${cardCount} 个）`}`);
 
   await page.screenshot({ path: join(SHOT_DIR, "shot-market.png"), fullPage: true });
 
@@ -221,8 +221,8 @@ async function probe(port) {
 
   // ── 7. 「发布众筹挖矿」表单的业务流程与 UI 约束 ──
   // 这一段锁的是 OwnerCreate 的结构与业务事实，改 UI 时容易被无意破坏：
-  //   a) 表单**含**处理器必选下拉（工厂无默认元件，开期人必须显式选）；
-  //   b) 表单**不含**建议方案（元件数/算力要到执行阶段才定，发布期给建议值会误导）；
+  //   a) 表单**含**处理器必选下拉（工厂无默认晶体管，开期人必须显式选）；
+  //   b) 表单**不含**建议方案（晶体管数/算力要到执行阶段才定，发布期给建议值会误导）；
   //   c) 表单**不含**官方市价参考模块（链下 API、只有买单侧，不是承诺）；
   //   d) 步骤编号唯一、顺序 = 真实业务顺序；
   //   e) 底部提交条不能吸底（sticky 会遮住分成地址行——那是要签名的参数）；
@@ -245,14 +245,14 @@ async function probe(port) {
     partsSelectCount >= 1 &&
     formTextEarly.includes("本期处理器") &&
     formTextEarly.includes("开期必选");
-  console.log(`${hasProcessor ? "ok  " : "FAIL"} 表单含处理器必选下拉（工厂无默认元件）`);
+  console.log(`${hasProcessor ? "ok  " : "FAIL"} 表单含处理器必选下拉（工厂无默认晶体管）`);
   const noSuggestion =
     !formTextEarly.includes("建议方案") &&
     !formTextEarly.includes("恢复建议") &&
     !formTextEarly.includes("已跟随") &&
-    !formTextEarly.includes("预计元件数") &&
+    !formTextEarly.includes("预计晶体管数") &&
     !formTextEarly.includes("预计权重");
-  console.log(`${noSuggestion ? "ok  " : "FAIL"} 表单不含建议方案（无元件数/算力预估）`);
+  console.log(`${noSuggestion ? "ok  " : "FAIL"} 表单不含建议方案（无晶体管数/算力预估）`);
   const noOfficialPrice =
     !formTextEarly.includes("官方市价参考") &&
     !formTextEarly.includes("报价快照") &&
@@ -307,7 +307,7 @@ async function probe(port) {
     !formText.includes("createCampaign") &&
     !formText.includes("setServiceFee");
   console.log(`${noTwoTxNote ? "ok  " : "FAIL"} 提交区已无「两笔交易」说明`);
-  // T-69：单件价格上限整卡已从合约与前端彻底移除（限制单件价格会导致买不到元件）。
+  // T-69：单件价格上限整卡已从合约与前端彻底移除（限制单件价格会导致买不到晶体管）。
   const noPriceCap =
     !formText.includes("单件价格上限") &&
     !formText.includes("每件上限") &&

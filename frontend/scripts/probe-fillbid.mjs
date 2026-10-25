@@ -1,11 +1,11 @@
 /**
- * 官方材料市场 fillBid 的真实签名与交付语义。
+ * 官方晶体管市场 fillBid 的真实签名与交付语义。
  *
  * 已知（probe-market-surface.mjs）：官方市场存在 fillBid(uint256,uint256)，且**只有买单侧**。
- * 合约注释假设：owner placeBid（托管 BNB）→ 卖家 fillBid → ERC1155 元件直接进 Campaign。
+ * 合约注释假设：owner placeBid（托管 BNB）→ 卖家 fillBid → ERC1155 晶体管直接进 Campaign。
  * 待确认：
  *   1. fillBid 的两个参数各是什么（bidId + ?）—— 合约不直接调它，但要确认流程成立。
- *   2. 成交后元件是否真的转进买家地址（Campaign 的 onERC1155Received 钩子才有意义）。
+ *   2. 成交后晶体管是否真的转进买家地址（Campaign 的 onERC1155Received 钩子才有意义）。
  *   3. 手续费：feeBps=100（1%），成交额里扣掉后，卖家实收多少；Campaign 锁价是否够付。
  *
  * 全部 eth_call 模拟，不花真钱。
@@ -32,7 +32,7 @@ async function call(sig, args = [], value = 0n) {
   }
 }
 
-// 取一个真实的、官方元件（TapeOut）的买单
+// 取一个真实的、官方晶体管（TapeOut）的买单
 const nb = await call("nextBidId()");
 const bidId = BigInt(nb.data) - 1n;
 const b = await call("bids(uint256)", [bidId]);

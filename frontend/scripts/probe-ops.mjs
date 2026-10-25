@@ -2,9 +2,9 @@
  * 探针：Owner 弹窗默认 tab「合约操作」的信息层级是否已简化。
  *
  * 这一轮针对该页做了三件事，都要在这里钉住：
- *   1. 删掉「官方元件最新价」整张卡（同源单价已在挂买单表格的「市价」列，点一下即填入）；
+ *   1. 删掉「官方晶体管最新价」整张卡（同源单价已在挂买单表格的「市价」列，点一下即填入）；
  *   2. 操作卡与右栏不再重复弹窗顶部概览条已有的数据 ——
- *      资金 / 元件 / 算力原本在「库存」「资金 / 库存」「预估算力」「链上算力 / 元件」
+ *      资金 / 晶体管 / 算力原本在「库存」「资金 / 库存」「预估算力」「链上算力 / 晶体管」
  *      四行里各写一遍，raised 本身就是 bnbPool，与「托管 BNB」同一个变量；
  *   3. 删掉 flow-panel 头部与「下一步」逐字重复的说明段落。
  *
@@ -59,22 +59,22 @@ const bodyText = await body.innerText().catch(() => "");
 const ok = {};
 
 // 1. 红框模块已清除
-ok.noOfficialPriceCard = !bodyText.includes("官方元件最新价") && !bodyText.includes("官方市场快照");
-console.log("红框「官方元件最新价」已移除:", ok.noOfficialPriceCard);
+ok.noOfficialPriceCard = !bodyText.includes("官方晶体管最新价") && !bodyText.includes("官方市场快照");
+console.log("红框「官方晶体管最新价」已移除:", ok.noOfficialPriceCard);
 console.log("  页内仍可出现「官方市价」列:", bodyText.includes("官方市价") || bodyText.includes("市价"));
 
-// 2. 操作卡不再重复顶部概览条的资金 / 元件 / 算力
+// 2. 操作卡不再重复顶部概览条的资金 / 晶体管 / 算力
 const billRows = await page.locator(".ops-bill li").allInnerTexts().catch(() => []);
 console.log("操作卡信息行:", JSON.stringify(billRows));
 ok.billMinimal = billRows.length <= 2
-  && !billRows.some((r) => /库存|募集款|资金|元件/.test(r.split("\n")[0]));
-console.log("  只保留子状态 / 处理器（无资金元件重复行）:", ok.billMinimal);
+  && !billRows.some((r) => /库存|募集款|资金|晶体管/.test(r.split("\n")[0]));
+console.log("  只保留子状态 / 处理器（无资金晶体管重复行）:", ok.billMinimal);
 
 // 3. 右栏「链上参数」只放顶部概览条没有的项
 const dts = await page.locator(".param-grid dt").allInnerTexts().catch(() => []);
 console.log("链上参数键:", JSON.stringify(dts));
-ok.paramNoDup = !dts.some((d) => /预估算力|算力|本期元件/.test(d));
-console.log("  不再重复算力 / 元件:", ok.paramNoDup);
+ok.paramNoDup = !dts.some((d) => /预估算力|算力|本期晶体管/.test(d));
+console.log("  不再重复算力 / 晶体管:", ok.paramNoDup);
 
 // 4. 挂单面板头部不再有重复说明段
 const panelHeadP = await page.locator(".ops-exec .flow-panel-head p").count().catch(() => 0);
@@ -87,10 +87,10 @@ console.log("  面板标题:", JSON.stringify(panelTitle));
 const steps = await page.locator(".flow-steps li").allInnerTexts().catch(() => []);
 console.log("步骤条:", JSON.stringify(steps));
 
-// 5b. 「材料市场 ↗」外链已移除（弹出框内不应再出现该外链）
+// 5b. 「晶体管市场 ↗」外链已移除（弹出框内不应再出现该外链）
 const marketLink = await page.locator('.sheet a[href*="tapeout.net"]').count().catch(() => 0);
-const marketLinkText = bodyText.includes("材料市场 ↗");
-console.log("「材料市场 ↗」外链（应为 0）:", marketLink, "| 文案残留:", marketLinkText);
+const marketLinkText = bodyText.includes("晶体管市场 ↗");
+console.log("「晶体管市场 ↗」外链（应为 0）:", marketLink, "| 文案残留:", marketLinkText);
 ok.noMarketExternalLink = marketLink === 0 && !marketLinkText;
 
 // 6. 挂买单表单仍可用（这是删卡后「市价」列必须自己扛住的地方）

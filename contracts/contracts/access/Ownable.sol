@@ -2,7 +2,8 @@
 pragma solidity ^0.8.24;
 
 /// @title Ownable — minimal, no external dependency
-/// @notice Single owner, transferable. The factory owner holds Campaign execute and bid privileges.
+/// @notice Single owner, transferable. The factory owner is also each Campaign's owner, holding its
+///         ordering, config and escape-hatch privileges.
 abstract contract Ownable {
     address public owner;
 
@@ -22,6 +23,8 @@ abstract contract Ownable {
         _;
     }
 
+    /// @notice Hand ownership to another address.
+    /// @param newOwner Next owner; must be non-zero.
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
         emit OwnershipTransferred(owner, newOwner);

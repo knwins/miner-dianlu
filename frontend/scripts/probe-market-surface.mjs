@@ -1,10 +1,10 @@
 /**
- * 官方材料市场（主网 0xA6a8…）的完整接口面探测。
+ * 官方晶体管市场（主网 0xA6a8…）的完整接口面探测。
  *
  * 背景：
- *   Campaign 的元件取得路径是 placeBid（买）→ fillBid（成交）→ ERC1155 直接转进 Campaign。
+ *   Campaign 的晶体管取得路径是 placeBid（买）→ fillBid（成交）→ ERC1155 直接转进 Campaign。
  *   但上一轮探测发现：placeAsk / cancelAsk / fillAsk / fillBid 全部 "missing revert data"。
- *   如果 fillBid 真的不存在，那「owner 下单买元件」永远成交不了 —— 主网直接死路。
+ *   如果 fillBid 真的不存在，那「owner 下单买晶体管」永远成交不了 —— 主网直接死路。
  *   也有可能是官方用了别的函数名（accept / sell / match / take …）。
  *
  * 做法：批量 eth_call 候选函数名，看哪些 selector 在代理上真实存在。

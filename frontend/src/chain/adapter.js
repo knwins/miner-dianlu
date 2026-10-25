@@ -5,11 +5,10 @@ import { ROUND } from "../fixtures.js";
 import { transistorIdFor } from "../prices.js";
 import { processorFromPartsContract } from "../tapeout.js";
 import { getCampaignAddress } from "./client.js";
-import { SCENE_LABEL } from "./config.js";
+import { rowState } from "../roundState.js";
 
 const SCENE_NAME = ["funding", "executing", "mining"];
 const PHASE_NAME = [undefined, "buying", "listed", "ready"];
-const SCENE_TONE = ["live", "wait", "mine"];
 
 const bem = (v) => {
   try { return Number(formatEther(v)); } catch { return 0; }
@@ -45,7 +44,7 @@ export function roundFromDeployment(dep) {
     /** 分成表：链上有就优先用链上的 */
     feeShares: Array.isArray(dep.feeShares) ? dep.feeShares : [],
     netlistHash: null,
-    /** 同 roundFromState：链上期次的元件数不从 fixtures 继承，链上真值走 book.transistorCount */
+    /** 同 roundFromState：链上期次的晶体管数不从 fixtures 继承，链上真值走 book.transistorCount */
     partCount: 0,
   };
 }
@@ -74,16 +73,16 @@ export function roundFromState(state, baseRound = ROUND, campaignIndex = 1) {
     feeShares: Array.isArray(state.feeShares) ? state.feeShares : [],
     netlistHash: null,
     /**
-     * 元件数：链上模式**不能**继承 fixtures 的默认值。
+     * 晶体管数：链上模式**不能**继承 fixtures 的默认值。
      *
      * `...baseRound` 把本地演示期次（ROUND.partCount = 68）一起带进来了，
      * 于是链上每一期的估算都用 68 颗算——链上根本没这个数。
-     * 链上的元件数权威来源是 nandQty + latchQty（成交到账量），
+     * 链上的晶体管数权威来源是 nandQty + latchQty（成交到账量），
      * 由 book.transistorCount 承载；round 上这个字段只作测算种子，
      * 链上模式一律归零（planTask 会兜底到 1），不拿演示数据冒充链上事实。
      */
     partCount: 0,
-    // 开期写入的 transistors 地址 = 官方处理器的元件合约（TapeOut / Behemoth）；不能沿用 ROUND 默认 Behemoth。
+    // 开期写入的 transistors 地址 = 官方处理器的晶体管合约（TapeOut / Behemoth）；不能沿用 ROUND 默认 Behemoth。
     processorId: processorFromPartsContract(state.transistors) || null,
     transistorId: processorFromPartsContract(state.transistors)
       ? transistorIdFor(processorFromPartsContract(state.transistors))
@@ -173,7 +172,7 @@ export function bookFromState(state, account, extra = {}) {
     serviceFeeSet: Boolean(state.serviceFeeSet),
     /** 本期服务费率（基点） */
     serviceFeeBps: Number(state.serviceFeeBps ?? 0),
-    /** 挖矿收益池（已扣服务费的净额）。owner 扫不走。 */
+    /** 累计挖矿净收益（已扣服务费）。真钱已并入持份人可领余款，owner 扫不走。 */
     revenuePool: bem(state.revenuePool ?? 0),
     bemBalance: 0,
     bnb,
@@ -182,7 +181,7 @@ export function bookFromState(state, account, extra = {}) {
     selfAddress: account,
     totalShares: Number(state.totalShares),
     /**
-     * 已成交到账的元件数（各腿 挂单量 − 市场 remaining）。
+     * 已成交到账的晶体管数（各腿 挂单量 − 市场 remaining）。
      * 注意不是挂单量：nandQty/latchQty 是「下单要买多少」，成交前不等于已买到。
      */
     transistorCount: Number(state.transistorCount),
@@ -191,7 +190,7 @@ export function bookFromState(state, account, extra = {}) {
     estHashpower: Number(state.estHashpower),
     priceLock: bem(state.priceLock),
     marketOrders: Boolean(state.marketOrders),
-    // 材料市场是否真有卖单侧。官方市场只有买单侧 → 挂卖单入口必须挡住。
+    // 晶体管市场是否真有卖单侧。主网只有买单侧 → 挂卖单入口必须挡住。
     marketAskSide: Boolean(state.marketAskSide),
     orderFilled: Boolean(state.orderFilled),
     nandBidId: state.nandBidId != null ? String(state.nandBidId) : "0",
@@ -221,7 +220,7 @@ export function bookFromState(state, account, extra = {}) {
     surplusBase: Number(state.surplusBase || 0),
     partsNand: Number(state.partsNand || 0),
     partsLatch: Number(state.partsLatch || 0),
-    /** 元件是否已投入矿池（不可逆）。入池后合约余额归 0，展示要用 transistorCount。 */
+    /** 晶体管是否已投入矿池（不可逆）。入池后合约余额归 0，展示要用 transistorCount。 */
     pooled: Boolean(state.pooled),
     transistors: state.transistors || "",
     _sharePriceWei: state.sharePriceBnb,
@@ -270,50 +269,30 @@ export function bookFromState(state, account, extra = {}) {
  * sold 是单调的历史事实，退款不会让它变小，用它判断「是否已全部退回」会永远为假。
  */
 export function campaignStatusOf(summary, nowSec = Math.floor(Date.now() / 1000)) {
+  /*
+   * 状态词一律从 roundState.js 取，本函数只负责把「链上摘要」翻译成那一层需要的字段。
+   * note 不再是自由文案：它就是子状态行（与「我的资产」表、Owner 卡片同一份实现），
+   * 否则列表卡片上一句「待挂单买晶体管」、资产表上一句「待挂单」，同一期两个说法。
+   */
   const scene = Number(summary?.scene) || 0;
-  const sold = Number(summary?.sold) || 0;
-  const outstanding = Number(summary?.outstandingShares ?? summary?.sold) || 0;
-  const totalShares = Number(summary?.totalShares) || 0;
-  const raised = Number(summary?.raisedBnb) || 0;
-  const price = Number(summary?.sharePriceBnb) || 0;
-  const phase = Number(summary?.phase) || 0;
-  const failed = Boolean(summary?.executionFailed);
-  const deadline = Number(summary?.fundingDeadline) || 0;
+  const state = rowState({
+    scene,
+    phase: Number(summary?.phase) || 0,
+    sold: Number(summary?.sold) || 0,
+    totalShares: Number(summary?.totalShares) || 0,
+    outstandingShares: summary?.outstandingShares,
+    raisedBnb: Number(summary?.raisedBnb) || 0,
+    sharePriceBnb: Number(summary?.sharePriceBnb) || 0,
+    executionFailed: Boolean(summary?.executionFailed),
+    fundingDeadline: Number(summary?.fundingDeadline) || 0,
+  }, nowSec);
 
-  const soldOut = totalShares > 0 && sold >= totalShares;
-  const fundingExpired = scene === 0 && !soldOut && deadline > 0 && nowSec > deadline;
-  const refundedOut = scene === 1 && failed && outstanding === 0;
-  const ended = refundedOut || fundingExpired;
-  // 与合约 refund() 的 short 口径一致：只有「待挂单」阶段池子cover不住全部份额才算缺口。
-  // 已挂单/已到账时 raisedBnb 减少是买元件花掉的，不是缺口。
-  const short = scene === 1 && phase === 1 && raised < outstanding * price;
-
-  if (ended) {
-    return {
-      status: "已结束",
-      tone: "done",
-      note: refundedOut ? "认筹已全部原路退回" : "超时未售罄 · 可原路退款",
-    };
-  }
-  if (scene === 1 && failed) {
-    return { status: "执行失败", tone: "back", note: "持有人可原路退款 · Owner 可重挂" };
-  }
-  if (scene === 0) {
-    return { status: "募集中", tone: "live", note: "" };
-  }
-  if (scene === 1) {
-    return {
-      status: "待执行",
-      tone: "wait",
-      note: short
-        ? "池子不足 · 可按比例退款"
-        : phase === 3 ? "元件到账 · 待入池" : phase === 2 ? "挂单中" : "待挂单买元件",
-    };
-  }
-  if (scene === 2) {
-    return { status: "挖矿中", tone: "mine", note: "元件已入池 · 不可逆" };
-  }
-  return { status: SCENE_LABEL[scene] || "—", tone: SCENE_TONE[scene] || "live", note: "" };
+  return {
+    status: state.label,
+    tone: state.tone,
+    note: state.substate,
+    ended: state.key === "ended",
+  };
 }
 
 /** 历史期次行（替换 PAST_ROUNDS 假数据）。 */
@@ -326,7 +305,7 @@ export function historyRowFromSummary(summary, index) {
     address: summary.address,
     status: state.status,
     statusNote: state.note,
-    ended: state.status === "已结束",
+    ended: state.ended,
     tone,
     shares: `${summary.sold}/${summary.totalShares}`,
     sold: summary.sold,

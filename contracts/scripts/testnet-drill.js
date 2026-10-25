@@ -180,7 +180,7 @@ async function main() {
   await (
     await campaign
       .connect(owner)
-      .placeTransistorOrder(partsAddr, NAND_QTY, UNIT_PRICE, LATCH_QTY, UNIT_PRICE)
+      .placeTransistorOrder(NAND_QTY, UNIT_PRICE, LATCH_QTY, UNIT_PRICE)
   ).wait();
   assert(Number(await campaign.phase()) === PHASE.Listed, "下单后应进入 Listed");
   const nandBidId = await campaign.nandBidId();

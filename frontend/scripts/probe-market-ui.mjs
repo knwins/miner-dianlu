@@ -3,9 +3,9 @@
  *
  * 当前测试网第 1 期处于「已结束」，无法进入挂单表单。
  * 这里改验两件事：
- *   1. 官方价格面板在「材料市场」页渲染出来了，且 NAND/LATCH 价不同
- *      （T-62 起认购页已删除该模块，市价统一在材料市场页查）
- *   2. officialPartPrices 能按处理器分别取到两种元件的价
+ *   1. 官方价格面板在「晶体管市场」页渲染出来了，且 NAND/LATCH 价不同
+ *      （T-62 起认购页已删除该模块，市价统一在晶体管市场页查）
+ *   2. officialPartPrices 能按处理器分别取到两种晶体管的价
  */
 import { createRequire } from "module";
 import { installWallet, OWNER_ADDRESS } from "./mock-wallet.mjs";
@@ -34,19 +34,19 @@ await installWallet(page, OWNER_ADDRESS);
 await page.goto(process.env.BASE || "http://127.0.0.1:4180", { waitUntil: "networkidle" });
 await page.waitForTimeout(2500);
 
-// T-62：认购页已删官方价面板，市价统一在「材料市场」页看
-const marketLink = page.locator(".nav-link-main").filter({ hasText: "材料市场" });
+// T-62：认购页已删官方价面板，市价统一在「晶体管市场」页看
+const marketLink = page.locator(".nav-link-main").filter({ hasText: "晶体管市场" });
 if (await marketLink.count()) await marketLink.first().click();
 // 链上成交价是异步取的，等久一点，避免把「读取中 / —」当成取价失败。
 await page.waitForTimeout(4500);
 
-// 材料市场页官方价
+// 晶体管市场页官方价
 const card = page.locator(".market-page .official-price-card").first();
-console.log("材料市场页官方价面板存在:", await card.count() > 0);
+console.log("晶体管市场页官方价面板存在:", await card.count() > 0);
 if (await card.count()) {
   const t = await card.innerText();
-  // 表格现在只有「元件 / 成交价」；tokenId 以 #0 / #1 后缀并入元件名。
-  // innerText 里 #0 与元件名之间没有空白（间距是 CSS margin），用 \s*。
+  // 表格现在只有「晶体管 / 成交价」；tokenId 以 #0 / #1 后缀并入晶体管名。
+  // innerText 里 #0 与晶体管名之间没有空白（间距是 CSS margin），用 \s*。
   const nand = /NAND\s*#\d+\s*([\d.]+)/.exec(t);
   const latch = /LATCH\s*#\d+\s*([\d.]+)/.exec(t);
   console.log("  NAND  成交价:", nand ? nand[1] : "?");

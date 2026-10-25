@@ -11,7 +11,7 @@ export const CHAIN_ID_HEX = "0x" + CHAIN_ID.toString(16);
 export const CAMPAIGN_ADDRESS = deployments.campaign || "";
 export const FACTORY_ADDRESS = deployments.factory || "";
 /**
- * 材料市场地址。合约侧已改名 materialMarket（T-79），部署记录里的字段名随之统一；
+ * 晶体管市场地址。合约侧已改名 materialMarket（T-79），部署记录里的字段名随之统一；
  * minter 是旧记录里的字段名，只为读旧记录兜底。
  */
 export const MATERIAL_MARKET_ADDRESS = deployments.materialMarket || deployments.minter || "";
@@ -55,8 +55,12 @@ const NETWORKS = {
 export const NETWORK = NETWORKS[CHAIN_ID] || NETWORKS[56];
 export const EXPLORER = NETWORK.explorer;
 
-export const SCENE_LABEL = ["募集中", "待执行", "挖矿中"];
-export const PHASE_LABEL = ["—", "待挂单", "挂单中", "已到账·待入池"];
+/*
+ * 状态词表统一在 ../roundState.js —— 这里只做转发，不再自己维护一份。
+ * 之前 config.js 有一套、adapter.js 有一份 note、App.jsx 又写一套，
+ * 同一个子状态在不同页面显示成四种写法。
+ */
+export { SCENE_LABEL, PHASE_LABEL } from "../roundState.js";
 
 export function explorerTx(hash) {
   return EXPLORER ? `${EXPLORER}/tx/${hash}` : "";

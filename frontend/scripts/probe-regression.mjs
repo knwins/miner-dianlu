@@ -71,7 +71,7 @@ async function probe(port) {
   await page.waitForTimeout(1200);
   const text = (await page.locator("body").innerText()).replace(/\s+/g, " ");
   for (const [word, why] of [
-    ["tapeout.net", "材料市场外链旧措辞"],
+    ["tapeout.net", "晶体管市场外链旧措辞"],
     ["可领", "BEM 可领取（已下线）"],
     ["全网日产", "日产指标（合约无此逻辑）"],
     ["待流片", "流片残留措辞"],

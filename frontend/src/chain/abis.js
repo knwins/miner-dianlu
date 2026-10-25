@@ -1,5 +1,5 @@
 // 与 contracts/contracts/Campaign.sol 对齐的最小 ABI（human-readable，ethers v6 直接可用）。
-// materialMarket() 是新代码的材料市场 getter；market() 保留给旧工厂造出来的期次
+// materialMarket() 是新代码的晶体管市场 getter；market() 保留给旧工厂造出来的期次
 // （含主网期次 #0 与测试网期次）—— 读取处的双名回退见 client.js 的 readMaterialMarket()。
 export const CAMPAIGN_ABI = [
   // ── 自动 getter（public 状态变量） ──
@@ -54,6 +54,7 @@ export const CAMPAIGN_ABI = [
   "function holderAt(uint256) view returns (address)",
   "function escrowOf(address) view returns (uint256)",
   "function refundedOf(address) view returns (uint256)",
+  "function surplusClaimedOf(address) view returns (uint256)",
   "function pendingSurplus(address) view returns (uint256)",
   "function totalPendingSurplus() view returns (uint256)",
   "function listingCount() view returns (uint256)",
@@ -68,7 +69,7 @@ export const CAMPAIGN_ABI = [
   "function listShares(uint256 count, uint256 priceBnbPerShare)",
   "function cancelListing(uint256 id)",
   "function takeListing(uint256 id, uint256 count) payable",
-  "function placeTransistorOrder(address transistors, uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
+  "function placeTransistorOrder(uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
   "function placeTransistorAsk(uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
   "function cancelTransistorAsk()",
   "function withdrawMarketProceeds()",
@@ -92,12 +93,13 @@ export const CAMPAIGN_ABI = [
   // ── 事件 ──
   "event Subscribed(address indexed subscriber, uint256 count, uint256 paidBnb)",
   "event Refunded(address indexed holder, uint256 amountBnb)",
+  "event SurplusClaimed(address indexed holder, uint256 amountBnb)",
   "event RefundSendFailed(address indexed holder, uint256 amountBnb)",
   "event Listed(uint256 indexed id, address indexed seller, uint256 count, uint256 priceBnbPerShare)",
   "event ListingTaken(uint256 indexed id, address indexed buyer, address indexed seller, uint256 count, uint256 paidBnb)",
   "event ListingCancelled(uint256 indexed id, address indexed seller, uint256 count)",
   "event ExecutionFailed(uint256 needBnb, uint256 raisedBnb)",
-  "event TransistorOrderPlaced(uint256 count, uint256 unitPriceBnb)",
+  "event TransistorOrderPlaced(uint256 count, uint256 escrowBnb)",
   "event TransistorOrderCancelled()",
   "event TransistorAskPlaced(uint256 nandQty, uint256 latchQty, uint256 nandAskId, uint256 latchAskId)",
   "event TransistorAskCancelled()",
@@ -111,9 +113,9 @@ export const CAMPAIGN_ABI = [
 ];
 
 /**
- * 材料市场 ABI。
+ * 晶体管市场 ABI。
  *
- * ⚠️ 同名事件在主网官方市场与 Mock 里的**签名不同**（2026-10-23 用 nodereal 拉
+ * ⚠️ 同名事件在主网晶体管市场与 Mock 里的**签名不同**（2026-10-23 用 nodereal 拉
  * 主网市场日志解出来的，topic0 已逐一核对）：
  *
  *   官方 BidPlaced(uint256,address,address,uint8,uint256,uint256)  0xcc402b0b…
@@ -122,9 +124,9 @@ export const CAMPAIGN_ABI = [
  *   官方 BidFilled(uint256 indexed id, address indexed seller, uint256 quantity,
  *                  uint256 proceeds, uint256 fee)                  0x8ba8eb46…
  *     —— 5 个参数；Mock 是 (id, quantity, remaining) 3 个。
- *        proceeds + fee = 买家为这批元件付出的托管额（fee 恒为 1%）。
+ *        proceeds + fee = 买家为这批晶体管付出的托管额（fee 恒为 1%）。
  *   官方 BidCancelled(uint256,uint256) 与 Mock **同签名**（0x434f4081…），只写一份。
- *   官方市场没有卖单侧（placeAsk 不存在），所以 AskPlaced / AskFilled /
+ *   晶体管市场没有卖单侧（placeAsk 不存在），所以 AskPlaced / AskFilled /
  *   AskCancelled / ProceedsWithdrawn 只有 Mock 会发。
  */
 export const MATERIAL_MARKET_ABI = [
@@ -138,7 +140,7 @@ export const MATERIAL_MARKET_ABI = [
   "function cancelBid(uint256 id)",
   "function cancelAsk(uint256 id)",
   "function withdraw()",
-  // —— 官方市场（主网 0xA6a80C19…，EIP-1967 代理）——
+  // —— 晶体管市场（主网 0xA6a80C19…，EIP-1967 代理）——
   "event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint256 price, uint256 quantity)",
   "event BidFilled(uint256 indexed id, address indexed seller, uint256 quantity, uint256 proceeds, uint256 fee)",
   "event BidCancelled(uint256 indexed id, uint256 refund)",
@@ -151,7 +153,7 @@ export const MATERIAL_MARKET_ABI = [
   "event ProceedsWithdrawn(address indexed account, uint256 amount)",
 ];
 
-/** MockERC1155 的调试入口：测试网元件由任何人 mint，用来代替卖方交割。 */
+/** MockERC1155 的调试入口：测试网晶体管由任何人 mint，用来代替卖方交割。 */
 export const MOCK_PARTS_ABI = [
   "function balanceOf(address account, uint256 id) view returns (uint256)",
   "function mint(address to, uint256 id, uint256 amount)",
@@ -163,13 +165,13 @@ export const FACTORY_ABI = [
   "function campaigns(uint256) view returns (address)",
   "function isRegistered(address campaign) view returns (bool)",
   "function materialMarket() view returns (address)",
-  // 元件白名单：工厂部署时写入，之后不可增删。白名单是安全边界 ——
+  // 晶体管白名单：工厂部署时写入，之后不可增删。白名单是安全边界 ——
   // 不在白名单里的 ERC1155 不允许开期（主网上防止把期次指向 MockERC1155）。
   "function allowedPartsCount() view returns (uint256)",
   "function allowedPartsAt(uint256) view returns (address)",
   "function isAllowedParts(address) view returns (bool)",
   // fundingSeconds 是秒，不是天：单位换算在前端做（days × 86400）。
-  // transistors 是**必选的处理器**：零地址一律 revert（工厂不再有默认元件），
+  // transistors 是**必选的处理器**：零地址一律 revert（工厂不再有默认晶体管），
   // 且必须在白名单内。开期时前端必须显式选择一个处理器。
   "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint64 fundingSeconds,address transistors) returns (address)",
   "function removeCampaign(uint256 index)",

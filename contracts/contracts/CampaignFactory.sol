@@ -70,16 +70,23 @@ contract CampaignFactory is Ownable {
     }
 
     /// @notice The index-th whitelisted parts contract. Feeds the frontend's processor picker.
+    /// @param index Position in the whitelist.
+    /// @return Parts contract at `index`; reverts IndexOutOfBounds when out of range.
     function allowedPartsAt(uint256 index) external view returns (address) {
         if (index >= _allowedParts.length) revert IndexOutOfBounds();
         return _allowedParts[index];
     }
 
     /// @notice True when `parts` is in the whitelist.
+    /// @param parts Parts contract to test.
+    /// @return Whether a round may lock that contract.
     function isAllowedParts(address parts) external view returns (bool) {
         return _isAllowed(parts);
     }
 
+    /// @dev Linear scan of the whitelist; it is written once at construction and is tiny.
+    /// @param parts Parts contract to test.
+    /// @return Whether `parts` is whitelisted.
     function _isAllowed(address parts) internal view returns (bool) {
         for (uint256 i = 0; i < _allowedParts.length; i++) {
             if (_allowedParts[i] == parts) return true;
@@ -91,11 +98,14 @@ contract CampaignFactory is Ownable {
     ///         The material market comes from the factory's immutable; the parts contract MUST be named
     ///         explicitly here — there is no factory default. The round owner may replace the material
     ///         market later via Campaign.setMaterialMarket.
-    /// @param fundingSeconds Funding length in seconds. Deadline = block.timestamp + fundingSeconds.
+    /// @param sharePriceBnb Price of one share in wei; 0 reverts ZeroCampaignParam.
+    /// @param totalShares Share cap and sell-out threshold; 0 reverts ZeroCampaignParam.
+    /// @param fundingSeconds Funding length in seconds; deadline = block.timestamp + fundingSeconds.
     ///        Seconds, not days: the deadline is packed into uint64 at creation, so the caller does the
     ///        unit conversion and no `× 1 days` can overflow before the narrowing cast.
     /// @param transistors_ Parts contract (processor). REQUIRED: address(0) reverts (no factory default)
     ///        and it must be in the whitelist. On mainnet that is the TapeOut / Behemoth parts contract.
+    /// @return campaign Address of the newly deployed round.
     function createCampaign(
         uint256 sharePriceBnb,
         uint256 totalShares,
@@ -128,12 +138,15 @@ contract CampaignFactory is Ownable {
         emit CampaignCreated(index, campaign, sharePriceBnb, totalShares, deadline);
     }
 
+    /// @notice Number of rounds in the registry; indexes run 0..campaignCount()-1.
     function campaignCount() external view returns (uint256) {
         return campaigns.length;
     }
 
     /// @notice True while `campaign` is in the registry. A retired Campaign lets anyone reclaim a stuck order.
-    ///         O(1): membership is tracked in `_registered`, so gas no longer grows with the number of campaigns.
+    ///         O(1): membership is tracked in `_registered`, so gas does not grow with the number of campaigns.
+    /// @param campaign Round to look up.
+    /// @return Whether the round is still registered.
     function isRegistered(address campaign) external view returns (bool) {
         return _registered[campaign];
     }
@@ -142,6 +155,7 @@ contract CampaignFactory is Ownable {
     ///         Does not selfdestruct the Campaign. Holders can still use the original address.
     ///         Swap-and-pop: the last address may move into the removed index. Do not cache indexes —
     ///         look a campaign up by scanning campaigns(0..campaignCount()), not by a stored index.
+    /// @param index Position in `campaigns`; reverts IndexOutOfBounds when out of range.
     function removeCampaign(uint256 index) external onlyOwner {
         uint256 len = campaigns.length;
         if (index >= len) revert IndexOutOfBounds();

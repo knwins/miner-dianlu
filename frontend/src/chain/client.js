@@ -9,6 +9,8 @@ import {
   CHAIN_ID_HEX,
   NETWORK,
   IS_CONFIGURED,
+  SCENE_LABEL,
+  PHASE_LABEL,
 } from "./config.js";
 import { discoverWallets, explainConnectError, inAppWalletName, rememberWallet, rememberedWalletId } from "./wallets.js";
 import deployments from "./deployments.json";
@@ -631,9 +633,9 @@ async function readStateOn(runner, account, campaignAddr) {
     totalRefunded, totalPendingSurplus, raisedBnb, netlistHash: null,
     soldOutAt: Number(soldOutAt), executionFailed, priceLock,
     /**
-     * 元件数 = **已成交到账量**（各腿 挂单量 − 市场 remaining），不是挂单量。
+     * 晶体管数 = **已成交到账量**（各腿 挂单量 − 市场 remaining），不是挂单量。
      * 合约在 placeTransistorOrder 就把 nandQty/latchQty 写成下单量，
-     * 拿它当「已买入」会让「等待成交」的期次显示已买到元件（数据自相矛盾）。
+     * 拿它当「已买入」会让「等待成交」的期次显示已买到晶体管（数据自相矛盾）。
      * 挂单量本身仍通过 nandQty/latchQty 暴露，供挂单进度展示。
      */
     transistorCount: Number(order.nandFilled ?? 0n) + Number(order.latchFilled ?? 0n), capped: false,
@@ -641,7 +643,7 @@ async function readStateOn(runner, account, campaignAddr) {
     minter: marketAddr, listings,
     ...order,
     pooled, miningPool,
-    // 开期即写入的元件合约优先；挂单后的 market 字段若为空也不要盖掉
+    // 开期即写入的晶体管合约优先；挂单后的 market 字段若为空也不要盖掉
     transistors: order.transistors && order.transistors !== ZeroAddress ? order.transistors : transistorsAddr,
     feeRecipient: "",
     market: marketAddr,
@@ -652,7 +654,7 @@ async function readStateOn(runner, account, campaignAddr) {
      * outstandingShares 是当前债务（已售未退）——「已售 X/Y」和退款分母都用它。
      */
     outstandingShares,
-    /** 入池后未发出去的余款池：surplusPool 是分子，surplusBase 是分母。 */
+    /** 入池后未发出去的余款池：surplusPool 是累计已记账，surplusBase 是本轮的分母。 */
     surplusPool,
     revenuePool,
     refundRatio: refundShort && outstandingShares > 0n
@@ -710,16 +712,13 @@ async function readStateOn(runner, account, campaignAddr) {
 export async function liveReadView(method, args = {}, account = null, campaignAddr = getCampaignAddress()) {
   if (!isAddr(campaignAddr)) throw new Error("未配置 Campaign");
   const state = await readState(account || args.account || null, campaignAddr);
-  const SCENE = ["募集中", "待执行", "挖矿中"];
   switch (method) {
     case "status":
     case "scene":
-      return SCENE[state.scene] || String(state.scene);
+      return SCENE_LABEL[state.scene] || String(state.scene);
     case "phase":
-    case "executePhase": {
-      const PHASE = ["无", "待挂单", "挂单中", "已到账"];
-      return PHASE[state.phase] || String(state.phase);
-    }
+    case "executePhase":
+      return PHASE_LABEL[state.phase] || String(state.phase);
     case "sold":
       return String(state.sold);
     case "outstandingShares":
@@ -832,7 +831,6 @@ export async function readHolders(campaignAddr = getCampaignAddress()) {
 }
 
 const POSITION_SCENE = ["funding", "executing", "mining"];
-const POSITION_LABEL = ["募集中", "待执行", "挖矿中"];
 
 /** 资产页：逐期读取公开状态，以及当前钱包在每一期的份数 / 可领 / 已退。addrs 为新→旧。 */
 export async function readAccountAcrossCampaigns(account, addrs) {
@@ -887,7 +885,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         id,
         address,
         scene: POSITION_SCENE[scene] || "funding",
-        sceneLabel: POSITION_LABEL[scene] || "—",
+        sceneLabel: SCENE_LABEL[scene] || "—",
         phase: ["", "buying", "listed", "ready"][phaseN] || "buying",
         sold: Number(res[1]),
         outstandingShares: Number(res[8]),
@@ -932,7 +930,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
 }
 
 /**
- * 读本期接的材料市场地址。
+ * 读本期接的晶体管市场地址。
  * 新代码 getter 是 materialMarket()；旧工厂造出来的期次（主网期次 #0、测试网期次、
  * legacyFactories 里的期次）只有 market()。两个都试，新的优先，都失败回 ZeroAddress。
  */
@@ -981,7 +979,7 @@ async function readMarketOrder(c) {
      * 所以「已经买到几颗」必须用市场剩余量反推：
      *   filled = 挂单量 − bids(id).remaining
      * 挂单还在等成交时 remaining == qty → filled = 0。
-     * 撤单后 bid id 归零、qty 也被清，此时手里还留着的元件（余额）就是当初成交到的量。
+     * 撤单后 bid id 归零、qty 也被清，此时手里还留着的晶体管（余额）就是当初成交到的量。
      */
     const filledOf = (qty, remaining, bidId, held) => {
       if (bidId !== 0n) {
@@ -1038,9 +1036,9 @@ async function readMarketAsk(c, marketAddr, transistors) {
 }
 
 /**
- * 探测材料市场**到底有没有卖单侧**。
+ * 探测晶体管市场**到底有没有卖单侧**。
  *
- * 官方市场（主网 0xA6a8…16E4）经 eth_call 核实：只有买单侧
+ * 晶体管市场（主网 0xA6a8…16E4）经 eth_call 核实：只有买单侧
  * （placeBid / cancelBid / bids / fillBid(uint256,uint256) / owed / withdraw / nextBidId / feeBps），
  * placeAsk / asks / nextAskId / cancelAsk / fillAsk 全部不存在。
  * 合约的 placeTransistorAsk / cancelTransistorAsk / confirmSale 在主网上必然 revert。
@@ -1049,7 +1047,7 @@ async function readMarketAsk(c, marketAddr, transistors) {
  * 代理合约的 fallback 会把未知 selector 都吃掉（missing revert data），
  * try/call 分不清「不存在」和「存在但报错」，所以不看调用结果。
  *
- * 注意：官方市场是 **EIP-1967 代理**，代理自身的 runtime 只有一百多字节，
+ * 注意：晶体管市场是 **EIP-1967 代理**，代理自身的 runtime 只有一百多字节，
  * selector 全在实现合约里。只扫代理地址会对任何市场都判 false（连 placeBid 都找不到），
  * 所以要先读实现槽再扫实现合约的字节码 —— 否则以后市场真的加上卖单侧，前端也永远不会放开挂卖。
  */
@@ -1129,22 +1127,22 @@ async function readAskRemaining(runner, marketAddr, id, qty) {
   }
 }
 
-// ── 材料市场（Mock）调试：查看订单簿 + 模拟卖方/买方成交 ──
+// ── 晶体管市场（Mock）调试：查看订单簿 + 模拟卖方/买方成交 ──
 const TOKEN_LABEL = ["NAND", "LATCH"];
 const shortAddr = (a) => (isAddr(a) ? `${a.slice(0, 6)}…${a.slice(-4)}` : String(a || "—"));
 
-/** 本期合约接的材料市场，并确认它带 Mock 订单簿（nextBidId / bids）。 */
+/** 本期合约接的晶体管市场，并确认它带 Mock 订单簿（nextBidId / bids）。 */
 async function marketHandle(runner, campaignAddr = getCampaignAddress()) {
   const campaign = campaignContract(runner, campaignAddr);
   const marketAddr = await readMaterialMarket(campaign);
   if (!isAddr(marketAddr) || marketAddr === ZeroAddress) {
-    throw new Error("本期合约没有配置材料市场（market 为 0）。");
+    throw new Error("本期合约没有配置晶体管市场（market 为 0）。");
   }
   const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
   try {
     await market.nextBidId();
   } catch {
-    throw new Error("这期接的材料市场没有 Mock 订单簿（nextBidId 调用失败），不能模拟撮合。");
+    throw new Error("这期接的晶体管市场没有 Mock 订单簿（nextBidId 调用失败），不能模拟撮合。");
   }
   return { campaign, market, marketAddr };
 }
@@ -1192,7 +1190,7 @@ async function readMarketOwedView(runner, campaignAddr, account) {
   return `${formatEther(await market.owed(account || campaignAddr))} BNB`;
 }
 
-// ── 待执行状态的材料市场成交记录 ──
+// ── 待执行状态的晶体管市场成交记录 ──
 const MARKET_LOG_WINDOWS = 6; // 最多回看 6 × 50k 块（约 10 天）；凑满条数会提前停
 const MARKET_LOG_SPAN = 50_000;
 /** 历史交易记录只保留最近这么多条（窄栏放不下更多，也不该翻旧账）。 */
@@ -1215,7 +1213,7 @@ async function blockTime(runner, blockNumber) {
 }
 
 /**
- * 卖单结束时间：旧版材料市场没有事件，用历史区块读 asks(id).remaining，
+ * 卖单结束时间：旧版晶体管市场没有事件，用历史区块读 asks(id).remaining，
  * 二分出 remaining 从 >0 变成 0 的区块，再取该区块时间戳。
  * 节点不支持历史状态时返回 null（前端不显示时间）。结果按「市场|订单号」缓存。
  */
@@ -1299,7 +1297,7 @@ export async function readAskSettleTimes(campaignAddr, legs) {
 }
 
 /**
- * 挂单 / 撤单 / 到账时间：旧版材料市场合约没有事件，用本期合约自己的事件补时间。
+ * 挂单 / 撤单 / 到账时间：旧版晶体管市场合约没有事件，用本期合约自己的事件补时间。
  * 返回按区块升序的标记，调用方取各类别最近一条。节点失败返回 null（前端不显示时间）。
  * 结果按「本期 + 水位区块」存 localStorage：刷新页面只补新区块，不再重扫历史。
  */
@@ -1482,8 +1480,8 @@ function buildMarketRows(parsed, me) {
     } else if (e.name === "BidFilled") {
       const meta = bidMeta.get(id) || {};
       /**
-       * 官方市场：BidFilled(id, seller, quantity, proceeds, fee) —— fee 恒 1%，
-       * 买家为这批元件付出的托管额 = proceeds + fee。
+       * 晶体管市场：BidFilled(id, seller, quantity, proceeds, fee) —— fee 恒 1%，
+       * 买家为这批晶体管付出的托管额 = proceeds + fee。
        * Mock：BidFilled(id, quantity, remaining) —— 没有金额，留空。
        */
       let amount = null;
@@ -1598,7 +1596,7 @@ function legStatus(side, qty, remaining) {
   return "filled";
 }
 
-/** 卖单 remaining 归零后，靠「元件是否已回到本期」区分成交与撤回。 */
+/** 卖单 remaining 归零后，靠「晶体管是否已回到本期」区分成交与撤回。 */
 function settleAskStatus(leg, owed, partsHeld) {
   if (leg.remaining == null || leg.remaining > 0) return leg.status;
   if (owed > 0) return "filled";
@@ -1608,7 +1606,7 @@ function settleAskStatus(leg, owed, partsHeld) {
 }
 
 /**
- * 待执行状态的材料市场成交记录：本期买单/卖单 + 成交进度 + 市场欠款。
+ * 待执行状态的晶体管市场成交记录：本期买单/卖单 + 成交进度 + 市场欠款。
  * 新版 Mock 有事件时同时返回链上流水；旧版无事件时退回按 bids/asks/owed 推导。
  */
 export async function readMarketTrades(campaignAddr = getCampaignAddress()) {
@@ -1689,7 +1687,7 @@ async function readMarketTradesOnce(campaignAddr) {
         partsNand = Number(n);
         partsLatch = Number(l);
       } catch {
-        /* 元件合约不可读时按 0 处理 */
+        /* 晶体管合约不可读时按 0 处理 */
       }
     }
 
@@ -1712,8 +1710,8 @@ async function readMarketTradesOnce(campaignAddr) {
     const confirmed = lastMark(marks, "TransistorsConfirmed");
 
     // 卖单历史：confirmSale / cancelTransistorAsk 会把 nandAskId / nandAskQty 清零，
-    // Mock 材料市场又没有事件，所以用本期合约的「挂卖」事件回放订单号与数量，
-    // 价格 / 剩余量仍以材料市场 asks(id) 为准。
+    // Mock 晶体管市场又没有事件，所以用本期合约的「挂卖」事件回放订单号与数量，
+    // 价格 / 剩余量仍以晶体管市场 asks(id) 为准。
     const askHistory = new Map();
     const askPlacedEvents = [];
     const askCancelBlocks = [];
@@ -2150,9 +2148,9 @@ async function readCampaignSummaryOn(runner, address) {
     readLegRemaining(runner, marketAddr, latchBidId, latchQtyBn).catch(() => null),
   ]);
   /**
-   * 元件数 = 已成交到账量（挂单量 − 市场剩余），不是挂单量。
+   * 晶体管数 = 已成交到账量（挂单量 − 市场剩余），不是挂单量。
    * 挂单未成交时 remaining == qty → 0；撤单后 ids/qty 归零，也就没有在途采购。
-   * 拿 nandQty + latchQty 当「已买入」会让等待成交的期次显示已买到元件。
+   * 拿 nandQty + latchQty 当「已买入」会让等待成交的期次显示已买到晶体管。
    */
   const filledOf = (qty, remaining) => (remaining == null ? 0 : Math.max(0, Number(qty) - Number(remaining)));
   const transistorCount = filledOf(nandQtyBn, nandRemaining) + filledOf(latchQtyBn, latchRemaining);
@@ -2186,7 +2184,7 @@ async function readCampaignSummaryOn(runner, address) {
   };
 }
 
-// ── 模拟材料市场对手方成交（测试网调试） ──
+// ── 模拟晶体管市场对手方成交（测试网调试） ──
 function parseUintField(raw, label, fallback = null) {
   const text = String(raw ?? "").trim();
   if (!text) {
@@ -2202,11 +2200,11 @@ async function mintPartsOrThrow(parts, buyer, tokenId, amount) {
     return await parts.mint(buyer, tokenId, amount);
   } catch (e) {
     const msg = String(e?.shortMessage || e?.message || e).slice(0, 140);
-    throw new Error(`市场已成交，但补发元件失败：${msg}。元件合约可能不是 MockERC1155，请手动 mint。`);
+    throw new Error(`市场已成交，但补发晶体管失败：${msg}。晶体管合约可能不是 MockERC1155，请手动 mint。`);
   }
 }
 
-/** 卖方成交一张买单：fillBid 扣减剩余，再把元件 mint 给买家（MockERC1155.mint 公开）。 */
+/** 卖方成交一张买单：fillBid 扣减剩余，再把晶体管 mint 给买家（MockERC1155.mint 公开）。 */
 async function fillBidWithParts(signer, bidId, quantity) {
   const { market } = await marketHandle(signer);
   const id = parseUintField(bidId, "买单 ID");
@@ -2219,7 +2217,7 @@ async function fillBidWithParts(signer, bidId, quantity) {
   return mintPartsOrThrow(parts, bid.buyer, bid.tokenId, qty);
 }
 
-/** 一键撮合本期全部买单：两条腿都 fillBid 并补齐元件，随后可直接 confirmTransistors。 */
+/** 一键撮合本期全部买单：两条腿都 fillBid 并补齐晶体管，随后可直接 confirmTransistors。 */
 async function fillCampaignBids(signer) {
   const c = signerOrThrow(signer);
   const { market } = await marketHandle(signer);
@@ -2236,7 +2234,7 @@ async function fillCampaignBids(signer) {
       await fill.wait();
       last = fill;
     }
-    // 元件按「本期还缺多少」补，不按买单剩余量补。
+    // 晶体管按「本期还缺多少」补，不按买单剩余量补。
     // 买单可能已经被别的路径成交（remaining 已是 0）却没发货，此时仍要 mint 才能 confirmTransistors。
     const tokenAddr = bid.transistors && bid.transistors !== ZeroAddress ? bid.transistors : await c.transistors();
     const parts = new Contract(tokenAddr, MOCK_PARTS_ABI, signer);
@@ -2248,11 +2246,11 @@ async function fillCampaignBids(signer) {
       last = minted;
     }
   }
-  if (!last) throw new Error("本期买单已全部成交且元件已到账，直接点「确认到账」即可");
+  if (!last) throw new Error("本期买单已全部成交且晶体管已到账，直接点「确认到账」即可");
   return last;
 }
 
-/** 买方吃掉一张卖单：按卖单价付 BNB，元件进入当前钱包。 */
+/** 买方吃掉一张卖单：按卖单价付 BNB，晶体管进入当前钱包。 */
 async function fillAskAsBuyer(signer, askId, quantity) {
   const { market } = await marketHandle(signer);
   const id = parseUintField(askId, "卖单 ID");
@@ -2301,8 +2299,8 @@ export const tx = {
   listShares: (signer, count, price) => signerOrThrow(signer).listShares(count, price),
   cancelListing: (signer, id) => signerOrThrow(signer).cancelListing(id),
   takeListing: (signer, id, count, valueWei) => signerOrThrow(signer).takeListing(id, count, { value: valueWei }),
-  placeTransistorOrder: (signer, transistors, nandQty, nandPrice, latchQty, latchPrice) =>
-    signerOrThrow(signer).placeTransistorOrder(transistors, nandQty, nandPrice, latchQty, latchPrice),
+  placeTransistorOrder: (signer, nandQty, nandPrice, latchQty, latchPrice) =>
+    signerOrThrow(signer).placeTransistorOrder(nandQty, nandPrice, latchQty, latchPrice),
   placeTransistorAsk: (signer, nandQty, nandPrice, latchQty, latchPrice) =>
     signerOrThrow(signer).placeTransistorAsk(nandQty, nandPrice, latchQty, latchPrice),
   cancelTransistorAsk: (signer) => signerOrThrow(signer).cancelTransistorAsk(),
@@ -2318,7 +2316,7 @@ export const tx = {
     throw new Error("这期是旧合约，链上没有 Owner 直接退款。重新部署工厂后，新开的期才能退款。");
   },
   /**
-   * 确认到账后立刻把没花完的募集款按份退回（不结束本期、元件留在合约、之后仍可 depositToPool）。
+   * 确认到账后立刻把没花完的募集款按份退回（不结束本期、晶体管留在合约、之后仍可 depositToPool）。
    * 老期次合约没有这个函数：它们只能在入池时把余款记账，由持份人 claimSurplus 领。
    */
   returnSurplus: async (signer) => {
@@ -2409,11 +2407,11 @@ export async function readFactoryOwner() {
 
 
 /**
- * 读工厂的元件合约白名单（部署时写入、之后不可增删）。
+ * 读工厂的晶体管合约白名单（部署时写入、之后不可增删）。
  *
  * 这是安全边界，不是运营开关：主网上防止 owner 把期次指向
- * MockERC1155（其 mint 无访问控制，任何人能无限造元件，
- * 「元件已到账」的检查形同虚设）。所以开期表单的可选处理器
+ * MockERC1155（其 mint 无访问控制，任何人能无限造晶体管，
+ * 「晶体管已到账」的检查形同虚设）。所以开期表单的可选处理器
  * 应该**从链上白名单生成**，而不是硬编码前端列表。
  *
  * 读不到就返回空数组，UI 如实显示「未配置白名单」，不拿前端列表冒充链上事实。
@@ -2440,11 +2438,11 @@ export async function readAllowedParts() {
  */
 /**
  * 开期：预检 Owner → staticCall → 发交易 → 解析新地址（事件失败则读 campaigns[n-1]）。
- * 当前工厂开期需 份额单价 / 总份数 / 募集天数 / 元件合约 四个参数；
- * 材料市场由工厂默认写入（不可变）。
+ * 当前工厂开期需 份额单价 / 总份数 / 募集天数 / 晶体管合约 四个参数；
+ * 晶体管市场由工厂默认写入（不可变）。
  *
- * 元件合约（第 4 参 transistors）是**必选的处理器**：零地址一律 revert（工厂不再有默认元件），
- * 且必须在工厂白名单内（主网白名单 = 官方两件套 TapeOut / Behemoth 的元件合约）。
+ * 晶体管合约（第 4 参 transistors）是**必选的处理器**：零地址一律 revert（工厂不再有默认晶体管），
+ * 且必须在工厂白名单内（主网白名单 = 官方两件套 TapeOut / Behemoth 的晶体管合约）。
  * 白名单是安全边界：不在白名单里的 ERC1155 会被工厂直接拒绝。
  * 开期人必须在前端从白名单里显式选一个——前端不允许留空（见 App.chainCreateCampaign 的预校验）。
  */
@@ -2454,7 +2452,7 @@ const CREATE_CURRENT =
 const SECONDS_PER_DAY = 86400;
 
 function createArgs(params) {
-  // 开期需 份额单价 / 总份数 / 募集天数 / 元件合约。
+  // 开期需 份额单价 / 总份数 / 募集天数 / 晶体管合约。
   // 单价以 BNB（十进制）传入，这里转 wei；
   // 天数在这里换成秒——工厂收 fundingSeconds，不再自己做 × 1 days。
   const sharePriceWei = params.sharePriceWei != null
@@ -2464,7 +2462,7 @@ function createArgs(params) {
   const fundingSeconds = params.fundingSeconds != null
     ? BigInt(params.fundingSeconds)
     : BigInt(Math.max(1, Math.trunc(days)) * SECONDS_PER_DAY);
-  // 元件合约（处理器）：必选，原样透传。空串/零地址会触发工厂 revert（前端已预校验必选）。
+  // 晶体管合约（处理器）：必选，原样透传。空串/零地址会触发工厂 revert（前端已预校验必选）。
   const transistorsArg = String(params.transistors || "").trim();
   return [sharePriceWei, params.totalShares, fundingSeconds, transistorsArg];
 }
@@ -2605,19 +2603,19 @@ function explainParsed(parsed) {
     return "这期是旧版合约，时间锁尚未到期。可稍后再试，或换到已去掉时间锁的新工厂开期。";
   }
   if (parsed?.name === "TransistorsNotReady") {
-    return "晶体管还没到账，不能确认/入池：买单需全部成交，且 NAND / LATCH 元件要真的在本期合约里（成交后卖家没发货也会这样）。";
+    return "晶体管还没到账，不能确认/入池：买单需全部成交，且 NAND / LATCH 晶体管要真的在本期合约里（成交后卖家没发货也会这样）。";
   }
   if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步。挂单中请先取消；已确认到账的旧期不能再挂卖或退款。";
-  if (parsed?.name === "AlreadyReady") return "本期已确认到账。元件锁在合约里，不能单独取出。这一期只能入池。";
+  if (parsed?.name === "AlreadyReady") return "本期已确认到账。晶体管锁在合约里，不能单独取出。这一期只能入池。";
   if (parsed?.name === "AlreadyAsked") return "还有未结算的卖单，先取消剩余或确认卖出。";
   if (parsed?.name === "NotAsked") return "当前没有可确认的卖单。";
   if (parsed?.name === "OrderFilled") return "买单已全部成交，不能再取消。";
-  if (parsed?.name === "InsufficientParts") return "合约里的元件数量不够。";
+  if (parsed?.name === "InsufficientParts") return "合约里的晶体管数量不够。";
   if (parsed?.name === "CanStillAfford") return "按当前报价还能买得起晶体管，旧合约不允许退款";
   if (parsed?.name === "WrongTransistors") {
-    return "元件合约地址与本期锁定的元件合约不一致。用本期 transistors() 读到的地址重试。";
+    return "晶体管合约地址与本期锁定的不符。旧版合约的挂单接口要显式传地址；当前界面只对新版合约（开期已锁定）下单。";
   }
-  if (parsed?.name === "ZeroAddress") return "地址不能为零地址（材料市场 / 元件合约 / 矿池 / 收款地址）";
+  if (parsed?.name === "ZeroAddress") return "地址不能为零地址（晶体管市场 / 晶体管合约 / 矿池 / 收款地址）";
   if (parsed?.name) return `合约拒绝：${parsed.name}`;
   return "";
 }
@@ -2644,7 +2642,7 @@ function decodeRevert(err, iface) {
     if (text) return text;
   }
   if (/no data present/i.test(raw)) {
-    return "合约拒绝了这笔交易，钱包没有带回具体原因。若是发布或挂单/入池，请确认当前钱包权限与元件子态后再试。";
+    return "合约拒绝了这笔交易，钱包没有带回具体原因。若是发布或挂单/入池，请确认当前钱包权限与晶体管子态后再试。";
   }
   if (/missing revert data/i.test(raw)) {
     return "节点没有带回失败原因（missing revert data）。开期请确认钱包 BSC 节点是 https://bsc-rpc.publicnode.com，不要用已超额的 1rpc。";

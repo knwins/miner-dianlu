@@ -11,12 +11,11 @@ contract MockERC1155 {
     error MockOnMainnet();
 
     constructor() {
-        // 最后一道防线：测试替身绝不能出现在 BSC 主网（chainId 56）。
-        //
-        // 这个 mock 的 mint 没有任何访问控制——一旦它成为某期的 transistors，
-        // 任何地址都能无限造 NAND / LATCH，「元件已到账」的检查随之失效，
-        // 期次可以在零真实采购的情况下被推进到挖矿。
-        // 部署到主网时直接失败并烧掉 gas，比留下一个「看起来正常」的假市场安全得多。
+        // Last line of defence: this test double must never exist on BSC mainnet (chainId 56).
+        // mint() has no access control, so if it ever became a round's transistors contract, anyone
+        // could create unlimited NAND / LATCH, the "parts arrived" checks would be meaningless and a
+        // round could reach Mining with zero real purchase. Reverting here burns gas but is far safer
+        // than leaving a mock that looks functional.
         if (block.chainid == 56) revert MockOnMainnet();
     }
 

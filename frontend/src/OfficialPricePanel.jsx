@@ -1,17 +1,17 @@
 /**
- * 官方处理器 · 元件市价面板。
+ * 官方处理器 · 晶体管市价面板。
  *
  * 展示 TapeOut / Behemoth 各自的 NAND 与 LATCH 市价（BNB/颗），
- * 数据优先读链上官方市场的活跃买单，成交事件补位，market.json 兜底，静态基准再兜底。
+ * 数据优先读链上晶体管市场的活跃买单，成交事件补位，market.json 兜底，静态基准再兜底。
  *
  * 口径说明（面板里也写清楚了，避免被当成链上结算价）：
- *   - 市价优先取最近一笔链上成交单价；官方市场成交很稀疏，没有成交时取
+ *   - 市价优先取最近一笔链上成交单价；晶体管市场成交很稀疏，没有成交时取
  *     当前最高的未成交买价（读 `bids(id)` 得到，见 officialPrices.js）。
  *   - 这不是**本期**的挂单价；本期真实成本以链上 Campaign 记录为准。
  *
  * ── 两种形态 ──
  *   - compact（开期表单 / Owner 弹窗）：只显示当前期次那一组，价格用紧凑表格。
- *   - full（材料市场页）：行情看板 —— 每个处理器一张卡，单价是卡里的主角
+ *   - full（晶体管市场页）：行情看板 —— 每个处理器一张卡，单价是卡里的主角
  *     （28px 数字 + 单位），处理器名 / 每颗算力 P 退到卡头，地址与白名单退到卡脚。
  *
  *   之前 full 形态和 compact 共用同一张 12px 表格：价格、地址、白名单全是同一号字，
@@ -70,7 +70,7 @@ export function OfficialPricePanel({
   processorId = null,
   compact = false,
   full = false,
-  title = "官方元件最新价",
+  title = "官方晶体管最新价",
   badge = null,
   renderFacts = null,
 }) {
@@ -95,7 +95,7 @@ export function OfficialPricePanel({
   const genText = snapshotTimeText(official?.generatedAt);
   const block = Number(official?.lastBlock) || 0;
   const statusText = official?.ok
-    ? (genText ? `官方市场快照 · ${genText}` : "官方市场快照")
+    ? (genText ? `晶体管市场快照 · ${genText}` : "晶体管市场快照")
     : official?.error
       ? "读取失败"
       : "读取中…";
@@ -146,13 +146,13 @@ export function OfficialPricePanel({
                   <div className="price-board-prices">
                     {g.items.map(({ model, row }) => {
                       // 成交价优先，没有成交时退回「当前最高未成交买价」——
-                      // 官方市场成交很稀疏，常态下挂单才是稳定的价源。
+                      // 晶体管市场成交很稀疏，常态下挂单才是稳定的价源。
                       const price = row?.last != null ? row.last : row?.bid != null ? row.bid : null;
                       return (
                         <div className="price-cell" key={model.id}>
                           {/*
                             tokenId 只有固定两值（NAND=0 / LATCH=1），
-                            作为元件名后缀带着走，不单独占一行。
+                            作为晶体管名后缀带着走，不单独占一行。
                           */}
                           <span className="price-cell-label">
                             {model.part}
@@ -190,7 +190,7 @@ export function OfficialPricePanel({
                 <table className="official-price-table">
                   <thead>
                     <tr>
-                      <th>元件</th>
+                      <th>晶体管</th>
                       {/*
                         列头不写「成交价」：这一列优先取最近成交价，没有成交时取
                         当前最高买价，写死「成交价」会与实际口径不符。
@@ -238,7 +238,7 @@ export function OfficialPricePanel({
 }
 
 /**
- * 单个元件的官方价（BNB/颗），没有则 null。
+ * 单个晶体管的官方价（BNB/颗），没有则 null。
  * 供表单做「填入市价」按钮用。
  */
 export function officialUnitPrice(official, transistorId) {

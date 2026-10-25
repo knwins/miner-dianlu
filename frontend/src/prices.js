@@ -1,21 +1,21 @@
 /**
- * 元件目录与本地区块报价。
+ * 晶体管目录与本地区块报价。
  *
  * ══════════════════════════════════════════════════════════════
  * 这里**只做数据**，不做取价。
  * ══════════════════════════════════════════════════════════════
  *
  * 前端不再直接读取价格：实时取价、跨域代理、轮询、涨跌高亮这一整套
- * 已经全部删除。页面上的元件单价只有两个来源：
+ * 已经全部删除。页面上的晶体管单价只有两个来源：
  *
  *   1. 链上实读：Campaign 记录了 Owner 实际挂单/成交的单价
  *      （nandPrice / latchPrice / nandAskPrice / latchAskPrice），
  *      这是权威值，由 chain/adapter 写进 book。
  *   2. 本文件的 NOMINAL_QUOTE：开期测算用的**静态基准价**，
- *      仅当链上还没有任何单价时兜底，用来把「募资总额能买多少元件」
+ *      仅当链上还没有任何单价时兜底，用来把「募资总额能买多少晶体管」
  *      这类预估算出来。它不是行情，不会自己变动。
  *
- * 需要看真实行情时，去材料市场页或区块浏览器，本项目前端不再代拉。
+ * 需要看真实行情时，去晶体管市场页或区块浏览器，本项目前端不再代拉。
  */
 
 import { MINE_GATE_LIMIT } from "./emission.js";
@@ -23,14 +23,14 @@ import { MINE_GATE_LIMIT } from "./emission.js";
 /* ────────────────────────── 品类定义 ────────────────────────── */
 
 /**
- * 官方处理器（材料市场 / 元件市场支持的处理器）。
+ * 官方处理器（晶体管市场支持的处理器）。
  *
  * ⚠️ **「在售」与「可挖矿」是两件事，不要混在一起**：
  *   TapeOut(P=1) / Behemoth(P=6)  有挖矿产出资格。
  *
  * T-59：官方创世基线 **Genesis CPU**（官方 mining 合约 processorMultiplier = 0，
  * 永远不出矿）已从本项目**整体移除**（安全 + 容量考虑：不能出矿的处理器
- * 一旦开期，用户花钱买的元件既不产生收益、又没有官方挖矿背书）。
+ * 一旦开期，用户花钱买的晶体管既不产生收益、又没有官方挖矿背书）。
  * 移除后官方只剩**两个**可挖矿处理器。
  *
  * `mineable` 字段保留为**声明式防御**：它与 MINEABLE_PROCESSORS 白名单一起，
@@ -62,14 +62,14 @@ export const MINEABLE_PROCESSORS = Object.freeze(
   Object.keys(PROCESSORS).filter((id) => PROCESSORS[id].mineable),
 );
 
-/** 元件类型。NAND 与 LATCH 权重相同（都是 1），区别在面积与市场价格。 */
+/** 晶体管类型。NAND 与 LATCH 权重相同（都是 1），区别在面积与市场价格。 */
 export const PARTS = {
   NAND: { id: "NAND", name: "NAND", areaWeight: 1, desc: "与非门，负责逻辑运算" },
   LATCH: { id: "LATCH", name: "LATCH", areaWeight: 6, desc: "锁存器，负责保存状态" },
 };
 
 /**
- * 元件单价的显示格式化（BNB/颗）。
+ * 晶体管单价的显示格式化（BNB/颗）。
  *
  * ⚠️ **不能统一用 toFixed(5)**：官方处理器的价差跨了数量级——
  *   Behemoth NAND  ≈ 0.601
@@ -88,10 +88,10 @@ export function formatUnitPrice(v) {
 }
 
 /**
- * 四种「处理器 × 元件」组合，对应官方材料市场的两个元件合约。
+ * 四种「处理器 × 晶体管」组合，对应官方晶体管市场的两个晶体管合约。
  *
  * ⚠️ **能买到 ≠ 能挖矿**。这四条（两个可挖矿处理器 × NAND/LATCH）都具备挖矿资格。
- * T-59：Genesis CPU 的两条元件记录已删除（不能出矿，不再作为可开期的元件来源）。
+ * T-59：Genesis CPU 的两条晶体管记录已删除（不能出矿，不再作为可开期的晶体管来源）。
  *
  * priceBnb 是**名义采购价**（BNB 计价），只用于链上没有单价时做开期测算，
  * 不代表市场现价；真实成本以 Campaign 记录的挂单/成交单价为准。
@@ -146,7 +146,7 @@ export function findTransistor(id) {
 }
 
 /**
- * 找到同一处理器下的**另一类**元件型号（NAND ↔ LATCH）。
+ * 找到同一处理器下的**另一类**晶体管型号（NAND ↔ LATCH）。
  *
  * ⚠️ 这里必须是按数据查表，不能写成
  * `processor === "Behemoth" ? "BEHEMOTH_LATCH" : "TAPE_OUT_LATCH"`
@@ -162,7 +162,7 @@ export function siblingTransistor(model) {
   );
 }
 
-/** 该处理器下的全部元件型号（NAND + LATCH），用于 UI 展示与遍历 */
+/** 该处理器下的全部晶体管型号（NAND + LATCH），用于 UI 展示与遍历 */
 export function transistorsOf(processor) {
   return TRANSISTORS.filter((t) => t.processor === processor);
 }
@@ -179,7 +179,7 @@ export function isMineable(processor) {
 }
 
 /**
- * 每颗元件的算力权重。
+ * 每颗晶体管的算力权重。
  * ⚠️ 不能用 `|| 1`：某处理器的官方倍数可能是 **0**，写成 `|| 1` 会把它
  * 悄悄变成 1，算出「有产出」的假象。用 ?? 只兜底「查不到」的情况。
  */
@@ -238,7 +238,7 @@ export function quoteOf(snapshot) {
   return NOMINAL_QUOTE;
 }
 
-/** 单个元件的价格口径：快照价 → 目录基准价。 */
+/** 单个晶体管的价格口径：快照价 → 目录基准价。 */
 export function priceOf(transistorId, snapshot) {
   return quoteOf(snapshot).prices?.[transistorId] ?? findTransistor(transistorId).priceBnb;
 }
@@ -246,15 +246,15 @@ export function priceOf(transistorId, snapshot) {
 /* ───────────────────────── 成本测算 ───────────────────────── */
 
 /**
- * 按「元件数量 + 选定元件」算出这一期的全部参数。
+ * 按「晶体管数量 + 选定晶体管」算出这一期的全部参数。
  *
- * 元件数由开期人直接决定（就是链上 placeTransistorOrder 的数量），
- * 元件单价决定真实采购成本，两者相乘才是这一期的实际支出。
- * 募资总额因此是元件数量的反向决定因素：要烧更多颗，募集就得跟着涨。
+ * 晶体管数由开期人直接决定（就是链上 placeTransistorOrder 的数量），
+ * 晶体管单价决定真实采购成本，两者相乘才是这一期的实际支出。
+ * 募资总额因此是晶体管数量的反向决定因素：要烧更多颗，募集就得跟着涨。
  *
  * @param {object} params
- * @param {number} params.parts       元件总数（NAND + LATCH）。必须是正整数。
- * @param {string} params.transistorId 元件组合
+ * @param {number} params.parts       晶体管总数（NAND + LATCH）。必须是正整数。
+ * @param {string} params.transistorId 晶体管组合
  * @param {object} params.snapshot    报价（缺省 = 静态基准）
  * @param {number} [params.latchRatio] LATCH 占比（默认 0.2；时序构成可传 0.5）
  */
@@ -264,7 +264,7 @@ export function planTask({ parts, transistorId, snapshot, latchRatio }) {
   const P = processorScale(processor);
 
   /**
-   * 元件总数。
+   * 晶体管总数。
    *
    * 只接受正整数；非法值（0/负数/小数/非数字）退回 1。
    * 不能让 0 变成免费矿机，也不能静默把 12.5 取整成 13——
@@ -277,7 +277,7 @@ export function planTask({ parts, transistorId, snapshot, latchRatio }) {
   /**
    * NAND / LATCH 按比例拆分。
    * 同处理器的 NAND 与 LATCH 共用同一个合约地址，只差 tokenId，
-   * 所以「选哪种元件」不是二选一，而是**按配比分别采购**。
+   * 所以「选哪种晶体管」不是二选一，而是**按配比分别采购**。
    * NAND 吸收四舍五入的差值，保证两类之和恰好等于总数。
    */
   const ratio = latchRatio ?? 0.2;
@@ -286,14 +286,14 @@ export function planTask({ parts, transistorId, snapshot, latchRatio }) {
 
   const sibling = siblingTransistor(model);
   /**
-   * 两种元件分别按各自单价计价（NAND 与 LATCH 市价不同，Behemoth 差距尤其大）。
+   * 两种晶体管分别按各自单价计价（NAND 与 LATCH 市价不同，Behemoth 差距尤其大）。
    *
    * 这里刻意按 part 归位而不是按「型号自身 / 另一类」——
    * 后者会让 priceNand 在传入 LATCH 型号时变成 LATCH 的价，字段名与内容对不上。
    */
   const priceMain = priceOf(model.id, snapshot);
   const priceOther = priceOf(sibling.id, snapshot);
-  /** 按元件种类归位的单价，键就是 PARTS 的 id */
+  /** 按晶体管种类归位的单价，键就是 PARTS 的 id */
   const priceByPart = {
     NAND: model.part === "NAND" ? priceMain : priceOther,
     LATCH: model.part === "LATCH" ? priceMain : priceOther,
@@ -303,10 +303,10 @@ export function planTask({ parts, transistorId, snapshot, latchRatio }) {
   const partsCost = costNand + costLatch;
 
   /**
-   * 权重：H = b* × P，P 为该处理器的每颗元件算力。
+   * 权重：H = b* × P，P 为该处理器的每颗晶体管算力。
    *
-   * 工本权重 b* 就是元件数量——烧多少颗就有多少算力，
-   * 这是开期人调元件数能提高产出的原理。
+   * 工本权重 b* 就是晶体管数量——烧多少颗就有多少算力，
+   * 这是开期人调晶体管数能提高产出的原理。
    * 没有「设计溢价」：算力全部来自工本权重，没有可参照的外部难度系数。
    */
   const q = 1;
@@ -319,7 +319,7 @@ export function planTask({ parts, transistorId, snapshot, latchRatio }) {
 
   /**
    * 挖矿闸门：面积超上限的期次只能进未验证池（分 1%）。
-   * 闸门按面积而不是按元件数判定——LATCH 占 6 倍面积，同为 100 颗也可能一个过一个不过。
+   * 闸门按面积而不是按晶体管数判定——LATCH 占 6 倍面积，同为 100 颗也可能一个过一个不过。
    */
   const capped = area > MINE_GATE_LIMIT;
 
@@ -327,18 +327,18 @@ export function planTask({ parts, transistorId, snapshot, latchRatio }) {
     model,
     processor,
     processorScale: P,
-    /** 按元件种类归位的单价（BNB/个）—— 键就是 PARTS 的 id */
+    /** 按晶体管种类归位的单价（BNB/个）—— 键就是 PARTS 的 id */
     priceByPart,
     /** NAND 单价（BNB/个）。与型号无关，传 LATCH 型号时也是 NAND 的价 */
     priceNand: priceByPart.NAND,
     /** LATCH 单价（BNB/个） */
     priceLatch: priceByPart.LATCH,
-    /** 另一类元件的单价 —— 兼容旧字段，等于 priceLatch */
+    /** 另一类晶体管的单价 —— 兼容旧字段，等于 priceLatch */
     priceSibling: priceOther,
     /** 型号自身那一类的单价 */
     priceMain,
     priceOther,
-    /** 两种元件各自的造价小计（BNB），相加等于 partsCost */
+    /** 两种晶体管各自的造价小计（BNB），相加等于 partsCost */
     costBreakdown: {
       NAND: { count: nand, price: priceByPart.NAND, cost: costNand },
       LATCH: { count: latch, price: priceByPart.LATCH, cost: costLatch },
@@ -346,9 +346,9 @@ export function planTask({ parts, transistorId, snapshot, latchRatio }) {
     nand,
     latch,
     latchRatio: ratio,
-    /** 实际元件总数（= nand + latch） */
+    /** 实际晶体管总数（= nand + latch） */
     totalParts,
-    /** 元件总价（BNB）—— 真正的采购成本 */
+    /** 晶体管总价（BNB）—— 真正的采购成本 */
     partsCost,
     q,
     baseWeight,
@@ -375,18 +375,18 @@ const PRICE_TIERS = [0.05, 0.1, 0.25, 0.5, 0.685, 1, 2.5, 5, 10];
  * 之前只倒推份数、保留手填单价，导致每份 BNB 是一个没有依据的孤立数字——
  * 用户得自己猜「0.685 是怎么来的」。这里把两个参数当成一个整体来设计：
  *
- *   1. 目标募资总额 = 元件成本 / 理想占比（默认 45%，落在健康区间 20%-75% 的中部）
+ *   1. 目标募资总额 = 晶体管成本 / 理想占比（默认 45%，落在健康区间 20%-75% 的中部）
  *   2. 每份 BNB 从常见档位里选**不超过**目标募资总额除以最小份数的最大档，
  *      避免出现「份数只有 3 份」这种没法分的方案
  *   3. 总份数 = 目标募资总额 / 每份，向上取整到 5 的倍数（份数好数）
- *   4. 校验：份数 × 单价 必须仍 ≥ 元件成本，否则补份数
+ *   4. 校验：份数 × 单价 必须仍 ≥ 晶体管成本，否则补份数
  *
  * 募资总额与成本同为 BNB 计价，全程不需要汇率换算。
  */
 export function designOffering({ parts, transistorId, snapshot, targetRatio = COST_RATIO_IDEAL, latchRatio = null }) {
   const plan = planTask({ parts, transistorId, snapshot, latchRatio });
   const cost = plan.partsCost;
-  // 目标募资总额：让元件成本正好落在理想占比上
+  // 目标募资总额：让晶体管成本正好落在理想占比上
   const targetCap = cost > 0 ? cost / targetRatio : 0;
   const minShares = 20;
 
@@ -412,10 +412,10 @@ export function designOffering({ parts, transistorId, snapshot, targetRatio = CO
   const actualRatio = hardCapBnb > 0 ? cost / hardCapBnb : Infinity;
   /**
    * 占比下限：受两个硬约束挤压——
-   *   - 元件数由开期人选定，不能靠选型调高成本
+   *   - 晶体管数由开期人选定，不能靠选型调高成本
    *   - 募资总额有下限（minShares × 最低档单价）
-   * 两者一夹，元件数太少就必然落在健康区间下方。这不是算法的缺陷，
-   * 而是「这个元件数不该开一期」的事实，必须如实报出来而不是掩盖。
+   * 两者一夹，晶体管数太少就必然落在健康区间下方。这不是算法的缺陷，
+   * 而是「这个晶体管数不该开一期」的事实，必须如实报出来而不是掩盖。
    */
   const floorCap = minShares * PRICE_TIERS[0];
   const bestRatio = floorCap > 0 ? cost / floorCap : Infinity;
@@ -423,7 +423,7 @@ export function designOffering({ parts, transistorId, snapshot, targetRatio = CO
 
   return {
     plan,
-    /** 实际生效的元件数（非法输入时已退回 1，与 plan.totalParts 同源） */
+    /** 实际生效的晶体管数（非法输入时已退回 1，与 plan.totalParts 同源） */
     parts: plan.totalParts,
     /** 每份 BNB（取自常见档位） */
     sharePriceBnb,
@@ -431,13 +431,13 @@ export function designOffering({ parts, transistorId, snapshot, targetRatio = CO
     totalShares,
     /** 实际募资总额 = 份数 × 单价 */
     hardCapBnb: round4(hardCapBnb),
-    /** 目标募资总额：元件成本 ÷ 理想占比，用于手动改份数后倒推单价 */
+    /** 目标募资总额：晶体管成本 ÷ 理想占比，用于手动改份数后倒推单价 */
     targetCapBnb: round4(targetCap),
-    /** 元件采购成本（BNB） */
+    /** 晶体管采购成本（BNB） */
     costBnb: round4(cost),
     /** 成本占募资总额比例 */
     costRatio: round4(actualRatio),
-    /** 元件涨价多少倍就不再够买 */
+    /** 晶体管涨价多少倍就不再够买 */
     priceTolerance: cost > 0 ? round4(hardCapBnb / cost) : 0,
     /** 采购后余量 */
     marginBnb: round4(hardCapBnb - cost),
@@ -445,7 +445,7 @@ export function designOffering({ parts, transistorId, snapshot, targetRatio = CO
     healthy: actualRatio >= COST_RATIO_MIN && actualRatio <= COST_RATIO_MAX,
     /** 占比过高（风险薄） */
     tooRisky: actualRatio > COST_RATIO_MAX,
-    /** 元件太少：即使压到最低募资总额，成本占比也够不到健康下限 */
+    /** 晶体管太少：即使压到最低募资总额，成本占比也够不到健康下限 */
     tooSmall: cappedByTiers,
     /** 该题能达到的最好占比（上限），用于解释为什么够不到 */
     bestRatio: round4(bestRatio),
@@ -474,18 +474,18 @@ export const COST_RATIO_IDEAL = 0.45;
  *
  * 所以真正的选择维度只有一个：**用哪个处理器烧**。
  *
- *   Behemoth(P=6)：权重是 TapeOut 的 6 倍，但元件贵约 7.5 倍
- *   TapeOut (P=1)：元件便宜，权重低
+ *   Behemoth(P=6)：权重是 TapeOut 的 6 倍，但晶体管贵约 7.5 倍
+ *   TapeOut (P=1)：晶体管便宜，权重低
  *
  * T-59：官方 Genesis CPU（P=0，永远不出矿）已整体移除，不再作为可选处理器。
  */
 
 /**
- * 处理器 -> 代表性元件id。
+ * 处理器 -> 代表性晶体管id。
  * 只取 NAND 作代表：成本/权重在 planTask 里按 NAND:LATCH 配比混合计算，选谁当代表都不影响结果。
  *
  * ⚠️ 查表而不是三元表达式：写死 `processor === "TapeOut" ? ... : "BEHEMOTH_NAND"`
- * 会在处理器数量变化后把新处理器错认成 Behemoth（元件价差可达数千倍）。
+ * 会在处理器数量变化后把新处理器错认成 Behemoth（晶体管价差可达数千倍）。
  */
 export function transistorIdFor(processor) {
   return transistorsOf(processor)[0]?.id || DEFAULT_TRANSISTOR;
@@ -500,7 +500,7 @@ export const PROCESSOR_IDS = ["Behemoth", "TapeOut"];
 
 
 /**
- * 反向：给定募资总额，推荐能负担的元件数量区间。
+ * 反向：给定募资总额，推荐能负担的晶体管数量区间。
  * 用于开期页在募资总额固定时给出「大概能烧多少颗」的范围。
  */
 export function suggestPartRange({ hardCapBnb, snapshot, transistorId }) {
