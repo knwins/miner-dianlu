@@ -56,10 +56,13 @@ contract CampaignFactory is Ownable {
     ///        (TapeOut / Behemoth). On testnets it is the mock parts contract.
     constructor(address materialMarket_, address[] memory allowedParts_) Ownable(msg.sender) {
         if (materialMarket_ == address(0)) revert ZeroAddress();
+        // A codeless market or parts contract would make every external call revert with empty
+        // returndata, bricking cancels / refunds for every round. Reject it at deploy time.
+        if (materialMarket_.code.length == 0) revert ZeroAddress();
         if (allowedParts_.length == 0) revert EmptyWhitelist();
         materialMarket = materialMarket_;
         for (uint256 i = 0; i < allowedParts_.length; i++) {
-            if (allowedParts_[i] == address(0)) revert ZeroAddress();
+            if (allowedParts_[i] == address(0) || allowedParts_[i].code.length == 0) revert ZeroAddress();
             _allowedParts.push(allowedParts_[i]);
         }
     }

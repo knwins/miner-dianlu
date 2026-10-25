@@ -279,7 +279,7 @@ export default function App() {
     const WRITE_METHODS = [
       "subscribe", "listShares", "cancelListing", "takeListing", "refund", "claimSurplus",
       "placeTransistorOrder", "cancelTransistorOrder", "placeTransistorAsk", "cancelTransistorAsk", "confirmSale", "setPhase",
-      "withdrawMarketProceeds", "confirmTransistors", "setPlan", "setMiningPool", "depositToPool", "returnSurplus",
+      "withdrawMarketProceeds", "confirmTransistors", "setPlan", "setMiningPool", "depositToPool", "returnSurplus", "topUpShortfall",
       "simulateFillBid", "simulateFillAsk", "simulateFillCampaignBids", "simulateFillCampaignAsks",
       "createCampaign", "openRefund", "abandonOrder", "markFailed", "removeCampaign", "removeCampaignAt",
       "setMaterialMarket", "recoverBnb", "recoverTransistors", "transferOwnership",
@@ -329,6 +329,9 @@ export default function App() {
         : { ok: false, message: "只有晶体管确认到账、且募集池还有余款时才能退" };
     }
     else if (method === "openRefund" || method === "abandonOrder") result = applyOpenRefund(round, book, actor);
+    else if (method === "topUpShortfall") {
+      result = { ok: true, message: "模拟：已补齐被晶体管吃掉的本金缺口，现在可以按原价退完持份人" };
+    }
     else if (method === "markFailed") {
       result = book.executionFailed
         ? { ok: false, message: "本期已判执行失败，持有人直接退款即可" }
@@ -396,6 +399,7 @@ export default function App() {
     createCampaign: "发布期次",
     openRefund: "退款",
     abandonOrder: "撤单退款",
+    topUpShortfall: "补齐本金缺口",
     markFailed: "判执行失败",
     removeCampaign: "移除期次",
     removeCampaignAt: "移除期次",
@@ -809,6 +813,13 @@ export default function App() {
       case "returnSurplus":
         // 无参：把当前 raisedBnb 按份记账退回持份人，期次继续、仍然可以入池。
         return chainTx.returnSurplus(signer);
+      case "topUpShortfall": {
+        // 自掏腰包补齐被晶体管吃掉的本金差额（payable，单位 BNB）。
+        const raw = String(args?.value ?? "0").trim();
+        const amount = raw ? parseEther(raw) : 0n;
+        if (amount <= 0n) throw new Error("补齐金额必须大于 0");
+        return chainTx.topUpShortfall(signer, amount);
+      }
       case "setMaterialMarket": return chainTx.setMaterialMarket(signer, args.materialMarket);
       case "setPhase": {
         const next = Number(args?.next);

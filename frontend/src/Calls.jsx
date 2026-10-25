@@ -245,15 +245,23 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "returnSurplus()",
-          summary: "晶体管确认到账后，把没花完的募集款按份记账退回持份人（各自 claimSurplus 领取）。不结束本期：晶体管留在合约、份额不变，之后仍然可以 depositToPool。要求没有未确认卖单、市场没有欠款。调用后 openRefund / abandonOrder 关闭（本金已经退过，晶体管只能走挖矿）。",
+          summary: "晶体管确认到账后，把没花完的募集款按份记账退回持份人（各自 claimSurplus 领取）。不结束本期：晶体管留在合约、份额不变，之后仍然可以 depositToPool。要求没有未确认卖单、市场没有欠款。Owner 随时可调；其他钱包须在售罄 / 最后一次下单满 3 天后 —— 这是 Owner 失联时把余款交回持份人的兜底。调用后 openRefund / abandonOrder 关闭（本金已经退过，晶体管只能走挖矿）。",
           fields: [],
+        },
+        {
+          name: "topUpShortfall",
+          kind: "write",
+          caller: "仅 Factory Owner",
+          signature: "topUpShortfall() payable",
+          summary: "自掏腰包补齐「已被晶体管吃掉」的本金缺口，让募集池重新按原价覆盖全部未退份额。买了晶体管之后想收摊必须先走这一步：不补齐的话 openRefund / abandonOrder 会以 PartsAreCollateral 回滚（份额一旦清零，晶体管既没人能领、Owner 也拿不走）。补齐 → 按原价退完 → 晶体管才可由 recoverTransistors 取回；多补的钱在份额清零后用 recoverBnb() 扫回。",
+          fields: [["value", "补齐金额", "0"]],
         },
         {
           name: "openRefund",
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "openRefund()",
-          summary: "只在待挂单（buying）时批量原路退款。晶体管确认到账（ready）后不可用：那个状态只能 returnSurplus 退余款、晶体管进矿池，不能转给 Owner（链上 UseReturnSurplus 回滚；确要结束本期得先 setPhase 改回 buying）。份额已全部退完时没有可退对象，会以 ZeroShares 回滚，用 recoverBnb() 扫尾差。退过余款之后会以 SurplusAlreadyReturned 回滚。",
+          summary: "只在待挂单（buying）时批量原路退款。晶体管确认到账（ready）后不可用：那个状态只能 returnSurplus 退余款、晶体管进矿池，不能转给 Owner（链上 UseReturnSurplus 回滚；确要结束本期得先 setPhase 改回 buying）。合约手上还有晶体管、而池子不足以按原价退完时以 PartsAreCollateral 回滚（先 topUpShortfall）。份额已全部退完时没有可退对象，会以 ZeroShares 回滚，用 recoverBnb() 扫尾差。退过余款之后会以 SurplusAlreadyReturned 回滚。",
           fields: [],
         },
         {
@@ -261,7 +269,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Factory Owner",
           signature: "abandonOrder()",
-          summary: "待执行 buying / listed 时放弃本期：撤未成交买单、撤卖单、提取市场欠款、把晶体管退回 Owner，再按池子批量退款。用来解开卡住的单（openRefund 在挂单中会回滚）。晶体管确认到账（ready）后不可用（UseReturnSurplus）：那个状态只能 returnSurplus 退余款、晶体管进矿池。",
+          summary: "待执行 buying / listed 时放弃本期：撤未成交买单、撤卖单、提取市场欠款、按池子批量退款，最后才把剩余晶体管退回 Owner（要求份额全清且持份人已按原价收回本金）。用来解开卡住的单（openRefund 在挂单中会回滚）。晶体管确认到账（ready）后不可用（UseReturnSurplus）。合约手上还有晶体管、池子又不足时以 PartsAreCollateral 回滚：先 topUpShortfall 补齐。",
           fields: [],
         },
         {
@@ -885,7 +893,18 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (!(outstandingOf(book) > 0)) {
       return { ok: false, reason: "份额已全部退完（已售未退 = 0），没有可退对象，链上会以 ZeroShares 回滚。尾差请用 recoverBnb() 取回。" };
     }
-    return { ok: true, reason: "将批量原路退回各认筹地址本金。" };
+    return { ok: true, reason: "将批量原路退回各认筹地址本金。若本期已买过晶体管、募集池又不足以按原价退完，链上会以 PartsAreCollateral 拒绝：先 topUpShortfall 补齐。" };
+  }
+  if (method.name === "topUpShortfall") {
+    if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
+    if (actor.role !== "owner") return { ok: false, reason: "只 Factory Owner 能补齐缺口。" };
+    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以补齐（入池后份额与晶体管都已经定局）。" };
+    const need = outstandingOf(book) * Number(round.sharePriceBnb || 0) - Number(book.bnbPool || 0);
+    const hint = need > 0 ? `按当前份额与池子，缺口约 ${need.toFixed(6)} BNB。` : "当前池子已能按原价覆盖全部份额，无需补齐（补齐的钱之后可用 recoverBnb 扫回）。";
+    return {
+      ok: true,
+      reason: `${hint}补齐后被晶体管吃掉的本金就回到池子里：持份人能按原价退完，Owner 才取得走晶体管。多补的部分在份额清零后用 recoverBnb 扫回。`,
+    };
   }
   if (method.name === "abandonOrder") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
@@ -896,7 +915,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     }
     return {
       ok: true,
-      reason: "撤未成交买单、撤卖单、提取市场欠款、把晶体管退回 Owner，再按池子退款。挂单中也能用（openRefund 会回滚）。",
+      reason: "撤未成交买单、撤卖单、提取市场欠款、按池子退款，最后才把剩余晶体管退回 Owner。若本期已买过晶体管、池子又不足以按原价退完，链上会以 PartsAreCollateral 拒绝：先 topUpShortfall 补齐。",
     };
   }
   if (method.name === "setPlan") {

@@ -2325,6 +2325,11 @@ export const tx = {
     if (code.includes(id("returnSurplus()").slice(2, 10))) return c.returnSurplus();
     throw new Error("这期是旧合约，链上没有提前退回剩余募集款。重新部署工厂后新开的期才有；这期的余款在 depositToPool 时记账，持份人用 claimSurplus 领取。");
   },
+  /**
+   * Owner 自掏腰包补齐「被晶体管吃掉」的本金缺口，让池子重新能按原价退完所有份额。
+   * 买入之后想收摊（openRefund / abandonOrder）必须先走这一步，否则链上 PartsAreCollateral。
+   */
+  topUpShortfall: async (signer, value) => signerOrThrow(signer).topUpShortfall({ value }),
   abandonOrder: async (signer) => {
     const c = signerOrThrow(signer);
     const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
@@ -2611,6 +2616,18 @@ function explainParsed(parsed) {
   if (parsed?.name === "NotAsked") return "当前没有可确认的卖单。";
   if (parsed?.name === "OrderFilled") return "买单已全部成交，不能再取消。";
   if (parsed?.name === "InsufficientParts") return "合约里的晶体管数量不够。";
+  if (parsed?.name === "SharesOutstanding") {
+    return "还有持份人没结清，当期晶体管是他们的抵押，不能取出。先让持份人退款 / 领完，或改成入池。";
+  }
+  if (parsed?.name === "HoldersNotMadeWhole") {
+    return "持份人还没按原价收回本金（买入花掉的那部分没补），当期晶体管不能交给 Owner。先 topUpShortfall 补齐再退款，或改成入池 / 卖出。";
+  }
+  if (parsed?.name === "PartsAreCollateral") {
+    return "合约手上还有本期晶体管、而募集池已不足以按原价退完所有份额：现在退款会把晶体管烧在合约里（没人有资格领）。先 topUpShortfall 补齐本金，或直接入池 / 卖出。";
+  }
+  if (parsed?.name === "RefundNotAvailable") {
+    return "当前状态不能退款：只有募资超时未售罄、或待挂单（buying）期次可退；挂单中 / 已到账 / 挖矿中都不行。";
+  }
   if (parsed?.name === "CanStillAfford") return "按当前报价还能买得起晶体管，旧合约不允许退款";
   if (parsed?.name === "WrongTransistors") {
     return "晶体管合约地址与本期锁定的不符。旧版合约的挂单接口要显式传地址；当前界面只对新版合约（开期已锁定）下单。";

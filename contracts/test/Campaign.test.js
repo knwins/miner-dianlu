@@ -80,6 +80,8 @@ describe("escrow can never be stranded", () => {
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
+    // 补齐被元件吃掉的那点本金，让持份人能按原价拿回全部本金：只有这时元件才可以离开。
+    await campaign.connect(owner).topUpShortfall({ value: UNIT });
 
     // 拒收方退款失败、份额保留 → 元件是他们的抵押，不能先给 Owner。
     await rejector.reject();
@@ -124,10 +126,13 @@ describe("escrow can never be stranded", () => {
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
 
+    // 元件已经吃掉一部分本金：owner 补齐差额后，持份人才能按原价收回本金、元件才归 owner。
+    await campaign.connect(owner).topUpShortfall({ value: UNIT });
+
     await campaign.connect(owner).abandonOrder();
     expect(await parts.balanceOf(owner.address, 0)).to.equal(1n);
     expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
-    // Sale 99/100 pro-rata: the holder gets 0.99 back and keeps nothing on the book.
+    // Full pool pays count × price, so the holder is made whole and keeps nothing on the book.
     expect(await campaign.sharesOf(alice.address)).to.equal(0n);
     // outstandingShares（已售未退）归零 = 没有待退份额了。
     // sold 是单调的历史事实，退款不会让它变小（H-1 后半：退款不能剥夺 owner 的下单资格）。
@@ -608,7 +613,9 @@ describe("transistor order + deposit to pool", () => {
     expect(after + receipt.gasUsed * receipt.gasPrice - before).to.equal(SHARE_PRICE * 100n);
   });
 
-  it("partial fill can be cancelled and holders refund the remaining pool", async () => {
+  it("partial fill can be cancelled, then the leftover is booked and the part is pooled", async () => {
+    // 1 件已到货、其余取消：持份人的钱一半变成了那颗元件。此时单人退款会把元件烧在合约里
+    // （份额清零后没人有资格领），所以出口是「余款记成可领余款 + 元件入池」，持份人份额保留。
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
@@ -620,15 +627,27 @@ describe("transistor order + deposit to pool", () => {
     await expect(campaign.connect(alice).cancelTransistorOrder()).to.emit(campaign, "TransistorOrderCancelled");
     expect(await campaign.phase()).to.equal(PHASE.Buying);
     expect(await campaign.raisedBnb()).to.equal(pool);
-    const aliceBefore = await ethers.provider.getBalance(alice.address);
-    const tx = await campaign.connect(alice).refund();
-    const receipt = await tx.wait();
-    expect(await ethers.provider.getBalance(alice.address) + receipt.gasUsed * receipt.gasPrice - aliceBefore).to.equal(
-      (pool * 60n) / 100n,
-    );
-    await campaign.connect(bob).refund();
+    // 元件在手、池子不足：退款被关掉（否则元件无人可领）。
+    await expect(campaign.connect(alice).refund())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+
+    // 取消后 priceLock 归零，但仍可凭「元件在手」回到 Ready（_readyBasis）。
+    await campaign.connect(owner).setPhase(PHASE.Ready);
+    const poolContract = await ethers.deployContract("MockERC1155");
+    await poolContract.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await poolContract.getAddress());
+    // 入池前先把余款记到持份人名下，元件跟着入池。
+    await expect(campaign.connect(owner).depositToPool()).to.emit(campaign, "DepositedToPool");
+
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
     expect(await campaign.raisedBnb()).to.equal(0n);
-    expect(await campaign.sharesOf(bob.address)).to.equal(0n);
+    expect(await parts.balanceOf(await poolContract.getAddress(), 0)).to.equal(1n);
+    await campaign.connect(alice).claimSurplus();
+    await campaign.connect(bob).claimSurplus();
+    // 余款按份额 60/40 全部领完，合约不留 BNB。
+    expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+    // 份额没有被清零：元件在池里，持份人继续持有挖矿申索。
+    expect(await campaign.sharesOf(bob.address)).to.equal(40n);
   });
 
   it("deliverBidAll fills the bid and mints the parts to the buyer", async () => {
@@ -780,8 +799,10 @@ describe("transistor order + deposit to pool", () => {
     expect(bid.transistors).to.equal(await campaign.transistors());
   });
 
-  it("leftover parts plus short raise refund pro-rata and leave no stranded BNB", async () => {
-    // Bid 100 @ UNIT buy only 1 unit; sell 1 unit but raise is short of 100 × 0.01.
+  it("leftover parts plus short raise are booked as surplus and pooled, leaving no stranded BNB", async () => {
+    // Bid 100 @ UNIT buy only 1 unit, then cancel. The raise (0.995) is short of principal (1.0) and the
+    // bought part is the difference: a refund would zero the shares and burn it, so the round books the
+    // leftover and pools the part instead, keeping the shares (and the mining claim) alive.
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
@@ -790,21 +811,27 @@ describe("transistor order + deposit to pool", () => {
     await minter.fillBid(await campaign.nandBidId(), 1n);
     await parts.mint(await campaign.getAddress(), 0, 1n);
     await campaign.connect(alice).cancelTransistorOrder();
-    // Raise is 0.995 but principal is 1.0. A partial fill cannot be sold until a later buy is confirmed.
     const pool = SHARE_PRICE * 100n - UNIT;
     expect(await campaign.raisedBnb()).to.equal(pool);
     expect(await campaign.totalRefunded()).to.equal(0n);
-    // Short pool: no owner switch needed, each holder pulls pro-rata.
-    const aliceBefore = await ethers.provider.getBalance(alice.address);
-    const tx = await campaign.connect(alice).refund();
-    const r = await tx.wait();
-    expect(await ethers.provider.getBalance(alice.address) + r.gasUsed * r.gasPrice - aliceBefore).to.equal((pool * 60n) / 100n);
-    await campaign.connect(bob).refund();
-    // Pool fully drained: no stranded BNB behind zeroed shares.
+    // 短池 + 元件在手 → 退款出口关闭。
+    await expect(campaign.connect(alice).refund())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+
+    await campaign.connect(owner).setPhase(PHASE.Ready);
+    const poolContract = await ethers.deployContract("MockERC1155");
+    await poolContract.waitForDeployment();
+    await campaign.connect(owner).setMiningPool(await poolContract.getAddress());
+    await campaign.connect(owner).depositToPool();
+    // 余款记成持份人可领的余款，元件在池里，份额不动。
     expect(await campaign.raisedBnb()).to.equal(0n);
-    expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.outstandingShares()).to.equal(100n);
     expect(await campaign.sold()).to.equal(100n);
+    await campaign.connect(alice).claimSurplus();
+    await campaign.connect(bob).claimSurplus();
+    // 一分不剩：余款全部领完，元件不在合约里。
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
   });
 
   it("a pro-rata refund that rounds to 0 still settles the holder instead of locking the dust forever", async () => {
@@ -889,9 +916,12 @@ describe("transistor order + deposit to pool", () => {
     await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "ZeroShares");
   });
 
-  it("abandonOrder reclaims a cancelable bid and refunds every holder in one call", async () => {
-    // Bid 100 @ UNIT, fill 1, then abandon: cancelBid returns 99 × UNIT, the holder gets principal back,
-    // and the spent 1 × UNIT is a realised loss for the holders (short pool, pro-rata).
+  it("abandonOrder refuses to burn the parts once they are bought, and works after a top-up", async () => {
+    // Bid 100 @ UNIT, fill 1: 1 × UNIT of the pool is now a part sitting in the contract. Abandoning at
+    // that point would zero every share while the part has no claimant and cannot be taken either
+    // (HoldersNotMadeWhole) — that is burning the holders' collateral, so the exit is closed. The owner
+    // must first make the holders whole (top up the spent amount), then the abandon is fair: holders get
+    // their full principal back and the bought part goes to the owner.
     const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
@@ -901,6 +931,11 @@ describe("transistor order + deposit to pool", () => {
     await parts.mint(await campaign.getAddress(), 0, 1n);
 
     await expect(campaign.connect(alice).abandonOrder()).to.be.revertedWithCustomError(campaign, "NotOwner");
+    await expect(campaign.connect(owner).abandonOrder())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+
+    // 补齐被那颗元件吃掉的本金后，放弃才是公平的。
+    await campaign.connect(owner).topUpShortfall({ value: UNIT });
     await expect(campaign.connect(owner).abandonOrder()).to.emit(campaign, "ExecutionFailed");
     expect(await campaign.sharesOf(alice.address)).to.equal(0n);
     expect(await campaign.sharesOf(bob.address)).to.equal(0n);
@@ -908,10 +943,10 @@ describe("transistor order + deposit to pool", () => {
     // _clearOrder drops ids, quantities and prices together (see Campaign._clearOrder).
     expect(await campaign.nandQty()).to.equal(0n);
     expect(await campaign.nandPrice()).to.equal(0n);
+    // 持份人按原价全额退回（top-up 补上了被元件吃掉的那部分）。
     expect(await campaign.raisedBnb()).to.equal(0n);
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
-    // 1 × UNIT spent on a part nobody needs is not recoverable.
-    expect(await campaign.totalRefunded()).to.equal(SHARE_PRICE * 100n - UNIT);
+    expect(await campaign.totalRefunded()).to.equal(SHARE_PRICE * 100n);
   });
 
   it("abandonOrder also works straight from a live bid and blocks once Ready", async () => {
@@ -1270,14 +1305,31 @@ describe("recover transistors / BNB", () => {
     await expect(campaign.connect(owner).setPhase(PHASE.None)).to.be.revertedWithCustomError(campaign, "WrongScene");
     await campaign.connect(owner).setPhase(PHASE.Buying);
     expect(await campaign.phase()).to.equal(PHASE.Buying);
+    // 池子被元件吃掉一部分：退款会被拒（份额清零后元件就没人有资格领了）。
+    await expect(campaign.connect(owner).openRefund())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    await expect(campaign.connect(alice).refund())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    // 份额还在，元件半步都出不去（S-2）。
     const held = await parts.balanceOf(await campaign.getAddress(), 0);
-    // 份额还没结清：当期元件半步都出不去（S-2）。
     await expect(campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, held))
       .to.be.revertedWithCustomError(campaign, "SharesOutstanding");
-    // 先结清持份人，元件才归 Owner。
+  });
+
+  it("owner can top up the shortfall, settle shares in full, then take the parts out", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 1n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    await campaign.connect(owner).setPhase(PHASE.Buying);
+    await campaign.connect(owner).topUpShortfall({ value: UNIT });
+
     await campaign.connect(owner).openRefund();
-    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
     expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.totalRefunded()).to.equal(100n * SHARE_PRICE);
+
+    const held = await parts.balanceOf(await campaign.getAddress(), 0);
     await campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, held);
     expect(await parts.balanceOf(owner.address, 0)).to.equal(held);
     expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
@@ -1517,10 +1569,11 @@ describe("returnSurplus: unspent principal goes back right after confirmation", 
     expect(await ethers.provider.getBalance(await campaign.getAddress())).to.equal(0n);
   });
 
-  it("is owner-only and refuses to end the round by refund afterwards", async () => {
+  it("is owner-anytime, holder-after-grace, and refuses to end the round by refund afterwards", async () => {
     const { campaign, owner, alice } = await readyFixture();
+    // 宽限期内第三方不能抢先记提（与 markFailed 同一把时间锁）。
     await expect(campaign.connect(alice).returnSurplus())
-      .to.be.revertedWithCustomError(campaign, "NotOwner");
+      .to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
 
     await campaign.connect(owner).returnSurplus();
     // 本金已经发回给持份人：再退款就是把份额清零、把元件交回 Owner
@@ -1839,5 +1892,142 @@ describe("factory parts whitelist", () => {
     expect(await factory.isAllowedParts(await parts.getAddress())).to.equal(true);
     const rogue = await ethers.deployContract("MockERC1155");
     expect(await factory.isAllowedParts(await rogue.getAddress())).to.equal(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 第三轮审查（旧合约可废弃，按全新语义收紧）
+// ─────────────────────────────────────────────────────────────────────────────
+describe("audit round 3: parts are collateral until holders are made whole", () => {
+  it("refund-after-purchase cannot be cashed out into the parts", async () => {
+    // 管理员逃生 setPhase(1) + openRefund 只退「剩余的」BNB（这里只剩一半）：
+    // 份额一旦清零，剩下的一半价值（元件）就再没有人有资格领，元件也不能给 owner。
+    // 所以这条出口本身就被 b 关掉，必须先把本金补齐。
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT); // 花掉 0.5 BNB
+    await fillAndConfirm(campaign, minter);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    expect(await campaign.raisedBnb()).to.equal(50n * SHARE_PRICE);
+
+    await campaign.connect(owner).setPhase(PHASE.Buying);
+    // 批量退款、单人退款都被拒：池子覆盖不了全部份额，退了就等于把元件烧在合约里。
+    await expect(campaign.connect(owner).openRefund())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    await expect(campaign.connect(alice).refund())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    // 份额还在，所以元件当然也不能被 owner 拿走。
+    await expect(campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 100n))
+      .to.be.revertedWithCustomError(campaign, "SharesOutstanding");
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(100n);
+  });
+
+  it("the owner can top up the shortfall and then take the parts fairly", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+
+    await campaign.connect(owner).setPhase(PHASE.Buying);
+    // 自掏腰包补齐差额（多补一点，便于验证多余部分能扫回），让每位持份人按原价拿回本金
+    await expect(campaign.connect(owner).topUpShortfall({ value: 60n * SHARE_PRICE }))
+      .to.emit(campaign, "ShortfallToppedUp");
+    await campaign.connect(owner).openRefund();
+    expect(await campaign.totalRefunded()).to.equal(100n * SHARE_PRICE);
+    expect(await campaign.outstandingShares()).to.equal(0n);
+
+    // 持份人已按原价拿回本金，晶体管才归 owner（相当于 owner 按成本买下）。
+    await campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 100n);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(100n);
+    // 多补的部分可由 owner 扫回，不会锁死。
+    await expect(campaign.connect(owner).recoverBnb()).to.emit(campaign, "BnbRecovered");
+  });
+
+  it("abandonOrder does not hand the parts over while the pool is short", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 100n);
+    await parts.mint(await campaign.getAddress(), 0, 100n);
+
+    // 全部本金都变成了元件：直接放弃会把 100 件元件烧在合约里，所以拒绝。
+    await expect(campaign.connect(owner).abandonOrder())
+      .to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    expect(await campaign.outstandingShares()).to.equal(100n);
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(100n);
+
+    // 补齐本金后放弃才是公平的：持份人全额退回，元件才归 owner。
+    await campaign.connect(owner).topUpShortfall({ value: 100n * UNIT });
+    await campaign.connect(owner).abandonOrder();
+    expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.totalRefunded()).to.equal(100n * SHARE_PRICE);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(100n);
+  });
+
+  it("refunds are closed outside Buying/Listed-cancelled state", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    // Ready 里执行失败的标记也换不出退款（阶段闸门先拒）
+    await expect(campaign.connect(alice).refund())
+      .to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+  });
+});
+
+describe("audit round 3: pooling and market guards", () => {
+  it("refuses to pool when no share or no part is left", async () => {
+    const { campaign, owner, alice, bob, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+
+    // 全部卖光：没有元件可入池，入池只会把份额挂空。
+    const askPrice = ethers.parseEther("0.01");
+    await campaign.connect(owner).placeTransistorAsk(100n, askPrice, 0n, 0);
+    await minter.connect(bob).fillAsk(await campaign.nandAskId(), 100n, { value: 100n * askPrice });
+    await campaign.connect(owner).cancelTransistorAsk();
+    await campaign.connect(owner).confirmSale();
+    await campaign.connect(owner).setPhase(PHASE.Ready);
+
+    await campaign.connect(owner).setMiningPool(bob.address);
+    await expect(campaign.connect(owner).depositToPool())
+      .to.be.revertedWithCustomError(campaign, "InsufficientParts");
+  });
+
+  it("rejects a market address that has no code", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
+    await expect(campaign.connect(owner).setMaterialMarket(alice.address))
+      .to.be.revertedWithCustomError(campaign, "ZeroAddress");
+  });
+
+  it("constructor rejects a market / parts address with no code", async () => {
+    const { factory, owner, alice } = await loadFixture(deployFixture);
+    await expect(
+      factory.connect(owner).createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, alice.address)
+    ).to.be.revertedWithCustomError(factory, "PartsNotAllowed");
+  });
+});
+
+describe("audit round 3: Ready has a permissionless failsafe", () => {
+  it("anyone can book the leftover BNB after the grace period", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+
+    // 宽限期内第三方不能抢跑
+    await expect(campaign.connect(alice).returnSurplus())
+      .to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+    await time.increase(3 * 24 * 3600 + 1);
+    // Owner 失联也能把余款记到持份人名下，钱不再锁在合约里
+    await expect(campaign.connect(alice).returnSurplus()).to.emit(campaign, "SurplusReturned");
+    expect(await campaign.surplusOf(alice.address)).to.be.greaterThan(0n);
   });
 });

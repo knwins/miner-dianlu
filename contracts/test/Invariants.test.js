@@ -273,8 +273,11 @@ describe("no wei left behind", () => {
     await place(campaign, owner, 100n, UNIT);
     await minter.fillBid(await campaign.nandBidId(), 40n);
     await parts.mint(await campaign.getAddress(), 0, 40n);
+    // 40 件吃掉了 0.2 BNB：owner 补齐后持份人才能按原价收回本金，元件才归 owner。
+    await campaign.connect(owner).topUpShortfall({ value: 40n * UNIT });
     await campaign.connect(owner).abandonOrder();
     expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.totalRefunded()).to.equal(100n * SHARE_PRICE);
     // 份额全部结清后，剩余元件在同一个调用里就交给 owner 了。
     expect(await parts.balanceOf(owner.address, 0)).to.equal(40n);
     expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
@@ -531,5 +534,82 @@ describe("boundary guards", () => {
       .to.be.revertedWithCustomError(campaign, "ZeroShares");
     await expect(campaign.connect(alice).refund())
       .to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 元件 = 抵押：只要合约手上还有本期元件，要么还有持份人，要么持份人已按原价全额收回本金。
+// ─────────────────────────────────────────────────────────────────────────────
+async function expectCollateralInvariant(campaign) {
+  const parts = await ethers.getContractAt("MockERC1155", await campaign.transistors());
+  const held = (await parts.balanceOf(await campaign.getAddress(), 0)) + (await parts.balanceOf(await campaign.getAddress(), 1));
+  if (held === 0n) return;
+  const [outstanding, sold, price, refunded] = await Promise.all([
+    campaign.outstandingShares(),
+    campaign.sold(),
+    campaign.sharePriceBnb(),
+    campaign.totalRefunded(),
+  ]);
+  // 元件还在 → 不能出现「没人有资格领」的中间态。
+  expect(outstanding > 0n || refunded >= sold * price).to.equal(true);
+}
+
+describe("parts collateral invariant", () => {
+  it("holds across a partial-fill, cancel, top-up and settle path", async () => {
+    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+    await expectCollateralInvariant(campaign);
+
+    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
+    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await minter.fillBid(await campaign.nandBidId(), 40n);
+    await parts.mint(await campaign.getAddress(), 0, 40n);
+    await expectCollateralInvariant(campaign);
+
+    // 部分成交后撤单：仍有份额，元件仍是抵押。
+    await campaign.connect(alice).cancelTransistorOrder();
+    await expectCollateralInvariant(campaign);
+    await expectLedgerClosed(campaign);
+    await expectSharesConserved(campaign);
+    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+
+    // owner 补齐被元件吃掉的部分 → 持份人按原价退完 → 元件才可离开。
+    await campaign.connect(owner).topUpShortfall({ value: 40n * UNIT });
+    await expectCollateralInvariant(campaign);
+    await expectLedgerClosed(campaign);
+    await campaign.connect(owner).openRefund();
+    await expectCollateralInvariant(campaign);
+    await expectSharesConserved(campaign);
+    await campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 40n);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(40n);
+    await expectNoDustLeft(campaign);
+  });
+
+  it("never reaches zero shares while the pool is short and parts are held", async () => {
+    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    expect(await campaign.phase()).to.equal(PHASE.Ready);
+    await campaign.connect(owner).setPhase(PHASE.Buying);
+
+    const poolBefore = await campaign.raisedBnb();
+    expect(poolBefore).to.be.lessThan(100n * SHARE_PRICE);
+    // 池子不足 + 元件在手：单人 / 批量 / 放弃 三条退款路全关。
+    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    await expect(campaign.connect(owner).abandonOrder()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
+    await expect(campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 100n))
+      .to.be.revertedWithCustomError(campaign, "SharesOutstanding");
+    await expectCollateralInvariant(campaign);
+    // 元件与份额都还在：入池仍是可用出口（份额继续享有产出）。
+    await campaign.connect(owner).setMiningPool((await ethers.getSigners())[5].address);
+    await campaign.connect(owner).setPhase(PHASE.Ready);
+    await campaign.connect(owner).depositToPool();
+    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
+    expect(await campaign.outstandingShares()).to.equal(100n);
+    await expectCollateralInvariant(campaign);
   });
 });

@@ -159,11 +159,12 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | 功能 | 类型 | 权限 / 场景 | 说明 |
 |---|---|---|---|
 | `subscribe(uint256 count)` | 写 payable | `funding`；截止前；`msg.value == count × sharePriceBnb` | 认筹整数份；售罄 → `executing` + `buying`，记 `soldOutAt` |
-| `refund()` | 写 | ① `funding` 且超时未售罄；或 ② `executing` + `executionFailed`；或 ③ `executing`+`buying` 且池子已不足以按原价兑付；**`ready` 一律拒绝** | 本钱包本金原路退、份额清零；有 escrow 锁定时跳过。`ready` 拒绝是硬约束：那里晶体管已是持份人的资产，按剩余 BNB 退等于让 owner 白拿元件（见 S-9） |
-| `markFailed()` | 写 | 任何人，但非 Owner 须在售罄满 `FAIL_GRACE`(3 天) 后；Owner 随时；**`ready` 一律拒绝（`UseReturnSurplus`）** | 先撤未成交买单（押金退回），再置 `executionFailed`，为所有持有人打开 `refund()`。撤单被市场拒绝时整笔回滚、可稍后重试。`ready` 不是失败态（元件已到账），标失败 + 退款会让持份人丢元件申索（S-9） |
-| `openRefund()` | 写 | Owner；仅 `buying`；且 `sold > 0`；且还没 `returnSurplus` | 批量退款（**不搬元件**）。`ready` 用 `UseReturnSurplus` 拒绝：元件已确认到账，只能 `returnSurplus` 退余款 + 入池（确要结束本期须先 `setPhase(1)`，属管理员逃生）。份额全退完后，当期元件才可由 `recoverTransistors` 提给 Owner（退出前 `SharesOutstanding` 拒绝）。份额全退完（`sold == 0`）时 `ZeroShares` 回滚，用 `recoverBnb()` 扫尾差。退过余款后 `SurplusAlreadyReturned` 回滚 |
-| `returnSurplus()` | 写 | Owner；`ready` 且无未确认卖单 / 无市场欠款；`raisedBnb > 0` | **不结束本期**：把没花完的募集款按份记账退回持份人（各 `claimSurplus()` 自领）。份额不变、元件留在合约、`phase` 仍是 `ready`，之后照常 `depositToPool()`。零持仓循环，成本不随持份人数增长。**入池前的必做步骤**（`depositToPool` 内部也会兜底记账） |
-| `abandonOrder()` | 写 | Owner；仅 `executing` + `buying` / `listed`；且还没 `returnSurplus` | 撤未成交买单、撤卖单、提取卖出款、退回元件、按池子退款。`ready` 用 `UseReturnSurplus` 拒绝（同上） |
+| `refund()` | 写 | ① `funding` 且超时未售罄；或 ② `executing` + **`buying`** + （`executionFailed` 或池子已不足以按原价兑付） | 本钱包本金原路退、份额清零；有 escrow 锁定时跳过。**`listed` / `ready` 一律拒绝**：`listed` 的押金还在市场里（此时按比例退是把还没回来的钱先分掉，市场回调还可能重入），`ready` 的晶体管已是持份人的资产（S-9）。**元件在手且池子不足时也拒绝（`PartsAreCollateral`）**：份额清零后元件既无人可领、owner 也拿不走，等于烧掉（S-14） |
+| `topUpShortfall()` | 写 payable | 仅 Owner；仅 `executing`；`msg.value > 0` | 自掏腰包补齐「已被元件吃掉」的本金缺口，让池子重新覆盖**全部份额的原价**。这是**买入之后想放弃本期**的唯一公平前置：补齐 → `openRefund` / `abandonOrder`（持份人按原价全额退回）→ 元件才可归 owner / 交回。多补的部分在份额清零后由 `recoverBnb()` 扫回，不会锁死（S-14） |
+| `markFailed()` | 写 | 任何人，但非 Owner 须在售罄满 `FAIL_GRACE`(3 天) 后；Owner 随时；**`ready` 一律拒绝（`UseReturnSurplus`）** | 先撤未成交买单（押金退回），再置 `executionFailed`，为所有持有人打开 `refund()`。撤单被市场拒绝时整笔回滚、可稍后重试。`ready` 不是失败态（元件已到账），标失败 + 退款会让持份人丢元件申索（S-9）。**元件在手且池子不足时标失败也不会打开退款**（`PartsAreCollateral`，见 S-14） |
+| `openRefund()` | 写 | Owner；仅 `buying`；且 `sold > 0`；且还没 `returnSurplus`；且**元件在手时池子必须覆盖全部份额** | 批量退款（**不搬元件**）。`ready` 用 `UseReturnSurplus` 拒绝：元件已确认到账，只能 `returnSurplus` 退余款 + 入池（确要结束本期须先 `setPhase(1)`，属管理员逃生）。**元件在手时按比例退款等于把元件烧在合约里**，故先 `topUpShortfall` 补齐（`PartsAreCollateral`，S-14）。份额全退完后当期元件才可由 `recoverTransistors` 提给 Owner；`sold == 0` 时 `ZeroShares`；退过余款后 `SurplusAlreadyReturned` |
+| `returnSurplus()` | 写 | **Owner 随时**；**其他任何人须在 `max(soldOutAt, lastOrderAt) + FAIL_GRACE` 之后**；`ready` 且无未确认卖单 / 无市场欠款；`raisedBnb > 0` | **不结束本期**：把没花完的募集款按份记账退回持份人（各 `claimSurplus()` 自领）。份额不变、元件留在合约、`phase` 仍是 `ready`，之后照常 `depositToPool()`。非 owner 的宽限期兜底是 **Ready 的失联救援**：owner 消失时余款也能变成持份人可领，不再锁在 `raisedBnb` 里；它不搬任何元件、也不改变归属，无法被用来牟利（S-16） |
+| `abandonOrder()` | 写 | Owner；仅 `executing` + `buying` / `listed`；且还没 `returnSurplus`；且**元件在手时池子必须覆盖全部份额** | 撤未成交买单、撤卖单、提取卖出款、按池子退款，最后才把剩余元件退 Owner（要求 `outstandingShares == 0` **且** `_holdersMadeWhole()`）。元件在手而池子不足时整笔拒绝（`PartsAreCollateral`）：先 `topUpShortfall`（S-14）。`ready` 用 `UseReturnSurplus` 拒绝 |
 | `depositToPool()` | 写 | Owner；`ready` + 元件在手 + 已设矿池 | **先把 `raisedBnb` 按份记账给持份人（`_returnSurplus`），再把元件转进矿池**，然后 `scene = mining`。顺序保证「钱先归持份人、元件才离开」，owner 无法扫走 |
 | `claimSurplus()` | 写 | 有 pending 余款者 | 领取余款（pull 模式，见 §5.3） |
 
@@ -188,15 +189,15 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 | `placeTransistorOrder(uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)` | 写 | `buying` → `listed` | 锁价并挂买单；晶体管合约在开期锁定，**不是参数**。仅 `buying` 可调（Listed/Ready 会 `WrongScene`）。一次只能有一张挂单。买不起则置 `executionFailed` 且不挂单（**不 revert**）。失败后仍售罄时可重挂并清 `executionFailed` |
 | `cancelTransistorOrder()` | 写 | `listed`/`ready` → `buying` | 未成交仅 owner 可撤。已有成交时任何人可撤剩余买单。全部成交且元件到账则不能撤 |
 | `confirmTransistors()` | 写 | `listed` → `ready` | 确认到账；保留 `priceLock`。**`ready` 是 Executing 终态**。**permissionless** 但前置客观条件 `priceLock != 0 && orderFilled() && _partsOnHand()`（真买过 + 已全部成交 + 元件已到货），结果相同无法滥用 |
-| `setPhase(uint8)` | 写 | Owner；仅 `executing` 且当前不是 `listed` | 改子状态，**不搬代币**。**`3(ready)` 必须由数据成立**：`priceLock != 0 && orderFilled()` —— 没真买过料进不去，撤单后 `priceLock` 归零也进不去；**`2(listed)` 必须有活单 id**，否则 `WrongScene`。元件是否在手只由 `confirmTransistors` 要求（`_readyInvariant`）：部分卖出后手上元件少于订单量，仍必须能回 `ready` 退余款 / 入池，否则余款和剩余元件一起锁死（S-10）。⚠️ 仍是 god-mode 逃生函数 |
+| `setPhase(uint8)` | 写 | Owner；仅 `executing` 且当前不是 `listed` | 改子状态，**不搬代币**。**`3(ready)` 必须由数据成立**：`_readyBasis()` = 已成交买单，**或元件已在手**（部分成交后撤单 `priceLock` 已归零，但元件确实在这里，必须还能回 `ready` 退余款 / 入池，否则余款和元件一起锁死，S-10/S-17）；**`2(listed)` 必须有活单 id**，否则 `WrongScene`。元件是否在手只由 `confirmTransistors` 要求（`_readyInvariant`）。⚠️ 仍是 god-mode 逃生函数 |
 | `placeTransistorAsk(...)` | 写 | Owner；仅 `ready` | ⚠️ **主网不可用**（官方市场只有买单侧，见 §7.1） |
 | `cancelTransistorAsk()` / `confirmSale()` | 写 | Owner | ⚠️ 同上，主网必然 revert |
 | `withdrawMarketProceeds()` | 写 | 任何人 | 从市场提取卖出/退回款（走 `receive()`） |
 | `setMaterialMarket(address)` | 写 | 仅 Owner；`listed` / 有活卖单 / **旧市场仍欠款（`owed > 0`）** 时拒绝 | 换本期材料市场（原 `setMinter`）。`owed()` 按市场记账，先换会把卖出款丢在旧市场；旧市场调不通时放行（那正是需要逃生的时候） |
 | `setMiningPool(address)` | 写 | 仅 Owner；入池前 | 设矿池地址；入池后 `AlreadyPooled`、零地址 `ZeroAddress` |
-| `depositToPool()` | 写 | 仅 Owner；`ready` + **已有成交买单（`priceLock` + 全部成交）** | **不可逆**：先把余量 BNB（含卖出款）按份记账给持份人（`_returnSurplus`，份额保留），再把**当前持有的全部**晶体管转入 `miningPool`，置 `pooled=true` 进入 `Mining`。未设池则 `PoolNotSet`。不要求「元件数量 == 订单数量」：部分卖出后入池剩余部分是合法出口（S-10） |
+| `depositToPool()` | 写 | 仅 Owner；`ready` + **已有成交买单或元件已在手**（`_readyBasis`）+ **还有份额** + **至少一件元件** + 已设矿池 | **不可逆**：先把余量 BNB（含卖出款）按份记账给持份人（`_returnSurplus`，份额保留），再把**当前持有的全部**晶体管转入 `miningPool`，置 `pooled=true` 进入 `Mining`。未设池 `PoolNotSet`；没有人持份 `ZeroShares`（池子会白拿）；一件元件都没有 `InsufficientParts`（纯现金期次不该进挖矿）。不要求「元件数量 == 订单数量」：部分卖出后入池剩余部分是合法出口（S-10） |
 | `recoverBnb()` | 写 | 仅 Owner | 测试救援。一次扫走所有可动 BNB：募集/待执行只转出超过 `raisedBnb` 的多余余额；`sold == 0` 时转出整池剩余并清零。**`surplusPool - surplusPaid` 与 `totalPendingFee` 已预留，扫不走**；`revenuePool` 只是累计展示值（钱已经在 surplus 预留额里），**不可再加一次** |
-| `recoverTransistors(address token, uint256 id, uint256 amount)` | 写 | 仅 Owner；禁止 `listed`；入池后禁止；**当期元件在 `outstandingShares > 0` 时禁止** | 把持有的 ERC1155 元件转给 Owner（救援，**不触发流片**）；当期元件（`token == transistors`）是持份人的抵押，只能走 `depositToPool`（入池）或 `placeTransistorAsk`（卖出），或等份额结清后提取（否则 `SharesOutstanding`）；`pooled` 后 `AlreadyPooled` |
+| `recoverTransistors(address token, uint256 id, uint256 amount)` | 写 | 仅 Owner；禁止 `listed`；入池后禁止；**当期元件在 `outstandingShares > 0` 或持份人未按原价收回本金时禁止** | 把持有的 ERC1155 元件转给 Owner（救援，**不触发流片**）；当期元件（`token == transistors`）是持份人的抵押，只能走 `depositToPool`（入池）或 `placeTransistorAsk`（卖出），或等份额结清**且** `totalRefunded >= sold × sharePriceBnb`（`HoldersNotMadeWhole`）后提取 —— 只结清份额但只退了半价（钱被元件吃掉）时仍然拿不走（S-14）；`pooled` 后 `AlreadyPooled` |
 | `transferOwnership(address)` | 写 | 仅 Owner | 转让本期 Owner |
 
 ### 4.4 服务费（**挖矿产出**的服务费；认筹款不收）
@@ -444,6 +445,10 @@ createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds
 14. **不给单件价格上限**。原因：元件市价浮动，链上写死绝对上限后市价涨破 → Owner 按市价挂单被拒 → 期次永久卡在「待挂单」→ 买不到料、进不了矿池、认筹人钱既退不了也产不出产出。**护栏本身变成了更大的风险源**。
 15. **可见性 ≠ 权限**：Owner 工作台入口对两路地址都显示，但 `actor.role` 只认本期 Campaign owner。
 16. **前端创建期次是链上两笔交易**（`createCampaign` + `setServiceFee`），第二笔失败不影响已建期次。
+17. **元件是持份人的抵押**：只要合约手上还有本期元件、而 `raisedBnb` 不足以按原价覆盖全部未退份额，**所有退款出口必须关闭**（`refund` / `openRefund` / `abandonOrder` 一律 `PartsAreCollateral`）。理由：份额一旦清零，元件既没有持份人有资格领、owner 也拿不走（`HoldersNotMadeWhole`），等于烧掉。owner 真想收摊只能：`topUpShortfall()` 补齐 → 按原价退完 → 再取元件。
+18. **当期元件离开合约，必须持份人已按原价收回本金**：`outstandingShares == 0` **且** `totalRefunded >= sold × sharePriceBnb`。只结清份额但只退了折价（钱被元件吃掉）时仍然拿不走 —— 这条是 S-14 的最后一道闸。
+19. **`returnSurplus()` 是 Ready 的失联兜底**：owner 随时可调，其他人须满 `FAIL_GRACE`。它只把余款记到持份人名下，不搬元件、不改归属，因此没有作恶面；不得改回 `onlyOwner`（否则 owner 失联时余款永久锁死，S-16）。
+20. **`depositToPool()` 要求「还有份额 + 至少一件元件」**：否则元件会进池而没有任何持份人分享产出。`setPhase(3)` / `depositToPool` 的前置是 `_readyBasis()`（已成交买单 **或** 元件已在手）——部分成交后撤单的期次必须还能进 `ready`，不可回退成只认 `priceLock`（S-17）。
 
 ---
 
@@ -578,6 +583,13 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-drill.
 | **S-11** | Medium | 上轮给 `setMaterialMarket` 加的「旧市场 `owed > 0` 就拒绝换市场」会形成环：市场报欠款却 `withdraw()` 失败时，既换不走也提不出，本期逃生全被堵住 | ✅ 改为「先尽力 `withdraw()` 提回托管池；提不出也放行换市场」。诚实的市场不留钱，坏市场不拖死本期（测试 `a market swap drains the proceeds...` / `a market that cannot pay does not block the swap`） |
 | **S-12** | Low（残留信任） | 市场合约彻底失活（代理升级成全 revert）时，`listed` 期次无法退出：`setPhase` 拒绝从 `listed` 走、`cancelTransistorOrder` / `markFailed` 都要调市场。此时本金在**市场 escrow** 里，Campaign 本身也无从取回 | 接受：官方市场是信任前提（同 H-7）。资金不在 Campaign 手上，任何本地改动都救不回来；运营上盯市场代理的升级权限 |
 | **S-13** | Low | `placeTransistorAsk` 给市场开了 `setApprovalForAll`，撤单 / 结算后**不回收**（只在换市场时 `_revokeApproval`）。市场若能越权拉走 ERC1155，Campaign 手上的元件可被直接转走 | 接受：官方市场为信任前提；若要收紧，可在 `confirmSale` / `cancelTransistorAsk` 后撤销授权（每次多一笔外部调用，按需再评估） |
+| **S-14** | ~~High~~ → 已修 | **`ready` 的折价套现绕过**：S-9 只关了 `markFailed`/`refund`，但 owner 仍可 `setPhase(1)` → `openRefund()`（只按**剩余** BNB 退，元件价钱那部分不退）→ 份额清零 → `recoverTransistors()` 拿走全部元件。持份人拿回半价，元件白送 | ✅ 已修（三层）：① 元件在手且池子不足以按原价覆盖全部份额时，**一切退款出口关闭**（`refund` / `openRefund` / `abandonOrder` → `PartsAreCollateral`）——否则份额清零后元件既无人可领、owner 也拿不走，等于烧掉；② 当期元件离开合约要求 `outstandingShares == 0` **且** `totalRefunded >= sold × sharePriceBnb`（`HoldersNotMadeWhole`），只退半价拿不走；③ 新增 `topUpShortfall()` 作为**公平逃生**：owner 自掏腰包补齐缺口 → 持份人按原价全额退回 → 元件才归 owner（等于 owner 按成本买下），多补的钱 `recoverBnb` 可扫回。测试 `refund-after-purchase cannot be cashed out into the parts` / `the owner can top up the shortfall and then take the parts fairly` |
+| **S-15** | Medium | `refund()` 的 `executionFailed` 分支没有相位限制：`listed` 时押金仍在市场 escrow 里，此时按比例退会把「还没回来的钱」先分掉；更糟的是 `markFailed()` → `_cancelLiveOrder()` → 市场 `cancelBid` 回调期间，市场可直接重入 `refund()`（`executionFailed` 已置位），在退款到账前按旧池子算比例 | ✅ 已修：`executing` 下 `refund()` **只接受 `buying`**（`listed` 的押金未回、`ready` 的元件已属持份人）。撤单完成后 `phase` 才是 `buying`，重入窗口关闭（测试 `refunds are closed outside Buying/Listed-cancelled state`） |
+| **S-16** | Medium | Ready 里 owner 失联时，余款一直躺在 `raisedBnb`，而 `refund`/`openRefund` 全被关 → 持份人**没有任何出口**（钱和元件都锁住） | ✅ 已修：`returnSurplus()` 改为 **owner 随时 / 其他人满 `FAIL_GRACE` 后可调**。它只把余款记到各持份人名下（`claimSurplus` 自取），不搬元件、不改归属、无法牟利；owner 失联时资金不再锁死（测试 `anyone can book the leftover BNB after the grace period`） |
+| **S-17** | Medium | 部分成交后 `cancelTransistorOrder()` 会 `_clearOrder()` 把 `priceLock` 归零，此时「已买过料」的证据消失：`setPhase(3)` / `depositToPool` 都要求 `_purchaseSettled()` → 永远回不到 `ready`，而退款出口又（因 S-14）关着 → 余款 + 元件死锁 | ✅ 已修：恢复路径改用 `_readyBasis()` = 已成交买单 **或 元件已在手**；正常到货证明仍由 `confirmTransistors` 的 `_readyInvariant()` 强制（测试 `partial fill can be cancelled, then the leftover is booked and the part is pooled`） |
+| **S-18** | Low（残留信任） | `setMiningPool` 由 owner 任意指定、`placeTransistorAsk` 价格由 owner 任意指定：owner 可把池子设成自己地址（入池即拿走元件），或挂 1 wei 卖单自成交把元件低价转走 | 接受（同 H-7）：Campaign owner 恒等于工厂 owner（`createCampaign` 是 `onlyOwner`，不存在第三方自建期次），这是平台权限而非隐藏后门；合约层已保证**无论 owner 怎么操作，持份人的本金不能被按折价清零**（S-14 的 `_holdersMadeWhole`），其余为运营信任 |
+| **S-19** | Low | 构造函数 / `setMaterialMarket` / 工厂白名单曾接受**无代码地址**：`placeBid` / `owed()` 对 EOA 返回空数据 → ABI 解码 revert，`cancelTransistorOrder`、`refund`、`claimFee` 全部瘫痪 | ✅ 已修：三处都加 `code.length != 0` 校验（测试 `rejects a market address that has no code`） |
+| **S-20** | Low | `depositToPool` 曾在 `outstandingShares == 0` 或持有的元件为 0 时也能执行：元件会转进矿池而**没有任何持份人**有资格领产出 | ✅ 已修：`ZeroShares` / `InsufficientParts` 双闸门（测试 `refuses to pool when no share or no part is left`） |
 
 ---
 
@@ -592,8 +604,8 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-drill.
 | `contracts/security/ReentrancyGuard.sol` | 防重入（自写） |
 | `contracts/mocks/MockMaterialMarket.sol` / `MockERC1155.sol` | 测试替身 |
 | `contracts/test-helpers/Rejector.sol` | 拒收合约（测试 pull 模式） |
-| `test/Campaign.test.js` | 业务/状态机测试（90 passing） |
-| `test/Invariants.test.js` | 账本恒等式、份额守恒、随机生命周期、边界拒绝（24 passing） |
+| `test/Campaign.test.js` | 业务/状态机测试（99 passing） |
+| `test/Invariants.test.js` | 账本恒等式、份额守恒、元件抵押不变式、随机生命周期、边界拒绝（26 passing） |
 | `scripts/deploy-bsc.js` | 主网/测试网部署（带硬断言） |
 | `scripts/deploy-factory.js` | 只布工厂 |
 | `scripts/deploy.js` | 本地部署 + 开一期示例 |

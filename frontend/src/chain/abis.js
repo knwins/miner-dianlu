@@ -74,6 +74,7 @@ export const CAMPAIGN_ABI = [
   "function cancelTransistorAsk()",
   "function withdrawMarketProceeds()",
   "function returnSurplus()",
+  "function topUpShortfall() payable",
   "function openRefund()",
   "function abandonOrder()",
   "function cancelTransistorOrder()",
