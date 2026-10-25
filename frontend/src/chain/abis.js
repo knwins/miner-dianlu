@@ -215,6 +215,19 @@ export const CIRCUIT_MARKET_ABI = [
   "error NothingOwed()",
 ];
 
+/**
+ * 官方 PoD 挖矿合约的只读切片（BSC 主网 0x7E2E…7b46）。
+ *
+ * 只用来判「这张电路还能不能开矿」：`getMiner(key).status === 2` 表示该矿工已被官方撤销，
+ * 电路再也不能复工 —— 这种挂单不能出现在「买入」面板里。完整 Miner 元组必须全部声明，
+ * 否则 Solidity 的返回数据无法解码。
+ */
+export const POD_MINING_ABI = [
+  "function minerKey(address circuits, uint256 circuitId) pure returns (bytes32)",
+  "function processorMultiplier(address circuits) view returns (uint256)",
+  "function getMiner(bytes32 key) view returns (tuple(address circuits, uint64 circuitId, uint32 taskId, uint32 gateCount, uint32 stateCount, uint32 depth, uint64 area, uint32 mult, uint64 since, uint8 status, address registrant, uint32 nandBurn, uint32 latchBurn, uint64 bstar, uint64 bonus, bool optimal, uint64 commitBlock, uint64 firstUnusedId, uint64 stopBlock, uint128 verifWeight, uint128 unverWeight, uint256 debt))",
+];
+
 /** MockCircuitNft 的调试入口：测试网电路由任何人 mint，用来制造市场卖单。 */
 export const MOCK_CIRCUIT_ABI = [
   "function balanceOf(address account) view returns (uint256)",

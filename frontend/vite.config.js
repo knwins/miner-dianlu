@@ -2,11 +2,13 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 /**
- * 官方电路市价来自链上电路市场的活跃卖单。
- *
  * 官方站点**不发** access-control-allow-origin，浏览器直连会被 CORS 拦下，
  * 所以这里加一个同源代理 `/tt-api` → https://tapeout.net。
- * 前端只认相对路径 `/tt-api/market.json`，开发与预览服同一写法，不需要区分环境。
+ *
+ * 前端同源路径：
+ *   /tt-api/market.json           → 晶体管市场（旧）
+ *   /tt-api/circuit-market.json   → 电路挂单全量快照（买入面板 / 底价主源）
+ * 开发与预览服同一写法；生产需配 nginx 反代（见 tt-api.nginx.conf）。
  */
 const TTOUT_PROXY = {
   "/tt-api": {

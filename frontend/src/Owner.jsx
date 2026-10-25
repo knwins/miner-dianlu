@@ -132,6 +132,8 @@ function CircuitExecPanel({
   const [marketRows, setMarketRows] = useState([]);
   const [marketState, setMarketState] = useState("idle"); // idle | loading | ready | error
   const [marketError, setMarketError] = useState("");
+  /** snapshot = 官方快照；fallback = 窗口扫描（生产未配 /tt-api 时） */
+  const [marketSource, setMarketSource] = useState("");
   const [marketReload, setMarketReload] = useState(0);
   const [picked, setPicked] = useState({});
   const lockedCircuits = String(book.circuits || "");
@@ -195,15 +197,19 @@ function CircuitExecPanel({
     }
     setMarketState("loading");
     setMarketError("");
+    setMarketSource("");
+    // 主路径：官方 circuit-market.json 快照作候选 → 链上复核；秒级返回。
     readCircuitListingsFor(marketAddr, lockedCircuits)
       .then((rows) => {
         if (!alive) return;
         setMarketRows(Array.isArray(rows) ? rows : []);
+        setMarketSource(rows?.source || "");
         setMarketState("ready");
       })
       .catch((e) => {
         if (!alive) return;
         setMarketRows([]);
+        setMarketSource("");
         setMarketState("error");
         setMarketError(e?.shortMessage || e?.message || "读取官方市场卖单失败");
       });
@@ -302,8 +308,13 @@ function CircuitExecPanel({
             {chainMode ? (
               <div className="flow-form">
                 <p className="fine">
-                  {`本期锁定的电路合约 ${shortAddress(lockedCircuits)}。下表是官方电路市场当前最低价的 5 笔在售卖单（按最近 200 笔挂单统计，实时读链，非模拟数据）。`}
+                  {`本期锁定的电路合约 ${shortAddress(lockedCircuits)}。下表是官方电路市场当前最低价的 5 笔在售卖单：读官方挂单快照作候选，再逐条链上复核价格与可挖矿资格（含撤销状态），非模拟数据。`}
                 </p>
+                {marketSource === "fallback" && (
+                  <p className="fine warn-text">
+                    官方挂单快照读不到（生产需配置 /tt-api 反代，见 frontend/tt-api.nginx.conf），已改用最近挂单窗口扫描，可能漏掉更早的低价单。
+                  </p>
+                )}
                 {marketState === "error" && <p className="fine warn-text">{marketError}</p>}
                 {marketState === "loading" && marketRows.length === 0 && (
                   <p className="flow-empty">正在读取官方市场卖单…</p>

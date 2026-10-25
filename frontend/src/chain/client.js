@@ -1,7 +1,7 @@
 // 链上对接客户端（ethers v6）。读取 Campaign 实时状态、发送写交易。
 // 无钱包时用公共 RPC 只读；有钱包（window.ethereum）时签名发送。
-import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress } from "ethers";
-import { CAMPAIGN_ABI, FACTORY_ABI, CIRCUIT_MARKET_ABI, MOCK_CIRCUIT_ABI } from "./abis.js";
+import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress, keccak256, solidityPacked } from "ethers";
+import { CAMPAIGN_ABI, FACTORY_ABI, CIRCUIT_MARKET_ABI, MOCK_CIRCUIT_ABI, POD_MINING_ABI } from "./abis.js";
 import {
   CAMPAIGN_ADDRESS,
   FACTORY_ADDRESS,
@@ -12,6 +12,7 @@ import {
   SCENE_LABEL,
   PHASE_LABEL,
   POD_LENS_ADDRESS,
+  POD_MINING_ADDRESS,
 } from "./config.js";
 import { discoverWallets, explainConnectError, inAppWalletName, rememberWallet, rememberedWalletId } from "./wallets.js";
 
@@ -1065,21 +1066,17 @@ async function marketHandle(runner, campaignAddr = getCampaignAddress()) {
 export async function readMarketBook(campaignAddr = getCampaignAddress()) {
   return withReadProvider(async (runner) => {
     const { campaign, market, marketAddr } = await marketHandle(runner, campaignAddr);
-    const circuits = String(await campaign.circuits()).toLowerCase();
-    const next = await market.nextListingId();
-    const lines = [`市场 ${shortAddr(marketAddr)}（卖家付 ${Number(await market.feeBps().catch(() => 0)) / 100}% 费）`];
-    // 上限 300 张，并发读：串行读几百张 RPC 会让调试页转十几秒。
-    const top = next - 1n > 300n ? next - 1n - 300n : 1n;
-    const ids = [];
-    for (let i = next - 1n; i >= top && ids.length < 100; i--) ids.push(i);
-    const listings = await Promise.all(ids.map((id) => market.listings(id).catch(() => null)));
-    let open = 0;
-    listings.forEach((l, idx) => {
-      if (!l || String(l.circuits).toLowerCase() !== circuits) return;
-      open += 1;
-      lines.push(`挂单 #${ids[idx]} · token #${l.tokenId} · 单价 ${formatEther(l.price)} BNB · 卖家 ${shortAddr(l.seller)}`);
-    });
-    if (open === 0) lines.push("市场里没有本期电路的卖单");
+    const circuits = String(await campaign.circuits());
+    const feeBps = Number(await market.feeBps().catch(() => 0));
+    const rows = await readCircuitListingsFor(marketAddr, circuits);
+    const lines = [`市场 ${shortAddr(marketAddr)}（卖家付 ${feeBps / 100}% 费）`];
+    if (!rows.length) {
+      lines.push("市场里没有本期电路的卖单");
+      return lines.join("\n");
+    }
+    for (const l of rows) {
+      lines.push(`挂单 #${l.id} · token #${l.tokenId} · 单价 ${formatEther(l.price)} BNB · 卖家 ${shortAddr(l.seller)}`);
+    }
     return lines.join("\n");
   });
 }
@@ -1788,70 +1785,330 @@ function parseUintField(raw, label, fallback = null) {
   return BigInt(text);
 }
 
+// ═══════════════════ 电路市场挂单（官方快照 + 链上复核） ═══════════════════
+
 /**
- * 扫最近的市场卖单，筛出属于本期电路合约、仍有效**且当前能挖矿**的挂单。
+ * 为什么不能只回看「最近 N 笔挂单」。
  *
- * 能挖矿用官方 Lens 的 `refsEligible` 判定（processorMultiplier > 0 且网表无 REF）。
- * 自动挑单必须走同一套过滤：买到一张不能出矿的电路，等于把募集款换成砖头。
+ * 官方电路市场的 listing id 是**全市场共用**的一本账。2026-10-26 实测
+ * `nextListingId` 已到 26,525：本期集合当时有 257 条有效挂单，落在「最近 200 笔」
+ * 里的可挖矿单只有 8 条；最便宜的几张（0.03499 / 0.035）比窗口下沿还老几千个 id，
+ * 面板就会显示成「假最低价」。
+ *
+ * 官方站点已经索引好了全市场挂单：`https://tapeout.net/circuit-market.json`
+ * （浏览器走同源 `/tt-api/circuit-market.json`，由 vite / nginx 反代）。我们拿它当
+ * **候选名单**，再逐条上链复核 `listingFor` + Lens/撤销状态 —— 秒级出结果，
+ * 价格与可买资格仍以链上为准。快照拿不到时才回退窗口扫描，并标明可能漏单。
  */
-async function scanCircuitListings(campaign, market, lookback = 200) {
-  const circuits = String(await campaign.circuits()).toLowerCase();
-  const next = await market.nextListingId();
-  const latest = next - 1n;
-  if (latest <= 0n) return [];
-  const first = latest > BigInt(lookback) ? latest - BigInt(lookback) + 1n : 1n;
-  const ids = [];
-  for (let i = latest; i >= first; i--) ids.push(i);
-  const rows = await Promise.all(ids.map(async (id) => {
-    try {
-      const l = await market.listings(id);
-      if (String(l.circuits).toLowerCase() !== circuits) return null;
-      const live = await market.listingFor(l.circuits, l.tokenId);
-      if (!live.valid || live.id !== id) return null;
-      const mineable = await readMineable(market.runner, circuits, Number(l.tokenId));
-      if (mineable === false) return null;
-      return { id, tokenId: l.tokenId, price: l.price, seller: l.seller };
-    } catch {
-      return null;
-    }
-  }));
-  return rows.filter(Boolean).sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+const CIRCUIT_MARKET_SNAPSHOT_URL = "/tt-api/circuit-market.json";
+/** 快照失败时的回退窗口：只用于兜底，不承诺全市场最低价。 */
+const FALLBACK_LOOKBACK = 2000;
+const _marketIface = new Interface(CIRCUIT_MARKET_ABI);
+
+/** 官方 PoD Lens：`refsEligible` = 倍率 > 0 且网表无 REF（官方 start 前置条件）。 */
+const POD_LENS_ABI = [
+  "function refsEligible(address circuits, uint256 circuitId) view returns (bool)",
+];
+
+function decodeListingFor(raw) {
+  if (typeof raw !== "string" || raw.length < 2 + 64 * 4) return null;
+  try {
+    const v = _marketIface.decodeFunctionResult("listingFor", raw);
+    return {
+      id: Number(v.id),
+      seller: String(v.seller || ""),
+      price: BigInt(v.price ?? 0),
+      valid: Boolean(v.valid),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function decodeListingRecord(raw) {
+  if (typeof raw !== "string" || raw.length < 2 + 64 * 5) return null;
+  try {
+    const l = _marketIface.decodeFunctionResult("listings", raw);
+    const seller = String(l.seller || "");
+    const circuits = String(l.circuits || "").toLowerCase();
+    if (!isAddr(seller) || seller === ZeroAddress) return null;
+    if (!isAddr(circuits) || circuits === ZeroAddress) return null;
+    const price = BigInt(l.price ?? 0);
+    if (price <= 0n) return null;
+    return { circuits, tokenId: Number(l.tokenId), price, seller };
+  } catch {
+    return null;
+  }
 }
 
 /**
- * 全局读电路市场卖单（市场页用）。不依赖某一期：
- * 传入市场地址 + 要筛选的 ERC721 集合（工厂白名单），返回有效挂单与每个集合的底价。
+ * 拉官方电路市场快照。同源 `/tt-api` 反代到 tapeout.net（见 vite.config.js /
+ * tt-api.nginx.conf）。
+ *
+ * 生产注意：`vite build` 产物不含代理；托管机必须配 `tt-api.nginx.conf`，
+ * 否则本函数返回 null，买入面板会退回窗口扫描（能开、但可能漏更早的低价单）。
+ * 官方站点不发 CORS，浏览器不能直连 tapeout.net。
+ *
+ * @returns {Promise<{marketAddr:string, listings:object[]}|null>}
  */
-export async function readCircuitMarketSnapshot(marketAddr, collections = [], lookback = 300) {
+async function fetchOfficialCircuitMarketSnapshot() {
+  try {
+    const res = await fetch(CIRCUIT_MARKET_SNAPSHOT_URL, {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json || !Array.isArray(json.listings)) return null;
+    return {
+      marketAddr: String(json.marketAddr || "").toLowerCase(),
+      listings: json.listings,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 从官方快照筛出某个集合的**可挖候选**挂单。
+ *
+ * 快照字段口径（与官方页面一致）：
+ *   · `valid`：挂单仍在售
+ *   · `eligible`：可挖（含倍率 / 无 REF）
+ *   · `revoked`：矿工已被官方撤销（永远不能再开矿）
+ * 这里只当候选：价格与有效性仍要上链复核。
+ */
+function candidatesFromSnapshot(snapshot, marketAddr, circuitsAddr) {
+  const wantMarket = String(marketAddr).toLowerCase();
+  const want = String(circuitsAddr).toLowerCase();
+  if (snapshot.marketAddr && snapshot.marketAddr !== wantMarket) return null;
+  const out = [];
+  for (const row of snapshot.listings) {
+    if (String(row.circuits || "").toLowerCase() !== want) continue;
+    if (row.valid === false) continue;
+    if (row.revoked === true) continue;
+    if (row.eligible === false) continue;
+    const id = Number(row.id);
+    const tokenId = Number(row.circuitId ?? row.tokenId);
+    if (!Number.isFinite(id) || id <= 0 || !Number.isFinite(tokenId)) continue;
+    out.push({ id, tokenId });
+  }
+  return out;
+}
+
+/**
+ * 逐条上链复核候选挂单：撤单、成交、改价、换集合都在这里被链上事实纠正。
+ * 复核失败不静默跳过 —— 少一条就可能让 Owner 以为「没有更便宜的」。
+ */
+async function verifyListings(runner, marketAddr, circuitsAddr, candidates) {
+  if (!candidates.length) return [];
+  const calls = candidates.map((c) => ({
+    to: marketAddr,
+    data: _marketIface.encodeFunctionData("listingFor", [circuitsAddr, c.tokenId]),
+  }));
+  const raws = [];
+  for (let i = 0; i < calls.length; i += 40) {
+    const slice = calls.slice(i, i + 40);
+    let chunk;
+    try {
+      chunk = await callBatchWithFailover(slice);
+    } catch {
+      chunk = await Promise.all(slice.map((c) => runner.call(c).catch(() => null)));
+      if (chunk.every((r) => r == null)) {
+        throw new Error("复核电路市场挂单失败（公共节点限流或超时），请稍后重试");
+      }
+    }
+    raws.push(...chunk);
+  }
+  const rows = [];
+  raws.forEach((raw, i) => {
+    const live = decodeListingFor(raw);
+    if (!live || !live.valid) return;
+    if (live.id !== candidates[i].id) return; // 该 token 已被重新挂过，旧 id 作废
+    if (live.price <= 0n) return;
+    rows.push({
+      id: candidates[i].id,
+      tokenId: candidates[i].tokenId,
+      price: live.price,
+      seller: live.seller,
+    });
+  });
+  return rows;
+}
+
+/**
+ * 读「能不能挖」的官方判据，一次批量算完。
+ *
+ * 两条规则叠加，缺一条就会把砖头当矿机卖：
+ *   1. Lens `refsEligible`：processorMultiplier > 0 且网表没有 REF 引用；
+ *   2. 矿工状态 `status != 2`：2 = 被官方撤销，这张电路永远不能再开矿。
+ *      （实测 token 13945：refsEligible = true、getMiner.status = 2）
+ *
+ * 读不到时返回 null（未知），不静默隐藏；只有链上明确返回不可挖的才过滤。
+ *
+ * @returns {Promise<Map<number, boolean|null>>}
+ */
+async function readMineableMap(runner, circuitsAddr, tokenIds) {
+  const out = new Map();
+  if (!tokenIds.length) return out;
+  const lensOn = isAddr(POD_LENS_ADDRESS);
+  const miningOn = isAddr(POD_MINING_ADDRESS);
+  if (!lensOn && !miningOn) return out;
+
+  const lensIface = new Interface(POD_LENS_ABI);
+  const miningIface = new Interface(POD_MINING_ABI);
+  const calls = [];
+  const plan = [];
+  for (const tokenId of tokenIds) {
+    if (lensOn) {
+      calls.push({
+        to: POD_LENS_ADDRESS,
+        data: lensIface.encodeFunctionData("refsEligible", [circuitsAddr, tokenId]),
+      });
+      plan.push({ tokenId, kind: "lens" });
+    }
+    if (miningOn) {
+      const key = keccak256(solidityPacked(["address", "uint256"], [circuitsAddr, tokenId]));
+      calls.push({ to: POD_MINING_ADDRESS, data: miningIface.encodeFunctionData("getMiner", [key]) });
+      plan.push({ tokenId, kind: "miner" });
+    }
+  }
+
+  const raws = [];
+  for (let i = 0; i < calls.length; i += 40) {
+    const slice = calls.slice(i, i + 40);
+    let chunk;
+    try {
+      chunk = await callBatchWithFailover(slice);
+    } catch {
+      chunk = await Promise.all(slice.map((c) => runner.call(c).catch(() => null)));
+    }
+    raws.push(...chunk);
+  }
+
+  plan.forEach(({ tokenId, kind }, i) => {
+    const raw = raws[i];
+    if (typeof raw !== "string" || raw.length <= 2) return;
+    try {
+      if (kind === "lens") {
+        const ok = Boolean(lensIface.decodeFunctionResult("refsEligible", raw)[0]);
+        if (!ok) out.set(tokenId, false);
+        else if (!out.has(tokenId)) out.set(tokenId, true);
+      } else {
+        const miner = miningIface.decodeFunctionResult("getMiner", raw)[0];
+        if (Number(miner.circuitId) !== Number(tokenId)) return;
+        if (Number(miner.status) === 2) out.set(tokenId, false);
+        else if (!out.has(tokenId)) out.set(tokenId, null);
+      }
+    } catch {
+      /* 解码失败 = 未知 */
+    }
+  });
+  return out;
+}
+
+/**
+ * 快照拿不到时的兜底：回看最近 FALLBACK_LOOKBACK 笔挂单 id。
+ * 可能漏掉更早的低价单，调用方应在 UI 标明。
+ */
+async function scanRecentListingCandidates(runner, marketAddr, circuitsAddr, lookback = FALLBACK_LOOKBACK) {
+  const want = String(circuitsAddr).toLowerCase();
+  const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
+  const next = await market.nextListingId();
+  const latest = Number(next) - 1;
+  if (latest <= 0) return [];
+  const first = Math.max(1, latest - lookback + 1);
+  const ids = [];
+  for (let id = latest; id >= first; id--) ids.push(id);
+
+  const candidates = [];
+  for (let i = 0; i < ids.length; i += 40) {
+    const slice = ids.slice(i, i + 40);
+    const calls = slice.map((id) => ({
+      to: marketAddr,
+      data: _marketIface.encodeFunctionData("listings", [id]),
+    }));
+    let raws;
+    try {
+      raws = await callBatchWithFailover(calls);
+    } catch {
+      raws = await Promise.all(calls.map((c) => runner.call(c).catch(() => null)));
+    }
+    raws.forEach((raw, k) => {
+      const rec = decodeListingRecord(raw);
+      if (!rec || rec.circuits !== want) return;
+      candidates.push({ id: slice[k], tokenId: rec.tokenId });
+    });
+  }
+  return candidates;
+}
+
+/**
+ * 把候选挂单变成「可买、可挖、已按价排序」的最终列表。
+ */
+async function finalizeListings(runner, marketAddr, circuitsAddr, candidates) {
+  const live = await verifyListings(runner, marketAddr, circuitsAddr, candidates);
+  const mineable = await readMineableMap(runner, circuitsAddr, live.map((r) => r.tokenId));
+  return live
+    .filter((row) => mineable.get(row.tokenId) !== false)
+    .sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0))
+    .map((r) => ({ ...r, priceBnb: Number(formatEther(r.price)) }));
+}
+
+/**
+ * 读某个集合的在售卖单（Owner 买入面板 + 自动挑单）。
+ *
+ * 主路径：官方 `circuit-market.json` 候选 → 链上复核。
+ * 兜底：最近 FALLBACK_LOOKBACK 笔 id 窗口扫描（可能漏更早的低价单）。
+ *
+ * @returns {Promise<Array<{id:number,tokenId:number,price:bigint,seller:string,priceBnb:number}>>}
+ */
+export async function readCircuitListingsFor(marketAddr, circuitsAddr) {
+  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return [];
+  if (!isAddr(circuitsAddr) || circuitsAddr === ZeroAddress) return [];
+  const want = String(circuitsAddr).toLowerCase();
+  return withReadProvider(async (runner) => {
+    const snap = await fetchOfficialCircuitMarketSnapshot();
+    let candidates = snap ? candidatesFromSnapshot(snap, marketAddr, want) : null;
+    const fromSnapshot = Array.isArray(candidates);
+    if (!fromSnapshot) {
+      candidates = await scanRecentListingCandidates(runner, marketAddr, want);
+    }
+    const rows = await finalizeListings(runner, marketAddr, want, candidates);
+    // 给 UI 标数据源：生产没配 /tt-api 反代时会走 fallback，需提示可能漏单。
+    rows.source = fromSnapshot ? "snapshot" : "fallback";
+    return rows;
+  });
+}
+
+/**
+ * 全局读电路市场卖单（多集合）。同样走官方快照 + 链上复核。
+ */
+export async function readCircuitMarketSnapshot(marketAddr, collections = []) {
   if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return null;
   return withReadProvider(async (runner) => {
     const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
     const [feeBps, next] = await Promise.all([market.feeBps(), market.nextListingId()]);
-    const allow = new Set((collections || []).map((a) => String(a).toLowerCase()));
-    const latest = next - 1n;
+    const allow = [...new Set((collections || []).filter(isAddr).map((a) => String(a).toLowerCase()))];
+    const snap = await fetchOfficialCircuitMarketSnapshot();
+
     const rows = [];
-    if (latest > 0n) {
-      const first = latest > BigInt(lookback) ? latest - BigInt(lookback) + 1n : 1n;
-      const ids = [];
-      for (let i = latest; i >= first; i--) ids.push(i);
-      const all = await Promise.all(ids.map((id) => market.listings(id).catch(() => null)));
-      for (let i = 0; i < all.length; i++) {
-        const l = all[i];
-        if (!l) continue;
-        const circuit = String(l.circuits).toLowerCase();
-        if (allow.size && !allow.has(circuit)) continue;
-        try {
-          const live = await market.listingFor(l.circuits, l.tokenId);
-          if (!live.valid || live.id !== ids[i]) continue;
-          // 市场页同样只展示「当前能挖矿」的电路，与 Owner 买入面板同口径。
-          const mineable = await readMineable(runner, l.circuits, Number(l.tokenId));
-          if (mineable === false) continue;
-          rows.push({ id: ids[i], circuits: l.circuits, tokenId: Number(l.tokenId), price: l.price, seller: l.seller });
-        } catch {
-          /* 单条挂单读失败不影响整页 */
-        }
+    const targets = allow.length ? allow : [];
+    if (!targets.length && snap) {
+      for (const row of snap.listings) {
+        const c = String(row.circuits || "").toLowerCase();
+        if (isAddr(c) && !targets.includes(c)) targets.push(c);
       }
     }
+    for (const circuit of targets) {
+      let candidates = snap ? candidatesFromSnapshot(snap, marketAddr, circuit) : null;
+      if (!candidates) {
+        candidates = await scanRecentListingCandidates(runner, marketAddr, circuit);
+      }
+      const live = await finalizeListings(runner, marketAddr, circuit, candidates);
+      for (const row of live) rows.push({ ...row, circuits: circuit });
+    }
+
     rows.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
     const floors = {};
     for (const row of rows) {
@@ -1860,9 +2117,9 @@ export async function readCircuitMarketSnapshot(marketAddr, collections = [], lo
       if (!(key in floors) || unit < floors[key]) floors[key] = unit;
     }
     return {
-    market: marketAddr,
-    circuitMarket: marketAddr,
-    feeBps: Number(feeBps),
+      market: marketAddr,
+      circuitMarket: marketAddr,
+      feeBps: Number(feeBps),
       nextListingId: Number(next - 1n),
       listings: rows.map((r) => ({ ...r, price: Number(formatEther(r.price)) })),
       floors,
@@ -1870,102 +2127,11 @@ export async function readCircuitMarketSnapshot(marketAddr, collections = [], lo
   });
 }
 
-/**
- * 官方 PoD Lens 的只读入口。
- * `refsEligible` 会把 processorMultiplier 与「网表不得含 REF」两条资格规则
- * 一起判掉 —— 这正是官方 start() 的前置条件，所以它比前端白名单更权威。
- */
-const POD_LENS_ABI = [
-  "function refsEligible(address circuits, uint256 circuitId) view returns (bool)",
-];
-
-/** 读一张电路是否真的有挖矿资格；Lens 未配置 / 读取失败时返回 null（未知）。 */
-async function readMineable(runner, circuitsAddr, tokenId) {
-  if (!isAddr(POD_LENS_ADDRESS)) return null;
-  try {
-    const lens = new Contract(POD_LENS_ADDRESS, POD_LENS_ABI, runner);
-    return Boolean(await lens.refsEligible(circuitsAddr, tokenId));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 读官方市场里某个 ERC721 集合的在售卖单（Owner「从电路市场买入」面板用）。
- *
- * 为什么不用期次合约去读：期次状态里已经有 `circuits`（开期锁定的集合）和
- * `circuitMarket`（市场地址），直接按这两个值扫市场即可 —— 少两次 RPC，
- * 而且列表严格 = 「本期能买的那一个集合」。
- *
- * 返回按单价从低到高排序，`price` 保留 wei（BigInt），`priceBnb` 是展示用数字。
- * lookback = 回扫多少笔挂单 ID（市场是全集合共用的一本账，太短会漏掉本集合的挂单）。
- */
-export async function readCircuitListingsFor(marketAddr, circuitsAddr, lookback = 200) {
-  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return [];
-  if (!isAddr(circuitsAddr) || circuitsAddr === ZeroAddress) return [];
-  const want = String(circuitsAddr).toLowerCase();
-  return withReadProvider(async (runner) => {
-    const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
-    const next = await market.nextListingId();
-    const latest = next - 1n;
-    if (latest <= 0n) return [];
-    const first = latest > BigInt(lookback) ? latest - BigInt(lookback) + 1n : 1n;
-    const ids = [];
-    for (let i = latest; i >= first; i--) ids.push(i);
-
-    /**
-     * 分批读挂单记录：每批 10 个。
-     *
-     * 为什么不是几百个 Promise 一起打出去：公共 RPC 对突发并发会限流，
-     * 读失败的请求被 catch 成 null 后，**最便宜的那笔挂单会被静默漏掉** ——
-     * 列表看着正常，底价却不是真的底价（实测漏过 0.0399 BNB 的卖单）。
-     * 每批 10 个实测 0 失败；批内失败项再重试一次，仍失败的才跳过。
-     */
-    const records = [];
-    for (let i = 0; i < ids.length; i += 10) {
-      const slice = ids.slice(i, i + 10);
-      const rows = await Promise.all(slice.map((id) => market.listings(id).catch(() => null)));
-      const retry = [];
-      rows.forEach((row, k) => { if (!row) retry.push(k); });
-      if (retry.length) {
-        await Promise.all(retry.map(async (k) => {
-          rows[k] = await market.listings(slice[k]).catch(() => null);
-        }));
-      }
-      records.push(...rows.map((row, k) => ({ id: slice[k], row })));
-    }
-
-    const matches = [];
-    for (const { id, row: l } of records) {
-      if (!l || String(l.circuits).toLowerCase() !== want) continue;
-      try {
-        const live = await market.listingFor(l.circuits, l.tokenId);
-        if (!live.valid || BigInt(live.id) !== id) continue;
-        matches.push({ id, tokenId: Number(l.tokenId), price: l.price, seller: l.seller });
-      } catch {
-        /* 单条有效性命中失败不影响整页 */
-      }
-    }
-    /**
-     * 只留下**当前可以挖矿**的电路：官方 Lens 的 refsEligible 会同时检查
-     * processorMultiplier > 0 与「网表没有 REF」——挂单在售 ≠ 能出矿。
-     * Lens 未配置（测试网）或单次读取失败时无法判定，不静默隐藏挂单；
-     * 但链上明确返回 false 的，一律不显示。
-     */
-    const lensConfigured = isAddr(POD_LENS_ADDRESS);
-    const mineable = [];
-    for (const row of matches) {
-      if (!lensConfigured) {
-        mineable.push(row);
-        continue;
-      }
-      const ok = await readMineable(runner, want, row.tokenId);
-      if (ok !== false) mineable.push(row);
-    }
-    return mineable
-      .sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0))
-      .map((r) => ({ ...r, priceBnb: Number(formatEther(r.price)) }));
-  });
+/** 自动挑单走同一套读取，保证「最便宜」与买入面板同口径。 */
+async function scanCircuitListings(campaign, market) {
+  const marketAddr = await market.getAddress();
+  const circuits = String(await campaign.circuits());
+  return readCircuitListingsFor(marketAddr, circuits);
 }
 
 /**

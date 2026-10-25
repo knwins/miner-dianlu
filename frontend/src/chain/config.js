@@ -22,6 +22,16 @@ export const CIRCUIT_MARKET_ADDRESS = deployments.circuitMarket || "";
 export const POD_LENS_ADDRESS = deployments.podLens
   || (CHAIN_ID === 56 ? "0xdd20b9537b9f5db9d2a23e6b11ad863cf81930d8" : "");
 
+/**
+ * 官方 PoD 挖矿合约。用于判定一张电路的矿工状态（0 无 / 1 挖矿中 / 2 已撤销 / 3 冷却中）。
+ *
+ * 「已撤销（status = 2）」的电路**不能重新开矿**：官方页面把它标成「不可挖矿」，
+ * 但 Lens 的 `refsEligible` 只检查算力倍率与网表引用，对撤销返回的仍是 true。
+ * 所以买入前的资格判定必须叠加这一条，否则会把砖头当矿机卖给人。
+ */
+export const POD_MINING_ADDRESS = deployments.podMining
+  || (CHAIN_ID === 56 ? "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46" : "");
+
 // 工厂已部署即可对接。campaign 为空表示尚未开期，页面不回退到本地模拟数据。
 export const IS_CONFIGURED = isAddr(FACTORY_ADDRESS);
 
