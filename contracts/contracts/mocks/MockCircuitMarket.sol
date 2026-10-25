@@ -129,7 +129,8 @@ contract MockCircuitMarket is ICircuitMarket {
         uint256 fee = (uint256(l.price) * l.feeBps) / 10_000;
         uint256 net = payNothing ? 0 : uint256(l.price) - fee;
         if (net != 0) _owed[l.seller] += net;
-        if (!skipTransfer) IERC721(l.circuits).transferFrom(l.seller, msg.sender, l.tokenId);
+        // Official market uses safeTransferFrom; mock must too or Campaign.receiver bugs stay hidden.
+        if (!skipTransfer) IERC721(l.circuits).safeTransferFrom(l.seller, msg.sender, l.tokenId);
         emit Bought(id, msg.sender, l.seller, l.tokenId, l.price, l.feeBps);
     }
 

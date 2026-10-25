@@ -186,7 +186,9 @@ function CircuitExecPanel({
    * 不依赖任何前端缓存或模拟数据。
    */
   useEffect(() => {
-    if (!chainMode || !buying || pending) return undefined;
+    if (!chainMode || !buying) return undefined;
+    // 故意不依赖 pending：交易进行中若把 pending 放进 deps 并 early-return，
+    // cleanup 会取消进行中的请求，界面会永远停在「读取中」。买入前仍会链上复核。
     let alive = true;
     const marketAddr = String(book.circuitMarket || book.market || "");
     if (!/^0x[0-9a-fA-F]{40}$/.test(marketAddr) || !/^0x[0-9a-fA-F]{40}$/.test(lockedCircuits)) {
@@ -198,7 +200,7 @@ function CircuitExecPanel({
     setMarketState("loading");
     setMarketError("");
     setMarketSource("");
-    // 主路径：官方 circuit-market.json 快照作候选 → 链上复核；秒级返回。
+    // 主路径：官方 circuit-market.json 快照作候选 → 链上复核最便宜的一批。
     readCircuitListingsFor(marketAddr, lockedCircuits)
       .then((rows) => {
         if (!alive) return;
@@ -216,7 +218,7 @@ function CircuitExecPanel({
     return () => {
       alive = false;
     };
-  }, [chainMode, buying, pending, book.circuitMarket, book.market, lockedCircuits, marketReload]);
+  }, [chainMode, buying, book.circuitMarket, book.market, lockedCircuits, marketReload]);
 
   /** 市场前 5 条（已按单价从低到高排序）。 */
   const topListings = marketRows.slice(0, 5);
@@ -297,7 +299,7 @@ function CircuitExecPanel({
                 className="btn btn-inline"
                 type="button"
                 disabled={marketState === "loading" || Boolean(pending)}
-                title="重新读官方市场卖单（价格以链上为准）"
+                title="重新读取官方卖单"
                 onClick={() => setMarketReload((k) => k + 1)}
               >
                 {marketState === "loading" ? "读取中…" : "刷新卖单"}
@@ -306,76 +308,88 @@ function CircuitExecPanel({
           </div>
           <div className="flow-panel-body">
             {chainMode ? (
-              <div className="flow-form">
-                <p className="fine">
-                  {`本期锁定的电路合约 ${shortAddress(lockedCircuits)}。下表是官方电路市场当前最低价的 5 笔在售卖单：读官方挂单快照作候选，再逐条链上复核价格与可挖矿资格（含撤销状态），非模拟数据。`}
-                </p>
+              <div className="flow-form flow-market">
+                <div className="flow-market-meta">
+                  <span>电路 <code>{shortAddress(lockedCircuits)}</code></span>
+                  <span className="flow-market-meta-sep" aria-hidden="true">·</span>
+                  <span>官方最低价可挖卖单 · 前 {topListings.length || 5} 笔</span>
+                </div>
                 {marketSource === "fallback" && (
-                  <p className="fine warn-text">
-                    官方挂单快照读不到（生产需配置 /tt-api 反代，见 frontend/tt-api.nginx.conf），已改用最近挂单窗口扫描，可能漏掉更早的低价单。
-                  </p>
+                  <p className="flow-market-hint is-warn">快照暂不可用，改扫最近挂单，可能漏更低价。</p>
                 )}
-                {marketState === "error" && <p className="fine warn-text">{marketError}</p>}
+                {marketState === "error" && <p className="flow-market-hint is-warn">{marketError}</p>}
                 {marketState === "loading" && marketRows.length === 0 && (
-                  <p className="flow-empty">正在读取官方市场卖单…</p>
+                  <p className="flow-empty">正在读取官方卖单…</p>
                 )}
                 {marketState === "ready" && marketRows.length === 0 && (
-                  <p className="flow-empty">
-                    {`官方市场当前没有本期电路的卖单（集合 ${shortAddress(lockedCircuits)}）。等卖方挂单后再刷新。`}
-                  </p>
+                  <p className="flow-empty">暂无可挖卖单，稍后刷新。</p>
                 )}
                 {topListings.length > 0 && (
                   <>
-                    <table className="flow-table">
+                    <table className="flow-table flow-market-table">
                       <thead>
-                        <tr><th>选择</th><th>挂单</th><th>tokenId</th><th>单价 BNB</th><th>卖家</th></tr>
+                        <tr>
+                          <th className="col-pick" scope="col">选</th>
+                          <th className="col-id" scope="col">挂单</th>
+                          <th className="col-token" scope="col">电路</th>
+                          <th className="col-price" scope="col">单价</th>
+                          <th className="col-seller" scope="col">卖家</th>
+                        </tr>
                       </thead>
                       <tbody>
                         {topListings.map((row) => {
                           const key = String(row.id);
                           return (
-                            <tr key={key}>
-                              <td>
-                                <input
-                                  type="checkbox"
-                                  checked={Boolean(picked[key])}
-                                  disabled={!canOperate || Boolean(pending) || halted || !soldOut}
-                                  onChange={() => setPicked((cur) => ({ ...cur, [key]: !cur[key] }))}
-                                />
+                            <tr key={key} className={picked[key] ? "is-picked" : undefined}>
+                              <td className="col-pick">
+                                <label className="flow-market-check">
+                                  <input
+                                    type="checkbox"
+                                    checked={Boolean(picked[key])}
+                                    disabled={!canOperate || Boolean(pending) || halted || !soldOut}
+                                    onChange={() => setPicked((cur) => ({ ...cur, [key]: !cur[key] }))}
+                                  />
+                                </label>
                               </td>
-                              <td className="mono">#{row.id}</td>
-                              <td className="mono">#{row.tokenId}</td>
-                              <td>{formatUnitPrice(round5(Number(row.priceBnb) || 0))}</td>
-                              <td className="mono">{shortAddress(row.seller)}</td>
+                              <td className="col-id mono">#{row.id}</td>
+                              <td className="col-token mono">#{row.tokenId}</td>
+                              <td className="col-price">
+                                <strong>{formatUnitPrice(round5(Number(row.priceBnb) || 0))}</strong>
+                                <span className="flow-market-unit">BNB</span>
+                              </td>
+                              <td className="col-seller mono" title={row.seller}>{shortAddress(row.seller)}</td>
                             </tr>
                           );
                         })}
                       </tbody>
                     </table>
-                    <div className="flow-form-bar">
-                      <span>
-                        {`已选 ${pickedRows.length} 张 · 合计 ${round4(pickedCost)} BNB · 募集余额 ${round4(raised)} BNB`
-                          + (pickedOverBudget ? " · 超余额，先降低选择" : "")
-                          + (marketRows.length > topListings.length ? ` · 市场共 ${marketRows.length} 笔在售` : "")}
-                      </span>
+                    <div className="flow-form-bar flow-market-bar">
+                      <div className="flow-market-stats">
+                        <span>已选 <strong>{pickedRows.length}</strong></span>
+                        <span>合计 <strong>{round4(pickedCost)}</strong> BNB</span>
+                        <span>余额 <strong>{round4(raised)}</strong> BNB</span>
+                        {pickedOverBudget && <span className="is-warn">超出余额</span>}
+                      </div>
                       <button
                         className="btn btn-primary"
                         type="button"
                         disabled={!canBuyPicked}
-                        title={!canOperate ? "只有 Owner 能买入" : halted ? "本期已熔断" : !soldOut ? "份数还没售完" : pickedRows.length === 0 ? "先勾选要买的挂单" : pickedOverBudget ? "合计超过募集余额，链上会空跑" : undefined}
+                        title={!canOperate ? "只有 Owner 能买入" : halted ? "本期已熔断" : !soldOut ? "份数还没售完" : pickedRows.length === 0 ? "先勾选要买的挂单" : pickedOverBudget ? "合计超过募集余额" : "签名前会再核一次链上现价"}
                         onClick={() => onBuyCircuits?.({
                           picks: pickedRows.map((row) => ({ id: row.id, tokenId: row.tokenId })),
                         })}
                       >
-                        {pending === "buyCircuits" ? "买入中…" : `买入选中 ${pickedRows.length} 张`}
+                        {pending === "buyCircuits"
+                          ? "买入中…"
+                          : pickedRows.length > 0
+                            ? `买入 ${pickedRows.length} 张`
+                            : "买入选中"}
                       </button>
                     </div>
-                    <p className="fine">
-                      勾选后按挂单逐一吃单（原子：任一失败整笔回滚）；采购款直接从募集余额扣，签名前会再读一次链上价格。
-                    </p>
+                    <p className="flow-market-hint">款从募集余额扣；任一失败整笔回滚；签名前再核现价。</p>
                   </>
                 )}
-                {!soldOut && <p className="fine warn-text">份数还没售完：售罄后才能开始买入。</p>}
+                {!soldOut && <p className="flow-market-hint is-warn">份数售罄后才能买入。</p>}
               </div>
             ) : (
               <div className="flow-form">

@@ -1801,8 +1801,15 @@ function parseUintField(raw, label, fallback = null) {
  * 价格与可买资格仍以链上为准。快照拿不到时才回退窗口扫描，并标明可能漏单。
  */
 const CIRCUIT_MARKET_SNAPSHOT_URL = "/tt-api/circuit-market.json";
-/** 快照失败时的回退窗口：只用于兜底，不承诺全市场最低价。 */
-const FALLBACK_LOOKBACK = 2000;
+/**
+ * 快照约 3 MB：公共网络实测下载就要 6～15 秒。超时设太短会 abort → 退回窗口扫描 →
+ * 面板一直「读取中」。给足余量；真正卡住由 AbortController 收掉。
+ */
+const SNAPSHOT_FETCH_MS = 60_000;
+/** 面板 / 自动买入只需最便宜的一小撮；展示用快照价，买入前再链上复核。 */
+const DISPLAY_TOP = 20;
+/** 快照失败时的回退窗口（笔）。故意压小：兜底不能再拖成「一直读取中」。 */
+const FALLBACK_LOOKBACK = 200;
 const _marketIface = new Interface(CIRCUIT_MARKET_ABI);
 
 /** 官方 PoD Lens：`refsEligible` = 倍率 > 0 且网表无 REF（官方 start 前置条件）。 */
@@ -1852,10 +1859,13 @@ function decodeListingRecord(raw) {
  * @returns {Promise<{marketAddr:string, listings:object[]}|null>}
  */
 async function fetchOfficialCircuitMarketSnapshot() {
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), SNAPSHOT_FETCH_MS) : null;
   try {
     const res = await fetch(CIRCUIT_MARKET_SNAPSHOT_URL, {
       cache: "no-store",
       headers: { Accept: "application/json" },
+      signal: ctrl?.signal,
     });
     if (!res.ok) return null;
     const json = await res.json();
@@ -1866,19 +1876,23 @@ async function fetchOfficialCircuitMarketSnapshot() {
     };
   } catch {
     return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
 /**
- * 从官方快照筛出某个集合的**可挖候选**挂单。
+ * 从官方快照筛出某个集合的**可挖**挂单，按快照价从低到高，带上价格供直接展示。
  *
  * 快照字段口径（与官方页面一致）：
  *   · `valid`：挂单仍在售
- *   · `eligible`：可挖（含倍率 / 无 REF）
- *   · `revoked`：矿工已被官方撤销（永远不能再开矿）
- * 这里只当候选：价格与有效性仍要上链复核。
+ *   · `eligible === true`：可挖；null/false 不进表
+ *   · `revoked`：已撤销，不进表
+ *
+ * 面板展示直接用快照价（官方页同款数据源）；真正付钱前 `buyCircuitsListings`
+ * 会再读 `listingFor`，撤单/改价不会按旧价成交。这里再扫一遍链只会把 UI 拖死。
  */
-function candidatesFromSnapshot(snapshot, marketAddr, circuitsAddr) {
+function listingsFromSnapshot(snapshot, marketAddr, circuitsAddr) {
   const wantMarket = String(marketAddr).toLowerCase();
   const want = String(circuitsAddr).toLowerCase();
   if (snapshot.marketAddr && snapshot.marketAddr !== wantMarket) return null;
@@ -1887,13 +1901,19 @@ function candidatesFromSnapshot(snapshot, marketAddr, circuitsAddr) {
     if (String(row.circuits || "").toLowerCase() !== want) continue;
     if (row.valid === false) continue;
     if (row.revoked === true) continue;
-    if (row.eligible === false) continue;
+    if (row.eligible !== true) continue;
     const id = Number(row.id);
     const tokenId = Number(row.circuitId ?? row.tokenId);
-    if (!Number.isFinite(id) || id <= 0 || !Number.isFinite(tokenId)) continue;
-    out.push({ id, tokenId });
+    const price = BigInt(row.price || 0);
+    const seller = String(row.seller || "");
+    if (!Number.isFinite(id) || id <= 0 || !Number.isFinite(tokenId) || price <= 0n) continue;
+    out.push({ id, tokenId, price, seller });
   }
-  return out;
+  out.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+  return out.slice(0, DISPLAY_TOP).map((r) => ({
+    ...r,
+    priceBnb: Number(formatEther(r.price)),
+  }));
 }
 
 /**
@@ -1907,8 +1927,8 @@ async function verifyListings(runner, marketAddr, circuitsAddr, candidates) {
     data: _marketIface.encodeFunctionData("listingFor", [circuitsAddr, c.tokenId]),
   }));
   const raws = [];
-  for (let i = 0; i < calls.length; i += 40) {
-    const slice = calls.slice(i, i + 40);
+  for (let i = 0; i < calls.length; i += 8) {
+    const slice = calls.slice(i, i + 8);
     let chunk;
     try {
       chunk = await callBatchWithFailover(slice);
@@ -2021,9 +2041,10 @@ async function scanRecentListingCandidates(runner, marketAddr, circuitsAddr, loo
   const ids = [];
   for (let id = latest; id >= first; id--) ids.push(id);
 
-  const candidates = [];
-  for (let i = 0; i < ids.length; i += 40) {
-    const slice = ids.slice(i, i + 40);
+  const found = [];
+  // 每批 8 个（与 callBatchWithFailover 的 BATCH_MAX 对齐），避免一次塞 40 个在公共节点上排队超时。
+  for (let i = 0; i < ids.length; i += 8) {
+    const slice = ids.slice(i, i + 8);
     const calls = slice.map((id) => ({
       to: marketAddr,
       data: _marketIface.encodeFunctionData("listings", [id]),
@@ -2037,17 +2058,19 @@ async function scanRecentListingCandidates(runner, marketAddr, circuitsAddr, loo
     raws.forEach((raw, k) => {
       const rec = decodeListingRecord(raw);
       if (!rec || rec.circuits !== want) return;
-      candidates.push({ id: slice[k], tokenId: rec.tokenId });
+      found.push({ id: slice[k], tokenId: rec.tokenId, price: rec.price });
     });
   }
-  return candidates;
+  found.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+  return found.slice(0, DISPLAY_TOP).map(({ id, tokenId }) => ({ id, tokenId }));
 }
 
 /**
- * 把候选挂单变成「可买、可挖、已按价排序」的最终列表。
+ * 把窗口扫描候选变成「可买、可挖、已按价排序」的最终列表（仅快照失败时走这里）。
  */
 async function finalizeListings(runner, marketAddr, circuitsAddr, candidates) {
-  const live = await verifyListings(runner, marketAddr, circuitsAddr, candidates);
+  const capped = candidates.length > DISPLAY_TOP ? candidates.slice(0, DISPLAY_TOP) : candidates;
+  const live = await verifyListings(runner, marketAddr, circuitsAddr, capped);
   const mineable = await readMineableMap(runner, circuitsAddr, live.map((r) => r.tokenId));
   return live
     .filter((row) => mineable.get(row.tokenId) !== false)
@@ -2058,8 +2081,9 @@ async function finalizeListings(runner, marketAddr, circuitsAddr, candidates) {
 /**
  * 读某个集合的在售卖单（Owner 买入面板 + 自动挑单）。
  *
- * 主路径：官方 `circuit-market.json` 候选 → 链上复核。
- * 兜底：最近 FALLBACK_LOOKBACK 笔 id 窗口扫描（可能漏更早的低价单）。
+ * 主路径：拉官方 `circuit-market.json`，筛可挖后按价取前 DISPLAY_TOP —— **不再逐条 eth_call**，
+ * 否则 3 MB 快照 + 几十次 RPC 会让面板卡在「读取中」。付钱前仍有链上复核。
+ * 兜底：快照失败才扫最近 FALLBACK_LOOKBACK 笔（小窗口，避免再拖死）。
  *
  * @returns {Promise<Array<{id:number,tokenId:number,price:bigint,seller:string,priceBnb:number}>>}
  */
@@ -2067,16 +2091,21 @@ export async function readCircuitListingsFor(marketAddr, circuitsAddr) {
   if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return [];
   if (!isAddr(circuitsAddr) || circuitsAddr === ZeroAddress) return [];
   const want = String(circuitsAddr).toLowerCase();
-  return withReadProvider(async (runner) => {
-    const snap = await fetchOfficialCircuitMarketSnapshot();
-    let candidates = snap ? candidatesFromSnapshot(snap, marketAddr, want) : null;
-    const fromSnapshot = Array.isArray(candidates);
-    if (!fromSnapshot) {
-      candidates = await scanRecentListingCandidates(runner, marketAddr, want);
+
+  // 快照不需要 eth_call，先拉；成功则立刻返回，不进 withReadProvider。
+  const snap = await fetchOfficialCircuitMarketSnapshot();
+  if (snap) {
+    const rows = listingsFromSnapshot(snap, marketAddr, want);
+    if (rows) {
+      rows.source = "snapshot";
+      return rows;
     }
+  }
+
+  return withReadProvider(async (runner) => {
+    const candidates = await scanRecentListingCandidates(runner, marketAddr, want);
     const rows = await finalizeListings(runner, marketAddr, want, candidates);
-    // 给 UI 标数据源：生产没配 /tt-api 反代时会走 fallback，需提示可能漏单。
-    rows.source = fromSnapshot ? "snapshot" : "fallback";
+    rows.source = "fallback";
     return rows;
   });
 }
@@ -2101,11 +2130,11 @@ export async function readCircuitMarketSnapshot(marketAddr, collections = []) {
       }
     }
     for (const circuit of targets) {
-      let candidates = snap ? candidatesFromSnapshot(snap, marketAddr, circuit) : null;
-      if (!candidates) {
-        candidates = await scanRecentListingCandidates(runner, marketAddr, circuit);
+      let live = snap ? listingsFromSnapshot(snap, marketAddr, circuit) : null;
+      if (!live) {
+        const candidates = await scanRecentListingCandidates(runner, marketAddr, circuit);
+        live = await finalizeListings(runner, marketAddr, circuit, candidates);
       }
-      const live = await finalizeListings(runner, marketAddr, circuit, candidates);
       for (const row of live) rows.push({ ...row, circuits: circuit });
     }
 
@@ -2692,8 +2721,17 @@ function explainParsed(parsed) {
   if (parsed?.name === "Reentrancy") {
     return "重入保护触发（Reentrancy）：上一笔还在处理中，等确认后再试。";
   }
+  if (parsed?.name === "ERC721InvalidReceiver") {
+    return "本期合约收不了电路 NFT（缺 onERC721Received）。当前已开的期次无法买入，需重新部署工厂并开新期。";
+  }
   if (parsed?.name) return `合约拒绝：${parsed.name}`;
   return "";
+}
+
+/** 钱包有时把整段 calldata / 超长 hex 塞进 message，不能当错误文案展示。 */
+function isOpaqueHexBlob(text) {
+  const t = String(text || "").trim();
+  return /^0x[0-9a-fA-F]{24,}$/i.test(t);
 }
 
 function decodeRevert(err, iface) {
@@ -2701,7 +2739,9 @@ function decodeRevert(err, iface) {
   const raw = nestedErrorText(err) || "交易失败";
   const selectors = [];
   if (data) selectors.push(data);
-  for (const match of raw.matchAll(/"(0x[0-9a-fA-F]{8})"/g)) selectors.push(match[1]);
+  for (const match of raw.matchAll(/"(0x[0-9a-fA-F]{8,})"/g)) selectors.push(match[1]);
+  // 有的钱包把整个 calldata 或 revert data 直接当 message。
+  if (isOpaqueHexBlob(raw)) selectors.push(raw.trim());
   if (iface) {
     for (const selector of selectors) {
       try {
@@ -2717,6 +2757,13 @@ function decodeRevert(err, iface) {
     const text = explainParsed({ name: revert, args: err?.revert?.args });
     if (text) return text;
   }
+  // OZ ERC721InvalidReceiver(address) 选择子，即便 ABI 未挂上也能认。
+  for (const blob of selectors) {
+    const hex = String(blob || "");
+    if (/^0x64a0ae92/i.test(hex)) {
+      return explainParsed({ name: "ERC721InvalidReceiver", args: [] });
+    }
+  }
   if (/no data present/i.test(raw)) {
     return "合约拒绝了这笔交易，钱包没带回原因。请确认钱包权限与当前子状态。";
   }
@@ -2731,6 +2778,9 @@ function decodeRevert(err, iface) {
   }
   if (/insufficient funds|exceeds the balance/i.test(raw)) {
     return "钱包 BNB 不够付 gas（开一期约 0.0002 BNB）。";
+  }
+  if (isOpaqueHexBlob(raw) || /0x6038f07a/i.test(raw)) {
+    return "买入模拟失败：本期合约收不了电路 NFT（缺 onERC721Received）。需重新部署并开新期后才能买入。";
   }
   return raw;
 }
@@ -2766,10 +2816,19 @@ export async function send(promiseTx, onSigned) {
       "error NotOwner(address caller)",
       "error AlreadyMinted()",
       "error NotApproved()",
+      // OZ ERC721：官方市场 safeTransferFrom 时，收款合约缺 Receiver 会抛这个。
+      "error ERC721InvalidReceiver(address receiver)",
     ])));
     let decoded = decodeRevert(err, iface);
     const txReq = err?.transaction;
-    if (/钱包没有带回具体原因/.test(decoded) && txReq?.to && txReq?.data) {
+    // 钱包常把 calldata / 空原因塞进 message；用公共节点 eth_call 重放拿真实 revert。
+    const needReplay = txReq?.to && txReq?.data && (
+      /钱包没有带回具体原因|missing revert|no data present|节点没带回/i.test(decoded)
+      || isOpaqueHexBlob(decoded)
+      || /0x6038f07a/i.test(decoded)
+      || decoded === "交易失败"
+    );
+    if (needReplay) {
       try {
         await getReadProvider().call({
           to: txReq.to,
@@ -2778,7 +2837,8 @@ export async function send(promiseTx, onSigned) {
           value: txReq.value && txReq.value !== "0x0" ? txReq.value : undefined,
         });
       } catch (replay) {
-        decoded = decodeRevert(replay, iface);
+        const again = decodeRevert(replay, iface);
+        if (again && !isOpaqueHexBlob(again)) decoded = again;
       }
     }
     throw new Error(decoded);

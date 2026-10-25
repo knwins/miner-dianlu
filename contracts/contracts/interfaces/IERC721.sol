@@ -2,8 +2,8 @@
 pragma solidity ^0.8.24;
 
 /// @notice Minimal ERC721 surface Campaign needs for circuit NFTs.
-/// @dev The official Circuit Market moves the token with `transferFrom`, not `safeTransferFrom`, so the
-///      round never has to implement IERC721Receiver. `approve` is per token (never setApprovalForAll).
+/// @dev The official Circuit Market moves the token with `safeTransferFrom`, so Campaign **must**
+///      implement `onERC721Received` (IERC721Receiver). `approve` is per token (never setApprovalForAll).
 interface IERC721 {
     /// @param owner Token owner query.
     /// @return Balance of `owner`.
@@ -26,6 +26,12 @@ interface IERC721 {
     /// @param to Recipient.
     /// @param tokenId Token to move.
     function transferFrom(address from, address to, uint256 tokenId) external;
+
+    /// @notice Safe move; reverts if `to` is a contract that rejects IERC721Receiver.
+    /// @param from Current owner.
+    /// @param to Recipient.
+    /// @param tokenId Token to move.
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
 
     /// @param interfaceId ERC165 id.
     /// @return Whether the token claims `interfaceId`.

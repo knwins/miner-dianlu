@@ -71,8 +71,21 @@ contract MockCircuitNft {
         emit Transfer(from, to, tokenId);
     }
 
+    /// @dev Mirrors OZ: after the move, contracts must return `onERC721Received.selector`.
+    ///      Keeps tests honest — the real Circuit Market also uses safeTransferFrom.
     function safeTransferFrom(address from, address to, uint256 tokenId) external {
         transferFrom(from, to, tokenId);
+        if (to.code.length == 0) return;
+        (bool ok, bytes memory ret) = to.call(
+            abi.encodeWithSignature(
+                "onERC721Received(address,address,uint256,bytes)",
+                msg.sender,
+                from,
+                tokenId,
+                ""
+            )
+        );
+        if (!ok || ret.length < 32 || bytes4(ret) != 0x150b7a02) revert NotApproved();
     }
 
     /// @notice Test mint. Reverts if the id is already taken.

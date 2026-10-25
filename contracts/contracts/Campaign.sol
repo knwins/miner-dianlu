@@ -385,6 +385,14 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (scene == Scene.Mining) _returnSurplus();
     }
 
+    /// @notice IERC721Receiver hook. Official Circuit Market delivers NFTs via `safeTransferFrom`;
+    ///         without this the buy reverts `ERC721InvalidReceiver(campaign)` and the round can never
+    ///         take a listing. Only the locked `circuits` collection is accepted.
+    function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
+        if (msg.sender != circuits) revert NotACircuit();
+        return this.onERC721Received.selector;
+    }
+
     /// @dev True when the factory no longer lists this round. A reverting call counts as retired.
     function _retired() internal view returns (bool) {
         try IFactory(factory).isRegistered(address(this)) returns (bool live) {

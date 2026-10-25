@@ -2881,6 +2881,144 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   font-size: 13px;
   line-height: 1.55;
 }
+
+/* ── 从电路市场买入：紧凑排版，价格优先 ── */
+.flow-market {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.flow-market-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  margin: 0;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.flow-market-meta code {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--color-bg-spotlight);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.flow-market-meta-sep {
+  color: var(--color-text-quaternary);
+}
+.flow-market-hint {
+  margin: 0;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.flow-market-hint.is-warn {
+  color: var(--color-danger);
+}
+.flow-market-table {
+  font-size: 13px;
+}
+.flow-market-table th {
+  padding: 0 8px 6px 0;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  border-bottom: 1px solid var(--color-border);
+}
+.flow-market-table td {
+  padding: 8px 8px 8px 0;
+  color: var(--color-text-secondary);
+  line-height: 1.35;
+}
+.flow-market-table .col-pick {
+  width: 36px;
+  padding-right: 4px;
+  text-align: center;
+}
+.flow-market-table .col-id { width: 72px; }
+.flow-market-table .col-token { width: 72px; }
+.flow-market-table .col-price {
+  width: 108px;
+  font-variant-numeric: tabular-nums;
+}
+.flow-market-table .col-seller { width: auto; }
+.flow-market-table .col-price strong {
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.flow-market-unit {
+  margin-left: 4px;
+  color: var(--color-text-quaternary);
+  font-size: 11px;
+  font-weight: 500;
+}
+.flow-market-table .mono {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.flow-market-table tr.is-picked td {
+  background: rgba(13, 158, 168, 0.06);
+}
+.flow-market-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  cursor: pointer;
+}
+.flow-market-check input {
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  min-height: 16px;
+  max-width: 16px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--color-primary);
+  cursor: pointer;
+}
+.flow-market-bar {
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+  padding-top: 10px;
+}
+.flow-market-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 14px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--color-text-secondary);
+}
+.flow-market-stats strong {
+  color: var(--color-text);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.flow-market-stats .is-warn {
+  color: var(--color-danger);
+  font-weight: 600;
+}
+@media (max-width: 640px) {
+  .flow-market-table .col-seller { display: none; }
+  .flow-market-table .col-id { width: 64px; }
+  .flow-market-table .col-token { width: 64px; }
+  .flow-market-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .flow-market-bar .btn { width: 100%; }
+}
 .flow-note {
   color: var(--color-text-tertiary);
   font-size: 12px;
