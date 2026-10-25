@@ -7,7 +7,7 @@ const { ethers, network } = require("hardhat");
 const { writeFileSync, readFileSync, existsSync, mkdirSync } = require("node:fs");
 const { join } = require("node:path");
 const { collectLegacyFactories, writeDeploymentRecords } = require("./_records");
-const { deployContract: safeDeploy } = require("./_deploy");
+const { deployContract: safeDeploy, createAddress } = require("./_deploy");
 
 /// @notice 官方 Circuit Market（BSC 主网，EIP-1967 代理）。
 const OFFICIAL_CIRCUIT_MARKET = "0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f";
@@ -38,9 +38,10 @@ async function main() {
   const chainId = Number(net.chainId);
   const dryRun = process.env.DRY_RUN === "1";
 
-  // 兼容旧环境变量名（MINTER_ADDRESS / ALLOWED_PARTS_ADDRESSES），但记录与链上字段一律用 circuit。
-  const market = env("CIRCUIT_MARKET_ADDRESS", "MINTER_ADDRESS") || OFFICIAL_CIRCUIT_MARKET;
-  const allowedFromEnv = env("ALLOWED_CIRCUITS_ADDRESSES", "ALLOWED_PARTS_ADDRESSES");
+  // 只用新的 CIRCUIT_* 变量名。旧的 MINTER_ADDRESS / ALLOWED_PARTS_ADDRESSES 指向晶体管时代的
+  // BEP-1155 合约，留作兜底会把工厂指向错误的电路市场 —— 主网部署绝不允许这种静默回退。
+  const market = env("CIRCUIT_MARKET_ADDRESS") || OFFICIAL_CIRCUIT_MARKET;
+  const allowedFromEnv = env("ALLOWED_CIRCUITS_ADDRESSES");
   const allowedCircuits = allowedFromEnv
     ? allowedFromEnv.split(",").map((s) => s.trim()).filter(Boolean)
     : OFFICIAL_CIRCUITS;
@@ -50,11 +51,21 @@ async function main() {
   if ((await ethers.provider.getCode(market)) === "0x") {
     throw new Error(`电路市场 ${market} 在当前链上没有代码`);
   }
+  // 白名单里的每一项都必须是**真实部署的 ERC721 集合**（不是 EOA、不是别的标准）。
+  const erc165 = new ethers.Interface(["function supportsInterface(bytes4) view returns (bool)"]);
   for (const addr of allowedCircuits) {
     if (!ethers.isAddress(addr)) throw new Error(`电路白名单含非法地址：${addr}`);
     if ((await ethers.provider.getCode(addr)) === "0x") {
       throw new Error(`电路白名单 ${addr} 在当前链上没有代码`);
     }
+    const [is721, is165] = await Promise.all([
+      ethers.provider.call({ to: addr, data: erc165.encodeFunctionData("supportsInterface", ["0x80ac58cd"]) }),
+      ethers.provider.call({ to: addr, data: erc165.encodeFunctionData("supportsInterface", ["0x01ffc9a7"]) }),
+    ]).then(([a, b]) => [
+      erc165.decodeFunctionResult("supportsInterface", a)[0],
+      erc165.decodeFunctionResult("supportsInterface", b)[0],
+    ]).catch(() => [false, false]);
+    if (!is721 || !is165) throw new Error(`电路白名单 ${addr} 不是 ERC721 合约`);
   }
 
   const balance = await ethers.provider.getBalance(deployer.address);
@@ -80,6 +91,12 @@ async function main() {
     console.log("\nDRY_RUN=1，未发送交易。");
     return;
   }
+
+  // 先把 CREATE 地址算出来打印：hardhat-ethers 的回读 bug 会让脚本在广播成功后静默退出，
+  // 有这个地址就能直接去链上核对，不会误判成「没发出去」再发一次。
+  const nonce = await ethers.provider.getTransactionCount(deployer.address, "pending");
+  const predicted = createAddress(deployer.address, nonce);
+  console.log(`预计 CREATE 地址：${predicted}（nonce ${nonce}）`);
 
   const factoryDeployed = await safeDeploy("CampaignFactory", [market, allowedCircuits]);
   const factoryAddr = factoryDeployed.address;

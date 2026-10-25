@@ -220,12 +220,24 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-bscscan
 
 环境变量（详见脚本头）：
 
-- `CIRCUIT_MARKET_ADDRESS`（旧名 `MINTER_ADDRESS` 兼容）
-- `ALLOWED_CIRCUITS_ADDRESSES`（旧名 `ALLOWED_PARTS_ADDRESSES` 兼容）
+- `CIRCUIT_MARKET_ADDRESS`（留空 = 官方主网电路市场；**不再兼容旧名 `MINTER_ADDRESS`**，旧地址指向已于废弃的晶体管市场）
+- `ALLOWED_CIRCUITS_ADDRESSES`（留空 = 官方 TapeOut / Behemoth；脚本会逐个校验 `supportsInterface(0x80ac58cd)`，不是 ERC721 直接中止）
 - `DEPLOYER_PRIVATE_KEY`、`DRY_RUN=1`
 
-> 合约创建交易不要用 hardhat-ethers 的回读路径：`scripts/_deploy.js` 已改为本地签名 +
-> `eth_sendRawTransaction`，避免 CREATE 回读崩溃后又重复部署。
+主网现状（chainId 56，2026-10-25）：
+
+| 角色 | 地址 |
+| --- | --- |
+| 工厂 `CampaignFactory` | `0x6768039789439a9da2044926293d8cc46ee4225e` |
+| 电路市场 | `0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f` |
+| 电路合约 TapeOut（ERC721） | `0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C` |
+| 电路合约 Behemoth（ERC721） | `0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c` |
+
+工厂已部署但**尚未开期**（`campaignCount == 0`）。开期时必须显式指定白名单内的 ERC721 电路合约。
+
+> 合约创建交易不要依赖 hardhat-ethers 的回读：`scripts/_deploy.js` 会先算出 CREATE 地址再广播，
+> 回读崩溃时按 CREATE 地址找回执；`deploy-factory.js` 还会在发交易前打印预计地址，
+> 避免「其实已上链、脚本却静默退出」被误判成失败而重复部署。
 
 ## 10. 测试
 

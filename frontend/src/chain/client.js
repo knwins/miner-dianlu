@@ -2029,6 +2029,81 @@ export async function readAllowedCircuits() {
 /** 兼容旧引用。 */
 export const readAllowedParts = readAllowedCircuits;
 
+/** ERC721 的 supportsInterface 标识（ERC-165）。 */
+const ERC721_INTERFACE_ID = "0x80ac58cd";
+const ERC165_INTERFACE_ID = "0x01ffc9a7";
+
+/**
+ * 校验一个地址能不能当「本期电路合约」。
+ *
+ * 开期第 4 参是**真实的 ERC721 电路集合**，不能只看地址格式：
+ *   1. 有代码（不是 EOA / 写错的地址）；
+ *   2. 实现 ERC-165 且声明 ERC721（`supportsInterface(0x80ac58cd)`）；
+ *   3. 在工厂白名单内（工厂已部署时才读得到；读不到返回 null = 未知）。
+ * 不满足 1/2 的地址发上链也只会 revert，所以前端必须先挡住。
+ *
+ * @param {string} address 候选 ERC721 合约
+ * @returns {Promise<{address:string,hasCode:boolean,isErc721:boolean,whitelisted:boolean|null,name:string,totalSupply:number|null,reason:string}>}
+ */
+export async function readCircuitContractInfo(address) {
+  const addr = String(address || "").trim();
+  const info = {
+    address: addr,
+    hasCode: false,
+    isErc721: false,
+    whitelisted: null,
+    name: "",
+    totalSupply: null,
+    reason: "",
+  };
+  if (!isAddr(addr) || addr === ZeroAddress) {
+    info.reason = "地址格式不正确";
+    return info;
+  }
+  try {
+    info.hasCode = await withReadProvider(async (runner) => (await runner.getCode(addr)) !== "0x");
+  } catch {
+    info.hasCode = false;
+  }
+  if (!info.hasCode) {
+    info.reason = "该地址没有合约代码";
+    return info;
+  }
+  const nftInfo = await withReadProvider(async (runner) => {
+    const nft = new Contract(
+      addr,
+      [
+        "function supportsInterface(bytes4) view returns (bool)",
+        "function name() view returns (string)",
+        "function totalSupply() view returns (uint256)",
+      ],
+      runner,
+    );
+    const [erc721, erc165, name, supply] = await Promise.all([
+      nft.supportsInterface(ERC721_INTERFACE_ID).catch(() => false),
+      nft.supportsInterface(ERC165_INTERFACE_ID).catch(() => false),
+      nft.name().catch(() => ""),
+      nft.totalSupply().then((v) => Number(v)).catch(() => null),
+    ]);
+    return { erc721: Boolean(erc721), erc165: Boolean(erc165), name, supply };
+  }).catch(() => ({ erc721: false, erc165: false, name: "", supply: null }));
+
+  info.isErc721 = Boolean(nftInfo.erc721 && nftInfo.erc165);
+  info.name = nftInfo.name;
+  info.totalSupply = nftInfo.supply;
+
+  if (isAddr(FACTORY_ADDRESS)) {
+    info.whitelisted = await withReadProvider((runner) =>
+      factoryContract(runner).isAllowedCircuits(addr).catch(() => null)
+    ).catch(() => null);
+  }
+
+  if (!info.isErc721) info.reason = "该合约不是 ERC721";
+  else if (info.whitelisted === false) info.reason = "该 ERC721 不在工厂白名单";
+  else info.reason = "";
+  return info;
+}
+
 /**
  * 开期：预检 Owner → staticCall → 发交易 → 解析新地址（事件失败则读 campaigns[n-1]）。
  * 当前工厂开期需 份额单价 / 总份数 / 募集天数 / 电路合约 四个参数；

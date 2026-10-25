@@ -21,8 +21,8 @@ async function main() {
   const api = process.env.BSCSCAN_API_KEY || "";
   console.log(`DEPLOYER_PRIVATE_KEY : ${mask(pk)}`);
   console.log(`BSCSCAN_API_KEY      : ${api ? mask(api) : "<未设置> — 退用 Sourcify 验证"}`);
-  console.log(`CIRCUIT_MARKET_ADDRESS: ${process.env.CIRCUIT_MARKET_ADDRESS || process.env.MINTER_ADDRESS || "<默认官方电路市场>"}`);
-  console.log(`ALLOWED_CIRCUITS_ADDRESSES: ${process.env.ALLOWED_CIRCUITS_ADDRESSES || process.env.ALLOWED_PARTS_ADDRESSES || "<默认官方两件套>"}`);
+  console.log(`CIRCUIT_MARKET_ADDRESS: ${process.env.CIRCUIT_MARKET_ADDRESS || "<默认官方电路市场>"}`);
+  console.log(`ALLOWED_CIRCUITS_ADDRESSES: ${process.env.ALLOWED_CIRCUITS_ADDRESSES || "<默认官方两件套>"}`);
   console.log(`OPEN_CAMPAIGN        : ${process.env.OPEN_CAMPAIGN || "<未设=只部署工厂不开期>"}`);
 
   if (Number(net.chainId) !== 56) {
@@ -45,12 +45,12 @@ async function main() {
 
   // 预演 deploy-bsc.js 的主网硬断言
   console.log("\n--- 预演主网硬断言 ---");
-  const marketEnv = process.env.CIRCUIT_MARKET_ADDRESS || process.env.MINTER_ADDRESS || "";
+  const marketEnv = process.env.CIRCUIT_MARKET_ADDRESS || "";
   if (marketEnv && marketEnv.toLowerCase() !== OFFICIAL_MARKET.toLowerCase()) {
     console.log(`✗ CIRCUIT_MARKET_ADDRESS 非官方市场：收到 ${marketEnv}`);
   } else console.log("✓ CIRCUIT_MARKET_ADDRESS 断言通过（默认官方市场）");
 
-  const wl = String(process.env.ALLOWED_CIRCUITS_ADDRESSES || process.env.ALLOWED_PARTS_ADDRESSES || "").trim();
+  const wl = String(process.env.ALLOWED_CIRCUITS_ADDRESSES || "").trim();
   if (wl) {
     const list = wl.split(",").map((s) => s.trim()).filter(Boolean);
     const bad = list.filter((a) => !OFFICIAL_CIRCUITS.some((o) => o.toLowerCase() === a.toLowerCase()));

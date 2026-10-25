@@ -27,16 +27,23 @@ function createAddress(sender, nonce) {
  */
 const CREATE_TX_READBACK_BUG = /invalid value for value\.to/;
 
-function withReadbackBugGuard(fn) {
-  const handler = (reason) => {
+/**
+ * 全局安装一次，**不随单个 Promise 结束而摘掉**。
+ *
+ * 2026-10-25 主网实测：`sent` 已经带着 hash 正常返回，checkTx 的 rejection 却在其后
+ * 才冒出来；原先在 `.finally` 里摘 handler 的做法已经太晚，进程被未处理拒绝打死
+ * （工厂上链成功、脚本却静默退出、记录也没写盘）。这里只在进程整个生命周期内
+ * 忽略这一条已知错误，其它未处理拒绝照旧抛。
+ */
+let readbackGuardInstalled = false;
+function installReadbackGuard() {
+  if (readbackGuardInstalled) return;
+  readbackGuardInstalled = true;
+  process.on("unhandledRejection", (reason) => {
     const msg = String((reason && reason.message) || reason || "");
     if (CREATE_TX_READBACK_BUG.test(msg)) return; // 已知：广播成功，只是回读崩溃
     throw reason; // 其他未处理拒绝照旧炸
-  };
-  process.on("unhandledRejection", handler);
-  return Promise.resolve()
-    .then(fn)
-    .finally(() => process.off("unhandledRejection", handler));
+  });
 }
 
 /** 轮询等 CREATE 地址长出代码（交易可能还在打包中，回执按块扫需要它先落块）。 */
@@ -68,7 +75,8 @@ async function deployContract(contractName, args = [], opts = {}) {
 
   let hash;
   try {
-    const sent = await withReadbackBugGuard(() => signer.sendTransaction(deployTx));
+    installReadbackGuard();
+    const sent = await signer.sendTransaction(deployTx);
     hash = sent.hash;
   } catch (e) {
     // 已知 bug：广播已成功、回读崩溃（见文件头）。先等 CREATE 地址长出代码（交易可能还在打包），

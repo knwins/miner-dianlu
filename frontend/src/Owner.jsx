@@ -7,7 +7,8 @@ import { ENDED, FAILED, SCENE, nextActionOf, phaseOf, roundState, rowState } fro
 import OnChainPage from "./OnChain.jsx";
 import { MarketTradePanel } from "./MarketTrades.jsx";
 import { RefundRecords } from "./RefundRecords.jsx";
-import { processorFromCircuitContract } from "./tapeout.js";
+import { processorFromCircuitContract, OFFICIAL_CIRCUIT_COLLECTIONS } from "./tapeout.js";
+import { readCircuitContractInfo } from "./chain/client.js";
 import PeriodNav from "./PeriodNav.jsx";
 import {
   formatUnitPrice,
@@ -1854,17 +1855,75 @@ export function OwnerCreate({
    * 而发布期不选处理器，建议值就成了来源不明的数字。宁可直接要求开期人自己填。
    */
   /**
-   * 本期电路合约（= 处理器）：**开期人必须显式选择**（T-79 核心改动）。
+   * 本期电路合约（= 处理器）：**开期人必须显式选择**。
    *
-   * 工厂不再有「默认电路」：`createCampaign` 第 4 参 circuits 由前端从链上白名单里选，
-   * 零地址一律 revert（主网白名单 = 官方两件套 TapeOut / Behemoth 各自的电路合约）。
+   * 工厂不再有「默认电路」：`createCampaign` 第 4 参 circuits 由前端选，
+   * 零地址一律 revert（主网白名单 = 官方两件套 TapeOut / Behemoth 各自的 ERC721 集合）。
    * 这样单工厂可承载多处理器，每期锁定一个，而不是所有期次被锁死到同一处理器。
    *
-   * 演示（非链上）模式没有白名单可读，处理器由系统选定，表单不收集、也不校验。
+   * 候选来源只有链上事实 + 官方常量，**不用模拟数据**：
+   *   1. 工厂白名单（部署时写入、不可增删）——最权威，链上会按它 revert；
+   *   2. 官方两个 ERC721 集合——方便在工厂刚部署、白名单还没读到时对照，
+   *      选中后会立刻做 ERC721 + 白名单双重校验，不在白名单就红框拦住。
    */
   const selectedProcessor = String(draft.circuits || "").trim();
-  const processorOptions = (Array.isArray(allowedCircuits) ? allowedCircuits : []).filter(
-    (a) => /^0x[0-9a-fA-F]{40}$/.test(String(a || "").trim())
+  const isAddrLike = (a) => /^0x[0-9a-fA-F]{40}$/.test(String(a || "").trim());
+  const processorOptions = (() => {
+    const seen = new Set();
+    const out = [];
+    for (const addr of Array.isArray(allowedCircuits) ? allowedCircuits : []) {
+      if (!isAddrLike(addr)) continue;
+      const key = addr.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ addr, whitelisted: true });
+    }
+    for (const [name, addr] of Object.entries(OFFICIAL_CIRCUIT_COLLECTIONS)) {
+      const key = String(addr).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ addr, whitelisted: false, official: name });
+    }
+    return out;
+  })();
+
+  /**
+   * 选中地址的链上校验结果：有代码 / 是 ERC721 / 在工厂白名单。
+   * 这是开期的最后一道闸：地址写错或指向非 ERC721，发上链也只会 revert。
+   */
+  const [circuitInfo, setCircuitInfo] = useState(null);
+  const [circuitChecking, setCircuitChecking] = useState(false);
+  const [circuitFailed, setCircuitFailed] = useState(false);
+  useEffect(() => {
+    if (!chainMode || !isAddrLike(selectedProcessor)) {
+      setCircuitInfo(null);
+      setCircuitChecking(false);
+      setCircuitFailed(false);
+      return undefined;
+    }
+    let alive = true;
+    setCircuitChecking(true);
+    setCircuitFailed(false);
+    readCircuitContractInfo(selectedProcessor)
+      .then((info) => {
+        if (!alive) return;
+        setCircuitInfo(info);
+        setCircuitChecking(false);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setCircuitInfo(null);
+        setCircuitChecking(false);
+        setCircuitFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [selectedProcessor, chainMode]);
+  const circuitChecked = Boolean(
+    circuitInfo
+    && isAddrLike(selectedProcessor)
+    && String(circuitInfo.address).toLowerCase() === selectedProcessor.toLowerCase()
   );
   const capNum = Number(draft.hardCapBnb);
   const sharesNum = Number(draft.totalShares);
@@ -1889,10 +1948,10 @@ export function OwnerCreate({
   const daysInvalid = (touched.fundingDays || submitTried) && !daysValid;
   const sharesInvalid = (touched.totalShares || submitTried) && !sharesValid;
   const feeInvalid = (touched.feePercent || submitTried) && !feeValid;
-  /** 处理器（电路合约）：链上模式必选，且必须是合法地址（白名单在链上校验） */
+  /** 处理器（电路合约）：必须显式选一个**真的 ERC721、且在工厂白名单内**的地址 */
   const circuitsValid = chainMode
-    ? /^0x[0-9a-fA-F]{40}$/.test(selectedProcessor)
-    : true;
+    ? isAddrLike(selectedProcessor) && circuitChecked && circuitInfo.isErc721 && circuitInfo.whitelisted !== false
+    : false;
   const circuitsInvalid =
     (touched.circuits || submitTried) && chainMode && !circuitsValid;
   /** 有效口径：直接用手填值。非法值保留原数字交给校验拦截，不静默回退成"建议值" */
@@ -1986,14 +2045,20 @@ export function OwnerCreate({
     });
   };
 
-  const canSubmit = review.ok && daysValid && circuitsValid && !pending && (chainMode ? isFactoryOwner : true);
+  /**
+   * 发布入口**只在链上模式开放**：开期要写进真实工厂（白名单 + 官方电路市场），
+   * 没有任何可用的模拟路径，所以未配置工厂时按钮直接禁用并说明原因。
+   */
+  const canSubmit = review.ok && daysValid && circuitsValid && !pending && chainMode && isFactoryOwner;
   const submitLabel = pending
     ? (pending === "createCampaign" ? "发布中…" : String(pending))
-    : chainMode && !connectedAccount
-      ? "请先连接 Owner 钱包"
-      : chainMode && !isFactoryOwner
-        ? "需 Owner 钱包"
-        : "发布众筹挖矿";
+    : !chainMode
+      ? "需先部署工厂（不支持模拟）"
+      : !connectedAccount
+        ? "请先连接 Owner 钱包"
+        : !isFactoryOwner
+          ? "需 Owner 钱包"
+          : "发布众筹挖矿";
 
   return (
     <section>
@@ -2010,9 +2075,7 @@ export function OwnerCreate({
             <div>
               <h1>发布众筹挖矿</h1>
               <p>
-                {chainMode
-                  ? "四项参数上链后不可改：每份单价、总份数、募集天数、本期电路合约。"
-                  : "四项参数上链后不可改：每份单价、总份数、募集天数、本期电路合约。"}
+                四项参数上链后不可改：每份单价、总份数、募集天数、本期电路合约（ERC721）。
               </p>
             </div>
           </div>
@@ -2028,6 +2091,14 @@ export function OwnerCreate({
             )}
           </div>
         </div>
+        {!chainMode && (
+          <div className="publish-auth">
+            <p>
+              当前读不到链上工厂：发布众筹挖矿要写入真实工厂（电路市场 + ERC721 白名单），
+              没有模拟路径。请先在 BSC 主网部署工厂并写入 <code>deployments.json</code>。
+            </p>
+          </div>
+        )}
         {chainMode && (!connectedAccount || !isFactoryOwner) && (
           <div className="publish-auth">
             <p>
@@ -2146,43 +2217,98 @@ export function OwnerCreate({
             </div>
           </article>
 
-          {/* ── 本期电路合约 ── */}
+          {/* ── 本期电路合约（ERC721）── */}
           {chainMode && (
             <article className="card">
               <div className="card-header">
-                <span>本期电路合约</span>
+                <span>本期电路合约（ERC721）</span>
                 <span className="stat-label">开期必选 · 锁定后不可改</span>
               </div>
               <div className="card-body">
                 <label className="field">
-                  <span>电路合约（处理器）</span>
+                  <span>选择电路合约</span>
                   <select
                     value={selectedProcessor}
                     className={circuitsInvalid ? "is-invalid" : undefined}
-                    title="从工厂白名单选一个电路合约；开期后锁定，不可改"
+                    title="必须选一个已实现 ERC721、且在工厂白名单内的电路合约；开期后锁定，不可改"
                     onChange={(event) => update("circuits", event.target.value)}
                     onBlur={() => touch("circuits")}
                   >
                     <option value="">— 请选择 —</option>
-                    {processorOptions.map((addr) => {
-                      const pid = processorFromCircuitContract(addr);
-                      const label = pid ? `${pid}` : "处理器";
+                    {processorOptions.map((option) => {
+                      const addr = option.addr;
+                      const pid = processorFromCircuitContract(addr) || option.official || "ERC721";
+                      const tag = option.whitelisted ? "工厂白名单" : "不在白名单";
                       return (
                         <option key={addr} value={addr}>
-                          {`${label} · ${shortAddress(addr)}`}
+                          {`${pid} · ${shortAddress(addr)} · ${tag}`}
                         </option>
                       );
                     })}
                   </select>
                 </label>
+
+                {/* 链上校验：ERC721 + 白名单，缺一不可 */}
+                {isAddrLike(selectedProcessor) && (
+                  <ul className="bill">
+                    <li>
+                      <span>合约代码</span>
+                      <strong>
+                        {!circuitChecked
+                          ? (circuitFailed ? "校验失败，请重选" : "校验中…")
+                          : circuitInfo.hasCode
+                            ? "已部署 ✓"
+                            : "无代码 ✗"}
+                      </strong>
+                    </li>
+                    <li>
+                      <span>ERC721</span>
+                      <strong>
+                        {!circuitChecked
+                          ? (circuitFailed ? "校验失败，请重选" : "校验中…")
+                          : circuitInfo.isErc721
+                            ? `${circuitInfo.name || "ERC721"} ✓`
+                            : "不是 ERC721 ✗"}
+                      </strong>
+                    </li>
+                    <li>
+                      <span>工厂白名单</span>
+                      <strong>
+                        {!circuitChecked || circuitInfo.whitelisted == null
+                          ? "未读到（链上仍会校验）"
+                          : circuitInfo.whitelisted
+                            ? "在白名单 ✓"
+                            : "不在白名单 ✗"}
+                      </strong>
+                    </li>
+                    {circuitInfo?.totalSupply != null && (
+                      <li>
+                        <span>总发行量</span>
+                        <strong>{circuitInfo.totalSupply.toLocaleString()} 张</strong>
+                      </li>
+                    )}
+                  </ul>
+                )}
+
                 {processorOptions.length === 0 && (
                   <p className="fine warn-text">
-                    无法读取工厂电路白名单，请确认链上工厂已部署且白名单非空。
+                    读不到工厂电路白名单，请确认链上工厂已部署。
                   </p>
                 )}
                 {circuitsInvalid && (
-                  <p className="fine warn-text">请选择本期电路合约，不能留空。</p>
+                  <p className="fine warn-text">
+                    {!selectedProcessor
+                      ? "请选择本期电路合约，不能留空。"
+                      : circuitChecking
+                        ? "正在校验该地址，稍等一秒。"
+                        : circuitInfo?.reason
+                          ? `不能用来开期：${circuitInfo.reason}。`
+                          : "该地址不能作为本期电路合约。"}
+                  </p>
                 )}
+                <p className="fine">
+                  开期后 `Campaign.circuits` 锁定为这里选中的 ERC721 集合，之后从电路市场买入的每一张都属于它。
+                </p>
               </div>
             </article>
           )}

@@ -1040,18 +1040,8 @@ export default function App() {
       invokeCall("createCampaign", { ...draft, _review: review });
       return;
     }
-    const result = applyCreate(round, draft, quote);
-    if (!result.ok) {
-      setNotice(result.message);
-      return;
-    }
-    setSimRound(result.round);
-    setSimBook(result.book);
-    // 演示模式：发布者即 Owner，把预览身份切到 Owner 常量，否则进不去工作台。
-    setSimAccount(OWNER);
-    setOwnerTab("overview");
-    setPage("owner");
-    setNotice(result.message);
+    // 发布众筹挖矿不再有模拟路径：开期必须写进真实工厂（电路市场 + ERC721 白名单）。
+    setNotice("发布众筹挖矿需要链上工厂：请先部署工厂并连接 Owner 钱包（不使用模拟数据）。");
   }
 
   function openPage(id, ownerSub) {
