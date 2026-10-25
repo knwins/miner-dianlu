@@ -3,7 +3,7 @@
  *
  * 背景：状态词原来散在 8 个地方各写一套，同一个子状态最多四种写法
  * （补不补买入动作、加不加「· 待入池」后缀、中间要不要空格，各写各的；
- * 旧文案里还混用过「晶体管」这个同义词），
+ * 旧文案里还用过「颗」这个量词），
  * 同一屏上下两处描述同一件事、措辞还不一样。改一次要翻 8 个文件，漏一个就自相矛盾。
  *
  * 这个探针做两件事：
@@ -47,8 +47,8 @@ const FORBIDDEN = [
   "待挂单买",
   "挂单中 · 待成交",
   "已挂单 · 待成交",
-  "晶体管到账 · 待入池",
-  "晶体管已到账",
+  "电路到账 · 待入池",
+  "电路已到账",
   "已到账 · 待入池",
   "已到账·待入池",
   "已失败原路退款",
@@ -137,7 +137,7 @@ check("已到账：表格用全称、卡片用下一步（两种口径都来自�
 const failed = rowState(cases[6][1], now / 1000, dealStatus);
 check("执行失败：阶段词是「执行失败」而不是「待执行」", failed.label === FAILED.label, failed.label);
 
-// ── 4. 术语：产品统一叫「晶体管」，市场统一叫「晶体管市场」 ──────────────────
+// ── 4. 术语：产品统一叫「电路」，市场统一叫「电路市场」 ──────────────────
 // 注释里可能引用被删掉的旧写法当反例，但真正渲染的代码必须干净，
 // 所以扫之前统一过一遍 codeOnly()。
 const files = fs.readdirSync(SRC, { withFileTypes: true });
@@ -148,10 +148,10 @@ const termFiles = files
   .filter((name) => fs.existsSync(path.join(SRC, name)));
 
 const legacyPart = termFiles.filter((name) => codeOnly(read(name)).includes("晶体管"));
-check("全站统一叫「晶体管」（不再出现「晶体管」）", legacyPart.length === 0, legacyPart.join("、"));
+check("全站统一叫「电路」（不再出现「晶体管」）", legacyPart.length === 0, legacyPart.join("、"));
 
-const legacyMarket = termFiles.filter((name) => /晶体管市场|晶体管市场/.test(codeOnly(read(name))));
-check("市场统一叫「晶体管市场」（不再出现「晶体管市场」/「晶体管市场」）", legacyMarket.length === 0, legacyMarket.join("、"));
+const legacyMarket = termFiles.filter((name) => /晶体管市场/.test(codeOnly(read(name))));
+check("市场统一叫「电路市场」（不再出现「晶体管市场」）", legacyMarket.length === 0, legacyMarket.join("、"));
 
 const ok = results.every((r) => r.ok);
 console.log(`\n${ok ? "全部通过" : "存在失败项"}（${results.filter((r) => r.ok).length}/${results.length}）`);

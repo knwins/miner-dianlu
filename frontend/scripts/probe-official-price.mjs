@@ -1,23 +1,10 @@
 /**
- * 探针：官方市价在「兜底 404」时仍要由链上主源撑住，且不靠扫日志。
+ * 探针：官方市价在「/tt-api 不存在」时仍要由链上主源撑住，且不靠扫日志。
  *
- * 为什么要有它：生产环境（静态托管）没有 vite 的 /tt-api 代理，那条路必然 404。
- * 官方市价的主源是**链上官方市场的活跃买单**（`nextBidId()` + `bids(id)`，
- * 纯 eth_call，不扫日志），兜底才是 market.json —— 只要主源能读到价，
- * 404 就不该让页面报错、价格也不该空。
- *
- * 坏过两次（都发生在 2026-10-23，值得记住）：
- *   1. 主源只查最近 5000/2000 块的成交事件，而官方市场成交极稀疏（实测 5000 块
- *      窗口 0 条、20000 块才有 32 条），主源恒空 → 生产一 404 就报错。
- *      看着像反代没配，根因其实是窗口太小。
- *   2. 修法是「窗口放大到 20000 × 8 档 ≈ 16 万块」，能取到价，但代价是节点：
- *      publicnode 把历史日志当 archive 请求（403）、drpc 限跨度、只剩 nodereal
- *      一个能用，量大就限流。
- *   于是主源换成读挂单状态 —— 挂单是当前状态，eth_call 读最新状态不需要 archive
- *      数据，任何公共节点都能答，一次 eth_getLogs 都不用发。
- *
- * 这里用路由拦截把 /tt-api 打成 404，精确复现生产那一幕；并直接调用应用的
- * fetchOfficialPrices 看它报的 source，确认走的确实是挂单而不是成交日志。
+ * 官方市价主源是链上官方电路市场的**活跃卖单**
+ * （`nextListingId()` + `listings(id)`，纯 eth_call，不扫日志）。
+ * 这里把 /tt-api 打成 404，复现生产静态托管没有反代的那一幕，
+ * 再直接调用应用的 fetchOfficialPrices 确认 source 是 onchain:listings。
  *
  * 运行：node scripts/probe-official-price.mjs [port]（默认 5180）
  */
@@ -71,7 +58,7 @@ page.on("request", (r) => {
 await page.goto(BASE, { waitUntil: "domcontentloaded" });
 await page.waitForTimeout(3000);
 // 官方价面板（全量卡片形态）在市场页
-await page.locator(".nav-link-main").filter({ hasText: "晶体管市场" }).first().click().catch(() => {});
+await page.locator(".nav-link-main").filter({ hasText: "电路市场" }).first().click().catch(() => {});
 await page.waitForTimeout(1500);
 await page.waitForSelector(".official-price-group", { timeout: 30000 }).catch(() => {});
 await page.waitForTimeout(9000);
@@ -105,7 +92,7 @@ const direct = await page.evaluate(async () => {
     const r = await mod.fetchOfficialPrices({ force: true });
     const rows = {};
     for (const [id, row] of Object.entries(r.prices || {})) {
-      rows[id] = row.bid != null ? `bid=${row.bid}` : `last=${row.last}`;
+      rows[id] = row.ask != null ? `ask=${row.ask}` : `last=${row.last}`;
     }
     return { ok: r.ok, source: r.source, error: r.error, rows };
   } catch (e) {
@@ -115,12 +102,12 @@ const direct = await page.evaluate(async () => {
 if (direct.err) fail.push(`直接调用 fetchOfficialPrices 失败：${direct.err}`);
 else {
   if (!direct.ok) fail.push(`fetchOfficialPrices ok=false：${direct.error}`);
-  // 来源必须含 openBids —— 那是「读挂单」的标记；只剩 trades 说明挂单没读到、退回扫日志了
-  if (!String(direct.source).includes("openBids")) {
-    fail.push(`市价来源不是挂单（source=${direct.source}）—— 退回扫成交日志了`);
+  // 来源必须含 listings —— 那是「读挂单」的标记
+  if (!String(direct.source).includes("listings")) {
+    fail.push(`市价来源不是链上挂单（source=${direct.source}）`);
   }
-  if (Object.keys(direct.rows || {}).length < 4) {
-    fail.push(`只拿到 ${Object.keys(direct.rows || {}).length} 个晶体管的价（应为 4）`);
+  if (Object.keys(direct.rows || {}).length < 1) {
+    fail.push(`没有拿到任何电路集合的价`);
   }
 }
 
@@ -128,7 +115,7 @@ console.log(
   `价面板=${view.groups} 单价=${JSON.stringify(view.prices)} eth_call=${ethCalls}` +
     ` eth_getLogs=${logCalls} 占位=${view.hasPlaceholder ? "有" : "无"} 失败提示=${view.failNotice ? "有" : "无"}`,
 );
-console.log(`模块直调：source=${direct.source} 晶体管=${JSON.stringify(direct.rows)}`);
+console.log(`模块直调：source=${direct.source} 电路=${JSON.stringify(direct.rows)}`);
 console.log("面板文本：" + view.firstText.replace(/\n+/g, " | ").slice(0, 260));
 fail.push(...errors);
 await browser.close();
@@ -137,5 +124,5 @@ if (fail.length) {
   console.log("\nFAIL\n" + fail.map((x) => ` - ${x}`).join("\n"));
   process.exitCode = 1;
 } else {
-  console.log("\nPASS  /tt-api 404（等同生产未配反代）下，官方市价仍由链上活跃买单给出，页面不报错，且没扫日志");
+  console.log("\nPASS  /tt-api 404（等同生产未配反代）下，官方市价仍由链上挂单给出，页面不报错，且没扫日志");
 }

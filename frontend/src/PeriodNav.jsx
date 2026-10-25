@@ -67,8 +67,8 @@ export default function PeriodNav({ periods, currentId, onSwitch }) {
             const on = String(item.id) === String(currentId);
             /*
              * 下拉里不画认购状态徽标：一是与「第 N 期」同排太挤，
-             * 二是「成交」在晶体管市场另有含义（晶体管成交），摆在期次旁容易被读成
-             * 「本期晶体管已买到」。要看去期次本身的主状态徽标与资产列表。
+             * 二是「成交」在电路市场另有含义（电路成交），摆在期次旁容易被读成
+             * 「本期电路已买到」。要看去期次本身的主状态徽标与资产列表。
              */
             return (
               <li key={item.address}>

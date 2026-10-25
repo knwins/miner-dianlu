@@ -77,7 +77,7 @@ function pickBuildInfo(targetBytes, sourceName, contractName) {
   return exact[exact.length - 1];
 }
 
-/** Campaign 的构造参数：6 个（sharePrice, totalShares, fundingDeadline, materialMarket, owner, transistors）。 */
+/** Campaign 的构造参数：6 个（sharePrice, totalShares, fundingDeadline, circuitMarket, owner, circuits）。 */
 async function campaignConstructorArgs(campaignAddr, dep) {
   const abi = require("../artifacts/contracts/CampaignFactory.sol/CampaignFactory.json").abi;
   const iface = new ethers.Interface(abi);
@@ -94,20 +94,15 @@ async function campaignConstructorArgs(campaignAddr, dep) {
     const parsed = iface.parseLog(log);
     if (String(parsed.args.campaign).toLowerCase() !== String(campaignAddr).toLowerCase()) continue;
     const c = await ethers.getContractAt("Campaign", campaignAddr);
-    // 新代码 getter 是 materialMarket()；旧工厂造出来的期次只有 market()，两种都认。
-    let marketAddr;
-    try {
-      marketAddr = await c.materialMarket();
-    } catch {
-      marketAddr = await c.materialMarket();
-    }
+    // 构造参数里的市场地址：Campaign.circuitMarket()。
+    const marketAddr = await c.circuitMarket();
     return [
       parsed.args.sharePriceBnb,
       parsed.args.totalShares,
       parsed.args.fundingDeadline,
       marketAddr,
       dep.deployer,
-      await c.transistors(),
+      await c.circuits(),
     ];
   }
   return [];
@@ -224,7 +219,7 @@ async function main() {
   const targets = [{
     address: dep.factory,
     contractName: "CampaignFactory",
-    args: [dep.materialMarket, dep.allowedParts],
+    args: [dep.circuitMarket, dep.allowedCircuits],
     sourceName: "contracts/CampaignFactory.sol",
     creationTxHash: dep.factoryDeploymentTx,
   }];

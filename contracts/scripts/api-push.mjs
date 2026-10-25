@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 
 const TOKEN = process.env.GH_TOKEN;
 if (!TOKEN) throw new Error("缺少 GH_TOKEN 环境变量");
-const REPO = "knwins/tapeout";
+const REPO = "knwins/miner-dianlu";
 const API = "https://api.github.com";
 
 /**
@@ -35,7 +35,7 @@ async function api(path, method = "GET", body) {
       authorization: `token ${TOKEN}`,
       accept: "application/vnd.github+json",
       "content-type": "application/json",
-      "user-agent": "tapeout-push",
+      "user-agent": "miner-dianlu-push",
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });

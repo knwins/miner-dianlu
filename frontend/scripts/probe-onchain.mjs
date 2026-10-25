@@ -76,11 +76,11 @@ if (okOnchain) {
   }
   const buyBtn = page.locator("button", { hasText: "挂买单" });
   console.log("  「挂买单」按钮存在:", await buyBtn.count() > 0);
-  // 在 NAND 数量 / 买价 输入，验证成本预览不报错、超余额时按钮禁用
-  const nandQty = page.locator('input[inputmode="numeric"]').first();
-  if (await nandQty.count()) {
+  // 在数量 / 买价 输入，验证成本预览不报错、超余额时按钮禁用
+  const circuitQty = page.locator('input[inputmode="numeric"]').first();
+  if (await circuitQty.count()) {
     try {
-      await nandQty.fill("1");
+      await circuitQty.fill("1");
       await page.waitForTimeout(300);
       const price = page.locator('input[inputmode="decimal"]').first();
       if (await price.count()) await price.fill("0.001");
@@ -113,13 +113,13 @@ if (okCalls) {
   const methodItem = page.locator(".method-item").first();
   console.log("  合约调用函数列表存在:", await methodItem.count() > 0);
   // 点开一个写函数，验证签名/摘要渲染不报错
-  const writeItem = page.locator(".method-item", { hasText: "placeTransistorOrder" }).first();
+  const writeItem = page.locator(".method-item", { hasText: "buyCircuits" }).first();
   if (await writeItem.count()) {
     try {
       await writeItem.click();
       await page.waitForTimeout(500);
-      const sig = page.locator(".mono", { hasText: "placeTransistorOrder" });
-      console.log("  placeTransistorOrder 签名渲染:", await sig.count() > 0);
+      const sig = page.locator(".mono", { hasText: "buyCircuits" });
+      console.log("  buyCircuits 签名渲染:", await sig.count() > 0);
     } catch (e) {
       console.log("  合约调用点选异常:", e.message);
     }

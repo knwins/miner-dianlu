@@ -1,228 +1,165 @@
-# TapeOut 众筹挖矿前端 — 业务逻辑说明文档
+# frontend · 电路众筹挖矿前端
 
-> 本文档用于**保存 / 复盘** BEM 众筹挖矿前端的业务规则与状态机设计。所有"链上交易"均为本地状态机模拟（预览/演示用途），不连接真实合约。
+> 仓库：<https://github.com/knwins/miner-dianlu>
+>
+> React 19 + Vite 6 + ethers v6。纯前端，无后端、无数据库。
 
----
-
-## 0. 项目定位与状态
-
-- **类型**：BEM 挖矿合约的**预览前端**，用 React 状态机模拟合约业务，便于评审"资金路径"和"退出机制"。
-- **技术栈**：React 19 + Vite 6；纯前端，无后端。
-- **单一真相源**：页面按钮与"合约调用"页共用同一套 `apply*` 写函数（`src/fixtures.js`），保证"界面临摹点得到的"和"合约里能调到的"永远是同一套逻辑。
-- **关键结论**：退出机制已收敛为**两条互不相交的路径**——份额转让（主动，仅挖矿中）+ 退款（被动安全阀，仅在募集超时 / 流片失败）；合约**不提供任何本金或收益赎回**。
-
----
-
-## 1. 核心数据模型
-
-| 概念 | 含义 | 落点 |
-|---|---|---|
-| `round`（期次参数） | 开期写死的全局参数：每份 BNB、总份数、募资总额、服务费、流片成本口径、选题、观察期 | `fixtures.js` 的 `ROUND` |
-| `book`（期次状态） | 当前这一期的运行态：已售份数、各钱包余额、场景、转让挂单板、领取累计等 | `createScene()` 产出 |
-| `scene` | 顶层状态机：`funding` / `executing` / `mining` | `book.scene` |
-| `executePhase` | `executing` 专属子态：`buying` → `listed` → `ready` | `book.executePhase` |
-| `wallets` | 多钱包余额账本，key=小写地址，`{mine, listingShares, claimed, refunded, bnb}` | `book.wallets` |
-| `bnbPool` | 合约代持的 BNB 池：募集款入账、退款/流片支出，与钱包余额隔离结算 | `book.bnbPool` |
-
-**恒等式（链上不可破）**：`募资总额 BNB = 总份数 × 每份 BNB`。每份由募资总额派生，用户只能买**整数份**，不能直接转账（直接转账不记份）。
-
----
-
-## 2. 状态机
-
-```
-                  applyBuy 自然售罄
-   ┌──────────┐ ───────────────────────► ┌────────────┐
-   │ funding  │                          │ executing  │
-   │ 募集中   │                          │ 待执行     │
-   └──────────┘                          └─────┬──────┘
-        │ 募集超时未售罄                            │ applyExecute
-        │ (endsAt 过期)                            │ (晶体管到位 + 观察期满)
-        ▼                                          ▼
-   ┌──────────────────────────┐            ┌──────────┐
-   │ refund（被动安全阀①）      │            │ mining   │
-   │ 原路退 BNB，份额清零       │            │ 挖矿中   │
-   └──────────────────────────┘            └─────┬────┘
-                                                  │ 流片失败 (executionFailed)
-                                                  │ 本金尚未支出
-                                                  ▼
-                                       ┌──────────────────────────┐
-                                       │ refund（被动安全阀②）      │
-                                       │ 原路退 BNB，份额清零       │
-                                       └──────────────────────────┘
-
-   mining 内唯一主动退出：份额转让环（挂单 → 接收 / 撤单）
-```
-
-### 2.1 `executing` 晶体管挂单子态
-
-晶体管来自 **tapeout.net 二级市场**，但**合约无法替人工去平台操作**，必须由 **Owner 钱包手动发起链上交易**完成：
-
-```
-   buying  ──placeTransistorOrder──►  listed  ──confirmTransistors──►  ready  ──applyExecute──► mining
-   (待挂单)                            (挂单中)                      (已到账)                    (流片开矿)
-              ◄──cancelTransistorOrder──
-```
-
-- `placeTransistorOrder`：调用 tapeout.net 挂单逻辑，进入"挂单中"。
-- `confirmTransistors`：确认成交到账，解锁流片。必须先挂单才能确认。
-- `cancelTransistorOrder`：取消挂单，回到"待挂单"。
-- **硬闸门**：`applyExecute` 在 `executePhase !== "ready"` 时**无条件拒绝**流片。自然售罄进入 `executing` 时 `applyBuy` 已写入 `executePhase="buying"`，所以**不可能绕过晶体管闸门直接流片**（问题①修复）。
-- 三个动作**仅 Factory Owner** 可调用。
-
-### 2.2 观察期
-
-`executeUnlockIn()`：售罄后必须等 `executeDelayHours`（48h）才能 `execute`，让用户核对网表哈希与报价快照。Owner 也不能提前执行。
-
----
-
-## 3. 退出机制（两条独立路径）
-
-### 3.1 主动退出 —— 份额转让（唯一主动退出途径）
-
-- **仅 `mining` 可操作**（`applyListShares / applyCancelListing / applyTakeListing` 首行即 `if (book.scene !== "mining") return 拒绝`）。
-- 流程：持份人挂单（按"每份 BNB"标价）→ 其他持份人按发布价**接收**（份额过户 + BNB 付给卖方，F4 原子结算：扣买方 `bnb`、贷记卖方 `bnb`）。
-- **份额锁定（escrow）**：挂单时立即从可用余额 `mine` 扣出、贷记 `listingShares`；撤单/成交才释放 → 杜绝一币多卖。
-- **不能买自己挂单**；部分成交后挂单份额相应扣减，售罄则移除。
-- 募集期、待执行期**不可挂牌**（文案见 `SCENE_COPY.funding.lead`）。
-
-### 3.2 被动安全阀 —— 退款（原路退 BNB）
-
-| 触发 | 条件 | 代码 |
-|---|---|---|
-| 募集超时 | `funding` + `now > endsAt` + 未售罄 | `applyRefund` |
-| 流片失败 | `executing` + `executionFailed === true`（晶体管涨价买不起，本金尚未支出） | `applyRefund` |
-
-- 退款只退**当前钱包**认购的 BNB，份额清零；`mining` **不可退款**。
-- 与已删除的 "exit 赎回" 完全不同：exit 是流片前/后主动赎回（已移除），退款是保护认购人、避免资金卡死的安全阀。
-
----
-
-## 4. tapeout.net 交互边界（重要澄清）
-
-- **不是**"人工去 tapeout.net 网站点鼠标手动买"。非钱包地址无法在平台操作。
-- **而是**：Owner（或 keeper）**手动调用本项目的挂单逻辑，发起链上交易**（即 `applyPlaceTransistorOrder` 等），由 Owner 钱包完成二级市场的挂单/取消/确认到账。
-- 合约侧只负责在晶体管 `ready` 后执行换币流片，**不替人工操作平台**。
-- 所有 UI 文案（`Calls.jsx` 摘要、`Owner.jsx` 晶体管卡片、`App.jsx` 认购页说明）已统一为"Owner 手动调用挂单逻辑（链上交易）"，外链按钮已删除。
-
----
-
-## 5. 多钱包账本（问题④修复 + F1 收益隔离 + F4 BNB 结算）
-
-引入 `book.wallets` 前，单钱包视图下 `takeListing` 不跨钱包追减，导致"卖出方份额没扣、买方也没加"的错账。
-
-- `buildWallets(seed, round)`：开期时按 `ROSTER` 权重分配演示持有人余额，连接钱包 `WALLET` 持有 `seed.mine` 份。**每个钱包独立维护五本账**：可用份额 `mine`、锁定份额 `listingShares`、已领 BEM `claimed`、已退 BNB `refunded`、BNB 余额 `bnb`（初始 `DEMO_BNB`）。
-- 所有份额流转**真正借记/贷记对应钱包**的 `mine / listingShares`：
-  - `applyBuy` / `applyRefund`：操作 `selfAddress` 钱包。
-  - `applyListShares` / `applyCancelListing`：借记/贷记卖方钱包。
-  - `applyTakeListing`：借记卖方 `listingShares`、贷记买方 `mine`，份额真正过户。
-- `recomputeSelf(book)`：**每次改写账本后**调用，让 `book.mine / book.listingShares / book.claimed / book.claimable / book.bnb / book.refundedSelf` 始终反映**当前连接钱包**（`selfAddress`）的余额，保证界面读到的"我的份额/可领/余额"与账本一致。`claimable = 全网日净 × 领取轮数 × 本钱包份额占比 − 本钱包已领`，与 `computeHarvest` 同口径（F1）。
-
-### 5.1 收益账本按持有人隔离（F1，顺带修复问题⑤）
-
-- `computeHarvest(round, book, address)`：收益累计按**传入地址**的 `wallets[address].mine` 与 `claimed` 计算，`pending = accruedNet(该地址) − claimed(该地址)`；默认地址为 `selfAddress`。harvest 是**全网分发**（所有地址按份额自动 accrual），claim/harvest 只领**本钱包** pending。
-- 已彻底废弃"一份全局 `claimable` 冒充所有持份人"的旧口径。切换钱包后"可领"随本钱包正确重算（原问题⑤的错位消失）。
-
-### 5.2 BNB 原子结算（F4）
-
-二级转让不再是"只过户份额、不碰 BNB"的账面演示，而是带 BNB 收付的闭环：
-
-- `applyBuy`：扣买方 `bnb`，累加进 `bnbPool`；余额不足拒。
-- `applyTakeListing`：先校验并锁定买方 `bnb`，成交时实时付给卖方（买方 `bnb` 减、卖方 `bnb` 加），份额同步过户。
-- `applyRefund`：从 `bnbPool` 支出、BNB 退回本钱包，并记 `wallets[addr].refunded` + 全局 `refundedBnb`（F6：区分"你退的"与"全网退的"）。
-- `applyExecute` 成功：从 `bnbPool` 支出实际流片所需 `actual.needBnb`。
-- 界面在「我的份数」页展示「我的 BNB 余额」「合约代持 BNB 池」「我的已退 BNB」，让资金托管一目了然。
-
----
-
-## 6. 产出 / 领取逻辑（无上限）
-
-- **领取次数不设上限**：只要本期还在出矿（`dailyBem > 0`），持份人就能一直领取，不存在"90 天/90 次封顶"终态；挖矿也不设截止日（`endsAt` 置 `undefined`）。
-- `computeHarvest()` 已 `maxRounds = Infinity / exhausted = false / totalGross = totalNet = null`，界面只展示"每次能领多少、是否已出矿"及"已领取次数"，**不展示任何整期总额外推**。
-- 产出机制（零和）：`日产 = 池日产 × 我的权重占比`；全网权重涨，所有人产出同步降。
-- `applyHarvest` 按 `userPart <= 0` 拒领（而非旧版按次数上限拒绝）；触发全网按份额分发，并把本钱包增量记入 accrual。只作用于「可用余额」，已挂出（escrow）份额不参与。
-- 存量领取（旧的 `applyClaim`）已随链上 `harvest`/`claim` 归一为占位实现一并移除 —— 前端不再有第二条领取路径。
-
----
-
-## 7. 关键业务约束与校验
-
-1. **整数份**：`applyBuy` 要求 `count` 为正整数且不超过剩余份数。
-2. **流片成本判定用混合均价**：`needBnb <= hardCapBnb`（NAND/LATCH 按各自实时价分别计价），不用"募资总额÷主晶体管价"粗估——混合配比下单一价会偏乐观（问题复盘已知）。
-3. **晶体管闸门**：`applyExecute` 拒绝 `executePhase !== "ready"`；拒绝 `sold < totalShares`；拒绝观察期内。
-4. **份额锁定**：挂单即 escrow，已挂出份额不可重复领取或转让。
-5. **权限模型**：`identify(address, book)` 严格按传入地址查账本判身份。**`execute` 不可逆（把全期募集款烧成晶体管），权限收紧为仅 Factory Owner**（F3），避免任一持份用户单方面把全期本金烧掉；真实合约应再加"时间锁 + 多签/投票"兜底防止 Owner 不作为卡死资金，本预览以"48h 观察期 + 报价快照锁定 + Owner 门槛"组合替代。晶体管三步（挂单/取消/确认）同样仅 Owner。
-6. **开期校验** `reviewRound`：每份/总份数/服务费(5–10%)/处理器资格/流片所需晶体管数/收费地址格式/成本可负担，任一不通过则拒绝开期。
-
----
-
-## 8. `apply*` 写操作清单（单一真相源，见 `src/fixtures.js`）
-
-| 函数 | 作用 | 关键约束 |
-|---|---|---|
-| `applyBuy` | 认购 | funding + 整数份 + 余量；售罄转 executing 并写 `executePhase="buying"` |
-| `applyRefund` | 原路退 BNB | 仅 funding超时 / executing失败；退当前钱包并记 `refunded` |
-| `applyListShares` | 发布转让挂单 | 仅 mining；余额足够；escrow 锁定 |
-| `applyCancelListing` | 撤单 | 仅挂单方或 Owner；释放锁定 |
-| `applyTakeListing` | 接收挂单 | 仅 mining；不能买自己；跨钱包过户 + BNB 原子结算 |
-| `applyHarvest` | 增量领取 | 仅 mining；`userPart>0`；次数不限；全网按份 accrual |
-| `applyPlaceTransistorOrder` | 调用 tapeout.net 挂单 | 仅 Owner；executing |
-| `applyCancelTransistorOrder` | 取消挂单 | 仅 Owner；须 listed |
-| `applyConfirmTransistors` | 确认到账 | 仅 Owner；须 listed→ready |
-| `applyExecute` | 换币+流片开矿 | **仅 Owner**（F3）+ 晶体管 ready + 观察期满 + 成本可负担；按**锁定报价快照**结算；成功清脏状态（F5）并从 `bnbPool` 支出 |
-| `applyCreate` | 开新一期 | 经 `reviewRound` 校验 |
-
----
-
-## 9. 设计缺陷专项修复记录（F1–F10，按优先级）
-
-> 由"多钱包账本"（问题④）顺带暴露并逐一定级。以下全部已修复并经 `node verify.mjs` + `vite build` 验证。
-
-| 编号 | 缺陷 | 严重度 | 修复 |
-|---|---|---|---|
-| F1 | 收益账本不隔离：一份全局 `claimable` 冒充所有持份人，切换钱包后可领量与持份对不上、误差滚雪球（即原问题⑤） | 高 | `computeHarvest(round, book, address)` 按地址算 `pending = accruedNet − claimed`；`claimed` 改按钱包存 `wallets[addr].claimed`；harvest 全网按份 accrual、claim 只领本钱包；`recomputeSelf` 按本钱包份额占比重算 `claimable` |
-| F2 | 切场景整体重建，丢失执行中途状态（晶体管子态、挂单、挖矿态） | 中 | `App.switchScene` 只改 `scene`，保留 `executePhase / wallets / listings / selfAddress` |
-| F3 | execute 无锁价且权限过松（任一持份用户可把全期本金烧掉） | 高 | 权限收紧为**仅 Owner**；按 `book.priceLock` 锁定报价快照结算；UI/Calls/Owner 文案同步 |
-| F4 | 二级转让只过户份额、不结算 BNB（账面演示） | 中 | `applyBuy / applyTakeListing / applyRefund / applyExecute` 均走 `bnbPool` 与钱包 `bnb` 原子收付；界面展示余额与托管 |
-| F5 | execute 成功后残留脏状态（`executionFailed / executePhase` 未清） | 低 | 成功分支清 `executionFailed:false, executePhase:undefined`，仅留 `priceLock` |
-| F6 | 退款总额误标为全局量，未区分"你退的" | 低 | 每钱包记 `wallets[addr].refunded` + 全局 `refundedBnb`；界面用 `refundedSelf` 显示"你的" |
-| F7 | 挂单/转让场景边界不清 | 低 | `listShares/takeListing` 与文案统一为"仅挖矿中" |
-| F8 | 募集超时缺自动终态提示 | 低 | 保持 `funding + now>endsAt` 即自动显示退款入口（被动安全阀自动可达），无需额外手动开关 |
-| F9 | 挖矿期冗余 `endsAt` 终态 | 低 | 移除，领取不设次数/时间上限 |
-| F10 | 文档滞后 | — | 本 README 已同步 |
-
-> 迁移注意：F1 使 `computeHarvest` 新增 `address` 参数并把领取语义改成 per-wallet；`book` 新增 `totalShares / bnbPool`，`wallets[addr]` 新增 `claimed / refunded / bnb`；`Calls.readCall("pendingBem")` 改按地址算，`callGate("execute")` 与 `Owner` execute 权限改 Owner-only。（当时一并调整的 `applyClaim` 后来随链上 `claim` 占位化被删除，见 §6。）
-
----
-
-## 10. 开发与验证
+## 1. 运行
 
 ```bash
-cd D:/Code/miner/frontend
-npm install            # 安装依赖（React 19 / Vite 6）
-npm run dev            # 本地预览（默认 127.0.0.1:5173）
-npm run build          # 生产构建（vite build）
-node verify.mjs        # 业务逻辑断言测试（55+ 组，全绿为通过）
+cd frontend
+npm install
+npm run dev -- --host     # 必须 --host；只绑 127.0.0.1 时预览面板走 ::1 会 500
+npm run build             # 生产构建
 ```
 
-- **预览交互**：顶栏"查看状态"可切换 `funding / executing / mining` 三个场景，以及"募集超时""流片失败"两个演示态；"身份"下拉可切换 Owner / 持份用户 / 未持份地址 / 各演示持有人，用于预览不同角色权限边界。
-- `verify.mjs` 覆盖：晶体管挂单全流程、份额转让跨钱包过户、退款双触发、execute 硬闸门、领取无上限等核心路径。
-- 构建与验证均需在 `D:/Code/miner/frontend` 目录下执行。
+链上配置从 `src/chain/deployments.json` 读取：
 
----
+```json
+{
+  "chainId": 56,
+  "circuitMarket": "0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f",
+  "allowedCircuits": ["0xb1024…14C", "0x1f5c…12c"],
+  "factory": "",
+  "campaign": ""
+}
+```
 
-## 11. 文件地图
+`factory` 为空表示尚未部署新工厂：页面只展示模拟数据，不伪造链上事实。
 
-| 文件 | 职责 |
+## 2. 目录
+
+| 路径 | 作用 |
 |---|---|
-| `src/fixtures.js` | 业务真相源：模型、状态机、所有 `apply*` 写操作、预估/校验 |
-| `src/App.jsx` | 顶层组件：场景切换、身份切换、唯一写入口 `invokeCall`、各页面 |
-| `src/Calls.jsx` | "合约调用"页 + 调用闸门 `callGate`（按角色/场景/子态限制可见可调用项） |
-| `src/Owner.jsx` | Owner 视图：期次概览、开新一期、份额明细、晶体管挂单卡片 |
-| `src/prices.js` | 价格源、晶体管目录、选题/权重/成本计算（`estimateHashpower` 依赖） |
-| `src/emission.js` | 全网日产、池权重、费率等产出常量 |
-| `src/verify.mjs` | 业务逻辑断言测试 |
+| `src/App.jsx` | 主壳、导航、认购/详情页、唯一动作入口 `invokeCall` |
+| `src/Owner.jsx` | Owner 工作台：开期、买电路、挂卖、确认、入池、退款 |
+| `src/OnChain.jsx` | 链上明细调试面板（读合约状态、逐张买电路） |
+| `src/MarketPage.jsx` | 电路市场页：官方处理器市价 + 各期锁定集合 |
+| `src/MarketTrades.jsx` | 成交记录 / 市场欠款 / 在售电路 |
+| `src/OfficialPricePanel.jsx` | 市价看板（full / compact 两种形态） |
+| `src/Calls.jsx` | 合约调用目录 + `callGate` 权限/状态闸门 |
+| `src/chain/` | 链上数据层（ABI、client、adapter、config、deployments） |
+| `src/prices.js` | 电路目录、静态基准价、成本/算力测算 |
+| `src/tapeout.js` | 官方处理器 → 电路集合地址、白名单解析 |
+| `src/officialPrices.js` | 官方市场最低挂单价读取 |
+| `src/fixtures.js` | 本地模拟引擎（`apply*`）与演示数据 |
+| `src/emission.js` | BEM 产出常量与估算 |
+| `src/roundState.js` / `dealStatus.js` | 状态文案唯一口径 |
 
----
+## 3. 链上数据流
 
-*文档基于 `frontend` 真实代码复盘整理；如业务逻辑再次调整，请同步更新本文件与 `verify.mjs`。*
+```text
+deployments.json
+      │
+      ▼
+chain/config.js ──► chain/client.js ──► chain/adapter.js ──► App/Owner/MarketPage
+      │                  │                     │
+      │                  │                     └─ state → 视图模型（book/round/summary）
+      │                  └─ ethers 读写、RPC failover、事件解析
+      └─ chainId / 地址 / 浏览器链接
+```
+
+- **读**：`client.js` 用 `Promise.all` 批量读 Campaign/Factory/Market，任一旧期次缺 getter 要做降级。
+- **写**：`App.invokeCall` 是唯一入口；`fixtures.js` 的 `apply*` 是模拟模式唯一真相源。
+- **链上/模拟同构**：按钮文案与校验尽量共用 `Calls.jsx` 的 `callGate` 与 `book` 字段。
+
+## 4. 电路市场页面
+
+### 4.1 官方市价（`officialPrices.js`）
+
+官方市场**只有卖单侧**，所以市价 = **当前最低挂单价（floor）**：
+
+1. `nextListingId()` 读挂单总数；
+2. 从最新 id 往回批量 `listings(id)`（每批 60，最多 600）；
+3. 过滤 `seller != 0`、`price > 0`，按 `circuits` 集合归位；
+4. 每个集合取最低价，写入 `prices[电路 id] = { ask, floor, listed }`；
+5. 60 秒 TTL 缓存，同一时刻并发请求去重；
+6. 读不到就返回 `{ok:false,error}`，页面退回静态基准价，不崩。
+
+> 不扫 `eth_getLogs`：公共节点对历史日志限制多，而挂单是当前状态，`eth_call` 即可。
+
+### 4.2 市价面板（`OfficialPricePanel.jsx`）
+
+- `full`：每个处理器一张卡，价格 28px，突出「当前最低挂单价」。
+- `compact`：开期表单 / Owner 弹窗里的紧凑表格。
+- 单位统一 **BNB / 张**。
+- 数据来源统一写在卡片底部，不在每个价格格重复标注。
+
+### 4.3 市场页（`MarketPage.jsx`）
+
+- 上：官方市价看板（TapeOut / Behemoth）。
+- 下：各期锁定的电路集合、市场地址、工厂白名单状态。
+- 工厂白名单来自 `deployments.allowedCircuits` / 链上 `allowedCircuitsCount()`。
+
+## 5. 电路目录与测算（`prices.js`）
+
+- `CIRCUITS`：两个官方处理器各一个 ERC721 集合。
+- `DEFAULT_CIRCUIT = "BEHEMOTH_CIRCUIT"`。
+- `planTask({parts, circuitId, snapshot})`：
+  - 电路总数必须是正整数，否则退回 1；
+  - 成本 = 张数 × 单价；
+  - 算力 `H = 张数 × P`（TapeOut P=1，Behemoth P=6）；
+  - 面积 = 张数，超过 `MINE_GATE_LIMIT` 只能进未验证池。
+- 只按「张」计量，单一电路腿。
+
+## 6. 关键页面字段
+
+| 字段 | 含义 |
+|---|---|
+| `circuitCount` | 累计买入张数（历史，不随卖出下降） |
+| `circuitHeldCount` | 当前持有张数（卖出/入池后下降） |
+| `circuits` | 本期锁定的 ERC721 集合地址 |
+| `listedCircuits` | 当前挂卖的电路（tokenId / listingId / price / cost） |
+| `circuitCostBasis(tokenId)` | 该 token 的买入价，挂卖底价 |
+| `marketOwed` | 市场欠本期的 BNB（可 `withdrawMarketProceeds`） |
+| `priceLock` | 累计买入成本（BNB） |
+
+## 7. Owner 工作流
+
+```text
+售罄 → buyCircuits（按挂单价批量买入，成本从 raisedBnb 扣）
+     → confirmCircuits（确认持有，进入 Ready）
+     → setPlan（算力估算）
+     → returnSurplus（可选：先把剩余 BNB 记成余款）
+     → setMiningPool
+     → depositToPool（不可逆，电路转给矿池）
+```
+
+需要变现时（Ready、未入池）：
+
+```text
+listCircuit(tokenId, price)  → 等待成交 → withdrawMarketProceeds()
+cancelCircuitListing(tokenId) → 撤回挂卖
+```
+
+- 挂卖价不得低于 `circuitCostBasis(tokenId)`。
+- 先撤掉全部挂卖，才能 `depositToPool`。
+
+## 8. 模拟模式
+
+`fixtures.js` 提供 `applyBuyCircuits` / `applyConfirmCircuits` / `applyListCircuit` /
+`applyCancelCircuitListing` 等写函数，用于无钱包预览。
+
+- 模拟数据**不能冒充链上事实**：链上模式的 `partCount` 从 0 开始，不用演示值倒推。
+- 链上读不到时，页面显示「—」或「读取中」，不编造数字。
+
+## 9. 常见坑
+
+1. **`vite build` 抓不到运行时错误**：自由变量、TDZ、`undefined.toLocaleString()` 都只在浏览器炸。
+   改前端后必须真实打开页面 / 跑探针。
+2. **跨组件改字段名要全局搜索消费方**；`Number(undefined)||0` 会把错误静默成 0。
+3. **不要恢复已删除的市场接口**：`placeBid` / `fillBid` / `nextBidId` / `openBids` 都是旧模型。
+4. **官方市场读取失败不是页面崩溃**：市价是辅助信息，失败要降级到静态基准。
+5. **单位统一「张」**：电路是 ERC721 单张交割，不是「颗」。
+6. **`deployments.circuitMarket` 是新字段**；旧文档里的 `materialMarket` 是历史名，代码不再引用。
+7. **RPC 公共节点会 403/429**：这是节点限流，不是应用错误；不要为此改业务代码。
+
+## 10. 验证
+
+```bash
+npm run build
+# 开发时手动打开页面，或用 Playwright/无头 Chrome 抓 pageerror
+```
+
+探针脚本在 `frontend/scripts/`（Playwright）。它们依赖真实页面与模拟钱包，
+改导航名、DOM 锚点或业务规则后要同步更新断言。

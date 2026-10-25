@@ -150,7 +150,7 @@ export function rowState(row, nowSec = Math.floor(Date.now() / 1000), dealOf) {
   const raised = Number(row?.raisedBnb ?? row?.bnbPool ?? 0);
   const need = outstandingOf(row) * price;
   // 与合约 refund() 的 short 口径一致：只有「待挂单」池子 cover 不住全部份额才叫缺口。
-  // 已挂单 / 已到账时池子变小是买晶体管花掉的，不是缺口。
+  // 已挂单 / 已到账时池子变小是买电路花掉的，不是缺口。
   const short = state.sceneKey === "executing"
     && state.phaseKey === "buying"
     && need > 0
@@ -164,7 +164,7 @@ export function rowState(row, nowSec = Math.floor(Date.now() / 1000), dealOf) {
   } else if (state.sceneKey === "executing") {
     substate = short ? "池子不足 · 按比例退" : state.phase.full;
   } else if (state.sceneKey === "mining") {
-    substate = "晶体管已入池 · 不可逆";
+    substate = "电路已入池 · 不可逆";
   }
 
   return {
@@ -172,7 +172,7 @@ export function rowState(row, nowSec = Math.floor(Date.now() / 1000), dealOf) {
     short,
     substate,
     /**
-     * 同屏别处已经说过「到账」时用（Owner 卡片 hero 就是「成交晶体管已到账」），
+     * 同屏别处已经说过「到账」时用（Owner 卡片 hero 就是「成交电路已到账」），
      * 这里只留下一步，不再重复「已到账」。
      */
     substateCompact: state.phaseKey === "ready" ? state.phase.sub : substate,

@@ -13,15 +13,15 @@ const r = await page.evaluate(async () => {
   const f = await import("/src/fixtures.js");
   const official = await m.fetchOfficialPrices({ force: true });
   const merged = m.officialQuote(p.NOMINAL_QUOTE, official);
-  const round = { ...f.ROUND, hardCapBnb: 0.16, totalShares: 2, sharePriceBnb: 0.08, transistorId: "TAPE_OUT_NAND" };
+  const round = { ...f.ROUND, hardCapBnb: 0.16, totalShares: 2, sharePriceBnb: 0.08, circuitModelId: p.DEFAULT_CIRCUIT };
   const est = f.estimateHashpower(round, merged, 2);
-  const plan = p.planTask({ parts: 100, transistorId: "TAPE_OUT_NAND", snapshot: merged });
+  const plan = p.planTask({ parts: 100, circuitId: p.DEFAULT_CIRCUIT, snapshot: merged });
   return {
     ok: official.ok,
-    rows: Object.fromEntries(Object.entries(official.prices).map(([k,v])=>[k, {bid:v.bid, last:v.last}])),
+    rows: Object.fromEntries(Object.entries(official.prices).map(([k,v])=>[k, {ask:v.ask, last:v.last}])),
     mergedPrices: merged.prices,
-    est: { hashpower: est.hashpower, usedParts: est.usedParts, priceBnb: est.priceBnb, priceNand: est.priceNand, priceLatch: est.priceLatch },
-    plan: { cost: plan.partsCost, priceNand: plan.priceNand, priceLatch: plan.priceLatch },
+    est: { hashpower: est.hashpower, usedParts: est.usedParts, priceBnb: est.priceBnb },
+    plan: { cost: plan.partsCost, priceMain: plan.priceMain, hashpower: plan.hashpower },
     nanCount: Object.values(est).filter(v=>typeof v==="number"&&!Number.isFinite(v)).length,
   };
 });

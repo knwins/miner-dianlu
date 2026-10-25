@@ -15,7 +15,7 @@ import {
   setCampaignAddress,
   createCampaignOnChain,
   readFactoryOwner,
-  readAllowedParts,
+  readAllowedCircuits,
 } from "./chain/client.js";
 import { discoverWallets, isMobile } from "./chain/wallets.js";
 import { useOfficialPrices } from "./useOfficialPrices.js";
@@ -35,10 +35,9 @@ import {
   recomputeSelf,
   applySubscribe,
   applyOpenRefund,
-  applyConfirmTransistors,
+  applyConfirmCircuits,
   applyCreate,
-  applyPlaceTransistorOrder,
-  applyCancelTransistorOrder,
+  applyBuyCircuits,
   applyListShares,
   applyCancelListing,
   applyTakeListing,
@@ -65,11 +64,11 @@ const LIFE_PAGES = [
   { id: "owner", label: "合约工作台", hint: "开期 / 入池 / 调试" },
 ];
 /**
- * 晶体管市场（不属于生命周期）：里面到底有哪些官方处理器与晶体管。
+ * 电路市场（不属于生命周期）：里面到底有哪些官方处理器与电路。
  * 单独分组是因为它跟「某一期走完哪一步」无关，是常驻的外部市场视图。
  */
 const MARKET_PAGES = [
-  { id: "market", label: "晶体管市场", hint: "官方晶体管成交价与期次锁定" },
+  { id: "market", label: "电路市场", hint: "官方电路挂单与期次锁定" },
 ];
 
 export default function App() {
@@ -91,23 +90,23 @@ export default function App() {
   const chain = useChain();
   const [factoryOwner, setFactoryOwner] = useState(deployments.deployer || "");
   /**
-   * 工厂晶体管白名单（部署时写入、之后不可增删）。
+   * 工厂电路白名单（部署时写入、之后不可增删）。
    *
    * 这是**安全边界**不是运营开关：主网上防止 owner 把期次指向 MockERC1155
-   * （其 mint 无访问控制，任何人能无限造晶体管）。开期表单的可选处理器必须
+   * （其 mint 无访问控制，任何人能无限造电路）。开期表单的可选处理器必须
    * 从这里生成，不能用前端硬编码列表冒充链上事实。
    *
-   * ⚠️ 工厂不再有「默认晶体管」：开期时前端必须**显式选择一个**白名单内的处理器，
+   * ⚠️ 工厂不再有「默认电路」：开期时前端必须**显式选择一个**白名单内的处理器，
    * 不能留空、也不能用工厂默认值代替。
    */
-  const [allowedParts, setAllowedParts] = useState([]);
+  const [allowedCircuits, setAllowedCircuits] = useState([]);
   useEffect(() => {
     if (!CHAIN_CONFIGURED) return;
     readFactoryOwner()
       .then((o) => o && setFactoryOwner(o))
       .catch(() => {});
-    readAllowedParts()
-      .then((list) => setAllowedParts(Array.isArray(list) ? list : []))
+    readAllowedCircuits()
+      .then((list) => setAllowedCircuits(Array.isArray(list) ? list : []))
       .catch(() => {});
   }, []);
 
@@ -116,8 +115,8 @@ export default function App() {
    *
    * 三个来源，优先级从高到低：
    *   1. 链上实读：Campaign 记录的 Owner 实际挂单/成交单价（由 adapter 写进 book）
-   *   2. 官方市价：链上晶体管市场最新成交事件为主源（见 useOfficialPrices / officialPrices.js），
-   *      tapeout.net 的 market.json 作按晶体管合并补齐的兜底，再无则静态基准
+   *   2. 官方市价：链上电路市场的当前最低挂单价（见 useOfficialPrices / officialPrices.js），
+   *      没有活跃挂单时退回静态基准
    *   3. 静态基准：prices.js 的 NOMINAL_QUOTE，只在链上与官方都没有价时兜底
    */
   const { quote, official } = useOfficialPrices(QUOTE);
@@ -137,7 +136,7 @@ export default function App() {
   const chainEmpty = chain.active && chain.empty && !chain.book;
   // 工厂已部署时，读失败不能退回本地演示数据，否则会把真期次盖成「还没有」或假的第 3 期。
   const chainBooting = chain.active && !chain.book && !chain.empty;
-  /** 从链上 setPlan 算力 + 晶体管数反推目标处理器，写入 round 供全页消费 */
+  /** 从链上 setPlan 算力 + 电路数反推目标处理器，写入 round 供全页消费 */
   const design = useMemo(() => {
     const baseRound = usingChain ? chain.round : simRound;
     const baseBook = usingChain ? chain.book : simBook;
@@ -151,7 +150,7 @@ export default function App() {
       ...base,
       // 链上未 setPlan 时不要把 fixtures 默认处理器写回 round，否则整页估算都会偏到 Behemoth
       processorId: design.processorKnown ? design.processorId : (usingChain ? null : base.processorId),
-      transistorId: design.processorKnown ? design.transistorId : (usingChain ? null : base.transistorId),
+      circuitModelId: design.processorKnown ? design.circuitModelId : (usingChain ? null : base.circuitModelId),
     };
   }, [usingChain, chain.round, simRound, design]);
   const chainEst = useMemo(
@@ -286,11 +285,11 @@ export default function App() {
   function invokeCall(method, args) {
     const WRITE_METHODS = [
       "subscribe", "listShares", "cancelListing", "takeListing", "refund", "claimSurplus",
-      "placeTransistorOrder", "cancelTransistorOrder", "sellTransistors", "setPhase",
-      "withdrawMarketProceeds", "confirmTransistors", "setPlan", "setMiningPool", "depositToPool", "returnSurplus", "topUpShortfall",
-      "simulateFillBid", "simulateExternalBid", "simulateFillCampaignBids",
+      "buyCircuits", "confirmCircuits", "listCircuit", "cancelCircuitListing", "setPhase",
+      "withdrawMarketProceeds", "setPlan", "setMiningPool", "depositToPool", "returnSurplus", "topUpShortfall",
+      "simulateBuyListing", "simulateExternalListing",
       "createCampaign", "openRefund", "abandonOrder", "markFailed", "removeCampaign", "removeCampaignAt",
-      "setMaterialMarket", "recoverBnb", "recoverTransistors", "transferOwnership",
+      "setCircuitMarket", "recoverBnb", "recoverCircuits", "transferOwnership",
       "setFactoryOwner", "claimFee", "setServiceFee",
       // 熔断：拉闸 / 抬闸都只认 Owner
       "halt", "resume",
@@ -301,11 +300,11 @@ export default function App() {
       return { ok: false, message: "harvest / claim 暂为占位，不产出发放。" };
     }
     if (chain.active && WRITE_METHODS.includes(method)) return chainInvoke(method, args);
-    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "transistors", "market", "materialMarket", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf", "halted"].includes(method)) {
+    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "circuits", "market", "circuitMarket", "circuitHeldCount", "circuitCount", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf", "halted"].includes(method)) {
       return { ok: true, message: readCall(method, args, round, book, quote) };
     }
-    if (/^market(OpenOrders|Bids|Sellable|Owed)$/.test(method) || method.startsWith("simulateFill") || method === "simulateExternalBid") {
-      return { ok: false, message: "晶体管市场调试只在链上模式可用：先连接测试网钱包。" };
+    if (/^market(OpenOrders|Listing|Sellable|Owed)$/.test(method) || method === "simulateExternalListing" || method === "simulateBuyListing") {
+      return { ok: false, message: "电路市场调试只在链上模式可用：先连接测试网钱包。" };
     }
 
     let result;
@@ -317,14 +316,18 @@ export default function App() {
     else if (method === "depositToPool") {
       result = {
         ok: true,
-        message: "模拟：晶体管已投入矿池，本期进入挖矿（不可逆）",
+        message: "模拟：电路已投入矿池，本期进入挖矿（不可逆）",
         book: { ...book, scene: "mining", pooled: true },
       };
     }
-    else if (method === "setPlan") result = { ok: true, message: "模拟：预估算力与晶体管数已写入" };
-    else if (method === "placeTransistorOrder") result = applyPlaceTransistorOrder(round, book, actor, args);
+    else if (method === "setPlan") result = { ok: true, message: "模拟：预估算力与电路数已写入" };
+    else if (method === "buyCircuits") result = applyBuyCircuits(round, book, actor, {
+      qty: args?.qty, maxPriceBnb: args?.maxPriceBnb,
+    });
+    else if (method === "listCircuit") result = { ok: true, message: "模拟：电路已挂回市场（链上走 listCircuit）" };
+    else if (method === "cancelCircuitListing") result = { ok: true, message: "模拟：已撤销电路挂单" };
     else if (method === "returnSurplus") {
-      // 模拟模式：把钱从募集池挪到「待领余款」，期次、份额、晶体管都不动 —— 与链上 returnSurplus 同口径。
+      // 模拟模式：把钱从募集池挪到「待领余款」，期次、份额、电路都不动 —— 与链上 returnSurplus 同口径。
       result = book.executePhase === "ready" && Number(book.bnbPool) > 0
         ? {
             ok: true,
@@ -336,11 +339,11 @@ export default function App() {
               bnbPool: 0,
             },
           }
-        : { ok: false, message: "只有晶体管确认到账、且募集池还有余款时才能退" };
+        : { ok: false, message: "只有电路确认到账、且募集池还有余款时才能退" };
     }
     else if (method === "openRefund" || method === "abandonOrder") result = applyOpenRefund(round, book, actor);
     else if (method === "topUpShortfall") {
-      result = { ok: true, message: "模拟：已补齐被晶体管吃掉的本金缺口，现在可以按原价退完持份人" };
+      result = { ok: true, message: "模拟：已补齐被电路吃掉的本金缺口，现在可以按原价退完持份人" };
     }
     else if (method === "markFailed") {
       result = book.executionFailed
@@ -361,12 +364,11 @@ export default function App() {
         ? { ok: true, message: "模拟：已解除熔断，入口恢复", book: { ...book, halted: false } }
         : { ok: false, message: "本期未熔断，无需解除" };
     }
-    else if (method === "cancelTransistorOrder") result = applyCancelTransistorOrder(round, book, actor);
-    else if (method === "confirmTransistors") result = applyConfirmTransistors(round, book, actor);
+    else if (method === "confirmCircuits") result = applyConfirmCircuits(round, book, actor);
     else if (method === "refund") result = applyRefund(round, book, actor);
     else if (method === "createCampaign") result = applyCreate(round, args, quote);
     else if (method === "recoverBnb") result = { ok: true, message: "模拟：可动 BNB 已一次性转给 Owner（不用填数量）" };
-    else if (method === "recoverTransistors") result = { ok: true, message: "模拟：晶体管已转给 Owner" };
+    else if (method === "recoverCircuits") result = { ok: true, message: "模拟：电路已转给 Owner" };
     else if (method === "claimFee") {
       result = { ok: true, message: "模拟：已领取你的挖矿产出服务费（链上走 claimFee）" };
     } else if (method === "setServiceFee") {
@@ -401,15 +403,14 @@ export default function App() {
     claimSurplus: "领取余款",
     claimFee: "领取挖矿产出服务费",
     setServiceFee: "设定挖矿产出服务费",
-    placeTransistorOrder: "挂买单",
-    cancelTransistorOrder: "取消买单",
-    sellTransistors: "卖入买单",
+    buyCircuits: "买入电路",
+    confirmCircuits: "确认到账",
+    listCircuit: "挂回电路市场",
+    cancelCircuitListing: "撤销电路挂单",
     setPhase: "改子状态",
     withdrawMarketProceeds: "提取卖出款",
-    simulateFillBid: "模拟卖方成交",
-    simulateExternalBid: "模拟外部买单",
-    simulateFillCampaignBids: "一键撮合买单",
-    confirmTransistors: "确认成交",
+    simulateBuyListing: "模拟外部买家吃单",
+    simulateExternalListing: "模拟外部卖家挂单",
     setPlan: "写入计划",
     setMiningPool: "设置矿池",
     depositToPool: "入池",
@@ -420,9 +421,9 @@ export default function App() {
     markFailed: "判执行失败",
     removeCampaign: "移除期次",
     removeCampaignAt: "移除期次",
-    setMaterialMarket: "更换晶体管市场",
+    setCircuitMarket: "更换电路市场",
     recoverBnb: "取回 BNB",
-    recoverTransistors: "取回晶体管",
+    recoverCircuits: "取回电路",
     transferOwnership: "转移所有权",
     setFactoryOwner: "转移工厂所有权",
     halt: "熔断（halt）",
@@ -468,16 +469,16 @@ export default function App() {
           const outstanding = Number(book.outstandingShares ?? book.sold ?? 0);
           const pool = Number(book.bnbPool || 0);
           const need = outstanding * Number(round.sharePriceBnb || 0);
-          const partsHeld = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0) > 0;
+          const partsHeld = Number(book.circuitHeldCount || 0) > 0;
           if (method === "openRefund" || method === "abandonOrder") {
             if (Number(book.surplusBase) > 0) {
               throw new Error("余款已按份退回（SurplusAlreadyReturned）：本金已在持份人手里，不能再打开退款。");
             }
             if (book.executePhase === "ready") {
-              throw new Error("晶体管已到账（UseReturnSurplus）：出口是退余款 + 入池，不能放弃挂单。");
+              throw new Error("电路已到账（UseReturnSurplus）：出口是退余款 + 入池，不能放弃挂单。");
             }
             if (partsHeld && pool + 1e-12 < need) {
-              throw new Error("晶体管还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口。");
+              throw new Error("电路还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口。");
             }
             if (method === "openRefund" && Number(book.marketOwed) > 0) {
               throw new Error("市场还有未提取的卖出款（ProceedsPending）：先 withdrawMarketProceeds 再打开退款。");
@@ -509,29 +510,28 @@ export default function App() {
           await chain.refresh();
           return;
         }
-        if (method === "placeTransistorOrder") {
-          const nandQty = BigInt(Math.floor(Number(args?.nandQty) || 0));
-          const latchQty = BigInt(Math.floor(Number(args?.latchQty) || 0));
-          if (nandQty === 0n && latchQty === 0n) throw new Error("NAND 与 LATCH 数量不能都为 0");
-          const nandPrice = nandQty > 0n ? parseEther(String(args?.nandPrice ?? "0").trim()) : 0n;
-          const latchPrice = latchQty > 0n ? parseEther(String(args?.latchPrice ?? "0").trim()) : 0n;
-          if ((nandQty > 0n && nandPrice <= 0n) || (latchQty > 0n && latchPrice <= 0n)) {
-            throw new Error("有数量的晶体管必须填写大于 0 的单价");
+        if (method === "buyCircuits") {
+          const qty = Math.floor(Number(args?.qty) || 0);
+          if (qty <= 0) throw new Error("买入张数要大于 0");
+          const maxPriceText = String(args?.maxPriceBnb ?? "0").trim() || "0";
+          const maxPriceWei = parseEther(maxPriceText);
+          if (maxPriceWei < 0n) throw new Error("最高单价不能为负");
+          await send(chainTx.buyCircuitsFromMarket(signer, qty, maxPriceWei), onSigned);
+        } else if (method === "listCircuit") {
+          const tokenId = BigInt(Math.floor(Number(args?.tokenId ?? -1)));
+          if (tokenId < 0n) throw new Error("请选择要挂回市场的电路");
+          const price = parseEther(String(args?.priceBnb ?? "").trim());
+          if (price <= 0n) throw new Error("挂单价必须大于 0");
+          await send(chainTx.listCircuit(signer, tokenId, price), onSigned);
+        } else if (method === "cancelCircuitListing") {
+          const tokenId = BigInt(Math.floor(Number(args?.tokenId ?? -1)));
+          if (tokenId < 0n) throw new Error("请选择要撤单的电路");
+          await send(chainTx.cancelCircuitListing(signer, tokenId), onSigned);
+        } else if (method === "confirmCircuits") {
+          if (book._chain && !(Number(book.circuitHeldCount) > 0)) {
+            throw new Error("本期合约还没持有电路，不能确认到账（CircuitsNotReady）。");
           }
-          const cost = nandQty * nandPrice + latchQty * latchPrice;
-          const pool = parseEther(String(book.bnbPool ?? 0));
-          if (cost > pool) {
-            throw new Error("托管金额超过募集余额，不会挂出。请降低数量或单价后再提交。");
-          }
-          await send(chainTx.placeTransistorOrder(signer, nandQty, nandPrice, latchQty, latchPrice), onSigned);
-        } else if (method === "sellTransistors") {
-          const bidId = BigInt(Math.floor(Number(args?.bidId ?? 0)));
-          const tokenId = Number(args?.tokenId ?? 0);
-          const quantity = BigInt(Math.floor(Number(args?.quantity ?? 0)));
-          if (bidId <= 0n) throw new Error("请选择一个有效的买单");
-          if (tokenId !== 0 && tokenId !== 1) throw new Error("tokenId 只能是 0（NAND）或 1（LATCH）");
-          if (quantity <= 0n) throw new Error("卖出数量必须大于 0");
-          await send(chainTx.sellTransistors(signer, bidId, tokenId, quantity), onSigned);
+          await send(chainTx.confirmCircuits(signer), onSigned);
         } else if (method === "openRefund") {
           await send(chainTx.openRefund(signer), onSigned);
         } else if (method === "abandonOrder") {
@@ -549,19 +549,21 @@ export default function App() {
           : method === "recoverBnb"
             ? "已把本期可动 BNB 转给 Owner。"
           : method === "abandonOrder"
-            ? "已撤未成交买单并打开退款：持份人各自领回本金，退完后剩余晶体管退回 Owner。"
-          : method === "placeTransistorOrder"
-            ? "已向市场挂买单，保证金从募集款里出。"
-            : method === "sellTransistors"
-              ? "已吃单卖出：晶体管已交付买家，卖出款已提回本期。"
+            ? "已撤未成交买单并打开退款：持份人各自领回本金，退完后剩余电路退回 Owner。"
+          : method === "buyCircuits"
+            ? "已从电路市场买入：采购款从募集余额扣除，电路已到账。"
+            : method === "listCircuit"
+              ? "已把电路挂回市场；成交后卖出款进入市场欠款，需提取。"
+              : method === "cancelCircuitListing"
+                ? "已撤销电路挂单，NFT 仍在本期合约。"
               : method === "withdrawMarketProceeds"
                 ? "卖出款已转入本期募集余额。"
                 : method === "markFailed"
                   ? "已标记执行失败：所有持有人现在可以按池子原路退款。"
-                  : method === "simulateFillBid" || method === "simulateFillCampaignBids"
-                    ? "已模拟卖方成交：市场剩余已扣减，晶体管已铸给买家（本期合约）。"
-                    : method === "simulateExternalBid"
-                      ? "已模拟外部买家挂单：BNB 已托管到 Mock 晶体管市场，本期可以吃这张买单。"
+                  : method === "simulateBuyListing"
+                    ? "已模拟外部买家吃单：电路已转给买家，卖出款记入市场欠款。"
+                    : method === "simulateExternalListing"
+                      ? "已模拟外部卖家挂单：Mock 电路已 mint 并挂到市场，本期可以买入。"
                     : method === "halt"
                       ? "已熔断：认筹、挂单、卖出、入池与份额交易暂停；退款与撤单仍可用。抬闸同样由 Owner 执行。"
                     : method === "resume"
@@ -611,22 +613,22 @@ export default function App() {
     }
 
     /**
-     * 开期参数：份额单价 / 总份数 / 募集天数 / **晶体管合约（处理器）**。
+     * 开期参数：份额单价 / 总份数 / 募集天数 / **电路合约（处理器）**。
      *
-     * ⚠️ 晶体管合约（第 4 参）是**必选**：开期人必须从白名单里显式选一个处理器，
-     * 零地址一律 revert（工厂不再有默认晶体管）。这是 T-79 的核心改动：
+     * ⚠️ 电路合约（第 4 参）是**必选**：开期人必须从白名单里显式选一个处理器，
+     * 零地址一律 revert（工厂不再有默认电路）。这是 T-79 的核心改动：
      * 之前所有期次被工厂默认值锁死到同一处理器，现在单工厂可承载多处理器
-     * （主网 TapeOut / Behemoth 各自的晶体管合约），由开期时显式选择。
+     * （主网 TapeOut / Behemoth 各自的电路合约），由开期时显式选择。
      *
-     * 晶体管**数量**同样不是开期参数：它在 Owner 买入晶体管（placeTransistorOrder）时确定。
+     * 电路**数量**同样不是开期参数：它在 Owner 用 buyCircuits 从电路市场买入时确定。
      */
-    const partsArg = String(draft.transistors || "").trim();
+    const partsArg = String(draft.circuits || "").trim();
     if (!/^0x[0-9a-fA-F]{40}$/.test(partsArg) || /^0x0{40}$/i.test(partsArg)) {
-      throw new Error("请先选择本期晶体管合约，不能留空。");
+      throw new Error("请先选择本期电路合约，不能留空。");
     }
     const { campaign: created, hash } = await createCampaignOnChain(
       activeSigner,
-      { sharePriceBnb: shareNum, totalShares, fundingDays, transistors: partsArg },
+      { sharePriceBnb: shareNum, totalShares, fundingDays, circuits: partsArg },
       onSigned
     );
 
@@ -801,39 +803,33 @@ export default function App() {
         if (shares <= 0n) throw new Error("买入份数必须大于 0");
         return chainTx.takeListing(signer, Number(id), shares, shares * wei);
       }
-      case "cancelTransistorOrder": return chainTx.cancelTransistorOrder(signer);
+      case "buyCircuits": {
+        const qty = Math.floor(Number(args?.qty) || 0);
+        if (qty <= 0) throw new Error("买入张数要大于 0");
+        return chainTx.buyCircuitsFromMarket(signer, qty, parseEther(String(args?.maxPriceBnb ?? "0")));
+      }
+      case "listCircuit": {
+        const tokenId = uintField(args?.tokenId, "电路 tokenId");
+        const price = parseEther(String(args?.priceBnb ?? "").trim());
+        if (price <= 0n) throw new Error("挂单价必须大于 0");
+        return chainTx.listCircuit(signer, tokenId, price);
+      }
+      case "cancelCircuitListing":
+        return chainTx.cancelCircuitListing(signer, uintField(args?.tokenId, "电路 tokenId"));
       case "markFailed": return chainTx.markFailed(signer, args?.campaign);
       case "withdrawMarketProceeds": return chainTx.withdrawMarketProceeds(signer);
-      case "simulateFillBid": return chainTx.simulateFillBid(signer, args.id, args.quantity);
-      case "simulateExternalBid": {
-        const tokenId = Number(args?.tokenId ?? 0);
-        if (tokenId !== 0 && tokenId !== 1) throw new Error("tokenId 只能是 0（NAND）或 1（LATCH）");
+      case "simulateBuyListing":
+        return chainTx.simulateBuyListing(signer, args?.id);
+      case "simulateExternalListing": {
         const price = parseEther(String(args?.price ?? "0").trim());
         if (price <= 0n) throw new Error("单价必须大于 0");
-        const quantity = uintField(args?.quantity, "数量");
-        if (quantity <= 0n) throw new Error("数量必须大于 0");
-        return chainTx.simulateExternalBid(signer, tokenId, price, quantity);
+        return chainTx.simulateExternalListing(signer, args?.tokenId, args?.price);
       }
-      case "simulateFillCampaignBids": return chainTx.simulateFillCampaignBids(signer);
-      case "confirmTransistors":
-        if (book._chain && !book.orderFilled) {
-          throw new Error("晶体管市场买单还没吃完（remaining > 0），不能进入待入池。");
+      case "confirmCircuits":
+        if (book._chain && !(Number(book.circuitHeldCount) > 0)) {
+          throw new Error("本期合约还没持有电路（CircuitsNotReady），不能确认到账。");
         }
-        if (book._chain) {
-          // 合约还要求本期合约真的持有晶体管；成交但卖家没发货时会以 TransistorsNotReady 回滚。
-          const needNand = Number(book.nandQty) || 0;
-          const needLatch = Number(book.latchQty) || 0;
-          const haveNand = Number(book.partsNand) || 0;
-          const haveLatch = Number(book.partsLatch) || 0;
-          if (haveNand < needNand || haveLatch < needLatch) {
-            const short = [
-              needNand > haveNand ? `${needNand - haveNand} NAND` : null,
-              needLatch > haveLatch ? `${needLatch - haveLatch} LATCH` : null,
-            ].filter(Boolean).join(" + ");
-            throw new Error(`晶体管还没到账：还缺 ${short}。测试网可点「补发晶体管」补齐后再确认。`);
-          }
-        }
-        return chainTx.confirmTransistors(signer);
+        return chainTx.confirmCircuits(signer);
       case "setPlan": {
         const src = args || {};
         const raw = src.hashpower ?? ((chainEst && chainEst.hashpower) || book.estimate?.hashpower || 0);
@@ -846,7 +842,7 @@ export default function App() {
       case "setMiningPool": {
         const pool = String(args?.pool || "").trim();
         if (!/^0x[0-9a-fA-F]{40}$/.test(pool)) throw new Error("矿池地址无效");
-        // 零地址格式合法，但 depositToPool 会把晶体管转进黑洞且不可逆。
+        // 零地址格式合法，但 depositToPool 会把电路转进黑洞且不可逆。
         if (/^0x0{40}$/i.test(pool)) throw new Error("矿池地址不能是零地址");
         // 合约同样拒绝 pool_ == address(this)。
         if (book._chain && String(book.campaign || "").toLowerCase() === pool.toLowerCase()) {
@@ -855,58 +851,48 @@ export default function App() {
         return chainTx.setMiningPool(signer, pool);
       }
       case "depositToPool":
-        // 合约门槛：未入池、Ready、矿池已设、仍有未退份额、手里真有晶体管（任一不满足都会 revert）。
+        // 合约门槛：未入池、Ready、矿池已设、仍有未退份额、手里真有电路（任一不满足都会 revert）。
         if (book._chain) {
           if (book.pooled) throw new Error("本期已入池（AlreadyPooled）");
-          if (book.executePhase !== "ready") throw new Error("晶体管还没确认到账，不能入池（WrongScene）");
+          if (book.executePhase !== "ready") throw new Error("电路还没确认到账，不能入池（WrongScene）");
           const mp = String(book.miningPool || "");
           if (!/^0x[0-9a-fA-F]{40}$/.test(mp) || /^0x0{40}$/i.test(mp)) throw new Error("还没设置矿池地址（PoolNotSet）");
           if (String(book.campaign || "").toLowerCase() === mp.toLowerCase()) throw new Error("矿池地址是本期合约自己（ZeroAddress）");
           if (!(Number(book.outstandingShares ?? book.sold ?? 0) > 0)) throw new Error("份额已全部退完，没有持有人可分产出（ZeroShares）");
-          if (!(Number(book.partsNand) > 0 || Number(book.partsLatch) > 0)) throw new Error("合约手上没有晶体管（InsufficientParts）");
+          if (!(Number(book.circuitHeldCount) > 0)) throw new Error("合约手上没有电路（InsufficientCircuits）");
         }
         return chainTx.depositToPool(signer);
       case "returnSurplus":
         // 无参：把当前 raisedBnb 按份记账退回持份人，期次继续、仍然可以入池。
         return chainTx.returnSurplus(signer);
       case "topUpShortfall": {
-        // 自掏腰包补齐被晶体管吃掉的本金差额（payable，单位 BNB）。
+        // 自掏腰包补齐被电路吃掉的本金差额（payable，单位 BNB）。
         const raw = String(args?.value ?? "0").trim();
         const amount = raw ? parseEther(raw) : 0n;
         if (amount <= 0n) throw new Error("补齐金额必须大于 0");
         return chainTx.topUpShortfall(signer, amount);
       }
-      case "setMaterialMarket": {
-        const market = String(args?.materialMarket || "").trim();
+      case "setCircuitMarket": {
+        const market = String(args?.circuitMarket || "").trim();
         if (!/^0x[0-9a-fA-F]{40}$/.test(market) || /^0x0{40}$/i.test(market)) {
-          throw new Error("晶体管市场地址无效（不能是零地址）");
+          throw new Error("电路市场地址无效（不能是零地址）");
         }
-        // 在途买单会把托管款留在旧市场：合约以 AlreadyListed 拒绝换市场。
-        if (book._chain && book.executePhase === "listed") {
-          throw new Error("挂单中不能更换晶体管市场（AlreadyListed）：先撤单或确认到账。");
+        // 还有电路挂在旧市场：合约以 AlreadyListed 拒绝换市场。
+        if (book._chain && Number(book.listedCircuits?.length || 0) > 0) {
+          throw new Error("还有电路挂在市场，不能更换电路市场（AlreadyListed）：先撤单。");
         }
-        return chainTx.setMaterialMarket(signer, market);
+        return chainTx.setCircuitMarket(signer, market);
       }
       case "setPhase": {
         const next = Number(args?.next);
         // 0 (None) 只在开期前存在；Executing 里设它会同时关掉挂单与退款，合约直接拒绝。
         if (!Number.isInteger(next) || next < 1 || next > 3) throw new Error("子状态只能是 1、2、3");
         if (book._chain) {
-          // 合约 setPhase：Listed 一律 AlreadyListed；2 需要市场里真有未成交买单；3 需要已成交或手上有晶体管。
-          if (book.executePhase === "listed") {
-            throw new Error("挂单中不能改子状态（AlreadyListed）：先撤单。");
+          // 合约 setPhase：Ready 需要本期真的持有电路；余款已记账后只能回到 Ready。
+          if (next === 3 && !(Number(book.circuitHeldCount) > 0)) {
+            throw new Error("改成「已到账」需要本期合约持有电路（CircuitsNotReady）。");
           }
-          const openLeft = Number(book.nandRemaining) > 0 || Number(book.latchRemaining) > 0;
-          if (next === 2 && !openLeft) {
-            throw new Error("改成「挂单中」需要市场里真的有未成交买单（WrongScene）。");
-          }
-          const settled = Number(book.priceLock) > 0 && book.orderFilled;
-          const heldParts = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0) > 0;
-          if (next === 3 && !settled && !heldParts) {
-            throw new Error("改成「已到账」需要买单已成交或手上有晶体管（TransistorsNotReady）。");
-          }
-          // 余款已按份退回（surplusBase != 0）后，离开 Ready 会把本期卡在「所有出口都回滚」的待挂单。
-          if (Number(book.surplusBase || 0) > 0 && next !== 3 && !settled && !heldParts) {
+          if (Number(book.surplusBase || 0) > 0 && next !== 3) {
             throw new Error("余款已按份退回，只有改回「已到账」能继续（WrongScene）。");
           }
         }
@@ -916,26 +902,24 @@ export default function App() {
         // 无参：合约一次扫走所有可动 BNB（多余余额，或已无人可退时的整池剩余）。
         return chainTx.recoverBnb(signer, args?.campaign);
       }
-      case "recoverTransistors": {
+      case "recoverCircuits": {
         const token = String(args?.token || "").trim();
-        const id = uintField(args?.id ?? 0, "晶体管 ID");
-        const amount = uintField(args?.amount ?? 0, "转出数量");
-        if (!/^0x[0-9a-fA-F]{40}$/.test(token)) throw new Error("晶体管合约地址无效");
-        if (amount <= 0n) throw new Error("转出数量必须大于 0");
+        const id = uintField(args?.id ?? 0, "电路 ID");
+        if (!/^0x[0-9a-fA-F]{40}$/.test(token)) throw new Error("电路合约地址无效");
         if (book._chain) {
           // 合约四道闸：已入池、挂单中、份额未结清、持份人未按原价收回本金。
-          if (book.pooled) throw new Error("本期已入池（AlreadyPooled）：晶体管已转给矿池，合约里没有可转出的余额。");
-          if (book.executePhase === "listed") throw new Error("挂单中不能转出晶体管（AlreadyListed）：先撤单或确认到账。");
-          if (String(token).toLowerCase() === String(book.transistors || "").toLowerCase()) {
+          if (book.pooled) throw new Error("本期已入池（AlreadyPooled）：电路已转给矿池，合约里没有可转出的余额。");
+          if (Number(book.listedCircuits?.length || 0) > 0) throw new Error("还有电路挂在市场（AlreadyListed）：先撤单。");
+          if (String(token).toLowerCase() === String(book.circuits || "").toLowerCase()) {
             if (Number(book.outstandingShares ?? book.sold ?? 0) > 0) {
-              throw new Error("还有持份人没结清（SharesOutstanding）：本期晶体管是他们的抵押，不能取回。先退款或入池。");
+              throw new Error("还有持份人没结清（SharesOutstanding）：本期电路是他们的抵押，不能取回。先退款或入池。");
             }
             if (Number(book.refundedTotal || 0) + 1e-12 < Number(book.sold || 0) * Number(round.sharePriceBnb || 0)) {
               throw new Error("持份人还没按原价收回本金（HoldersNotMadeWhole）：先 topUpShortfall 补齐再退款。");
             }
           }
         }
-        return chainTx.recoverTransistors(signer, token, id, amount);
+        return chainTx.recoverCircuits(signer, token, id);
       }
       case "transferOwnership": return chainTx.transferOwnership(signer, args.newOwner);
       case "setFactoryOwner": return chainTx.setFactoryOwner(signer, args.newOwner);
@@ -1168,8 +1152,8 @@ export default function App() {
             );
           })}
           {/*
-           * 晶体管市场只有一条，不再单独起分组标题：
-           * 标题与导航项同名，会让侧栏连续出现两个「晶体管市场」，
+           * 电路市场只有一条，不再单独起分组标题：
+           * 标题与导航项同名，会让侧栏连续出现两个「电路市场」，
            * 看着像两个入口（上面的还因为紧贴工作台卡片被读成子项）。
            */}
           {MARKET_PAGES.map((item) => (
@@ -1322,7 +1306,7 @@ export default function App() {
                 type="button"
                 className={book._execFailedPreview ? "is-on" : ""}
                 onClick={() => switchScene("executing", false, true)}
-                title="演示：执行失败（晶体管报价超过募资总额，本金尚未支出）"
+                title="演示：执行失败（电路报价超过募资总额，本金尚未支出）"
               >
                 执行失败（演示）
               </button>
@@ -1479,18 +1463,18 @@ export default function App() {
             usingChain={usingChain}
             chain={chain}
             factoryOwner={factoryOwner}
-            allowedParts={allowedParts}
+            allowedCircuits={allowedCircuits}
             chainHolders={chainHolders}
             holdersCampaign={holdersCampaign}
             now={now}
-            onPlaceTransistorOrder={(args) => act("placeTransistorOrder", args)}
+            onBuyCircuits={(args) => act("buyCircuits", args)}
             onOpenRefund={() => act("openRefund")}
             onRecoverBnb={() => act("recoverBnb")}
             onAbandonOrder={() => act("abandonOrder")}
-            onCancelTransistorOrder={() => act("cancelTransistorOrder")}
-            onSellTransistors={(args) => act("sellTransistors", args)}
+            onCancelCircuitListing={(args) => act("cancelCircuitListing", args)}
+            onListCircuit={(args) => act("listCircuit", args)}
             onWithdrawMarketProceeds={() => act("withdrawMarketProceeds")}
-            onConfirmTransistors={() => act("confirmTransistors")}
+            onConfirmCircuits={() => act("confirmCircuits")}
             onSetPlan={() => act("setPlan")}
             onSetMiningPool={(args) => act("setMiningPool", args)}
             onDepositToPool={() => act("depositToPool")}
@@ -1507,7 +1491,7 @@ export default function App() {
           <MarketPage
             official={official}
             processorId={round?.processorId || null}
-            allowedParts={allowedParts}
+            allowedCircuits={allowedCircuits}
             campaigns={usingChain ? chain.campaigns : []}
           />
         )}
@@ -1571,7 +1555,7 @@ export { outstandingOf };
  * 生命周期进度条：募集 → 待执行 → 挖矿。
  *
  * 子状态只挂在**当前那一步**下面，全页仅此一处 —— 之前阶段词在这里出现一次、
- * 在「当前进度」的 bill 行里又出现一次、晶体管市场面板的 stage 行还出现一次，
+ * 在「当前进度」的 bill 行里又出现一次、电路市场面板的 stage 行还出现一次，
  * 同一屏三处讲同一件事，措辞还各不相同。
  */
 function LifecycleStrip({ book }) {
@@ -1627,41 +1611,25 @@ function RoundHub({
   const ended = refundSettled(book);
   /**
    * 阶段 / 子状态 / 认购徽标（见 ./roundState.js + ./dealStatus.js）。
-   * 全页只算一次：标题徽标、生命周期条、进度卡、晶体管市场面板都用这一份，
+   * 全页只算一次：标题徽标、生命周期条、进度卡、电路市场面板都用这一份，
    * 不再各写一套字面量。
    */
   const state = rowState(book, Date.now() / 1000, dealStatus);
 
-  // 待执行：晶体管市场成交进度（官方市场只有买单簿，卖出是吃单）。
-  const buyLegs = [
-    { part: "NAND", qty: Number(book.nandQty) || 0, remaining: book.nandRemaining, price: Number(book.nandPrice) || 0 },
-    { part: "LATCH", qty: Number(book.latchQty) || 0, remaining: book.latchRemaining, price: Number(book.latchPrice) || 0 },
-  ].filter((leg) => leg.qty > 0);
-  const buyQty = buyLegs.reduce((acc, leg) => acc + leg.qty, 0);
-  /**
-   * 已成交量 = 挂单量 − 市场剩余。
-   * remaining 读不到（RPC 失败）时按「未成交」算，不能按 0 算——
-   * 那会把一笔还在等的挂单显示成全部成交，与市场记录自相矛盾。
-   */
-  const filledOfLeg = (leg) => Math.max(0, leg.qty - (leg.remaining == null ? leg.qty : Number(leg.remaining)));
-  const buyFilled = buyLegs.reduce((acc, leg) => acc + filledOfLeg(leg), 0);
-  /** 卖出没有挂单量，这里不推算：成交明细由 MarketTrades 从 TransistorsSold 事件读取。 */
-  const sellQty = 0;
-  const sellFilled = 0;
+  // 待执行：电路市场成交进度（官方市场只有卖单；买入即原子到账）。
   const marketOwed = Number(book.marketOwed) || 0;
   /**
-   * 晶体管数量有几个不同口径，不能混用：
-   *  - nandQty / latchQty：**挂单量**（下单要买多少）。合约在 placeTransistorOrder 就写入，
-   *    成交前不代表已买到，不能拿它当「已买入晶体管」。
-   *  - partsOnHand：合约 ERC1155 余额，只在晶体管还留在本期合约里时大于 0（入池后归 0）。
-   *  - transistorCount：**已成交到账量**（各腿 挂单量 − 市场 remaining），入池后仍可展示。
-   *  - buyFilled：买单成交进度，与 transistorCount 同口径。
+   * 电路数量两个口径：
+   *  - circuitCount：**累计买入**张数（历史事实，卖出/入池后不变）。
+   *  - circuitHeldCount：**当前持有**张数（卖出或入池后归零）。
+   * 不要用挂单量反推 —— 官方市场买入是原子交割，成交即到账。
    */
-  const partsOnHand = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0);
-  const boughtParts = Number(book.transistorCount) || 0;
+  const boughtParts = Number(book.circuitCount ?? book.boughtCount ?? 0) || 0;
+  const partsOnHand = Number(book.circuitHeldCount ?? 0) || 0;
   const tradeKey = [
-    book.executePhase, book.nandRemaining, book.latchRemaining, book.marketOwed,
-    book.partsNand, book.partsLatch, book.orderFilled,
+    book.executePhase, book.marketOwed, boughtParts, partsOnHand,
+    book.orderFilled,
+    (book.listedCircuits || []).map((c) => `${c.tokenId}:${c.listingId}`).join(","),
   ].join("|");
 
   return (
@@ -1709,7 +1677,7 @@ function RoundHub({
               ? "执行失败，认筹款已按认筹地址全部原路退回。"
               : state.key === "failed"
                 ? "执行失败，本金未支出。持份人可原路退回，Owner 也可降价重挂。"
-                : "份数已售完。Owner 买入晶体管并确认到账后投入矿池；入池前会先把没花完的募集款按份退回持份人。"}
+                : "份数已售完。Owner 买入电路并确认到账后投入矿池；入池前会先把没花完的募集款按份退回持份人。"}
             badge={state.label}
             tone={state.tone}
             deal={state.deal}
@@ -1731,15 +1699,15 @@ function RoundHub({
                 <li><span>托管 BNB</span><strong>{round4(book.bnbPool || 0)} BNB</strong></li>
                 <li>
                   <span>
-                    {book.pooled ? "已入池晶体管" : book.executePhase === "ready" ? "晶体管库存" : "买单成交"}
+                    {book.pooled ? "已入池电路" : book.executePhase === "ready" ? "电路库存" : "已买入电路"}
                   </span>
-                  <strong className={book.executePhase !== "ready" && buyQty > 0 && buyFilled < buyQty ? "is-wait" : undefined}>
+                  <strong className={book.executePhase !== "ready" && boughtParts > 0 && partsOnHand === 0 ? "is-wait" : undefined}>
                     {book.pooled && boughtParts > 0
-                      ? `${boughtParts} 颗（已转入矿池）`
-                      : book.executePhase === "ready" && partsOnHand > 0
-                        ? `${partsOnHand} 颗在手`
-                        : buyQty > 0
-                          ? `${buyFilled} / ${buyQty} 颗`
+                      ? `${boughtParts} 张（已转入矿池）`
+                      : partsOnHand > 0
+                        ? `${partsOnHand} 张在手${boughtParts > partsOnHand ? ` · 累计买入 ${boughtParts} 张` : ""}`
+                        : boughtParts > 0
+                          ? `${boughtParts} 张（已卖出）`
                           : "—"}
                   </strong>
                 </li>
@@ -1769,7 +1737,7 @@ function RoundHub({
                 ) : null
               ) : (
                 <p className="fine">
-                  没花完的募集款按份退回持份人（退余款或入池时记账），各自领取；本期继续，晶体管留在合约。
+                  没花完的募集款按份退回持份人（退余款或入池时记账），各自领取；本期继续，电路留在合约。
                 </p>
               )}
               <div className="actions">
@@ -1831,7 +1799,7 @@ function RoundHub({
                 )}
                 {!book.executionFailed && book.markFailedAt && Date.now() < book.markFailedAt && (
                   <p className="fine">
-                    Owner 还没入池。合约给了 3 天窗口买晶体管，
+                    Owner 还没入池。合约给了 3 天窗口买电路，
                     {isOwner
                       ? "你可以随时在合约工作台「原路退款 / 放弃挂单」立即退款，不必等这 3 天。"
                       : `非 Owner 可在 ${formatClock(book.markFailedAt)} 后判失败（还需 ${formatRemaining(book.markFailedAt - Date.now())}），届时先撤未成交买单，再开放退款。`}
@@ -1855,15 +1823,9 @@ function RoundHub({
               campaignAddr={book.address || round.contract}
               refreshKey={tradeKey}
               fallbackRows={{
-                buyQty, buyFilled, sellQty, sellFilled, marketOwed,
-                nandQty: Number(book.nandQty) || 0,
-                latchQty: Number(book.latchQty) || 0,
-                nandRemaining: book.nandRemaining,
-                latchRemaining: book.latchRemaining,
-                nandPrice: Number(book.nandPrice) || 0,
-                latchPrice: Number(book.latchPrice) || 0,
-                nandBidId: book.nandBidId, latchBidId: book.latchBidId,
-                partsOnHand,
+                marketOwed,
+                circuitCount: boughtParts,
+                circuitHeldCount: partsOnHand,
               }}
             />
           )}
@@ -1884,7 +1846,7 @@ function RoundHub({
          * 数值统一 20px、单位降级到 13px；「已入池 · 不可逆」这类长文案改用胶囊，
          * 不再和数字抢同一档字号。说明行贴底，四张卡的说明落在同一条基线上。
          */
-        const pooledParts = Number(book.transistorCount) || 0;
+        const pooledParts = Number(book.circuitCount) || 0;
         const hashpower = Number(book.estHashpower || 0);
         const mine = Number(book.mine || 0);
         const totalShares = Number(round.totalShares) || 0;
@@ -1893,7 +1855,7 @@ function RoundHub({
           <section className="mining-desk">
             <RoundTitle
               id={round.id}
-              lead="本期晶体管已投入矿池，进入挖矿。"
+              lead="本期电路已投入矿池，进入挖矿。"
               badge={state.label}
               tone={state.tone}
               deal={state.deal}
@@ -1903,12 +1865,12 @@ function RoundHub({
             />
             <div className="mining-stats">
               <article className="mining-stat is-accent">
-                <p className="mining-stat-label">入池晶体管</p>
+                <p className="mining-stat-label">入池电路</p>
                 <p className="mining-stat-value">
                   {pooledParts.toLocaleString("zh-CN")}
-                  <span className="mining-stat-unit">颗</span>
+                  <span className="mining-stat-unit">张</span>
                 </p>
-                <p className="mining-stat-note">成交到账的 NAND + LATCH 数量</p>
+                <p className="mining-stat-note">已转入矿池的电路张数</p>
               </article>
               <article className="mining-stat">
                 <p className="mining-stat-label">预估算力</p>
@@ -1933,8 +1895,8 @@ function RoundHub({
                 <p className="mining-stat-value is-text">
                   <span className="mining-pill">已入池</span>
                 </p>
-                {/* 「不可逆」只在这里说一次：页面别处（lead / 卡片头 / 晶体管去向）不再复述 */}
-                <p className="mining-stat-note">入池不可逆，合约无法再取回晶体管</p>
+                {/* 「不可逆」只在这里说一次：页面别处（lead / 卡片头 / 电路去向）不再复述 */}
+                <p className="mining-stat-note">入池不可逆，合约无法再取回电路</p>
               </article>
             </div>
             <article className="card mining-card">
@@ -2208,9 +2170,9 @@ function AssetsHub({
 /** 合约工作台：开期 / 入池 / 持有人 / 调用 / 调试 */
 function OwnerDesk({
   tab, round, book, copy, quote, official, pending, pendingTarget, actor, account,
-  executeWait, connected, usingChain, chain, factoryOwner, allowedParts, chainHolders, holdersCampaign, now,
-  onPlaceTransistorOrder, onOpenRefund, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
-  onSellTransistors, onWithdrawMarketProceeds,
+  executeWait, connected, usingChain, chain, factoryOwner, allowedCircuits, chainHolders, holdersCampaign, now,
+  onBuyCircuits, onOpenRefund, onAbandonOrder, onCancelCircuitListing, onConfirmCircuits,
+  onListCircuit, onWithdrawMarketProceeds,
   onSetPlan,
   /**
    * 入池前两步的回调。必须由OwnerDesk 显式透传给 OwnerOverview——
@@ -2242,13 +2204,13 @@ function OwnerDesk({
           executeWait={executeWait}
           history={chain.active ? chain.campaigns : null}
           onSwitchCampaign={usingChain ? chain.switchCampaign : null}
-          onPlaceTransistorOrder={onPlaceTransistorOrder}
+          onBuyCircuits={onBuyCircuits}
           onOpenRefund={onOpenRefund}
           onAbandonOrder={onAbandonOrder}
-          onCancelTransistorOrder={onCancelTransistorOrder}
-          onSellTransistors={onSellTransistors}
+          onCancelCircuitListing={onCancelCircuitListing}
+          onListCircuit={onListCircuit}
           onWithdrawMarketProceeds={onWithdrawMarketProceeds}
-          onConfirmTransistors={onConfirmTransistors}
+          onConfirmCircuits={onConfirmCircuits}
           onSetPlan={onSetPlan}
           onSetMiningPool={onSetMiningPool}
           onDepositToPool={onDepositToPool}
@@ -2262,7 +2224,6 @@ function OwnerDesk({
           chainHolders={chainHolders}
           holdersCampaign={holdersCampaign}
           onInvoke={onInvoke}
-          transistorUnitPrice={usingChain ? chain.transistorUnitPrice : null}
         />
       )}
       {activeTab === "advanced" && (
@@ -2285,7 +2246,7 @@ function OwnerDesk({
           factoryOwner={factoryOwner}
           connectedAccount={chain?.account || ""}
           defaultFeeRecipient={chain?.account || ""}
-          allowedParts={allowedParts}
+          allowedCircuits={allowedCircuits}
           onCreate={onCreate}
           onConnect={onConnect}
         />
@@ -2317,30 +2278,28 @@ function RoundFacts({ round, book, quote }) {
   const namedProcessor = Boolean(round.processorId);
   const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
   /**
-   * 晶体管数与算力的权威口径：链上以「实际成交到账的晶体管」为准。
-   *  - transistorCount = 各腿（挂单量 − 市场 remaining），成交后才大于 0。
-   *    ⚠️ 不能用 nandQty + latchQty —— 合约在 placeTransistorOrder 时就把这两个
-   *    字段写成**下单量**，成交前拿它当「已买入」会让等待成交的期次显示已买到晶体管。
+   * 电路数与算力的权威口径：链上以 `circuitHeldCount` / `circuitCount` 为准。
+   *  - circuitCount 是累计买入张数（历史事实）；circuitHeldCount 是当前持有张数。
+   *    两者都不从市场挂单反推 —— 官方电路市场买入即交割，没有「等待成交」的挂单量。
    *  - hashpower = estHashpower，是 Owner 用 setPlan 写入的预估算力。
    * 链下演示模式没有链上数据，仍用募资额反推的估算值。
    */
   const onChain = Boolean(book?._chain);
-  const chainParts = Number(book?.transistorCount) || 0;
-  /** 挂单量（下单要买多少）：用来区分「还没挂单」与「已挂单等待成交」。 */
-  const bidParts = (Number(book?.nandQty) || 0) + (Number(book?.latchQty) || 0);
+  const chainParts = Number(book?.circuitHeldCount ?? 0) || 0;
+  const boughtParts = Number(book?.circuitCount) || 0;
   const chainHashpower = Number(book?.hashpower) || Number(book?.estHashpower) || 0;
-  /** 链上已有成交晶体管 → 展示真实值；否则展示募资反推的预期值并标注是预期。 */
+  /** 链上已有持有电路 → 展示真实值；否则展示募资反推的预期值并标注是预期。 */
   const hasBought = chainParts > 0;
   const partsValue = onChain ? (hasBought ? chainParts : null) : (est.usedParts || null);
   const weightValue = onChain ? (chainHashpower > 0 ? chainHashpower : null) : (est.hashpower || null);
-  /** 晶体管数与算力是否来自链上真实数据 */
+  /** 电路数与算力是否来自链上真实数据 */
   const partsFromChain = onChain && hasBought;
   /**
-   * 处理器与每颗算力 P：
-   *  - 名称优先用合约里锁定的 transistors 地址反推出来的 processorId；
-   *  - P 只在「有已成交晶体管」时才敢给——P 是每颗晶体管的算力标度，
-   *    没有晶体管数时它无法对应到任何真实数量，链上模式一律留空。
-   *  - 链上如果连处理器都没记录，可以从「已成交晶体管数 + setPlan 算力」反推标度（P ≈ H ÷ 晶体管数）。
+   * 处理器与每张算力 P：
+   *  - 名称优先用合约里锁定的 circuits 地址反推出来的 processorId；
+   *  - P 只在「有已成交电路」时才敢给——P 是每张电路的算力标度，
+   *    没有电路数时它无法对应到任何真实数量，链上模式一律留空。
+   *  - 链上如果连处理器都没记录，可以从「已成交电路数 + setPlan 算力」反推标度（P ≈ H ÷ 电路数）。
    */
   const shownProcessor = round.processorId || (onChain ? null : est.processor) || null;
   const inferredScale = hasBought && chainHashpower > 0 ? chainHashpower / chainParts : null;
@@ -2363,25 +2322,25 @@ function RoundFacts({ round, book, quote }) {
     <>
       <div className="stat-grid facts">
         <article className="stat-card">
-          <div className="stat-label">{partsFromChain ? "已买入晶体管" : "晶体管数"}</div>
+          <div className="stat-label">{partsFromChain ? "已买入电路" : "电路数"}</div>
           <div className="stat-value">
             {partsValue != null
-              ? `${partsValue} 颗`
-              : onChain && bidParts > 0
-                ? <span className="muted-value">待成交</span>
+              ? `${partsValue} 张`
+              : onChain && boughtParts > 0
+                ? <span className="muted-value">已卖出/入池</span>
                 : "未买入"}
           </div>
           <div className="stat-note">
             {partsFromChain ? (
               <>
                 权重 {weightValue != null ? weightValue.toLocaleString("zh-CN") : "—"} H
-                {" · "}NAND {Number(book.nandFilled ?? 0) || 0} · LATCH {Number(book.latchFilled ?? 0) || 0}
-                <em className="est-tag">成交口径</em>
+                {" · "}累计买入 {boughtParts} 张
+                <em className="est-tag">持仓口径</em>
               </>
             ) : onChain ? (
-              bidParts > 0
-                ? `已挂单 ${bidParts} 颗（NAND ${Number(book.nandQty) || 0} · LATCH ${Number(book.latchQty) || 0}），等待成交`
-                : "尚未挂单买入，晶体管与算力待成交后确定"
+              boughtParts > 0
+                ? `累计买入 ${boughtParts} 张，当前持有 0 张（已卖出或入池）`
+                : "尚未买入，电路与算力待成交后确定"
             ) : est.hashpower ? (
               `权重 ${est.hashpower}（按募资额预估）`
             ) : (
@@ -2398,7 +2357,7 @@ function RoundFacts({ round, book, quote }) {
           {onChain && !shownProcessor ? (
             <div className="stat-note">合约未写入处理器地址，算力规模无法反推</div>
           ) : onChain && !hasBought ? (
-            <div className="stat-note">每颗算力 P 待晶体管成交后才有意义</div>
+            <div className="stat-note">每张算力 P 待电路成交后才有意义</div>
           ) : null}
         </article>
         {/*
@@ -2449,7 +2408,7 @@ function RoundFacts({ round, book, quote }) {
        *  - 演示模式：给出按报价反推的算力与估算口径；
        *  - 链上已成交：给出 setPlan 算力与锁价。
        * 链上尚未成交时，「未写入 / 成交后才出现」这两张空卡不画 —— 那句话已经在
-       * 上面「晶体管数」卡的备注和下面的强制提示里各有一份，再画一排只会重复。
+       * 上面「电路数」卡的备注和下面的强制提示里各有一份，再画一排只会重复。
        */}
       {!onChain ? (
         <div className="stat-grid detail">
@@ -2467,8 +2426,8 @@ function RoundFacts({ round, book, quote }) {
             <p className="note-copy">
               {round.processorId ? (
                 <>
-                  晶体管数由募资总额按当前报价反推：本期 {est.usedParts} 颗，
-                  权重 H = {est.hashpower} = {est.usedParts} × {est.processorScale}（晶体管数 × 每颗算力）。
+                  电路数由募资总额按当前报价反推：本期 {est.usedParts} 张，
+                  权重 H = {est.hashpower} = {est.usedParts} × {est.processorScale}（电路数 × 每张算力）。
                   实际采购价随市场浮动，上面的算力只是估算。
                 </>
               ) : (
@@ -2489,7 +2448,7 @@ function RoundFacts({ round, book, quote }) {
           <article className="stat-card span-3">
             <div className="stat-label">锁价</div>
             <div className="stat-value">{Number(book.priceLock) > 0 ? `${round4(book.priceLock)} BNB` : "未锁"}</div>
-            <div className="stat-note">挂单时锁定的晶体管总成本</div>
+            <div className="stat-note">挂单时锁定的电路总成本</div>
           </article>
         </div>
       ) : null}
@@ -2498,8 +2457,8 @@ function RoundFacts({ round, book, quote }) {
        */}
       {book.scene !== "funding" && (
         <div className="commit-warning wide" role="note">
-          <strong>晶体管数不构成本期承诺。</strong>
-          <span>不约定晶体管数量与买价，由 Owner 售罄后按市价决定，可能低于按当前报价的估值；分配合约接入前不发放收益。</span>
+          <strong>电路数不构成本期承诺。</strong>
+          <span>不约定电路数量与买价，由 Owner 售罄后按市价决定，可能低于按当前报价的估值；分配合约接入前不发放收益。</span>
         </div>
       )}
     </>
@@ -2549,7 +2508,7 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, exec
             </div>
             <Countdown countdown={countdown} />
             {/*
-             * 这里原本还有一条 Pipeline（募集 / 买晶体管 / 入池开矿），
+             * 这里原本还有一条 Pipeline（募集 / 买电路 / 入池开矿），
              * 和页首的生命周期条是同一件事的两种画法，两条进度条并排出现。
              * 只留生命周期条（它带子状态），本卡只讲资金路径。
              *
@@ -2560,7 +2519,7 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, exec
               <h2>资金只走这条路径</h2>
               <ol>
                 <li>未售罄：到期后各自退回本金。</li>
-                <li>售罄：挂单买入晶体管，到账后投入矿池成为矿机。</li>
+                <li>售罄：挂单买入电路，到账后投入矿池成为矿机。</li>
                 <li>挖矿：入池后进入挖矿（不可逆），分配合约接入前不产出发放。</li>
               </ol>
               <p className="mono">{shortAddress(round.contract)} · {onChain ? "链上合约" : "预览地址"}</p>
@@ -2619,18 +2578,18 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, exec
             {canSubscribe ? <p className="remain">剩余 {remaining} 份，不能自填金额</p> : null}
             {/*
              * C-1 要求的**强制提示**（认购人点下去之前必须看到）：
-             * 晶体管数不构成本期承诺。
+             * 电路数不构成本期承诺。
              *
              * 之前只有一处小字说明「预估随报价浮动，不是承诺」，
              * 藏在页面上方的事实卡片里，认购按钮旁边什么都没有。
              * 认购是花钱动作，风险提示必须贴着按钮，且不能是折叠的、可跳过的。
              */}
             <div className="commit-warning" role="note">
-              <strong>晶体管数不构成本期承诺。</strong>
+              <strong>电路数不构成本期承诺。</strong>
               <span>
-                不指定晶体管数量与买价，由 Owner 售罄后按市价决定，可能少于按当前报价的估值。
+                不指定电路数量与买价，由 Owner 售罄后按市价决定，可能少于按当前报价的估值。
                 挖矿收益在分配合约接入前不发放。挖矿产出服务费从矿池收益里计提，
-                <strong>认筹款不收任何服务费</strong> —— 你付的 BNB 全额进托管池，只用于买晶体管。
+                <strong>认筹款不收任何服务费</strong> —— 你付的 BNB 全额进托管池，只用于买电路。
               </span>
             </div>
             <button
@@ -2992,12 +2951,12 @@ function RecentBuys({ round, book, usingChain = false, account = "" }) {
 function RulesPage({ campaigns = [] }) {
   const flow = [
     { n: "1", title: SCENE.funding.label, body: "按份认筹，BNB 进托管池" },
-    { n: "2", title: SCENE.executing.label, body: "晶体管到账后投入矿池" },
-    { n: "3", title: SCENE.mining.label, body: "晶体管入池后不可撤出；退出走挖矿份额转让" },
+    { n: "2", title: SCENE.executing.label, body: "电路到账后投入矿池" },
+    { n: "3", title: SCENE.mining.label, body: "电路入池后不可撤出；退出走挖矿份额转让" },
   ];
   const exits = [
     { title: "被动 · 退款", body: "募集超时、执行失败或池子不足时退回本金，份额清零。" },
-    { title: "确认到账 · 退余款", body: "晶体管到账后，没花完的募集款按份退回认筹地址（各自领取）。本期继续，晶体管留在合约照常入池。" },
+    { title: "确认到账 · 退余款", body: "电路到账后，没花完的募集款按份退回认筹地址（各自领取）。本期继续，电路留在合约照常入池。" },
     { title: "主动 · 挖矿份额转让", body: "仅挖矿中。在「资产转让」发布出售挂单，份额立即锁定，成交款直接付给你。" },
   ];
   const roles = [
@@ -3011,24 +2970,24 @@ function RulesPage({ campaigns = [] }) {
       name: "开期工厂",
       address: deployments.factory,
       verify: true,
-      use: "各期共用。开期写入每份单价、总份数、募集天数、本期晶体管合约（从白名单选）。",
+      use: "各期共用。开期写入每份单价、总份数、募集天数、本期电路合约（从白名单选）。",
     },
     {
-      name: "晶体管市场",
-      address: deployments.materialMarket,
-      use: "各期共用的官方晶体管市场。NAND 为 tokenId 0，LATCH 为 1；挂单 placeBid，撤单 cancelBid。",
+      name: "电路市场",
+      address: deployments.circuitMarket,
+      use: "各期共用的官方 ERC721 电路市场。只有卖单侧：list 挂单、buy 成交、delist 撤单；卖家货款 pull 提取。",
     },
   ];
   /**
-   * 晶体管合约：工厂的**晶体管白名单**（部署时写入、不可增删），每期开期时选其中一个锁定。
-   * 主网 = 官方两件套（TapeOut / Behemoth）。
+   * 电路合约：工厂的**电路白名单**（部署时写入、不可增删），每期开期时选其中一个锁定。
+   * 主网 = 官方两个集合（TapeOut / Behemoth）。
    */
-  const partsContracts = (Array.isArray(deployments.allowedParts) ? deployments.allowedParts : [])
+  const partsContracts = (Array.isArray(deployments.allowedCircuits) ? deployments.allowedCircuits : [])
     .map((address) => ({
-      name: "晶体管合约（ERC1155）",
+      name: "电路合约（ERC721）",
       address,
       verify: true,
-      use: "工厂白名单里的一个晶体管合约，开期时选中并锁定。到账后由 depositToPool 转入矿池。",
+      use: "工厂白名单里的一个电路合约，开期时选中并锁定。到账后由 depositToPool 转入矿池。",
     }));
   const periodContracts = (Array.isArray(campaigns) ? [...campaigns] : [])
     .filter((item) => item?.address)
@@ -3084,8 +3043,8 @@ function RulesPage({ campaigns = [] }) {
           </div>
         </div>
         <p className="round-hero-lead">
-          认筹款先托管，售罄后才买晶体管。没花完的本金按份退回；退出只有退款和挖矿份额转让。
-          晶体管到账后由 Owner 投入矿池，进入挖矿（不可逆）。
+          认筹款先托管，售罄后才买电路。没花完的本金按份退回；退出只有退款和挖矿份额转让。
+          电路到账后由 Owner 投入矿池，进入挖矿（不可逆）。
         </p>
       </header>
 
@@ -3111,7 +3070,7 @@ function RulesPage({ campaigns = [] }) {
         <section className="rules-block">
           <div className="rules-block-head">
             <h2>退出</h2>
-            <p>三条路径互不交叉：募集中和待执行不能转让份额；退余款只动钱，不动晶体管。</p>
+            <p>三条路径互不交叉：募集中和待执行不能转让份额；退余款只动钱，不动电路。</p>
           </div>
           <div className="rules-exit-list">
             {exits.map((item) => (
@@ -3126,7 +3085,7 @@ function RulesPage({ campaigns = [] }) {
         <section className="rules-block">
           <div className="rules-block-head">
             <h2>入池</h2>
-            <p>晶体管到账后，Owner 写入预估计划并入池（不可逆）。</p>
+            <p>电路到账后，Owner 写入预估计划并入池（不可逆）。</p>
           </div>
           {/*
            * 这里不再重复「挂单 → 到账 → depositToPool」三步：
@@ -3141,14 +3100,14 @@ function RulesPage({ campaigns = [] }) {
       <section className="rules-block">
         <div className="rules-block-head">
           <h2>挖矿</h2>
-          <p>晶体管入池后进入挖矿。分配合约接入前不产出发放。</p>
+          <p>电路入池后进入挖矿。分配合约接入前不产出发放。</p>
         </div>
         <div className="rules-formula">
           <span>入池条件</span>
-          <strong>份额售罄 → 买入 NAND / LATCH → 确认到账 → setPlan → returnSurplus（按份退余款）→ setMiningPool → depositToPool</strong>
+          <strong>份额售罄 → buyCircuits 从电路市场买入 → confirmCircuits 确认到账 → setPlan → returnSurplus（按份退余款）→ setMiningPool → depositToPool</strong>
         </div>
         {/*
-         * 这里原本还有一句「晶体管入池后不可撤出；挖矿中的退出只有挖矿份额转让」——
+         * 这里原本还有一句「电路入池后不可撤出；挖矿中的退出只有挖矿份额转让」——
          * 页首 lead 与上方第 3 步已经各说过一次，同一屏第三遍。删掉。
          */}
       </section>
@@ -3158,7 +3117,7 @@ function RulesPage({ campaigns = [] }) {
           <div className="rules-block-head">
             <h2>共用合约</h2>
             <p>
-              {NETWORK.name} 上工厂与市场各期共用；晶体管合约从工厂白名单里选，开期时锁定。
+              {NETWORK.name} 上工厂与市场各期共用；电路合约从工厂白名单里选，开期时锁定。
             </p>
           </div>
           <ul className="rules-contracts">{renderContractRows([...sharedContracts, ...partsContracts])}</ul>
@@ -3166,7 +3125,7 @@ function RulesPage({ campaigns = [] }) {
         <section className="rules-block">
           <div className="rules-block-head">
             <h2>期次合约</h2>
-            <p>每期一个独立 Campaign，认筹、托管、买晶体管、入池和退款都走它。</p>
+            <p>每期一个独立 Campaign，认筹、托管、买电路、入池和退款都走它。</p>
           </div>
           {campaignRows.length ? (
             <ul className="rules-contracts">{renderContractRows(campaignRows)}</ul>

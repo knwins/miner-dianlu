@@ -210,9 +210,9 @@ async function campaignConstructorArgs(campaignAddr, dep) {
       parsed.args.sharePriceBnb,
       parsed.args.totalShares,
       parsed.args.fundingDeadline,
-      await c.materialMarket(),
+      await c.circuitMarket(),
       dep.deployer,
-      await c.transistors(),
+      await c.circuits(),
     ];
   }
   throw new Error(`工厂事件里找不到 ${campaignAddr} 的 CampaignCreated，无法还原构造参数`);
@@ -235,7 +235,7 @@ async function main() {
     address: dep.factory,
     contractName: "CampaignFactory",
     sourceName: "contracts/CampaignFactory.sol",
-    args: [dep.materialMarket, dep.allowedParts],
+    args: [dep.circuitMarket, dep.allowedCircuits],
   }];
   if (dep.campaign) {
     targets.push({

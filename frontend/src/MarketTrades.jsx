@@ -23,8 +23,7 @@ function tradeStatusOf(side, qty, remaining, owed) {
   if (side === "sell" && !(owed > 0)) return "settled";
   return "filled";
 }
-
-/** 挂单成交状态：用于「晶体管数」项（挂出 / 成交两列）的视觉区分。
+/** 挂单成交状态：用于「电路数」项（挂出 / 成交两列）的视觉区分。
  *  - wait     等待成交（挂单中 / 部分成交，仍未全部吃完）
  *  - done     已成交（全部成交 / 待结算）
  *  - partial  部分成交（仍属等待成交，但已吃了一部分）
@@ -53,35 +52,12 @@ function formatStampFull(ts) {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
-/** 链上读不到市场时，用 book 里已有的买单余额拼出同样的表（卖出只有事件，没有挂单可拼）。 */
-export function fallbackTradeLegs(f) {
-  const rows = [];
-  const push = (side, part, qty, remaining, price, id) => {
-    if (!(qty > 0) || !id || String(id) === "0") return;
-    const rem = remaining == null ? null : Number(remaining);
-    const filled = rem == null ? null : Math.max(0, qty - rem);
-    rows.push({
-      side,
-      part,
-      orderId: String(id),
-      orderQty: qty,
-      price: Number(price) || 0,
-      filled,
-      remaining: rem,
-      amount: filled == null ? null : filled * (Number(price) || 0),
-      status: tradeStatusOf(side, qty, rem, f.marketOwed),
-      placedAt: null,
-      cancelAt: null,
-      confirmedAt: null,
-      filledAt: null,
-    });
-  };
-  push("buy", "NAND", f.nandQty, f.nandRemaining, f.nandPrice, f.nandBidId);
-  push("buy", "LATCH", f.latchQty, f.latchRemaining, f.latchPrice, f.latchBidId);
-  return rows;
+/** 链上读不到市场时，用 book 里已有的电路读数拼出汇总（明细只来自链上事件）。 */
+export function fallbackTradeLegs() {
+  return [];
 }
 
-/** 市场订单 + 结算状态。refreshKey 变化时重读（挂单/成交/确认后由父组件传入）。 */
+/** 市场订单 + 结算状态。refreshKey 变化时重读（买入/挂单/撤单/确认后由父组件传入）。 */
 export function useMarketTrades(campaignAddr, refreshKey) {
   const [data, setData] = useState(null);
   const [failed, setFailed] = useState(false);
@@ -100,37 +76,36 @@ export function useMarketTrades(campaignAddr, refreshKey) {
 
 function totalsOf(data, legs, fallbackRows) {
   if (data?.totals) return data.totals;
-  const sum = (rows, key) => rows.reduce((acc, row) => acc + (Number(row[key]) || 0), 0);
-  const buy = legs.filter((l) => l.side === "buy");
-  const sell = legs.filter((l) => l.side === "sell");
+  /** 链上读数兜底：只给汇总，明细（挂单/成交事件）读不到就是空。 */
+  const buyQty = Number(fallbackRows.circuitCount) || 0;
   return {
-    buyQty: sum(buy, "orderQty"),
-    buyFilled: sum(buy, "filled"),
-    buySpent: sum(buy, "amount"),
-    sellQty: sum(sell, "orderQty"),
-    sellFilled: sum(sell, "filled"),
-    sellProceeds: sum(sell, "amount"),
+    buyQty,
+    buyFilled: buyQty,
+    buySpent: 0,
+    sellQty: 0,
+    sellFilled: 0,
+    sellProceeds: 0,
     owed: fallbackRows.marketOwed,
-    partsNand: fallbackRows.partsNand,
-    partsLatch: fallbackRows.partsLatch,
+    partsHeld: Number(fallbackRows.circuitHeldCount) || 0,
+    listed: 0,
   };
 }
 
 /** 完整版：待执行页面的大卡片（汇总 + 明细表 + 链上流水）。 */
 export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
   const { data, failed } = useMarketTrades(campaignAddr, refreshKey);
-  const legs = data?.legs?.length ? data.legs : fallbackTradeLegs(fallbackRows);
+  const legs = data?.legs?.length ? data.legs : fallbackTradeLegs();
   if (!legs.length && !data) return null;
 
   const totals = totalsOf(data, legs, fallbackRows);
   const events = Array.isArray(data?.events) ? data.events : null;
-  const marketAddr = data?.market || "";
-  const partsOnHand = data ? totals.partsNand + totals.partsLatch : Number(fallbackRows.partsOnHand) || 0;
+  const marketAddr = data?.circuitMarket || data?.market || "";
+  const partsOnHand = Number(totals.partsHeld || 0);
 
   return (
     <article className="card market-card">
       <div className="card-header">
-        <span>晶体管市场交易记录</span>
+        <span>电路市场交易记录</span>
         {marketAddr ? (
           <a className="market-link" href={explorerAddress(marketAddr)} target="_blank" rel="noreferrer">
             {shortAddress(marketAddr)} ↗
@@ -143,18 +118,18 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
         <ul className="trade-totals">
           <li>
             <span>买单成交</span>
-            <strong>{totals.buyFilled} / {totals.buyQty} 颗</strong>
+            <strong>{totals.buyFilled} / {totals.buyQty} 张</strong>
             <small>支出 {round4(totals.buySpent)} BNB</small>
           </li>
           <li>
             <span>卖出成交</span>
-            <strong>{totals.sellFilled} 颗</strong>
+            <strong>{totals.sellFilled} 张</strong>
             <small>回款 {round4(totals.sellProceeds)} BNB</small>
           </li>
           <li>
-            <span>晶体管在手</span>
-            <strong>{partsOnHand} 颗</strong>
-            <small>{data ? `NAND ${totals.partsNand} · LATCH ${totals.partsLatch}` : "读取中…"}</small>
+            <span>电路在手</span>
+            <strong>{partsOnHand} 张</strong>
+            <small>{data ? `在售 ${Number(totals.listed || 0)} 张` : "读取中…"}</small>
           </li>
           <li>
             <span>市场欠款</span>
@@ -170,7 +145,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
             <thead>
               <tr>
                 <th>方向</th>
-                <th>晶体管</th>
+                <th>电路</th>
                 <th>单号</th>
                 <th>挂价</th>
                 <th>挂出</th>
@@ -191,13 +166,13 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
                   <td>{leg.part}</td>
                   <td className="mono">#{leg.orderId}</td>
                   <td>{round4(leg.price)} BNB</td>
-                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="挂出晶体管数">
+                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="挂出电路数">
                     <span className="qty-dot" aria-hidden="true" />
-                    {leg.orderQty == null ? "—" : `${leg.orderQty} 颗`}
+                    {leg.orderQty == null ? "—" : `${leg.orderQty} 张`}
                   </td>
-                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="成交晶体管数">
+                  <td className={`qty-cell qty-${legTradeState(leg)}`} title="成交电路数">
                     <span className="qty-dot" aria-hidden="true" />
-                    {leg.filled == null ? "—" : `${leg.filled} 颗`}
+                    {leg.filled == null ? "—" : `${leg.filled} 张`}
                   </td>
                   <td>{leg.amount == null ? "—" : `${round4(leg.amount)} BNB`}</td>
                   <td
@@ -220,7 +195,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
             </tbody>
           </table>
         ) : (
-          <p className="fine">还没有挂过买单。Owner 挂出后，这里会显示挂价与成交进度。</p>
+          <p className="fine">还没有电路市场记录。Owner 买入或挂单后，这里会显示挂价与成交进度。</p>
         )}
 
         {events && events.length > 0 && (
@@ -251,11 +226,12 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
 }
 
 function eventText(evt) {
-  const bnb = (wei) => `${round4(Number(wei) / 1e18)} BNB`;
-  const at = evt.price ? ` @ ${bnb(evt.price)}` : "";
-  if (evt.kind === "place") return `挂买单 #${evt.id} · ${evt.part || ""} ${evt.qty} 颗${at}`.replace("  ", " ");
-  if (evt.kind === "fill") return `${evt.side === "buy" ? "买单" : "卖出"} #${evt.id} 成交 ${evt.qty} 颗${at}${evt.amount ? ` · ${bnb(evt.amount)}` : ""}`;
-  if (evt.kind === "cancel") return `买单 #${evt.id} 撤回${evt.amount ? ` · 退回 ${bnb(evt.amount)}` : ""}`;
+  const bnb = (v) => `${round4(Number(v) || 0)} BNB`;
+  const price = Number(evt.price) > 0 ? ` @ ${bnb(evt.price)}` : "";
+  const token = evt.tokenId != null ? `电路 #${evt.tokenId}` : "电路";
+  if (evt.kind === "list") return `挂单 #${evt.id} · ${token}${price}`;
+  if (evt.kind === "fill") return `${evt.side === "buy" ? "买入" : "卖出"} #${evt.id} · ${token}${price}${evt.amount != null ? ` · ${bnb(evt.amount)}` : ""}`;
+  if (evt.kind === "cancel") return `撤单 #${evt.id}${evt.tokenId != null ? ` · ${token}` : ""}`;
   if (evt.kind === "withdraw") return `提取市场款 ${bnb(evt.amount)}`;
   return "";
 }
@@ -263,14 +239,14 @@ function eventText(evt) {
 /**
  * 紧凑版：Owner 合约操作弹窗右栏的历史交易记录。
  * 记录**只来自市场合约的链上事件**（挂单 / 成交 / 撤单），不再按订单状态反推：
- * 状态能说「现在成交了几颗」，说不出「什么时候挂的、哪一笔成交的」。
+ * 状态能说「现在成交了几张」，说不出「什么时候挂的、哪一笔成交的」。
  */
 export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title = "历史交易记录" }) {
   const { data, failed } = useMarketTrades(campaignAddr, refreshKey);
-  const legs = data?.legs?.length ? data.legs : fallbackTradeLegs(fallbackRows);
+  const legs = data?.legs?.length ? data.legs : fallbackTradeLegs();
   const totals = totalsOf(data, legs, fallbackRows);
   const events = Array.isArray(data?.events) ? data.events : null;
-  const marketAddr = data?.market || "";
+  const marketAddr = data?.circuitMarket || data?.market || "";
 
   const allRecords = events && events.length
     ? [...events].reverse().map((evt, index) => ({
@@ -280,7 +256,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title
         title: eventText(evt),
         note: [
           evt.id ? `#${evt.id}` : "",
-          evt.part || "",
+          evt.tokenId != null ? `电路 ${evt.tokenId}` : "",
           evt.ts ? "" : `区块 ${evt.blockNumber}`,
         ].filter(Boolean).join(" · "),
         ts: evt.ts || null,
@@ -293,7 +269,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title
   /** 窄栏只放最近几条：再往前翻是翻旧账，对当前决策没用（条数见 MARKET_TRADE_LIMIT） */
   const records = allRecords.slice(0, MARKET_TRADE_LIMIT);
 
-  const partsOnHand = Number(fallbackRows.partsNand || 0) + Number(fallbackRows.partsLatch || 0);
+  const partsOnHand = Number(totals.partsHeld || 0);
   /*
    * 这里原本还有一行 stage（「挂单中 · 待成交」/「已到账 · 待入池」/「未挂单」）。
    * 那是子状态，生命周期条已经在当前步下面写过一次；同一屏两处讲同一件事，
@@ -304,7 +280,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title
   return (
     <article className="card trade-panel">
       <div className="card-header">
-        <span>{title}<em className="fine trade-panel-sub">· 晶体管市场</em></span>
+        <span>{title}<em className="fine trade-panel-sub">· 电路市场</em></span>
         {marketAddr ? (
           <a className="market-link" href={explorerAddress(marketAddr)} target="_blank" rel="noreferrer">
             {shortAddress(marketAddr)} ↗
@@ -326,9 +302,9 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title
             <small>{round4(totals.sellProceeds)} BNB</small>
           </div>
           <div>
-            <span>晶体管</span>
+            <span>电路</span>
             <strong>{partsOnHand}</strong>
-            <small>颗在手</small>
+            <small>张在手</small>
           </div>
           <div>
             <span>欠款</span>
@@ -386,7 +362,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title
 
         {/*
          * 只在真的异常时说话。
-         * 正常态原本还有一句「读晶体管市场 bids / asks / owed，与确认到账、提取卖出款
+         * 正常态原本还有一句「读电路市场 bids / asks / owed，与确认到账、提取卖出款
          * 同一份状态」—— 那是实现说明，对 Owner 没有任何可操作信息，删掉。
          */}
         {failed ? (

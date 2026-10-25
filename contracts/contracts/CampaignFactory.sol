@@ -6,18 +6,18 @@ import {Campaign} from "./Campaign.sol";
 
 /// @title CampaignFactory — opens each crowdfunding round
 /// @notice Owner-only creation and registry removal. Economic params are fixed at creation; the shared
-///         materialMarket is immutable (a round may replace its own via setMaterialMarket).
-///         The parts contract is NOT fixed here: every round must name a whitelisted one, so one factory
-///         serves several processors and carries no "default parts". The whitelist is a deploy-time
-///         security boundary — an open choice would allow a mock that mints unlimited parts — and can
-///         never be edited.
+///         circuitMarket is immutable (a round may replace its own via setCircuitMarket).
+///         The circuit NFT collection is NOT fixed here: every round must name a whitelisted one, so one
+///         factory serves several processors and carries no "default circuit". The whitelist is a
+///         deploy-time security boundary — an open choice would allow a mock that mints unlimited circuits
+///         — and can never be edited.
 ///         removeCampaign only edits the registry; the Campaign itself stays callable.
 contract CampaignFactory is Ownable {
-    /// @notice Shared material market (the placeBid target). Immutable.
-    address public immutable materialMarket;
+    /// @notice Shared Circuit Market (the list / buy target). Immutable.
+    address public immutable circuitMarket;
 
-    /// @notice Parts contracts a round may lock; written once at construction and never editable.
-    address[] private _allowedParts;
+    /// @notice Circuit NFT collections a round may lock; written once at construction and never editable.
+    address[] private _allowedCircuits;
 
     address[] public campaigns;
 
@@ -38,72 +38,73 @@ contract CampaignFactory is Ownable {
     error IndexOutOfBounds();
     /// @notice The whitelist was empty at construction.
     error EmptyWhitelist();
-    /// @notice The parts contract is not whitelisted.
-    error PartsNotAllowed(address parts);
+    /// @notice The circuit collection is not whitelisted.
+    error CircuitsNotAllowed(address circuits);
 
-    /// @param materialMarket_ Shared market; immutable. Rounds may replace it individually.
-    /// @param allowedParts_ Whitelisted parts contracts; at least one, all with code.
-    constructor(address materialMarket_, address[] memory allowedParts_) Ownable(msg.sender) {
-        if (materialMarket_ == address(0)) revert ZeroAddress();
+    /// @param circuitMarket_ Shared market; immutable. Rounds may replace it individually.
+    /// @param allowedCircuits_ Whitelisted circuit NFT contracts; at least one, all with code.
+    constructor(address circuitMarket_, address[] memory allowedCircuits_) Ownable(msg.sender) {
+        if (circuitMarket_ == address(0)) revert ZeroAddress();
         // A codeless target would revert every market call with empty returndata, bricking every round.
-        if (materialMarket_.code.length == 0) revert ZeroAddress();
-        if (allowedParts_.length == 0) revert EmptyWhitelist();
-        materialMarket = materialMarket_;
-        for (uint256 i = 0; i < allowedParts_.length; i++) {
-            if (allowedParts_[i] == address(0) || allowedParts_[i].code.length == 0) revert ZeroAddress();
-            _allowedParts.push(allowedParts_[i]);
+        if (circuitMarket_.code.length == 0) revert ZeroAddress();
+        if (allowedCircuits_.length == 0) revert EmptyWhitelist();
+        circuitMarket = circuitMarket_;
+        for (uint256 i = 0; i < allowedCircuits_.length; i++) {
+            if (allowedCircuits_[i] == address(0) || allowedCircuits_[i].code.length == 0) revert ZeroAddress();
+            _allowedCircuits.push(allowedCircuits_[i]);
         }
     }
 
-    /// @notice Number of whitelisted parts contracts.
-    function allowedPartsCount() external view returns (uint256) {
-        return _allowedParts.length;
+    /// @notice Number of whitelisted circuit collections.
+    function allowedCircuitsCount() external view returns (uint256) {
+        return _allowedCircuits.length;
     }
 
-    /// @notice The index-th whitelisted parts contract.
+    /// @notice The index-th whitelisted circuit collection.
     /// @param index Position in the whitelist.
-    /// @return Parts contract at `index`; reverts when out of range.
-    function allowedPartsAt(uint256 index) external view returns (address) {
-        if (index >= _allowedParts.length) revert IndexOutOfBounds();
-        return _allowedParts[index];
+    /// @return Circuit NFT contract at `index`; reverts when out of range.
+    function allowedCircuitsAt(uint256 index) external view returns (address) {
+        if (index >= _allowedCircuits.length) revert IndexOutOfBounds();
+        return _allowedCircuits[index];
     }
 
-    /// @notice True when `parts` is in the whitelist.
-    /// @param parts Parts contract to test.
+    /// @notice True when `circuits` is in the whitelist.
+    /// @param circuits Circuit NFT contract to test.
     /// @return Whether a round may lock that contract.
-    function isAllowedParts(address parts) external view returns (bool) {
-        return _isAllowed(parts);
+    function isAllowedCircuits(address circuits) external view returns (bool) {
+        return _isAllowed(circuits);
     }
 
     /// @dev Linear scan; the whitelist is tiny and fixed.
-    /// @param parts Parts contract to test.
-    /// @return Whether `parts` is whitelisted.
-    function _isAllowed(address parts) internal view returns (bool) {
-        for (uint256 i = 0; i < _allowedParts.length; i++) {
-            if (_allowedParts[i] == parts) return true;
+    /// @param circuits Circuit NFT contract to test.
+    /// @return Whether `circuits` is whitelisted.
+    function _isAllowed(address circuits) internal view returns (bool) {
+        for (uint256 i = 0; i < _allowedCircuits.length; i++) {
+            if (_allowedCircuits[i] == circuits) return true;
         }
         return false;
     }
 
-    /// @notice Create one round. Share price, supply and the parts contract are then immutable.
-    ///         The market comes from the factory; the parts contract must be named explicitly (no default).
+    /// @notice Create one round. Share price, supply and the circuit collection are then immutable.
+    ///         The market comes from the factory; the circuit collection must be named explicitly (no
+    ///         default).
     /// @param sharePriceBnb Price of one share in wei; 0 reverts.
     /// @param totalShares Share cap and sell-out threshold; 0 reverts.
     /// @param fundingSeconds Funding length in seconds; deadline = block.timestamp + fundingSeconds.
-    /// @param transistors_ Parts contract; required, non-zero and whitelisted.
+    /// @param circuits_ Circuit NFT collection; required, non-zero and whitelisted.
     /// @return campaign Address of the new round.
     function createCampaign(
         uint256 sharePriceBnb,
         uint256 totalShares,
         uint64 fundingSeconds,
-        address transistors_
+        address circuits_
     ) external onlyOwner returns (address campaign) {
         // A factory default would lock every round to the same processor.
-        if (transistors_ == address(0)) revert ZeroAddress();
-        if (!_isAllowed(transistors_)) revert PartsNotAllowed(transistors_);
+        if (circuits_ == address(0)) revert ZeroAddress();
+        if (!_isAllowed(circuits_)) revert CircuitsNotAllowed(circuits_);
         if (totalShares == 0 || sharePriceBnb == 0) revert ZeroCampaignParam();
 
-        address mi = materialMarket;
+        address mi = circuitMarket;
         address ow = owner;
         // Both operands fit in uint64, and the checked sum is validated before the narrowing cast.
         uint64 deadline = uint64(block.timestamp) + fundingSeconds;
@@ -114,7 +115,7 @@ contract CampaignFactory is Ownable {
             deadline,
             mi,
             ow, // Campaign owner = factory owner
-            transistors_
+            circuits_
         );
         campaign = address(c);
         _registered[campaign] = true;
@@ -128,7 +129,7 @@ contract CampaignFactory is Ownable {
         return campaigns.length;
     }
 
-    /// @notice True while `campaign` is registered; a retired round lets anyone reclaim a stuck order.
+    /// @notice True while `campaign` is registered; a retired round lets anyone clean up its listings.
     /// @param campaign Round to look up.
     /// @return Whether the round is still registered.
     function isRegistered(address campaign) external view returns (bool) {

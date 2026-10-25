@@ -32,11 +32,11 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
   const [logs, setLogs] = useState([]);
   /*
    * 表单初值一律留空 / 0。
-   * 之前这里硬编码了 est:"408"、nandQty:100、nandPrice:"0.005"、listPrice:"0.02"
+   * 之前这里硬编码了 est:"408"、buyQty:100、maxPrice:"0.005"、listPrice:"0.02"
    * 这些演示数字——在链上模式下点「发送」会拿这组值真的发交易，
    * 等于用演示参数下真单。调试页的所有输入都必须由人自己填。
    */
-  const [form, setForm] = useState({ buyCount: 1, listCount: 1, listPrice: "", takeId: 0, takeCount: 1, est: "", nandQty: 0, nandPrice: "", latchQty: 0, latchPrice: "" });
+  const [form, setForm] = useState({ buyCount: 1, listCount: 1, listPrice: "", takeId: 0, takeCount: 1, est: "", buyQty: 1, maxPrice: "" });
 
   // 内嵌模式下复用工作台已有的连接（account / connected / signer 由 App 透传），
   // 避免 Owner 在「链上调试」里再点一次「连接钱包」才能挂买单。
@@ -112,18 +112,14 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
   }
 
   const s = state;
-  // 与合约一致：成交部分上链不可撤，全部成交后不再显示「取消挂单」。
-  const cancelBlockedByFill = Boolean(s?.orderFilled)
-    && [s?.nandRemaining, s?.latchRemaining].every((remaining) => remaining != null && Number(remaining) === 0);
-  // confirmTransistors 还要求本期合约真的持有晶体管；只成交不发货时链上会 TransistorsNotReady。
-  const partsShort = Boolean(s) && (
-    Number(s.partsNand || 0) < Number(s.nandQty || 0) || Number(s.partsLatch || 0) < Number(s.latchQty || 0)
-  );
+  const heldNum = Number(s?.circuitHeldCount ?? 0) || 0;
+  const listedNum = Number(s?.listedCircuits?.length || 0) || 0;
   // openRefund / depositToPool 的链上门槛，逐条对应合约里的 revert（挡在签名之前，省 gas）。
   const marketOwedNum = s ? Number(formatEther(s.marketOwed || 0n)) : 0;
   const surplusBooked = Number(s?.surplusBase || 0) > 0;
   const outstandingNum = s ? Number(s.outstandingShares || 0n) : 0;
-  const partsHeld = s ? Number(s.partsNand || 0) + Number(s.partsLatch || 0) : 0;
+  const partsHeld = heldNum;
+  const raisedBnbNum = s ? Number(formatEther(s.raisedBnb)) : 0;
   const poolSet = s
     ? /^0x[0-9a-fA-F]{40}$/.test(String(s.miningPool || "")) && !/^0x0{40}$/i.test(String(s.miningPool || ""))
     : false;
@@ -134,30 +130,25 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
     : surplusBooked ? "余款已按份退回，本金已在持份人手里（SurplusAlreadyReturned）"
     : s.phase !== 1 ? "只有待挂单（Buying）能打开退款（WrongScene）"
     : outstandingNum <= 0 ? "份额已全部退完，没有可退对象（ZeroShares）"
-    : marketOwedNum > 0 ? "晶体管市场还欠本期卖出款（ProceedsPending）：先提取"
-    : partsHeld > 0 && !poolCoversShares ? "晶体管还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall"
+    : marketOwedNum > 0 ? "电路市场还欠本期卖出款（ProceedsPending）：先提取"
+    : partsHeld > 0 && !poolCoversShares ? "电路还在合约里、池子不够按原价退完（CircuitsAreCollateral）：先 topUpShortfall"
     : "";
   const poolGate = !s ? ""
     : s.pooled ? "本期已入池（AlreadyPooled）"
-    : s.phase !== 3 ? "先确认晶体管到账（Ready）再入池"
+    : s.phase !== 3 ? "先确认电路到账（Ready）再入池"
     : !poolSet ? "还没写矿池地址（PoolNotSet）：在「合约工作台」里先 setMiningPool"
     : outstandingNum <= 0 ? "份额已全部退完（ZeroShares），没有持有人可分产出"
-    : partsHeld <= 0 ? "合约手上没有晶体管（InsufficientParts）"
+    : listedNum > 0 ? "还有电路挂在市场（CircuitStillListed）：先撤单"
+    : partsHeld <= 0 ? "合约手上没有电路（InsufficientCircuits）"
     : halted ? "本期已熔断，入池已暂停"
     : "";
-  // 挂买单参数与成本预览。
-  // 链上 placeTransistorOrder 在 cost > raisedBnb 时只置 executionFailed、不真正挂单，
-  // 等于用一次失败把整期标记为「执行失败」。前端必须先把超余额挡在签名之外。
-  const raisedBnbNum = s ? Number(formatEther(s.raisedBnb)) : 0;
-  const buyNandN = Math.max(0, Math.floor(Number(form.nandQty) || 0));
-  const buyLatchN = Math.max(0, Math.floor(Number(form.latchQty) || 0));
-  const buyNandP = Number(form.nandPrice) || 0;
-  const buyLatchP = Number(form.latchPrice) || 0;
-  const buyHasLeg = buyNandN > 0 || buyLatchN > 0;
-  const buyLegOk = (buyNandN === 0 || buyNandP > 0) && (buyLatchN === 0 || buyLatchP > 0);
-  const buyCost = buyNandN * buyNandP + buyLatchN * buyLatchP;
+  // 买入参数与成本预览。buyCircuits 是 non-payable，采购款直接从募集余额扣；
+  // 前端先把超余额挡在签名之外，避免用一次失败把整期标记为执行失败。
+  const buyQty = Math.max(0, Math.floor(Number(form.buyQty) || 0));
+  const buyUnit = Number(form.maxPrice) || 0;
+  const buyCost = buyQty * buyUnit;
   const buyOverBudget = buyCost > raisedBnbNum;
-  const canPlaceBuy = isOwner && s?.phase === 1 && buyHasLeg && buyLegOk && !buyOverBudget;
+  const canBuy = isOwner && s?.phase === 1 && buyQty > 0 && !buyOverBudget;
   return (
     <section className="chain-debug">
       {!embedded && (
@@ -238,37 +229,35 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
 
               {s.scene === 1 && (
                 <div>
-                  <p className="fine">待执行 · {PHASE_LABEL[s.phase]} · 售罄于 {fmtTime(s.soldOutAt)} · 锁价 {s.priceLock > 0 ? `${fmt(s.priceLock)} BNB/颗 × ${s.transistorCount}` : "未锁"}</p>
+                  <p className="fine">待执行 · {PHASE_LABEL[s.phase]} · 售罄于 {fmtTime(s.soldOutAt)} · 累计采购 {s.priceLock > 0 ? `${fmt(s.priceLock)} BNB / ${heldNum} 张在手` : "未买入"}</p>
                   {s.phase === 1 && Number(s.raisedBnb) < Number(s.sold) * Number(s.sharePriceBnb) && (
-                    <p className="fine chain-warn">池子已低于按份全退所需，持份人可按比例退款；卖出晶体管可以补回一部分。</p>
+                    <p className="fine chain-warn">池子已低于按份全退所需，持份人可按比例退款；把电路挂回市场卖出可以补回一部分。</p>
                   )}
-                  {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降价重挂或退款；锁价为 0 时不要入池。</p>}
+                  {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降低单价重试或退款；没有电路时不要入池。</p>}
                   {canOperate && (
                     <div className="chain-actions">
                       {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est || "0")))}>写入预估算力</button>}
                       {s.phase === 1 && isOwner && (
                         <div className="buy-debug">
-                          <p className="fine">挂买单买晶体管：晶体管合约开期已锁定（{short(s.transistors)}）。托管 = 单价 × 数量，合计不能超过募集余额，否则不会挂出。</p>
+                          <p className="fine">从官方电路市场买入：电路集合开期已锁定（{short(s.circuits)}）。按市场卖单从低到高挑单，采购款直接从募集余额扣；最高单价留 0 表示不设上限。</p>
                           <div className="form-grid cols-2">
-                            <label className="field"><span>NAND 数量</span><input inputMode="numeric" value={form.nandQty} onChange={(e) => setForm({ ...form, nandQty: e.target.value })} /></label>
-                            <label className="field"><span>NAND 买价 BNB</span><input inputMode="decimal" step="0.00001" value={form.nandPrice} onChange={(e) => setForm({ ...form, nandPrice: e.target.value })} /></label>
-                            <label className="field"><span>LATCH 数量</span><input inputMode="numeric" value={form.latchQty} onChange={(e) => setForm({ ...form, latchQty: e.target.value })} /></label>
-                            <label className="field"><span>LATCH 买价 BNB</span><input inputMode="decimal" step="0.00001" value={form.latchPrice} onChange={(e) => setForm({ ...form, latchPrice: e.target.value })} /></label>
+                            <label className="field"><span>买入张数</span><input inputMode="numeric" value={form.buyQty} onChange={(e) => setForm({ ...form, buyQty: e.target.value })} /></label>
+                            <label className="field"><span>最高单价 BNB</span><input inputMode="decimal" step="0.00001" value={form.maxPrice} onChange={(e) => setForm({ ...form, maxPrice: e.target.value })} /></label>
                           </div>
                           <p className={buyOverBudget ? "chain-warn" : "fine"}>
-                            托管合计 {buyCost.toFixed(4)} BNB · 募集余额 {raisedBnbNum.toFixed(4)} BNB
-                            {buyOverBudget ? " · 超余额，链上不会真正挂出（会判执行失败）" : ""}
+                            预计支出 {buyCost.toFixed(4)} BNB · 募集余额 {raisedBnbNum.toFixed(4)} BNB
+                            {buyOverBudget ? " · 超余额，链上会以 ExecutionFailed 空跑" : ""}
                           </p>
                           <button
                             className="btn btn-primary"
                             type="button"
-                            disabled={busy || !canPlaceBuy}
-                            title={!isOwner ? "仅 Owner 可挂买单" : !buyHasLeg ? "至少填一条腿的数量" : !buyLegOk ? "有数量的腿必须填单价" : buyOverBudget ? "托管超过募集余额，链上不会挂出" : undefined}
-                            onClick={() => run("挂买单", (sg) => tx.placeTransistorOrder(
+                            disabled={busy || !canBuy}
+                            title={!isOwner ? "仅 Owner 可买入" : buyQty <= 0 ? "买入张数须大于 0" : buyOverBudget ? "支出超过募集余额，链上会空跑" : undefined}
+                            onClick={() => run("买入电路", (sg) => tx.buyCircuitsFromMarket(
                               sg,
-                              BigInt(buyNandN), buyNandN > 0 ? parseBnb(form.nandPrice) : 0n,
-                              BigInt(buyLatchN), buyLatchN > 0 ? parseBnb(form.latchPrice) : 0n,
-                            ))}>挂买单</button>
+                              buyQty,
+                              buyUnit > 0 ? parseBnb(form.maxPrice) : 0n,
+                            ))}>买入电路</button>
                         </div>
                       )}
                       {s.phase === 1 && (
@@ -304,18 +293,20 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                           </button>
                         );
                       })()}
-                      {s.phase === 2 && (
+                      {s.phase === 2 && heldNum > 0 && (
                         <button
-                          className={partsShort ? "btn btn-inline" : "btn btn-primary"}
+                          className="btn btn-primary"
                           type="button"
-                          disabled={busy || partsShort}
-                          title={partsShort ? "买单已成交，但晶体管还没进本期合约（余额不足），链上会拒绝确认。" : undefined}
-                          onClick={() => run("同步成交", (sg) => tx.confirmTransistors(sg))}
+                          disabled={busy}
+                          title="confirmCircuits 要求本期合约真的持有 ERC721 电路。"
+                          onClick={() => run("确认到账", (sg) => tx.confirmCircuits(sg))}
                         >
-                          {partsShort ? "同步官方成交（等待晶体管到账）" : "同步官方成交"}
+                          确认 {heldNum} 张电路到账
                         </button>
                       )}
-                      {s.phase === 2 && !cancelBlockedByFill && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("取消挂单", (sg) => tx.cancelTransistorOrder(sg))}>取消挂单</button>}
+                      {s.phase === 2 && heldNum <= 0 && (
+                        <p className="fine">本期合约还没有电路：先在「买入电路」里从市场买入，再确认到账。</p>
+                      )}
                       {s.phase === 3 && !s.executionFailed && isOwner && (
                         <button
                           className="btn btn-primary"
@@ -340,7 +331,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
               {s.scene === 2 && (
                 <div>
                   <p className="fine">
-                    晶体管已入池，本期进入挖矿（不可逆）。harvest / claim 为占位空实现，不产出发放；
+                    电路已入池，本期进入挖矿（不可逆）。harvest / claim 为占位空实现，不产出发放；
                     持份用户退出只能通过「发布转让挂单」走份额转让。
                   </p>
                 </div>

@@ -1,5 +1,5 @@
-// 测试网准备：部署 MockERC1155（晶体管合约，供工厂默认写入与卖方交割）。
-// 电路 NFT / BEM / PoD 已随流片逻辑移除，不再部署。
+// 测试网准备：部署 MockCircuitMarket + MockCircuitNft（电路 NFT，供工厂白名单与交割使用）。
+// 两者都有 chainId 56 部署即 revert 的护栏，主网绝不能出现。
 // 运行：npx hardhat run scripts/testnet-setup.js --network bscTestnet
 const { ethers } = require("hardhat");
 const { writeFileSync, mkdirSync } = require("node:fs");
@@ -11,13 +11,16 @@ async function main() {
   console.log(`network ${net.name} chainId ${net.chainId}`);
   console.log(`deployer ${deployer.address} ${ethers.formatEther(await ethers.provider.getBalance(deployer.address))} BNB`);
 
-  const parts = await ethers.deployContract("MockERC1155");
-  await parts.waitForDeployment();
+  const market = await ethers.deployContract("MockCircuitMarket", [250]);
+  await market.waitForDeployment();
+  const circuits = await ethers.deployContract("MockCircuitNft");
+  await circuits.waitForDeployment();
 
   const out = {
     chainId: Number(net.chainId),
     deployer: deployer.address,
-    parts: await parts.getAddress(),
+    circuitMarket: await market.getAddress(),
+    circuits: await circuits.getAddress(),
     deployedAt: new Date().toISOString(),
   };
   mkdirSync(join(__dirname, "..", "deployments"), { recursive: true });

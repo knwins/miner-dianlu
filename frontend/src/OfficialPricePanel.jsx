@@ -1,18 +1,18 @@
 /**
- * 官方处理器 · 晶体管市价面板。
+ * 官方处理器 · 电路市价面板。
  *
- * 展示 TapeOut / Behemoth 各自的 NAND 与 LATCH 市价（BNB/颗），
- * 数据优先读链上晶体管市场的活跃买单，成交事件补位，market.json 兜底，静态基准再兜底。
+ * 展示 TapeOut / Behemoth 各自电路集合的**当前最低挂单价**（BNB/张），
+ * 主源是链上官方电路市场的活跃卖单（`nextListingId()` + `listings(id)`），
+ * 静态基准价兜底。
  *
  * 口径说明（面板里也写清楚了，避免被当成链上结算价）：
- *   - 市价优先取最近一笔链上成交单价；晶体管市场成交很稀疏，没有成交时取
- *     当前最高的未成交买价（读 `bids(id)` 得到，见 officialPrices.js）。
- *   - 这不是**本期**的挂单价；本期真实成本以链上 Campaign 记录为准。
+ *   - 官方电路市场只有卖单侧，可成交价就是「当前最低挂单价」。
+ *   - 这不是**本期**的成交价；本期真实成本以链上 Campaign 记录为准。
  *
  * ── 两种形态 ──
  *   - compact（开期表单 / Owner 弹窗）：只显示当前期次那一组，价格用紧凑表格。
- *   - full（晶体管市场页）：行情看板 —— 每个处理器一张卡，单价是卡里的主角
- *     （28px 数字 + 单位），处理器名 / 每颗算力 P 退到卡头，地址与白名单退到卡脚。
+ *   - full（电路市场页）：行情看板 —— 每个处理器一张卡，单价是卡里的主角
+ *     （28px 数字 + 单位），处理器名 / 每张算力 P 退到卡头，地址与白名单退到卡脚。
  *
  *   之前 full 形态和 compact 共用同一张 12px 表格：价格、地址、白名单全是同一号字，
  *   页面上「什么贵、贵多少」要逐字读才发现。行情页的重点本来就该是价格本身。
@@ -22,7 +22,7 @@
  * 会自动标注，而不是静默展示成产期。
  */
 import {
-  TRANSISTORS,
+  CIRCUITS,
   PROCESSOR_IDS,
   PROCESSORS,
   isMineable,
@@ -30,7 +30,7 @@ import {
   formatUnitPrice,
 } from "./prices.js";
 
-/** 按处理器分组展示：NAND / LATCH 各一格。顺序与 PROCESSOR_IDS 一致，新增处理器自动进表。 */
+/** 按处理器分组展示：每个处理器一个电路集合。顺序与 PROCESSOR_IDS 一致，新增处理器自动进表。 */
 const BY_PROCESSOR = PROCESSOR_IDS;
 
 function formatPrice(v) {
@@ -40,8 +40,7 @@ function formatPrice(v) {
 /**
  * 快照时间文案。
  *
- * `generatedAt` 有两个来源、两种格式：market.json 给 ISO 时间串，
- * 链上主源给字面量 "onchain"（没有时间戳，只有区块号）。
+ * `generatedAt` 有两种格式：历史快照给 ISO 时间串，链上主源给字面量 "onchain"。
  * 直接 `new Date("onchain")` 得到 Invalid Date，页面上会印出
  * 「NaN-NaN-NaN NaN:NaN」—— 这里必须先判可解析，解析不了就不显示时间。
  */
@@ -70,7 +69,7 @@ export function OfficialPricePanel({
   processorId = null,
   compact = false,
   full = false,
-  title = "官方晶体管最新价",
+  title = "官方电路最新价",
   badge = null,
   renderFacts = null,
 }) {
@@ -84,18 +83,17 @@ export function OfficialPricePanel({
       desc: PROCESSORS[p]?.desc || "",
       mineable: isMineable(p),
       scale: processorScale(p),
-      items: TRANSISTORS.filter((t) => t.processor === p).map((model) => ({
+      items: CIRCUITS.filter((t) => t.processor === p).map((model) => ({
         model,
         row: rows[model.id] || null,
-      })),
-    }))
+      })),    }))
     .filter((g) => g.items.length > 0);
   if (shown.length === 0) return null;
 
   const genText = snapshotTimeText(official?.generatedAt);
   const block = Number(official?.lastBlock) || 0;
   const statusText = official?.ok
-    ? (genText ? `晶体管市场快照 · ${genText}` : "晶体管市场快照")
+    ? (genText ? `电路市场快照 · ${genText}` : "电路市场快照")
     : official?.error
       ? "读取失败"
       : "读取中…";
@@ -137,7 +135,7 @@ export function OfficialPricePanel({
                       {current && <em className="est-tag">本期</em>}
                     </div>
                     {g.mineable ? (
-                      <span className="price-board-scale">每颗算力 P = {g.scale}</span>
+                      <span className="price-board-scale">每张算力 P = {g.scale}</span>
                     ) : (
                       <em className="est-tag warn-tag">无挖矿产出</em>
                     )}
@@ -145,28 +143,16 @@ export function OfficialPricePanel({
                   {g.desc ? <p className="price-board-desc">{g.desc}</p> : null}
                   <div className="price-board-prices">
                     {g.items.map(({ model, row }) => {
-                      // 成交价优先，没有成交时退回「当前最高未成交买价」——
-                      // 晶体管市场成交很稀疏，常态下挂单才是稳定的价源。
-                      const price = row?.last != null ? row.last : row?.bid != null ? row.bid : null;
+                      // 官方市场只有卖单侧：可成交价 = 当前最低挂单价。
+                      const price = row?.ask != null ? row.ask : row?.last != null ? row.last : row?.bid ?? null;
                       return (
                         <div className="price-cell" key={model.id}>
-                          {/*
-                            tokenId 只有固定两值（NAND=0 / LATCH=1），
-                            作为晶体管名后缀带着走，不单独占一行。
-                          */}
-                          <span className="price-cell-label">
-                            {model.part}
-                            <em className="part-id">#{model.tokenId}</em>
-                          </span>
+                          <span className="price-cell-label">电路</span>
                           <strong className="price-cell-value">
                             {price != null ? formatPrice(price) : "—"}
                           </strong>
                           <span className="price-cell-unit">
-                            {/*
-                              有价时只写单位：这一格可能是成交价也可能是买价，
-                              逐格标来源会把卡片撑散，来源统一写在下方 .fine 里。
-                            */}
-                            {price != null ? "BNB / 颗" : "暂无报价"}
+                            {price != null ? "BNB / 张" : "暂无挂单"}
                           </span>
                         </div>
                       );
@@ -190,7 +176,7 @@ export function OfficialPricePanel({
                 <table className="official-price-table">
                   <thead>
                     <tr>
-                      <th>晶体管</th>
+                      <th>电路</th>
                       {/*
                         列头不写「成交价」：这一列优先取最近成交价，没有成交时取
                         当前最高买价，写死「成交价」会与实际口径不符。
@@ -202,13 +188,13 @@ export function OfficialPricePanel({
                     {g.items.map(({ model, row }) => (
                       <tr key={model.id}>
                         <td>
-                          <strong>{model.part}</strong>
+                          <strong>电路</strong>
                         </td>
                         <td className="mono" style={{ fontWeight: 600 }}>
-                          {row?.last != null
-                            ? formatPrice(row.last)
-                            : row?.bid != null
-                              ? formatPrice(row.bid)
+                          {row?.ask != null
+                            ? formatPrice(row.ask)
+                            : row?.last != null
+                              ? formatPrice(row.last)
                               : "—"}
                         </td>
                       </tr>
@@ -226,11 +212,11 @@ export function OfficialPricePanel({
           末行只剩「考。」两个字挂在下面，像排版事故。
         */}
         <p className="fine">
-          市价 = 最近一笔链上成交单价（BNB/颗），无成交时取当前最高未成交买价。
+          市价 = 官方电路市场当前最低挂单价（BNB/张）；没有活跃挂单时显示「暂无挂单」。
           {block ? ` 区块 ${block.toLocaleString("zh-CN")}。` : ""}
         </p>
         {full && (
-          <p className="fine">本期实际成本以链上 Campaign 挂单 / 成交记录为准，这里只作市价参考。</p>
+          <p className="fine">本期实际成本以链上 Campaign 买入记录为准，这里只作市价参考。</p>
         )}
       </div>
     </article>
@@ -238,35 +224,12 @@ export function OfficialPricePanel({
 }
 
 /**
- * 单个晶体管的官方价（BNB/颗），没有则 null。
+ * 单个电路集合的官方价（BNB/张），没有则 null。
  * 供表单做「填入市价」按钮用。
  */
-export function officialUnitPrice(official, transistorId) {
-  const row = official?.prices?.[transistorId];
+export function officialUnitPrice(official, circuitId) {
+  const row = official?.prices?.[circuitId];
   if (!row) return null;
-  const p = row.last != null ? row.last : row.bid;
+  const p = row.ask != null ? row.ask : row.last != null ? row.last : row.bid;
   return p != null && p > 0 ? p : null;
-}
-
-/**
- * 处理器下 NAND / LATCH 的官方价对。
- *
- * ⚠️ 按 TRANSISTORS 查表，不能写
- * `processorId === "Behemoth" ? "BEHEMOTH_*" : "TAPE_OUT_*"`：
- * 那种二元写法在处理器数量变化后会落到 TapeOut 的 id 上，取不到新处理器的市价。
- */
-export function officialPartPrices(official, processorId) {
-  const out = {};
-  for (const part of ["NAND", "LATCH"]) {
-    const model = TRANSISTORS.find((t) => t.processor === processorId && t.part === part);
-    // 取不到时给 0 而不是 null：调用方会拿它做算术与比较（`> 0` / `× 1.5`），
-    // null 会让 `null > 0` 依赖隐式转换、也让乘法结果变 null，UI 容易显示成 "null BNB"。
-    if (!model) {
-      out[part] = 0;
-      continue;
-    }
-    const p = officialUnitPrice(official, model.id);
-    out[part] = p != null && p > 0 ? p : 0;
-  }
-  return out;
 }

@@ -322,7 +322,6 @@ export function useChain(extra = {}) {
     refresh,
     refreshHistory,
     error,
-    transistorUnitPrice: null,
     owner: book?.owner || deployments.deployer || "",
     campaignAddress,
     campaigns,

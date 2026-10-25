@@ -11,9 +11,9 @@ export const CHAIN_ID_HEX = "0x" + CHAIN_ID.toString(16);
 export const CAMPAIGN_ADDRESS = deployments.campaign || "";
 export const FACTORY_ADDRESS = deployments.factory || "";
 /**
- * 晶体管市场地址。合约侧字段名就是 materialMarket，部署记录随之统一。
+ * 电路市场地址。合约侧字段名就是 circuitMarket，部署记录随之统一。
  */
-export const MATERIAL_MARKET_ADDRESS = deployments.materialMarket || "";
+export const CIRCUIT_MARKET_ADDRESS = deployments.circuitMarket || "";
 
 // 工厂已部署即可对接。campaign 为空表示尚未开期，页面不回退到本地模拟数据。
 export const IS_CONFIGURED = isAddr(FACTORY_ADDRESS);

@@ -13,10 +13,10 @@ const { ethers, network } = hre;
 const { readFileSync, existsSync } = require("node:fs");
 const { join } = require("node:path");
 
-const OFFICIAL_MARKET = "0xA6a80C1919a8326022d7c601a488888C13aA16E4";
-const OFFICIAL_PARTS = [
-  "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087", // TapeOut
-  "0xE2DfD802081C7a05341E20b6582b04b908e8550c", // Behemoth
+const OFFICIAL_MARKET = "0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f";
+const OFFICIAL_CIRCUITS = [
+  "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C", // TapeOut
+  "0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c", // Behemoth
 ];
 
 /** 读部署记录（部署脚本已写好）。 */
@@ -28,10 +28,10 @@ function readDeployment() {
 
 /**
  * 构造参数：验证时必须与部署时完全一致，否则 Sourcify 匹配不上。
- * 工厂是 (materialMarket, allowedParts[])；Campaign 由工厂内部 CREATE 创建，
+ * 工厂是 (circuitMarket, allowedCircuits[])；Campaign 由工厂内部 CREATE 创建，
  * 其 6 个构造参数需要从工厂事件 + 链上 Campaign 状态还原：
- *   (sharePriceBnb, totalShares, fundingDeadline, materialMarket, owner, transistors)
- * 前三个来自 CampaignCreated 事件；materialMarket / transistors 直接读链上 Campaign
+ *   (sharePriceBnb, totalShares, fundingDeadline, circuitMarket, owner, circuits)
+ * 前三个来自 CampaignCreated 事件；circuitMarket / circuits 直接读链上 Campaign
  * （它们是创建时写入的 immutable，开期人无法事后改），owner 是当时的 Factory Owner（= 部署者）。
  */
 async function campaignConstructorArgs(campaignAddr, dep) {
@@ -48,15 +48,15 @@ async function campaignConstructorArgs(campaignAddr, dep) {
       const parsed = iface.parseLog(log);
       if (String(parsed.args.campaign).toLowerCase() !== String(campaignAddr).toLowerCase()) continue;
       const c = await ethers.getContractAt("Campaign", campaignAddr);
-      const materialMarket = await c.materialMarket();
-      const transistors = await c.transistors();
+      const circuitMarket = await c.circuitMarket();
+      const circuits = await c.circuits();
       return [
         parsed.args.sharePriceBnb,
         parsed.args.totalShares,
         parsed.args.fundingDeadline,
-        materialMarket,
+        circuitMarket,
         dep.deployer,
-        transistors,
+        circuits,
       ];
     }
   } catch {
@@ -78,27 +78,27 @@ async function main() {
     );
   }
 
-  // 主网额外核对：晶体管市场必须是官方地址；晶体管白名单必须是官方两件套。
+  // 主网额外核对：电路市场必须是官方地址；ERC721 电路白名单必须是官方两件套。
   if (chainId === 56) {
-    const market = String(dep.materialMarket || "").toLowerCase();
+    const market = String(dep.circuitMarket || "").toLowerCase();
     if (market !== OFFICIAL_MARKET.toLowerCase()) {
-      throw new Error(`主网晶体管市场应为 ${OFFICIAL_MARKET}，部署记录是 ${dep.materialMarket}`);
+      throw new Error(`主网电路市场应为 ${OFFICIAL_MARKET}，部署记录是 ${dep.circuitMarket}`);
     }
-    const wl = Array.isArray(dep.allowedParts) ? dep.allowedParts.map((a) => a.toLowerCase()) : [];
-    for (const o of OFFICIAL_PARTS) {
+    const wl = Array.isArray(dep.allowedCircuits) ? dep.allowedCircuits.map((a) => a.toLowerCase()) : [];
+    for (const o of OFFICIAL_CIRCUITS) {
       if (!wl.includes(o.toLowerCase())) {
-        throw new Error(`主网晶体管白名单必须包含官方晶体管 ${o}（否则它的期次开不了）`);
+        throw new Error(`主网电路白名单必须包含官方电路 ${o}（否则它的期次开不了）`);
       }
     }
   }
 
   const targets = [];
   if (dep.factory) {
-    // 工厂构造是 2 参：(materialMarket, allowedParts[]) —— 两者缺一不可，否则验证对不上。
+    // 工厂构造是 2 参：(circuitMarket, allowedCircuits[]) —— 两者缺一不可，否则验证对不上。
     targets.push({
       address: dep.factory,
       name: "CampaignFactory",
-      args: [dep.materialMarket, dep.allowedParts],
+      args: [dep.circuitMarket, dep.allowedCircuits],
     });
   }
   if (dep.campaign) {

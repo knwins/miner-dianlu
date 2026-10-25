@@ -1,5 +1,8 @@
-// 与 contracts/contracts/Campaign.sol、CampaignFactory.sol 严格对齐的 ABI（human-readable，ethers v6）。
-// 旧版期次已废弃，这里不再保留任何兼容旧 getter / 旧事件 / 旧函数名的条目。
+// 与 contracts/contracts/Campaign.sol、CampaignFactory.sol、ICircuitMarket.sol 严格对齐的 ABI
+// （human-readable，ethers v6）。旧期次 / 旧电路市场已废弃，这里不保留兼容条目。
+//
+// 电路市场只有**卖单侧**：list / delist / buy / listingFor / listingOf / listings / owed / withdraw。
+// 买入 = 吃一张挂着的卖单（Campaign.buyCircuits 批量、原子）；卖出 = 把持有的 ERC721 电路挂回市场。
 export const CAMPAIGN_ABI = [
   // ── 自动 getter（public 状态变量） ──
   "function scene() view returns (uint8)",
@@ -33,20 +36,17 @@ export const CAMPAIGN_ABI = [
   "function raisedBnb() view returns (uint256)",
   "function totalRefunded() view returns (uint256)",
   "function priceLock() view returns (uint256)",
-  "function nandBidId() view returns (uint256)",
-  "function latchBidId() view returns (uint256)",
-  "function nandQty() view returns (uint256)",
-  "function latchQty() view returns (uint256)",
-  "function nandPrice() view returns (uint96)",
-  "function latchPrice() view returns (uint96)",
-  "function nandCostBasis() view returns (uint96)",
-  "function latchCostBasis() view returns (uint96)",
+  "function activeListingCount() view returns (uint256)",
+  "function circuitCount() view returns (uint256)",
+  "function circuitIds(uint256) view returns (uint256)",
+  "function circuitCostBasis(uint256) view returns (uint96)",
+  "function circuitListingId(uint256) view returns (uint256)",
   "function estHashpower() view returns (uint256)",
   "function sharePriceBnb() view returns (uint256)",
   "function totalShares() view returns (uint256)",
   "function fundingDeadline() view returns (uint64)",
-  "function transistors() view returns (address)",
-  "function materialMarket() view returns (address)",
+  "function circuits() view returns (address)",
+  "function circuitMarket() view returns (address)",
   "function miningPool() view returns (address)",
   "function factory() view returns (address)",
   "function owner() view returns (address)",
@@ -61,8 +61,7 @@ export const CAMPAIGN_ABI = [
   "function surplusClaimedOf(address) view returns (uint256)",
   "function listingCount() view returns (uint256)",
   "function getListing(uint256) view returns (address seller, uint256 shares, uint256 priceBnbPerShare, bool open)",
-  "function orderFilled() view returns (bool)",
-  "function supportsInterface(bytes4) pure returns (bool)",
+  "function circuitHeldCount() view returns (uint256)",
   // ── 写 ──
   "function subscribe(uint256 count) payable",
   "function refund()",
@@ -72,10 +71,12 @@ export const CAMPAIGN_ABI = [
   "function listShares(uint256 count, uint256 priceBnbPerShare)",
   "function cancelListing(uint256 id)",
   "function takeListing(uint256 id, uint256 count) payable",
-  "function placeTransistorOrder(uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
-  "function sellTransistors(uint256 bidId, uint8 tokenId, uint256 quantity)",
-  "function cancelTransistorOrder()",
-  "function confirmTransistors()",
+  // 采购：批量吃市场卖单；钱从本期 raisedBnb 出（non-payable），不另收 msg.value。
+  "function buyCircuits(uint256[] listingIds, uint256[] tokenIds, uint96[] prices)",
+  "function confirmCircuits()",
+  // 卖出：把本期持有的某张 ERC721 电路挂回市场（逐 token approve，不用 setApprovalForAll）。
+  "function listCircuit(uint256 tokenId, uint96 price)",
+  "function cancelCircuitListing(uint256 tokenId)",
   "function withdrawMarketProceeds()",
   "function returnSurplus()",
   "function topUpShortfall() payable",
@@ -83,7 +84,7 @@ export const CAMPAIGN_ABI = [
   "function abandonOrder()",
   "function markFailed()",
   "function setPhase(uint8 next)",
-  "function setMaterialMarket(address materialMarket_)",
+  "function setCircuitMarket(address circuitMarket_)",
   "function setMiningPool(address pool_)",
   "function setPlan(uint256 estHashpower)",
   "function depositToPool()",
@@ -91,7 +92,7 @@ export const CAMPAIGN_ABI = [
   "function claim() returns (uint256)",
   "function depositRevenue() payable",
   "function recoverBnb()",
-  "function recoverTransistors(address token, uint256 id, uint256 amount)",
+  "function recoverCircuits(address token, uint256 id)",
   "function transferOwnership(address newOwner)",
   "function halt()",
   "function resume()",
@@ -103,12 +104,14 @@ export const CAMPAIGN_ABI = [
   "event SurplusAccrued(address indexed holder, uint256 amountBnb)",
   "event Listed(uint256 indexed id, address indexed seller, uint256 count, uint256 priceBnbPerShare)",
   "event ListingTaken(uint256 indexed id, address indexed buyer, address indexed seller, uint256 count, uint256 paidBnb)",
-  "event ListingCancelled(uint256 indexed id, address indexed seller, uint256 count)",
+  "event ListingCancelled(uint256 indexed id, address indexed seller, uint256 shares)",
   "event ExecutionFailed(uint256 needBnb, uint256 raisedBnb)",
-  "event TransistorOrderPlaced(uint256 count, uint256 escrowBnb)",
-  "event TransistorOrderCancelled()",
-  "event TransistorsSold(uint256 indexed bidId, uint8 indexed tokenId, uint256 quantity, uint256 proceeds)",
-  "event TransistorsConfirmed()",
+  "event CircuitsBought(uint256 count, uint256 paidBnb)",
+  "event CircuitBought(uint256 indexed tokenId, uint256 indexed listingId, uint256 price)",
+  "event CircuitsConfirmed()",
+  "event CircuitListed(uint256 indexed tokenId, uint256 indexed listingId, uint256 price)",
+  "event CircuitListingCancelled(uint256 indexed tokenId, uint256 indexed listingId)",
+  "event MarketProceedsWithdrawn(uint256 amount)",
   "event RefundsOpened(uint256 outstandingShares, uint256 escrowBnb)",
   "event SurplusReturned(uint256 amountBnb, uint256 baseShares)",
   "event ServiceFeeSet(uint16 feeBps, address[] recipients, uint16[] sharesBps)",
@@ -117,14 +120,14 @@ export const CAMPAIGN_ABI = [
   "event RevenueDeposited(uint256 gross, uint256 fee, uint256 net)",
   "event ShortfallToppedUp(uint256 amount, uint256 raisedBnb)",
   "event MiningPoolSet(address indexed previous, address indexed next)",
-  "event DepositedToPool(address indexed pool, uint256 nandAmount, uint256 latchAmount)",
-  "event MaterialMarketUpdated(address indexed previous, address indexed next)",
-  "event MaterialMarketApprovalRevoked(address indexed market)",
+  "event DepositedToPool(address indexed pool, uint256 count)",
+  "event CircuitMarketUpdated(address indexed previous, address indexed next)",
+  "event CircuitApprovalRevoked(uint256 indexed tokenId, address indexed market)",
   "event PhaseChanged(uint8 indexed previous, uint8 indexed next)",
   "event PlanUpdated(uint256 estHashpower)",
   "event BnbRecovered(uint256 amount, address indexed to)",
-  "event TransistorsRecovered(address indexed token, uint256 indexed id, uint256 amount, address indexed to)",
-  "event OwnershipTransferred(address indexed previous, address indexed next)",
+  "event CircuitRecovered(address indexed token, uint256 indexed id, address indexed to)",
+  "event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)",
   // ── 自定义错误（decodeRevert 直接按本 ABI 解码） ──
   "error DirectTransferNotAllowed()",
   "error Halted()",
@@ -133,7 +136,7 @@ export const CAMPAIGN_ABI = [
   "error NotOwner(address caller)",
   "error WrongScene()",
   "error FundingEnded()",
-  "error TransistorsNotReady()",
+  "error CircuitsNotReady()",
   "error RefundNotAvailable()",
   "error ZeroShares()",
   "error ZeroPrice()",
@@ -141,7 +144,7 @@ export const CAMPAIGN_ABI = [
   "error InsufficientShares()",
   "error SharesOutstanding()",
   "error HoldersNotMadeWhole()",
-  "error PartsAreCollateral()",
+  "error CircuitsAreCollateral()",
   "error ExceedsRemaining()",
   "error WrongPayment()",
   "error NoListing()",
@@ -151,14 +154,11 @@ export const CAMPAIGN_ABI = [
   "error NotListed()",
   "error AlreadyReady()",
   "error TransferFailed()",
-  "error OrderFilled()",
-  "error BadBidId()",
   "error ProceedsPending()",
-  "error NotABid()",
+  "error NotACircuit()",
   "error PriceBelowCost()",
   "error SelfTrade()",
-  "error NoProceeds()",
-  "error InsufficientParts()",
+  "error InsufficientCircuits()",
   "error PoolNotSet()",
   "error AlreadyPooled()",
   "error SurplusAlreadyReturned()",
@@ -169,73 +169,81 @@ export const CAMPAIGN_ABI = [
   "error NotSoldOutYet()",
   "error ZeroAddress()",
   "error Reentrancy()",
+  "error BadListingId()",
+  "error CircuitNotDelivered()",
+  "error CircuitStillListed()",
+  "error NotACircuitOwner()",
+  "error TooManyCircuits()",
 ];
 
 /**
- * 晶体管市场 ABI。
+ * 官方电路市场（BSC 主网 0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f，EIP-1967 UUPS 代理）。
  *
- * ⚠️ 同名事件在主网晶体管市场与 Mock 里的**签名不同**（2026-10-23 用 nodereal 拉
- * 主网市场日志解出来的，topic0 已逐一核对）：
- *
- *   官方 BidPlaced(uint256,address,address,uint8,uint256,uint256)  0xcc402b0b…
- *     —— 价是 uint256；Mock 是 uint96，签名不同 → 用 Mock ABI 解析必然失败，
- *        看起来就像「市场没有事件」。两个变体都要留在 ABI 里，ethers 按 topic 选。
- *   官方 BidFilled(uint256 indexed id, address indexed seller, uint256 quantity,
- *                  uint256 proceeds, uint256 fee)                  0x8ba8eb46…
- *     —— 5 个参数；Mock 是 (id, quantity, remaining) 3 个。
- *        proceeds + fee = 买家为这批晶体管付出的托管额（fee 恒为 1%）。
- *   官方 BidCancelled(uint256,uint256) 与 Mock **同签名**（0x434f4081…），只写一份。
- *   晶体管市场没有卖单侧（placeAsk / asks / fillAsk / cancelAsk 都不存在），只有买单簿；
- *   卖出 = 卖方调用 fillBid 吃一张已挂买单。所以这里也不需要 Ask* 事件。
+ * 只有卖单侧：每次成交 1 张 ERC721 电路，没有买单簿、没有部分成交、没有自动撮合。
+ * 无托管：卖家在成交前一直持有 NFT；`buy` 必须精确支付挂单价。
+ * 卖家货款是 pull 模式：`buy` 记到 `owed[seller]`，卖家自己 `withdraw()`。
  */
-export const MATERIAL_MARKET_ABI = [
-  "function nextBidId() view returns (uint256)",
-  "function bids(uint256) view returns (address buyer, address transistors, uint96 price, uint8 tokenId, uint16 feeBps, uint256 remaining)",
+export const CIRCUIT_MARKET_ABI = [
+  "function nextListingId() view returns (uint256)",
+  "function feeBps() view returns (uint16)",
+  "function listings(uint256) view returns (address seller, address circuits, uint96 price, uint16 feeBps, uint256 tokenId)",
+  "function listingFor(address circuits, uint256 tokenId) view returns (uint256 id, address seller, uint96 price, bool valid)",
+  "function listingOf(address circuits, uint256 tokenId) view returns (uint256 id)",
   "function owed(address) view returns (uint256)",
-  "function placeBid(address transistors, uint8 tokenId, uint96 price, uint256 quantity) payable returns (uint256)",
-  "function fillBid(uint256 id, uint256 quantity)",
-  "function cancelBid(uint256 id)",
+  "function list(address circuits, uint256 tokenId, uint96 price) returns (uint256 id)",
+  "function delist(uint256 id)",
+  "function buy(uint256 id, uint96 expectedPrice) payable",
   "function withdraw()",
-  // —— 晶体管市场（主网 0xA6a80C19…，EIP-1967 代理）——
-  "event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint256 price, uint256 quantity)",
-  "event BidFilled(uint256 indexed id, address indexed seller, uint256 quantity, uint256 proceeds, uint256 fee)",
-  "event BidCancelled(uint256 indexed id, uint256 refund)",
-  // —— Mock 市场（测试网）——
-  "event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint96 price, uint256 quantity)",
-  "event BidFilled(uint256 indexed id, uint256 quantity, uint256 remaining)",
+  // 官方市场的事件签名（按主网日志核对；Mock 同签名）。
+  "event Listed(uint256 indexed id, address indexed seller, address indexed circuits, uint256 tokenId, uint96 price)",
+  "event Delisted(uint256 indexed id)",
+  "event Bought(uint256 indexed id, address indexed buyer, address indexed seller, uint256 tokenId, uint96 price, uint16 feeBps)",
   "event ProceedsWithdrawn(address indexed account, uint256 amount)",
+  "error BadListing()",
+  "error NotSeller()",
+  "error PriceMismatch()",
+  "error NothingOwed()",
 ];
 
-/** MockERC1155 的调试入口：测试网晶体管由任何人 mint，用来代替卖方交割。 */
-export const MOCK_PARTS_ABI = [
-  "function balanceOf(address account, uint256 id) view returns (uint256)",
-  "function mint(address to, uint256 id, uint256 amount)",
+/** MockCircuitNft 的调试入口：测试网电路由任何人 mint，用来制造市场卖单。 */
+export const MOCK_CIRCUIT_ABI = [
+  "function balanceOf(address account) view returns (uint256)",
+  "function ownerOf(uint256 tokenId) view returns (address)",
+  "function approve(address to, uint256 tokenId)",
+  "function mint(address to, uint256 tokenId)",
+];
+
+/** MockCircuitMarket 的调试开关（仅测试网；主网地址没有这些函数）。 */
+export const MOCK_CIRCUIT_MARKET_ABI = [
+  ...CIRCUIT_MARKET_ABI,
+  "function nextListingId() view returns (uint256)",
+  "function setFeeBps(uint16 feeBps_)",
+  "function creditOwed(address account, uint256 amount) payable",
 ];
 
 export const FACTORY_ABI = [
   "function owner() view returns (address)",
-  "function materialMarket() view returns (address)",
+  "function circuitMarket() view returns (address)",
   "function campaignCount() view returns (uint256)",
   "function campaigns(uint256) view returns (address)",
   "function isRegistered(address campaign) view returns (bool)",
-  // 晶体管白名单：工厂部署时写入，之后不可增删。白名单是安全边界 ——
-  // 不在白名单里的 ERC1155 不允许开期（主网上防止把期次指向 MockERC1155）。
-  "function allowedPartsCount() view returns (uint256)",
-  "function allowedPartsAt(uint256) view returns (address)",
-  "function isAllowedParts(address) view returns (bool)",
+  // 电路白名单：工厂部署时写入，之后不可增删。白名单是安全边界 ——
+  // 不在白名单里的 ERC721 不允许开期（主网上防止把期次指向 MockCircuitNft）。
+  "function allowedCircuitsCount() view returns (uint256)",
+  "function allowedCircuitsAt(uint256) view returns (address)",
+  "function isAllowedCircuits(address) view returns (bool)",
   // fundingSeconds 是秒，不是天：单位换算在前端做（days × 86400）。
-  // transistors 是**必选的处理器**：零地址一律 revert（工厂不再有默认晶体管），
-  // 且必须在白名单内。开期时前端必须显式选择一个处理器。
-  "function createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds, address transistors) returns (address)",
+  // circuits 是**必选的 ERC721 电路合约**：零地址一律 revert，且必须在白名单内。
+  "function createCampaign(uint256 sharePriceBnb, uint256 totalShares, uint64 fundingSeconds, address circuits) returns (address)",
   "function removeCampaign(uint256 index)",
   "function transferOwnership(address newOwner)",
   "event CampaignCreated(uint256 indexed index, address indexed campaign, uint256 sharePriceBnb, uint256 totalShares, uint64 fundingDeadline)",
   "event CampaignRemoved(uint256 indexed index, address indexed campaign)",
-  "event OwnershipTransferred(address indexed previous, address indexed next)",
+  "event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)",
   "error ZeroAddress()",
   "error ZeroCampaignParam()",
   "error EmptyWhitelist()",
   "error IndexOutOfBounds()",
-  "error PartsNotAllowed(address parts)",
+  "error CircuitsNotAllowed(address circuits)",
   "error NotOwner(address caller)",
 ];

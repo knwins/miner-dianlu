@@ -1,8 +1,8 @@
 /**
- * 官方晶体管市价钩子。
+ * 官方电路市价钩子。
  *
- * 拉 tapeout.net 的 market.json，解析成按晶体管 id 归位的市价表，
- * 并把官方价合并进现有 quote 快照（链上单价仍可覆盖它）。
+ * 读链上电路市场的活跃挂单，解析成按电路集合 id 归位的市价表，
+ * 并把官方价合并进现有 quote 快照（链上 Campaign 的成交单价仍可覆盖它）。
  *
  * 失败不抛错：市价是辅助信息，拉不到就退回静态基准价，页面照常用。
  */
@@ -46,11 +46,11 @@ export function useOfficialPrices(baseQuote = QUOTE) {
     quote,
     official,
     loading,
-    /** 某个晶体管的官方市价（BNB/个），没有则 null */
+    /** 某个电路集合的官方最低挂单价（BNB/张），没有则 null */
     priceOf(id) {
       const row = official?.prices?.[id];
       if (!row) return null;
-      const p = row.last != null ? row.last : row.bid;
+      const p = row.ask != null ? row.ask : row.last != null ? row.last : row.bid;
       return p != null && p > 0 ? p : null;
     },
   };

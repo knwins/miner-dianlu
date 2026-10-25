@@ -1,7 +1,7 @@
 // 链上对接客户端（ethers v6）。读取 Campaign 实时状态、发送写交易。
 // 无钱包时用公共 RPC 只读；有钱包（window.ethereum）时签名发送。
 import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress } from "ethers";
-import { CAMPAIGN_ABI, FACTORY_ABI, MATERIAL_MARKET_ABI, MOCK_PARTS_ABI } from "./abis.js";
+import { CAMPAIGN_ABI, FACTORY_ABI, CIRCUIT_MARKET_ABI, MOCK_CIRCUIT_ABI } from "./abis.js";
 import {
   CAMPAIGN_ADDRESS,
   FACTORY_ADDRESS,
@@ -503,28 +503,26 @@ async function readStateOn(runner, account, campaignAddr) {
   const withDefault = (p, fallback) => p.catch(() => fallback);
   const [
     scene, phase, sold, totalShares, sharePriceBnb, estHashpower,
-    nandQty, latchQty, priceLock, soldOutAt, executionFailed, raisedBnb, totalRefunded,
-    fundingDeadline, transistorsAddr, marketAddr, factoryAddr, owner, halted, pooled, miningPool,
-    listingCount, totalPendingSurplus, orderFilled,
+    priceLock, soldOutAt, executionFailed, raisedBnb, totalRefunded,
+    fundingDeadline, circuitsAddr, marketAddr, factoryAddr, owner, halted, pooled, miningPool,
+    listingCount, totalPendingSurplus,
     outstandingShares, serviceFeeBps, serviceFeeSet, feeRecipientCount,
     revenuePool, surplusPool, lastOrderAt, surplusBase, surplusPaid,
   ] = await Promise.all([
     c.scene(), c.phase(), c.sold(), c.totalShares(), c.sharePriceBnb(),
     withDefault(c.estHashpower(), 0n),
-    withDefault(c.nandQty(), 0n), withDefault(c.latchQty(), 0n),
     withDefault(c.priceLock(), 0n),
     withDefault(c.soldOutAt(), 0n),
     withDefault(c.executionFailed(), false),
     c.raisedBnb(),
     withDefault(c.totalRefunded(), 0n),
-    c.fundingDeadline(), c.transistors(), c.materialMarket(), c.factory(),
+    c.fundingDeadline(), c.circuits(), c.circuitMarket(), c.factory(),
     c.owner(),
     withDefault(c.halted(), false),
     withDefault(c.pooled(), false),
     withDefault(c.miningPool(), ZeroAddress),
     withDefault(c.listingCount(), 0n),
     withDefault(c.totalPendingSurplus(), 0n),
-    withDefault(c.orderFilled(), false),
     withDefault(c.outstandingShares(), 0n),
     withDefault(c.serviceFeeBps(), 0),
     withDefault(c.serviceFeeSet(), false),
@@ -536,7 +534,7 @@ async function readStateOn(runner, account, campaignAddr) {
     withDefault(c.surplusBase(), 0n),
     withDefault(c.surplusPaid(), 0n),
   ]);
-  const order = await readMarketOrder(c);
+  const order = await readCircuitOrder(c);
 
   const n = Number(listingCount);
   // 逐条降级：单条挂单读失败不应让整期状态读不出来。
@@ -586,7 +584,7 @@ async function readStateOn(runner, account, campaignAddr) {
   const refundShort = Number(scene) === 1
     && Number(phase) === 1
     && raisedBnb < outstandingShares * sharePriceBnb;
-  // 工厂已移除该期时，cancelTransistorOrder 允许任何人撤剩余单（合约里的 _retired 口径）。
+  // 工厂已移除该期时，cancelCircuitListing 允许任何人撤剩余挂卖（合约里的 _retired 口径）。
   let retired = false;
   try {
     if (factoryAddr && factoryAddr !== ZeroAddress) {
@@ -613,22 +611,20 @@ async function readStateOn(runner, account, campaignAddr) {
     totalRefunded, totalPendingSurplus, raisedBnb, netlistHash: null,
     soldOutAt: Number(soldOutAt), executionFailed, priceLock,
     /**
-     * 晶体管数 = **已成交到账量**（各腿 挂单量 − 市场 remaining），不是挂单量。
-     * 合约在 placeTransistorOrder 就把 nandQty/latchQty 写成下单量，
-     * 拿它当「已买入」会让「等待成交」的期次显示已买到晶体管（数据自相矛盾）。
-     * 挂单量本身仍通过 nandQty/latchQty 暴露，供挂单进度展示。
+     * 电路数 = **本期仍持有的 ERC721 电路张数**（circuitHeldCount）。
+     * 买入是原子交割，成交后立刻到账；卖出 / 入池后持仓下降。
      */
-    transistorCount: Number(order.nandFilled ?? 0n) + Number(order.latchFilled ?? 0n), capped: false,
+    circuitHeldCount: Number(order.heldCount ?? 0n), capped: false,
     owner, fundingDeadline: Number(fundingDeadline),
-    /** 熔断状态：true 时认筹/挂单/卖晶体管/入池/份额挂单与接单全部停，pulls 与撤单不受影响。 */
+    /** 熔断状态：true 时认筹/挂单/卖电路/入池/份额挂单与接单全部停，pulls 与撤单不受影响。 */
     halted: Boolean(halted),
     listings,
     ...order,
     pooled, miningPool,
-    // 开期即写入的晶体管合约优先；挂单后的 market 字段若为空也不要盖掉
-    transistors: order.transistors && order.transistors !== ZeroAddress ? order.transistors : transistorsAddr,
+    circuits: order.circuits && order.circuits !== ZeroAddress ? order.circuits : circuitsAddr,
     feeRecipient: "",
     market: marketAddr,
+    circuitMarket: marketAddr,
     markFailedAt,
     refundShort,
     /**
@@ -720,24 +716,29 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       return `${Number(formatEther(state.totalRefunded)).toFixed(4)} BNB`;
     case "raisedBnb":
       return `${Number(formatEther(state.raisedBnb)).toFixed(4)} BNB`;
-    case "transistors":
-      return state.transistors || "—";
+    case "circuits":
+      return state.circuits || "—";
     case "market":
-    case "materialMarket":
-      return state.market || "—";
+    case "circuitMarket":
+      return state.circuitMarket || state.market || "—";
+    case "circuitHeldCount":
+      return `${state.circuitHeldCount ?? 0} 张`;
+    case "circuitCount":
+      return withReadProvider(async (runner) => `${await campaignContract(runner, campaignAddr).circuitCount()} 张（历史买入）`);
     case "marketOpenOrders":
       return readMarketBook(campaignAddr);
-    case "marketBids":
-      return withReadProvider((runner) => readMarketBidView(runner, campaignAddr, args.id || 1));
+    case "marketListing":
+      return readListingView(args.id || 1, campaignAddr);
     case "marketSellable":
       return withReadProvider(async (runner) => {
-        const c = campaignContract(runner, campaignAddr);
-        const marketAddr = await readMaterialMarket(c);
-        const transistors = await c.transistors().catch(() => ZeroAddress);
-        const bids = await readSellableBids(runner, marketAddr, transistors, campaignAddr);
-        if (!bids.length) return "没有可吃的买单（标的是本期晶体管且有剩余量）";
-        return bids
-          .map((b) => `买单 #${b.id} · ${TOKEN_LABEL[b.tokenId]} 剩余 ${b.remaining} · 单价 ${formatEther(b.price)} BNB · 买家 ${shortAddr(b.buyer)}`)
+        const campaign = campaignContract(runner, campaignAddr);
+        const marketAddr = await readCircuitMarket(campaign);
+        if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return "本期没有配置电路市场";
+        const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
+        const rows = await scanCircuitListings(campaign, market);
+        if (!rows.length) return "市场里还没有本期电路的卖单";
+        return rows
+          .map((l) => `挂单 #${l.id} · 电路 #${l.tokenId} · 单价 ${formatEther(l.price)} BNB · 卖家 ${shortAddr(l.seller)}`)
           .join("\n");
       });
     case "marketOwed":
@@ -754,7 +755,7 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
         : "—";
     case "priceLock":
       return Number(state.priceLock) > 0
-        ? `${Number(formatEther(state.priceLock)).toFixed(4)} BNB（${state.transistorCount} 颗）`
+        ? `${Number(formatEther(state.priceLock)).toFixed(4)} BNB（${state.circuitHeldCount} 张电路）`
         : "未锁价";
     case "holderCount":
       return `${await campaignContract(getReadProvider(), campaignAddr).holderCount()} 个地址`;
@@ -883,157 +884,124 @@ export async function readAccountAcrossCampaigns(account, addrs) {
   return rows;
 }
 
-/** 读本期接的晶体管市场地址；读不到按零地址处理（展示层显示「未配置」）。 */
-async function readMaterialMarket(c) {
+/** 读本期接的电路市场地址；读不到按零地址处理（展示层显示「未配置」）。 */
+async function readCircuitMarket(c) {
   try {
-    const a = await c.materialMarket();
+    const a = await c.circuitMarket();
     return isAddr(a) && a !== ZeroAddress ? a : ZeroAddress;
   } catch {
     return ZeroAddress;
   }
 }
 
+const ERC721_READ_ABI = [
+  "function ownerOf(uint256) view returns (address)",
+  "function balanceOf(address) view returns (uint256)",
+];
+
 /**
- * 本期挂单 / 卖出席位读数。
+ * 本期电路持仓 / 市场读数，映射成页面长期使用的那套 book 字段。
  *
- * 本期合约的买单与成本基准 getter 一定存在，读失败属于 RPC 异常，直接返回空值让
- * 页面显示「未挂单」，不把它伪装成「旧合约」；市场侧读数（remaining / owed / 可吃买单）
- * 单独降级，缺一项不影响其余字段。
+ * 电路市场只有卖单侧且无托管：
+ *   - 采购是 buyCircuits 原子吃单，成交后 NFT 立刻到期次合约（没有「等成交」的挂单）；
+ *   - 卖出是 listCircuit 把某张 NFT 挂回市场，成交前 NFT 仍在期次合约里；
+ *   - 卖家货款进 owed(address)，需要 withdrawMarketProceeds 提回。
+ *
+ * 字段说明：
+ *   heldCount = 本期持有的电路张数（circuitHeldCount）；
+ *   sellBids = 尚未挂单的持仓，每张一行（id = tokenId），点击卖出 = 以成本价挂回市场；
+ *   listedCircuits = 已挂单的持仓，供 Owner 撤单（撤单后才能入池）。
  */
-async function readMarketOrder(c) {
+async function readCircuitOrder(c) {
   const empty = {
-    nandBidId: 0n, latchBidId: 0n, nandQty: 0n, latchQty: 0n,
-    nandPrice: 0n, latchPrice: 0n, transistors: ZeroAddress, orderFilled: false,
-    nandCostBasis: 0n, latchCostBasis: 0n,
-    partsNand: 0n, partsLatch: 0n, marketOwed: 0n, sellBids: [], sellSide: false,
-    nandFilled: 0n, latchFilled: 0n,
+    circuits: ZeroAddress, orderFilled: false,
+    marketOwed: 0n, sellBids: [], listedCircuits: [], sellSide: false,
+    heldCount: 0n, boughtCount: 0n, circuitHeldCount: 0n,
   };
   try {
-    const [
-      nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled,
-      nandCostBasis, latchCostBasis,
-    ] = await Promise.all([
-      c.nandBidId(), c.latchBidId(), c.nandQty(), c.latchQty(), c.nandPrice(), c.latchPrice(),
-      c.transistors(), c.orderFilled(),
-      c.nandCostBasis().catch(() => 0n), c.latchCostBasis().catch(() => 0n),
+    const holder = c.target;
+    const circuits = await c.circuits();
+    const marketAddr = await readCircuitMarket(c);
+    const [boughtCount, heldCount] = await Promise.all([
+      c.circuitCount().catch(() => 0n),
+      c.circuitHeldCount().catch(() => 0n),
     ]);
-    const marketAddr = await readMaterialMarket(c);
-    const [nandRemaining, latchRemaining] = await Promise.all([
-      readLegRemaining(c.runner, marketAddr, nandBidId, nandQty),
-      readLegRemaining(c.runner, marketAddr, latchBidId, latchQty),
-    ]);
-    const sell = await readMarketSell(c, marketAddr, transistors);
-    /**
-     * 成交到账量 —— 与「挂单量」是两个不同的东西，不能混用。
-     * 合约在 placeTransistorOrder 时就把 nandQty/latchQty 写成**下单量**，
-     * 只有撤单 _clearOrder 才清零。所以「已经买到几颗」必须用市场剩余量反推：
-     *   filled = 挂单量 − bids(id).remaining
-     * 挂单还在等成交时 remaining == qty → filled = 0。
-     * 撤单后 bid id 归零、qty 也被清，此时手里还留着的晶体管（余额）就是当初成交到的量。
-     */
-    const filledOf = (qty, remaining, bidId, held) => {
-      if (bidId !== 0n) {
-        const rem = remaining == null ? qty : remaining;
-        return qty > rem ? qty - rem : 0n;
+    const token = isAddr(circuits) && circuits !== ZeroAddress
+      ? new Contract(circuits, ERC721_READ_ABI, c.runner)
+      : null;
+    const market = isAddr(marketAddr) && marketAddr !== ZeroAddress
+      ? new Contract(marketAddr, CIRCUIT_MARKET_ABI, c.runner)
+      : null;
+
+    const n = Number(boughtCount);
+    const ids = n > 0
+      ? await Promise.all(Array.from({ length: n }, (_, i) => c.circuitIds(i).catch(() => null)))
+      : [];
+    const rows = await Promise.all(ids.filter((v) => v != null).map(async (tokenId) => {
+      const [cost, listingId] = await Promise.all([
+        c.circuitCostBasis(tokenId).catch(() => 0n),
+        c.circuitListingId(tokenId).catch(() => 0n),
+      ]);
+      let owned = false;
+      if (token) {
+        try {
+          owned = String(await token.ownerOf(tokenId)).toLowerCase() === String(holder).toLowerCase();
+        } catch {
+          owned = false;
+        }
       }
-      return held || 0n;
-    };
-    const nandFilled = filledOf(nandQty, nandRemaining, nandBidId, sell.partsNand);
-    const latchFilled = filledOf(latchQty, latchRemaining, latchBidId, sell.partsLatch);
+      let listed = false;
+      let listingPrice = 0n;
+      if (owned && listingId !== 0n && market) {
+        try {
+          const live = await market.listingFor(circuits, tokenId);
+          listed = Boolean(live.valid) && live.id === listingId;
+          listingPrice = live.price;
+        } catch {
+          listed = false;
+        }
+      }
+      return { tokenId, cost, listingId, owned, listed, listingPrice };
+    }));
+
+    const held = rows.filter((r) => r.owned);
+    const unlisted = held.filter((r) => !r.listed);
+    const listed = held.filter((r) => r.listed);
+    // 成本基准取最高的一张：挂单底价必须覆盖每一张的买入成本，避免低价烧抵押。
+    const floor = held.reduce((m, r) => (r.cost > m ? r.cost : m), 0n);
+    const marketOwed = market ? await market.owed(holder).catch(() => 0n) : 0n;
+    const feeBps = market ? Number(await market.feeBps().catch(() => 0)) : 0;
+
     return {
-      nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled,
-      nandCostBasis, latchCostBasis,
-      nandRemaining, latchRemaining, nandFilled, latchFilled, ...sell,
+      circuits,
+      orderFilled: heldCount > 0n,
+      heldCount,
+      boughtCount,
+      circuitHeldCount: heldCount,
+      marketOwed,
+      sellSide: Boolean(market),
+      // 每张未挂单的持仓一行；价格预填成本价（>= 成本才允许挂）。
+      sellBids: unlisted.map((r) => ({
+        id: r.tokenId,
+        tokenId: 0,
+        price: r.cost,
+        remaining: 1n,
+        feeBps,
+        buyer: marketAddr,
+        circuitTokenId: r.tokenId,
+      })),
+      listedCircuits: listed.map((r) => ({
+        tokenId: r.tokenId,
+        listingId: r.listingId,
+        price: r.listingPrice || r.cost,
+        cost: r.cost,
+      })),
     };
   } catch {
     return empty;
   }
 }
 
-/**
- * 卖出侧读数。官方晶体管市场**没有卖单簿**，所以这里不存在"本期挂着的卖单"，
- * 只有三样东西：合约手里的晶体管余额、市场欠本期的款、以及**可以吃的外部买单**。
- */
-async function readMarketSell(c, marketAddr, transistors) {
-  const blank = { partsNand: 0n, partsLatch: 0n, marketOwed: 0n, sellBids: [], sellSide: false };
-  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return blank;
-  const holder = c.target;
-  try {
-    const [partsNand, partsLatch, marketOwed, sellBids] = await Promise.all([
-      readPartBalance(c.runner, transistors, holder, 0),
-      readPartBalance(c.runner, transistors, holder, 1),
-      readMarketOwed(c.runner, marketAddr, holder),
-      readSellableBids(c.runner, marketAddr, transistors, holder),
-    ]);
-    return { partsNand, partsLatch, marketOwed, sellBids, sellSide: true };
-  } catch {
-    return blank;
-  }
-}
-
-/**
- * 挑出本期能吃的外部买单：标的是本期晶体管合约、还有剩余量、买家不是本期自己。
- * 全部读 `bids(id)`，不扫日志；只回看最近 500 张，按单价从高到低（同价新单在前）。
- */
-async function readSellableBids(runner, marketAddr, transistors, holder) {
-  const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
-  let next = 1n;
-  try {
-    next = await market.nextBidId();
-  } catch {
-    return [];
-  }
-  const first = next > 500n ? next - 500n : 1n;
-  const ids = [];
-  for (let i = next - 1n; i >= first && ids.length < 20; i--) ids.push(i);
-  const rows = await Promise.all(ids.map(async (bidId) => {
-    try {
-      const b = await market.bids(bidId);
-      if (b.remaining === 0n) return null;
-      if (!isAddr(b.transistors) || b.transistors.toLowerCase() !== String(transistors).toLowerCase()) return null;
-      if (String(b.buyer).toLowerCase() === String(holder).toLowerCase()) return null;
-      return {
-        id: bidId,
-        tokenId: Number(b.tokenId),
-        price: BigInt(b.price),
-        remaining: BigInt(b.remaining),
-        feeBps: Number(b.feeBps),
-        buyer: b.buyer,
-      };
-    } catch {
-      return null;
-    }
-  }));
-  return rows
-    .filter(Boolean)
-    .sort((a, b) => (a.price === b.price ? Number(b.id - a.id) : a.price > b.price ? -1 : 1));
-}
-
-async function readPartBalance(runner, transistors, holder, tokenId) {
-  if (!transistors || transistors === ZeroAddress || !holder) return 0n;
-  try {
-    const token = new Contract(transistors, ["function balanceOf(address,uint256) view returns (uint256)"], runner);
-    return await token.balanceOf(holder, tokenId);
-  } catch {
-    return 0n;
-  }
-}
-
-async function readLegRemaining(runner, marketAddr, id, qty) {
-  if (marketAddr == null) return null;
-  if (marketAddr === ZeroAddress || id === 0n || qty === 0n) return 0n;
-  try {
-    const market = new Contract(marketAddr, [
-      "function bids(uint256) view returns (address buyer, address transistors, uint96 price, uint8 tokenId, uint16 feeBps, uint256 remaining)",
-    ], runner);
-    const bid = await market.bids(id);
-    return bid.remaining;
-  } catch {
-    return null;
-  }
-}
-
-/** 卖出成交款先落在市场 owed，不提取的话 openRefund / depositToPool 会被合约拒绝。 */
 async function readMarketOwed(runner, marketAddr, account) {
   if (!marketAddr || marketAddr === ZeroAddress || !account) return 0n;
   try {
@@ -1044,53 +1012,55 @@ async function readMarketOwed(runner, marketAddr, account) {
   }
 }
 
-// ── 晶体管市场（Mock）调试：查看订单簿 + 模拟卖方/买方成交 ──
-const TOKEN_LABEL = ["NAND", "LATCH"];
+// ── 电路市场（sell-side）调试：查看挂单 + 市场欠款 ──
 const shortAddr = (a) => (isAddr(a) ? `${a.slice(0, 6)}…${a.slice(-4)}` : String(a || "—"));
 
-/** 本期合约接的晶体管市场，并确认它带 Mock 订单簿（nextBidId / bids）。 */
+/** 本期合约接的电路市场。官方市场与 Mock 都提供 sell-side ABI。 */
 async function marketHandle(runner, campaignAddr = getCampaignAddress()) {
   const campaign = campaignContract(runner, campaignAddr);
-  const marketAddr = await readMaterialMarket(campaign);
+  const marketAddr = await readCircuitMarket(campaign);
   if (!isAddr(marketAddr) || marketAddr === ZeroAddress) {
-    throw new Error("本期合约没有配置晶体管市场（market 为 0）。");
+    throw new Error("本期合约没有配置电路市场（circuitMarket 为 0）。");
   }
-  const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
+  const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
   try {
-    await market.nextBidId();
+    await market.nextListingId();
   } catch {
-    throw new Error("这期接的晶体管市场没有 Mock 订单簿（nextBidId 调用失败），不能模拟撮合。");
+    throw new Error("这期接的电路市场不提供 nextListingId，无法读取挂单。");
   }
   return { campaign, market, marketAddr };
 }
 
-/** 列出市场里所有未成交的买单，供调试页直接看。市场没有卖单侧，所以只有买单。 */
+/** 列出市场里属于本期电路合约、仍未成交的卖单。 */
 export async function readMarketBook(campaignAddr = getCampaignAddress()) {
   return withReadProvider(async (runner) => {
-    const { market, marketAddr } = await marketHandle(runner, campaignAddr);
-    const nextBid = await market.nextBidId();
-    const lines = [`市场 ${shortAddr(marketAddr)}`];
-    // 上限 500 张，并发读：串行 500 次 RPC 会让调试页转十几秒。
-    const top = nextBid - 1n > 500n ? 500n : nextBid - 1n;
+    const { campaign, market, marketAddr } = await marketHandle(runner, campaignAddr);
+    const circuits = String(await campaign.circuits()).toLowerCase();
+    const next = await market.nextListingId();
+    const lines = [`市场 ${shortAddr(marketAddr)}（卖家付 ${Number(await market.feeBps().catch(() => 0)) / 100}% 费）`];
+    // 上限 300 张，并发读：串行读几百张 RPC 会让调试页转十几秒。
+    const top = next - 1n > 300n ? next - 1n - 300n : 1n;
     const ids = [];
-    for (let i = 1n; i <= top; i++) ids.push(i);
-    const bids = await Promise.all(ids.map((id) => market.bids(id).catch(() => null)));
+    for (let i = next - 1n; i >= top && ids.length < 100; i--) ids.push(i);
+    const listings = await Promise.all(ids.map((id) => market.listings(id).catch(() => null)));
     let open = 0;
-    bids.forEach((b, idx) => {
-      if (!b || b.remaining === 0n) return;
+    listings.forEach((l, idx) => {
+      if (!l || String(l.circuits).toLowerCase() !== circuits) return;
       open += 1;
-      lines.push(`买单 #${ids[idx]} · ${TOKEN_LABEL[Number(b.tokenId)] || b.tokenId} 剩余 ${b.remaining} · 单价 ${formatEther(b.price)} BNB · 买家 ${shortAddr(b.buyer)}`);
+      lines.push(`挂单 #${ids[idx]} · token #${l.tokenId} · 单价 ${formatEther(l.price)} BNB · 卖家 ${shortAddr(l.seller)}`);
     });
-    if (open === 0) lines.push("订单簿没有未成交买单");
+    if (open === 0) lines.push("市场里没有本期电路的卖单");
     return lines.join("\n");
   });
 }
 
-async function readMarketBidView(runner, campaignAddr, id) {
-  const { market } = await marketHandle(runner, campaignAddr);
-  const bidId = parseUintField(id, "买单 ID");
-  const b = await market.bids(bidId);
-  return `买单 #${bidId} · ${TOKEN_LABEL[Number(b.tokenId)] || b.tokenId} · 买家 ${shortAddr(b.buyer)} · 单价 ${formatEther(b.price)} BNB · 剩余 ${b.remaining} · 手续费 ${b.feeBps} bps`;
+async function readListingView(id, campaignAddr) {
+  return withReadProvider(async (runner) => {
+    const { market } = await marketHandle(runner, campaignAddr);
+    const listingId = parseUintField(id, "挂单 ID");
+    const l = await market.listings(listingId);
+    return `挂单 #${listingId} · 电路 #${l.tokenId} · 卖家 ${shortAddr(l.seller)} · 单价 ${formatEther(l.price)} BNB · 卖家费 ${l.feeBps} bps`;
+  });
 }
 
 async function readMarketOwedView(runner, campaignAddr, account) {
@@ -1098,7 +1068,7 @@ async function readMarketOwedView(runner, campaignAddr, account) {
   return `${formatEther(await market.owed(account || campaignAddr))} BNB`;
 }
 
-// ── 待执行状态的晶体管市场成交记录 ──
+// ── 待执行状态的电路市场成交记录 ──
 const MARKET_LOG_WINDOWS = 6; // 最多回看 6 × 50k 块（约 10 天）；凑满条数会提前停
 const MARKET_LOG_SPAN = 50_000;
 /** 历史交易记录只保留最近这么多条（窄栏放不下更多，也不该翻旧账）。 */
@@ -1146,10 +1116,12 @@ function saveTradeMarksCache(campaignAddr, lastBlock, rows) {
 async function readTradeMarks(runner, campaignAddr, latest) {
   const iface = new Interface(CAMPAIGN_ABI);
   const names = [
-    "TransistorOrderPlaced",
-    "TransistorOrderCancelled",
-    "TransistorsSold",
-    "TransistorsConfirmed",
+    "CircuitsBought",
+    "CircuitBought",
+    "CircuitListed",
+    "CircuitListingCancelled",
+    "CircuitsConfirmed",
+    "MarketProceedsWithdrawn",
   ];
   // topics 是「每个位置可选的取值集合」：五个事件都是 topic0，必须塞进同一个位置数组才是 OR。
   const hashes = [];
@@ -1263,62 +1235,59 @@ function clearMarketNoEvents(addr) {
 }
 
 /**
- * 市场事件 → 历史交易记录行。只认「先出现 BidPlaced 且买方是本期」的订单号，
- * 再按订单号收该单的成交与撤回 —— 否则把别人的成交也画进来。
- * 卖出是原子吃单（没有 AskPlaced），记录由 readMarketTradesOnce 用 TransistorsSold 补齐。
+ * 电路市场事件 → 历史交易记录行。只收本期自己的挂单 / 成交 / 撤单 / 提款：
+ *   Listed(id, seller, circuits, tokenId, price)   seller == 本期 → 挂出
+ *   Bought(id, buyer, seller, tokenId, price, feeBps)
+ *     buyer == 本期 → 买入；seller == 本期 → 卖出（净得 price − fee）
+ *   Delisted(id) → 撤回自己的挂单
+ *   ProceedsWithdrawn(account, amount) → 本期提款
  */
 function buildMarketRows(parsed, me) {
-  const bidIds = new Set();
-  const bidMeta = new Map();
-  for (const e of parsed) {
-    if (e.name === "BidPlaced" && String(e.args.buyer).toLowerCase() === me) {
-      bidIds.add(String(e.args.id));
-      bidMeta.set(String(e.args.id), { price: e.args.price, part: TOKEN_LABEL[Number(e.args.tokenId)] || String(e.args.tokenId) });
-    }
-  }
-
+  const myListings = new Set();
   const rows = [];
+  const bnb = (wei) => Number(formatEther(BigInt(wei || 0)));
   for (const e of parsed) {
     const id = e.args?.id != null ? String(e.args.id) : "";
-    const isBid = e.name.startsWith("Bid");
-    if (isBid && !bidIds.has(id)) continue;
-    if (e.name === "ProceedsWithdrawn" && String(e.args.account).toLowerCase() !== me) continue;
-    let row;
-    if (e.name === "BidPlaced") {
-      row = { kind: "place", side: "buy", id, qty: e.args.quantity, price: e.args.price, amount: null, part: TOKEN_LABEL[Number(e.args.tokenId)] || String(e.args.tokenId) };
-    } else if (e.name === "BidFilled") {
-      const meta = bidMeta.get(id) || {};
-      /**
-       * 晶体管市场：BidFilled(id, seller, quantity, proceeds, fee) —— fee 恒 1%，
-       * 买家为这批晶体管付出的托管额 = proceeds + fee。
-       * Mock：BidFilled(id, quantity, remaining) —— 没有金额，留空。
-       */
-      let amount = null;
-      if (e.args.proceeds != null && e.args.fee != null) {
-        try { amount = (BigInt(e.args.proceeds) + BigInt(e.args.fee)).toString(); } catch { amount = null; }
+    const tokenId = e.args?.tokenId != null ? Number(e.args.tokenId) : null;
+    const base = { id, tokenId, txHash: e.hash || null, blockNumber: e.blockNumber ?? null };
+    if (e.name === "Listed") {
+      if (String(e.args.seller).toLowerCase() !== me) continue;
+      myListings.add(id);
+      rows.push({ ...base, kind: "list", side: "sell", qty: 1, price: bnb(e.args.price), amount: null });
+    } else if (e.name === "Bought") {
+      const buyer = String(e.args.buyer).toLowerCase();
+      const seller = String(e.args.seller).toLowerCase();
+      if (buyer !== me && seller !== me) continue;
+      let amount = BigInt(e.args.price);
+      if (seller === me) {
+        const fee = (BigInt(e.args.price) * BigInt(e.args.feeBps || 0)) / 10000n;
+        amount -= fee;
       }
-      row = { kind: "fill", side: "buy", id, qty: e.args.quantity, remaining: e.args.remaining, price: meta.price ?? null, part: meta.part || "—", amount };
-    } else if (e.name === "BidCancelled") {
-      row = { kind: "cancel", side: "buy", id, amount: e.args.refund };
+      rows.push({
+        ...base,
+        kind: "fill",
+        side: buyer === me ? "buy" : "sell",
+        qty: 1,
+        price: bnb(e.args.price),
+        amount: bnb(amount),
+      });
+    } else if (e.name === "Delisted") {
+      if (!myListings.has(id)) continue;
+      rows.push({ ...base, kind: "cancel", side: "sell", amount: null });
     } else if (e.name === "ProceedsWithdrawn") {
-      row = { kind: "withdraw", side: "sell", id: "", amount: e.args.amount };
-    } else {
-      continue;
+      if (String(e.args.account).toLowerCase() !== me) continue;
+      rows.push({ ...base, kind: "withdraw", side: "sell", id: "", amount: bnb(e.args.amount) });
     }
-    rows.push({ ...row, txHash: e.hash, blockNumber: e.blockNumber, ts: null });
   }
-  return rows;
+  return rows.map((row) => ({ ...row, ts: null }));
 }
 
 /**
- * 历史交易记录只需最近 MARKET_TRADE_LIMIT 条，所以从最新窗口往旧翻，
- * 够数就停 —— 不再固定扫满 6 个窗口（6 × 5 万块 ≈ 10 天，光等节点就要好几秒）。
+ * 历史交易记录只需最近 MARKET_TRADE_LIMIT 条，所以从最新窗口往旧翻，够数就停。
  */
 async function readMarketLogs(runner, marketAddr, campaignAddr, limit = MARKET_TRADE_LIMIT) {
-  const iface = new Interface(MATERIAL_MARKET_ABI);
+  const iface = new Interface(CIRCUIT_MARKET_ABI);
   const cacheKey = String(marketAddr).toLowerCase();
-  // 曾判过「没有事件」的市场：不再整段跳过，只探最新一个窗口 —— 判错（早先节点读不到）
-  // 时能自己恢复，不用等 10 分钟 TTL。
   const knownNoEvents = marketHasNoEvents(marketAddr);
   let latest;
   try {
@@ -1327,7 +1296,6 @@ async function readMarketLogs(runner, marketAddr, campaignAddr, limit = MARKET_T
     return null;
   }
 
-  // 首次回看固定窗口；之后只扫上次水位之后的新块，并把历史日志留在缓存里。
   const cursor = marketScanCursor.get(cacheKey);
   const ranges = [];
   if (cursor == null) {
@@ -1366,16 +1334,13 @@ async function readMarketLogs(runner, marketAddr, campaignAddr, limit = MARKET_T
       raw.push(...logs);
       ingest(logs);
     } catch {
-      // 节点限制区间：首次探测失败就当旧版市场（没有事件）；增量失败下次再补。
       if (cursor == null && raw.length === 0) return null;
       marketScanCursor.set(cacheKey, { lastBlock: latest, logs: raw });
       return buildMarketRows(parsed, me);
     }
-    // 最新窗口往往就够了：凑满 limit 条即停，不再往更早的窗口翻。
     if (limit > 0 && buildMarketRows(parsed, me).length >= limit) break;
   }
   marketScanCursor.set(cacheKey, { lastBlock: cursor ? Math.max(cursor.lastBlock, latest) : latest, logs: raw });
-  // 扫完整个回看区间仍然一条事件都没有：记下「没有事件」，之后每次只探最新窗口。
   if (!raw.length && cursor == null) {
     if (!knownNoEvents) markMarketNoEvents(marketAddr);
     return [];
@@ -1384,27 +1349,17 @@ async function readMarketLogs(runner, marketAddr, campaignAddr, limit = MARKET_T
   if (knownNoEvents) clearMarketNoEvents(marketAddr);
 
   const rows = buildMarketRows(parsed, me);
-  const needsTime = rows;
-  const times = await Promise.all([...new Set(needsTime.map((r) => r.blockNumber))].map((bn) => blockTime(runner, bn)));
-  const byBlock = new Map([...new Set(needsTime.map((r) => r.blockNumber))].map((bn, i) => [bn, times[i]]));
+  const times = await Promise.all([...new Set(rows.map((r) => r.blockNumber))].map((bn) => blockTime(runner, bn)));
+  const byBlock = new Map([...new Set(rows.map((r) => r.blockNumber))].map((bn, i) => [bn, times[i]]));
   for (const row of rows) row.ts = byBlock.get(row.blockNumber) ?? null;
   return rows.sort((a, b) => (a.blockNumber - b.blockNumber) || String(a.kind).localeCompare(String(b.kind)));
 }
 
-function legStatus(side, qty, remaining) {
-  if (qty <= 0) return "empty";
-  if (remaining == null) return "open";
-  if (remaining > 0) return remaining < qty ? "partial" : "open";
-  return "filled";
-}
-
 /**
- * 待执行状态的晶体管市场成交记录：本期买单 + 卖出记录 + 市场欠款。
- * 官方市场没有卖单簿，卖出是原子吃单，所以卖出的每一笔都来自本期的 TransistorsSold 事件。
+ * 待执行 / Ready 的电路市场成交记录：本期买入 + 挂回卖出 + 市场欠款。
  */
 export async function readMarketTrades(campaignAddr = getCampaignAddress()) {
   if (!isAddr(campaignAddr)) return null;
-  // 同一页可能同时挂大卡片和 Owner 侧栏两个面板：共用一次读取，别把请求翻倍。
   const key = String(campaignAddr).toLowerCase();
   if (marketTradesInflight.has(key)) return marketTradesInflight.get(key);
   const task = readMarketTradesOnce(campaignAddr).finally(() => {
@@ -1419,187 +1374,103 @@ const marketTradesInflight = new Map();
 async function readMarketTradesOnce(campaignAddr) {
   return withReadProvider(async (runner) => {
     const c = campaignContract(runner, campaignAddr);
-    const marketAddr = await readMaterialMarket(c);
+    const marketAddr = await readCircuitMarket(c);
     if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return null;
-    const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
+    const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
+    const circuits = await c.circuits().catch(() => ZeroAddress);
 
-    const [
-      nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice,
-      transistors, ordered,
-    ] = await Promise.all([
-      c.nandBidId().catch(() => 0n), c.latchBidId().catch(() => 0n),
-      c.nandQty().catch(() => 0n), c.latchQty().catch(() => 0n),
-      c.nandPrice().catch(() => 0n), c.latchPrice().catch(() => 0n),
-      c.transistors().catch(() => ZeroAddress),
-      c.orderFilled().catch(() => false),
+    const [boughtCount, heldCount, activeListings] = await Promise.all([
+      c.circuitCount().catch(() => 0n),
+      c.circuitHeldCount().catch(() => 0n),
+      c.activeListingCount().catch(() => 0n),
     ]);
+    const owed = await market.owed(campaignAddr).catch(() => 0n);
 
-    let owed = 0n;
-    try {
-      owed = await market.owed(campaignAddr);
-    } catch {
-      owed = 0n;
-    }
+    const n = Number(boughtCount);
+    const ids = n > 0
+      ? await Promise.all(Array.from({ length: n }, (_, i) => c.circuitIds(i).catch(() => null)))
+      : [];
+    const rows = await Promise.all(ids.filter((v) => v != null).map(async (tokenId) => {
+      const [cost, listingId] = await Promise.all([
+        c.circuitCostBasis(tokenId).catch(() => 0n),
+        c.circuitListingId(tokenId).catch(() => 0n),
+      ]);
+      let listingPrice = 0n;
+      if (listingId !== 0n && isAddr(circuits) && circuits !== ZeroAddress) {
+        try {
+          const live = await market.listingFor(circuits, tokenId);
+          if (live.valid && live.id === listingId) listingPrice = live.price;
+        } catch {
+          listingPrice = 0n;
+        }
+      }
+      return { tokenId, cost, listingId, listingPrice };
+    }));
 
-    const legs = [];
-    const bidLegs = [
-      { part: "NAND", id: nandBidId, qty: nandQty, price: nandPrice },
-      { part: "LATCH", id: latchBidId, qty: latchQty, price: latchPrice },
-    ];
-    for (const leg of bidLegs) {
-      if (leg.id === 0n || leg.qty === 0n) continue;
-      const bid = await market.bids(leg.id).catch(() => null);
-      const remaining = bid ? Number(bid.remaining) : null;
-      const filled = remaining == null ? null : Math.max(0, Number(leg.qty) - remaining);
-      legs.push({
-        side: "buy",
-        part: leg.part,
-        orderId: String(leg.id),
-        orderQty: Number(leg.qty),
-        price: formatEther(leg.price),
-        filled,
-        remaining,
-        amount: filled == null ? null : formatEther(BigInt(filled) * leg.price),
-        status: legStatus("buy", Number(leg.qty), remaining),
+    const spent = rows.reduce((acc, r) => acc + Number(formatEther(r.cost)), 0);
+    const buyLegs = boughtCount > 0n ? [{
+      side: "buy",
+      part: "电路",
+      orderId: "—",
+      orderQty: Number(boughtCount),
+      price: Number(boughtCount) > 0 ? Number(formatEther(rows.reduce((acc, r) => acc + r.cost, 0n) / boughtCount)) : null,
+      filled: Number(boughtCount),
+      remaining: 0,
+      amount: spent,
+      status: "settled",
+      live: false,
+      placedAt: null,
+      filledAt: null,
+      cancelAt: null,
+      confirmedAt: null,
+    }] : [];
+
+    const sellLegs = rows
+      .filter((r) => r.listingId !== 0n)
+      .map((r) => ({
+        side: "sell",
+        part: "电路",
+        orderId: String(r.listingId),
+        orderQty: 1,
+        price: Number(formatEther(r.listingPrice || r.cost)),
+        filled: 0,
+        remaining: 1,
+        amount: null,
+        status: "open",
         live: true,
-      });
-    }
+        placedAt: null,
+        filledAt: null,
+        cancelAt: null,
+        confirmedAt: null,
+        tokenId: Number(r.tokenId),
+      }));
 
-    let partsNand = 0;
-    let partsLatch = 0;
-    if (isAddr(transistors) && transistors !== ZeroAddress) {
-      try {
-        const token = new Contract(transistors, [
-          "function balanceOf(address,uint256) view returns (uint256)",
-        ], runner);
-        const [n, l] = await Promise.all([token.balanceOf(campaignAddr, 0), token.balanceOf(campaignAddr, 1)]);
-        partsNand = Number(n);
-        partsLatch = Number(l);
-      } catch {
-        /* 晶体管合约不可读时按 0 处理 */
-      }
-    }
-
-    // 市场事件只覆盖买单侧（挂单 / 成交 / 撤回 / 提取）；卖出记录来自本期的 TransistorsSold。
     const events = await readMarketLogs(runner, marketAddr, campaignAddr).catch(() => null);
+    const feed = Array.isArray(events) ? [...events] : [];
+    /** 卖出回款取链上事件（卖家实收 = 成交价 − 手续费）；读不到事件就留 0。 */
+    const soldFills = feed.filter((row) => row.kind === "fill" && row.side === "sell");
+    const sellProceeds = soldFills.reduce((acc, row) => acc + (Number(row.amount) || 0), 0);
 
-    let marks = null;
-    try {
-      const latest = await runner.getBlockNumber();
-      marks = await readTradeMarks(runner, campaignAddr, latest);
-    } catch {
-      marks = null;
-    }
-    const bidPlaced = lastMark(marks, "TransistorOrderPlaced");
-    const bidCancel = lastMark(marks, "TransistorOrderCancelled");
-    const confirmed = lastMark(marks, "TransistorsConfirmed");
-
-    /**
-     * 卖出腿：官方市场没有卖单簿，卖出是"吃一张已挂买单"的原子动作，不存在挂着的卖单。
-     * 每笔卖出都来自本期的 TransistorsSold(bidId, tokenId, quantity, proceeds)；
-     * proceeds 已扣 1% 市场费，所以这里的单价是**净得款单价**，不假装是挂价。
-     */
-    const sellEvents = [];
-    if (Array.isArray(marks)) {
-      for (const m of marks) {
-        if (m.name !== "TransistorsSold") continue;
-        const qty = Number(m.args?.quantity || 0);
-        let proceeds = 0n;
-        try { proceeds = BigInt(m.args?.proceeds || "0"); } catch { proceeds = 0n; }
-        const tokenId = Number(m.args?.tokenId || 0);
-        const part = TOKEN_LABEL[tokenId] || String(tokenId);
-        const netPrice = qty > 0 ? formatEther(proceeds / BigInt(qty)) : null;
-        legs.push({
-          side: "sell",
-          part,
-          orderId: String(m.args?.bidId || ""),
-          orderQty: qty || null,
-          price: netPrice,
-          filled: qty || null,
-          remaining: 0,
-          amount: formatEther(proceeds),
-          status: "settled",
-          live: false,
-          placedAt: null,
-          filledAt: m.ts ?? null,
-          cancelAt: null,
-          confirmedAt: null,
-        });
-        sellEvents.push({
-          kind: "fill",
-          side: "sell",
-          id: String(m.args?.bidId || ""),
-          qty: qty || null,
-          price: null,
-          amount: String(proceeds),
-          part,
-          txHash: m.txHash,
-          blockNumber: m.blockNumber,
-          ts: m.ts ?? null,
-        });
-      }
-    }
-
-    for (const leg of legs) {
-      if (leg.side !== "buy") continue;
-      leg.placedAt = bidPlaced?.ts ?? null;
-      leg.cancelAt = bidCancel && bidPlaced && bidCancel.blockNumber >= bidPlaced.blockNumber
-        ? bidCancel.ts ?? null
-        : null;
-      // 只有确认发生在本次挂单之后，才算这一单到账，避免把上一轮的时间贴到新单上。
-      leg.confirmedAt = confirmed && bidPlaced && confirmed.blockNumber >= bidPlaced.blockNumber
-        ? confirmed.ts ?? null
-        : null;
-    }
-
-    /**
-     * 时间优先取市场事件本身：给的是**这一单**（按订单号）的挂出 / 成交 / 撤回时刻，
-     * 比本期合约的「最近一次挂单」更准。
-     */
-    if (Array.isArray(events) && events.length) {
-      const byId = new Map();
-      for (const evt of events) {
-        if (!evt.id) continue;
-        const row = byId.get(String(evt.id)) || {};
-        if (evt.kind === "place" && row.placedAt == null) row.placedAt = evt.ts ?? null;
-        if (evt.kind === "fill" && row.filledAt == null) row.filledAt = evt.ts ?? null;
-        if (evt.kind === "cancel" && row.cancelAt == null) row.cancelAt = evt.ts ?? null;
-        byId.set(String(evt.id), row);
-      }
-      for (const leg of legs) {
-        const ts = byId.get(String(leg.orderId));
-        if (!ts) continue;
-        if (leg.placedAt == null) leg.placedAt = ts.placedAt ?? null;
-        if (leg.filledAt == null) leg.filledAt = ts.filledAt ?? null;
-        if (leg.cancelAt == null) leg.cancelAt = ts.cancelAt ?? null;
-      }
-    }
-
-    const buyLegs = legs.filter((l) => l.side === "buy");
-    const sellLegs = legs.filter((l) => l.side === "sell");
-    const sum = (rows, key) => rows.reduce((acc, r) => acc + (Number(r[key]) || 0), 0);
     const totals = {
-      buyQty: sum(buyLegs, "orderQty"),
-      buyFilled: sum(buyLegs, "filled"),
-      buySpent: buyLegs.reduce((acc, r) => acc + (Number(r.amount) || 0), 0),
-      sellQty: sum(sellLegs, "orderQty"),
-      sellFilled: sum(sellLegs, "filled"),
-      sellProceeds: sellLegs.reduce((acc, r) => acc + (Number(r.amount) || 0), 0),
+      buyQty: Number(boughtCount),
+      buyFilled: Number(boughtCount),
+      buySpent: spent,
+      sellQty: Number(activeListings) + soldFills.length,
+      sellFilled: soldFills.length,
+      sellProceeds,
       owed: Number(formatEther(owed)),
-      partsNand,
-      partsLatch,
+      partsHeld: Number(heldCount),
+      listed: Number(activeListings),
     };
-
-    const feed = Array.isArray(events) ? [...events, ...sellEvents] : sellEvents;
-    feed.sort((a, b) => (a.blockNumber || 0) - (b.blockNumber || 0));
 
     return {
       market: marketAddr,
-      orderFilled: Boolean(ordered),
-      legs,
+      circuits,
+      orderFilled: heldCount > 0n,
+      legs: [...buyLegs, ...sellLegs],
       totals,
       events: feed,
-      marks,
+      marks: null,
       supportsEvents: feed.length > 0,
     };
   });
@@ -1828,37 +1699,21 @@ export async function readCampaignSummary(address) {
 
 async function readCampaignSummaryOn(runner, address) {
   const c = campaignContract(runner, address);
-  // 合约**没有** transistorCount() 这个 getter——之前这里调它，
-  // 整行 Promise.all 直接 reject，历史期次列表全军覆没（还被 useChain 的 catch
-  // 兜底成「—」，页面不报错但数据全假）。
-  // 每个可选 getter 单独 catch，单个缺失只降级那一个字段，不拖垮整行。
-  const [scene, sold, totalShares, sharePriceBnb, estHashpower, raisedBnb, transistors] = await Promise.all([
+  /**
+   * 每项单独 catch：历史期次可能由旧版合约部署，缺 getter 不能让整行变成「—」。
+   * 电路数量用 circuitHeldCount()（本期仍持有的 ERC721 张数），不再猜挂单剩余。
+   */
+  const [scene, sold, totalShares, sharePriceBnb, estHashpower, raisedBnb, circuits, circuitCount, circuitHeldCount] = await Promise.all([
     c.scene().then(Number).catch(() => 0),
     c.sold().then(Number).catch(() => 0),
     c.totalShares().then(Number).catch(() => 0),
     c.sharePriceBnb().then((v) => Number(formatEther(v))).catch(() => 0),
     c.estHashpower().then(Number).catch(() => 0),
     c.raisedBnb().then((v) => Number(formatEther(v))).catch(() => 0),
-    c.transistors().catch(() => "0x0000000000000000000000000000000000000000"),
+    c.circuits().catch(() => ZeroAddress),
+    c.circuitCount().then(Number).catch(() => 0),
+    c.circuitHeldCount().then(Number).catch(() => 0),
   ]);
-  const [nandQtyBn, latchQtyBn, nandBidId, latchBidId, marketAddr] = await Promise.all([
-    c.nandQty().catch(() => 0n),
-    c.latchQty().catch(() => 0n),
-    c.nandBidId().catch(() => 0n),
-    c.latchBidId().catch(() => 0n),
-    readMaterialMarket(c).catch(() => ZeroAddress),
-  ]);
-  const [nandRemaining, latchRemaining] = await Promise.all([
-    readLegRemaining(runner, marketAddr, nandBidId, nandQtyBn).catch(() => null),
-    readLegRemaining(runner, marketAddr, latchBidId, latchQtyBn).catch(() => null),
-  ]);
-  /**
-   * 晶体管数 = 已成交到账量（挂单量 − 市场剩余），不是挂单量。
-   * 挂单未成交时 remaining == qty → 0；撤单后 ids/qty 归零，也就没有在途采购。
-   * 拿 nandQty + latchQty 当「已买入」会让等待成交的期次显示已买到晶体管。
-   */
-  const filledOf = (qty, remaining) => (remaining == null ? 0 : Math.max(0, Number(qty) - Number(remaining)));
-  const transistorCount = filledOf(nandQtyBn, nandRemaining) + filledOf(latchQtyBn, latchRemaining);
   // 结束状态不在 scene 里：执行失败与募集到期必须靠这几项判断。旧期次缺 getter 时按未结束处理。
   const [phase, executionFailed, fundingDeadline, totalRefunded, outstandingShares] = await Promise.all([
     c.phase().then(Number).catch(() => 0),
@@ -1884,12 +1739,13 @@ async function readCampaignSummaryOn(runner, address) {
     distributed: 0,
     feeBem: 0,
     raisedBnb: Number(raisedBnb),
-    transistorCount: Number(transistorCount),
-    transistors,
+    circuitCount,
+    circuitHeldCount,
+    circuits,
   };
 }
 
-// ── 模拟晶体管市场对手方成交（测试网调试） ──
+// ── 电路市场操作（含测试网 Mock 调试） ──
 function parseUintField(raw, label, fallback = null) {
   const text = String(raw ?? "").trim();
   if (!text) {
@@ -1900,72 +1756,152 @@ function parseUintField(raw, label, fallback = null) {
   return BigInt(text);
 }
 
-async function mintPartsOrThrow(parts, buyer, tokenId, amount) {
-  try {
-    return await parts.mint(buyer, tokenId, amount);
-  } catch (e) {
-    const msg = String(e?.shortMessage || e?.message || e).slice(0, 140);
-    throw new Error(`已成交，但补发晶体管失败：${msg}。可能不是 MockERC1155，请手动 mint。`);
-  }
-}
-
-/** 卖方成交一张买单：fillBid 扣减剩余，再把晶体管 mint 给买家（MockERC1155.mint 公开）。 */
-async function fillBidWithParts(signer, bidId, quantity) {
-  const { market } = await marketHandle(signer);
-  const id = parseUintField(bidId, "买单 ID");
-  const bid = await market.bids(id);
-  const qty = parseUintField(quantity, "成交数量", bid.remaining);
-  if (qty <= 0n) throw new Error("成交数量必须大于 0");
-  if (qty > bid.remaining) throw new Error(`买单 #${id} 剩余 ${bid.remaining}，不能成交 ${qty}`);
-  await (await market.fillBid(id, qty)).wait();
-  const parts = new Contract(bid.transistors, MOCK_PARTS_ABI, signer);
-  return mintPartsOrThrow(parts, bid.buyer, bid.tokenId, qty);
-}
-
-/** 一键撮合本期全部买单：两条腿都 fillBid 并补齐晶体管，随后可直接 confirmTransistors。 */
-async function fillCampaignBids(signer) {
-  const c = signerOrThrow(signer);
-  const { market } = await marketHandle(signer);
-  const legs = [
-    [await c.nandBidId(), await c.nandQty()],
-    [await c.latchBidId(), await c.latchQty()],
-  ];
-  let last = null;
-  for (const [id, qty] of legs) {
-    if (id === 0n || qty === 0n) continue;
-    const bid = await market.bids(id);
-    if (bid.remaining !== 0n) {
-      const fill = await market.fillBid(id, bid.remaining);
-      await fill.wait();
-      last = fill;
+/** 扫最近的市场卖单，筛出属于本期电路合约、仍有效的挂单。 */
+async function scanCircuitListings(campaign, market, lookback = 200) {
+  const circuits = String(await campaign.circuits()).toLowerCase();
+  const next = await market.nextListingId();
+  const latest = next - 1n;
+  if (latest <= 0n) return [];
+  const first = latest > BigInt(lookback) ? latest - BigInt(lookback) + 1n : 1n;
+  const ids = [];
+  for (let i = latest; i >= first; i--) ids.push(i);
+  const rows = await Promise.all(ids.map(async (id) => {
+    try {
+      const l = await market.listings(id);
+      if (String(l.circuits).toLowerCase() !== circuits) return null;
+      const live = await market.listingFor(l.circuits, l.tokenId);
+      if (!live.valid || live.id !== id) return null;
+      return { id, tokenId: l.tokenId, price: l.price, seller: l.seller };
+    } catch {
+      return null;
     }
-    // 晶体管按「本期还缺多少」补，不按买单剩余量补。
-    // 买单可能已经被别的路径成交（remaining 已是 0）却没发货，此时仍要 mint 才能 confirmTransistors。
-    const tokenAddr = bid.transistors && bid.transistors !== ZeroAddress ? bid.transistors : await c.transistors();
-    const parts = new Contract(tokenAddr, MOCK_PARTS_ABI, signer);
-    const held = await parts.balanceOf(bid.buyer, bid.tokenId);
-    const missing = qty > held ? qty - held : 0n;
-    if (missing > 0n) {
-      const minted = await mintPartsOrThrow(parts, bid.buyer, bid.tokenId, missing);
-      await minted.wait();
-      last = minted;
-    }
-  }
-  if (!last) throw new Error("本期买单已全部成交且晶体管已到账，直接点「确认到账」即可");
-  return last;
+  }));
+  return rows.filter(Boolean).sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
 }
 
-/** 模拟一个外部买家：用当前钱包挂一张买单，供本期 Owner 吃单卖出（仅测试网 Mock）。 */
-async function placeExternalBid(signer, tokenId, price, quantity) {
-  const c = signerOrThrow(signer);
-  const { market } = await marketHandle(signer);
-  const part = parseUintField(tokenId, "晶体管编号", 0n);
-  if (part > 1n) throw new Error("晶体管编号只能是 0（NAND）或 1（LATCH）");
-  const unit = parseEther(String(price));
-  if (!(unit > 0n)) throw new Error("单价必须大于 0");
-  const qty = parseUintField(quantity, "数量", 1n);
-  if (qty <= 0n) throw new Error("数量必须大于 0");
-  return market.placeBid(await c.transistors(), part, unit, qty, { value: unit * qty });
+/**
+ * 全局读电路市场卖单（市场页用）。不依赖某一期：
+ * 传入市场地址 + 要筛选的 ERC721 集合（工厂白名单），返回有效挂单与每个集合的底价。
+ */
+export async function readCircuitMarketSnapshot(marketAddr, collections = [], lookback = 300) {
+  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return null;
+  return withReadProvider(async (runner) => {
+    const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
+    const [feeBps, next] = await Promise.all([market.feeBps(), market.nextListingId()]);
+    const allow = new Set((collections || []).map((a) => String(a).toLowerCase()));
+    const latest = next - 1n;
+    const rows = [];
+    if (latest > 0n) {
+      const first = latest > BigInt(lookback) ? latest - BigInt(lookback) + 1n : 1n;
+      const ids = [];
+      for (let i = latest; i >= first; i--) ids.push(i);
+      const all = await Promise.all(ids.map((id) => market.listings(id).catch(() => null)));
+      for (let i = 0; i < all.length; i++) {
+        const l = all[i];
+        if (!l) continue;
+        const circuit = String(l.circuits).toLowerCase();
+        if (allow.size && !allow.has(circuit)) continue;
+        try {
+          const live = await market.listingFor(l.circuits, l.tokenId);
+          if (!live.valid || live.id !== ids[i]) continue;
+          rows.push({ id: ids[i], circuits: l.circuits, tokenId: Number(l.tokenId), price: l.price, seller: l.seller });
+        } catch {
+          /* 单条挂单读失败不影响整页 */
+        }
+      }
+    }
+    rows.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+    const floors = {};
+    for (const row of rows) {
+      const key = String(row.circuits).toLowerCase();
+      const unit = Number(formatEther(row.price));
+      if (!(key in floors) || unit < floors[key]) floors[key] = unit;
+    }
+    return {
+    market: marketAddr,
+    circuitMarket: marketAddr,
+    feeBps: Number(feeBps),
+      nextListingId: Number(next - 1n),
+      listings: rows.map((r) => ({ ...r, price: Number(formatEther(r.price)) })),
+      floors,
+    };
+  });
+}
+
+/** 读某一期可买的市场卖单（UI 表单用）。 */
+export async function readCampaignCircuitListings(campaignAddr = getCampaignAddress()) {
+  return withReadProvider(async (runner) => {
+    const campaign = campaignContract(runner, campaignAddr);
+    const marketAddr = await readCircuitMarket(campaign);
+    if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return [];
+    const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
+    const rows = await scanCircuitListings(campaign, market);
+    return rows.map((r) => ({ ...r, priceBnb: Number(formatEther(r.price)) }));
+  });
+}
+
+/**
+ * 本期从市场买入电路：按价格从低到高挑 maxQty 张，且单价不超过 maxPriceWei。
+ * 采购款从本期 raisedBnb 出（buyCircuits 是 non-payable），不需要 msg.value。
+ */
+async function buyCircuitsFromMarket(signer, maxQty, maxPriceWei) {
+  const campaign = signerOrThrow(signer);
+  const marketAddr = await campaign.circuitMarket();
+  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) throw new Error("本期没有配置电路市场");
+  const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, signer);
+  const all = await scanCircuitListings(campaign, market);
+  if (all.length === 0) throw new Error("市场里还没有本期电路的卖单，等卖方挂单后再试");
+  const qty = Math.max(1, Math.floor(Number(maxQty) || 1));
+  const budget = BigInt(maxPriceWei ?? 0);
+  const affordable = budget > 0n ? all.filter((l) => BigInt(l.price) <= budget) : all;
+  if (affordable.length === 0) {
+    throw new Error(`没有单价 ≤ ${formatEther(budget)} BNB 的卖单（市场最低 ${formatEther(all[0].price)} BNB）`);
+  }
+  const picks = affordable.slice(0, qty);
+  return campaign.buyCircuits(
+    picks.map((l) => l.id),
+    picks.map((l) => l.tokenId),
+    picks.map((l) => l.price),
+  );
+}
+
+/** 把本期持有的一张电路挂回市场；价格缺省 = 该 token 的买入成本（合约下限）。 */
+async function listHeldCircuit(signer, tokenId, priceWei) {
+  const campaign = signerOrThrow(signer);
+  const id = parseUintField(tokenId, "电路 tokenId");
+  let price = priceWei != null ? BigInt(priceWei) : 0n;
+  if (price <= 0n) price = await campaign.circuitCostBasis(id);
+  if (price <= 0n) throw new Error("读不到该电路的买入成本，请显式给出挂单价");
+  return campaign.listCircuit(id, price);
+}
+
+/** 测试网 Mock：mint 一张电路给当前钱包，approve 市场并挂出卖单。 */
+async function simulateExternalListing(signer, tokenId, price) {
+  const campaign = signerOrThrow(signer);
+  const circuitsAddr = await campaign.circuits();
+  const marketAddr = await campaign.circuitMarket();
+  if (!isAddr(circuitsAddr) || circuitsAddr === ZeroAddress) throw new Error("本期没有配置电路合约");
+  const circuits = new Contract(circuitsAddr, MOCK_CIRCUIT_ABI, signer);
+  const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, signer);
+  const id = parseUintField(tokenId, "电路 tokenId", 1n);
+  const unit = parseEther(String(price || "0"));
+  if (unit <= 0n) throw new Error("挂单价必须大于 0");
+  const me = await signer.getAddress();
+  await (await circuits.mint(me, id)).wait();
+  await (await circuits.approve(marketAddr, id)).wait();
+  return market.list(circuitsAddr, id, unit);
+}
+
+/** 测试网 Mock：当前钱包作为外部买家吃一张市场卖单。 */
+async function simulateBuyListing(signer, listingId) {
+  const campaign = signerOrThrow(signer);
+  const marketAddr = await campaign.circuitMarket();
+  const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, signer);
+  const id = parseUintField(listingId, "挂单 ID");
+  const l = await market.listings(id);
+  const live = await market.listingFor(l.circuits, l.tokenId);
+  if (!live.valid) throw new Error(`挂单 #${id} 已成交或已撤销`);
+  return market.buy(id, l.price, { value: l.price });
 }
 
 // ── 写操作：均返回 tx（调用方 await tx.wait()） ──
@@ -1986,29 +1922,34 @@ export const tx = {
   listShares: (signer, count, price) => signerOrThrow(signer).listShares(count, price),
   cancelListing: (signer, id) => signerOrThrow(signer).cancelListing(id),
   takeListing: (signer, id, count, valueWei) => signerOrThrow(signer).takeListing(id, count, { value: valueWei }),
-  placeTransistorOrder: (signer, nandQty, nandPrice, latchQty, latchPrice) =>
-    signerOrThrow(signer).placeTransistorOrder(nandQty, nandPrice, latchQty, latchPrice),
-  sellTransistors: (signer, bidId, tokenId, quantity) =>
-    signerOrThrow(signer).sellTransistors(bidId, tokenId, quantity),
+
+  // 电路市场：买入按「最多 N 张、单价不超过 P」自动挑单。
+  confirmCircuits: (signer) => signerOrThrow(signer).confirmCircuits(),
   withdrawMarketProceeds: (signer) => signerOrThrow(signer).withdrawMarketProceeds(),
-  simulateFillBid: (signer, id, quantity) => fillBidWithParts(signer, id, quantity),
-  simulateExternalBid: (signer, tokenId, price, quantity) => placeExternalBid(signer, tokenId, price, quantity),
-  simulateFillCampaignBids: (signer) => fillCampaignBids(signer),
+  listCircuit: (signer, tokenId, priceWei) => listHeldCircuit(signer, tokenId, priceWei),
+  cancelCircuitListing: (signer, tokenId) =>
+    signerOrThrow(signer).cancelCircuitListing(parseUintField(tokenId, "电路 tokenId")),
+  // 原样批量买入（高级用法；UI 用 buyCircuitsFromMarket 自动挑单）。
+  buyCircuits: (signer, listingIds, tokenIds, prices) =>
+    signerOrThrow(signer).buyCircuits(listingIds, tokenIds, prices),
+  buyCircuitsFromMarket: (signer, qty, maxPriceWei) => buyCircuitsFromMarket(signer, qty, maxPriceWei),
+
+  simulateBuyListing: (signer, id) => simulateBuyListing(signer, id),
+  simulateExternalListing: (signer, tokenId, price) => simulateExternalListing(signer, tokenId, price),
+
   openRefund: (signer) => signerOrThrow(signer).openRefund(),
   /**
-   * 确认到账后立刻把没花完的募集款按份退回（不结束本期、晶体管留在合约、之后仍可 depositToPool）。
+   * 确认到账后立刻把没花完的募集款按份退回（不结束本期、电路留在合约、之后仍可 depositToPool）。
    * 合约在 depositToPool 里也会自动做同一件事，所以这一步是可选的「提前退」。
    */
   returnSurplus: (signer) => signerOrThrow(signer).returnSurplus(),
   /**
-   * Owner 自掏腰包补齐「被晶体管吃掉」的本金缺口，让池子重新能按原价退完所有份额。
-   * 买入之后想收摊（openRefund / abandonOrder）必须先走这一步，否则链上 PartsAreCollateral。
+   * Owner 自掏腰包补齐「被电路吃掉」的本金缺口，让池子重新能按原价退完所有份额。
+   * 买入之后想收摊（openRefund / abandonOrder）必须先走这一步，否则链上 CircuitsAreCollateral。
    */
   topUpShortfall: (signer, value) => signerOrThrow(signer).topUpShortfall({ value }),
   abandonOrder: (signer) => signerOrThrow(signer).abandonOrder(),
-  cancelTransistorOrder: (signer) => signerOrThrow(signer).cancelTransistorOrder(),
   markFailed: (signer, address) => signerOrThrow(signer, address).markFailed(),
-  confirmTransistors: (signer) => signerOrThrow(signer).confirmTransistors(),
   setPhase: (signer, next) => signerOrThrow(signer).setPhase(next),
   setPlan: (signer, est) => signerOrThrow(signer).setPlan(est),
   halt: (signer) => signerOrThrow(signer).halt(),
@@ -2033,10 +1974,10 @@ export const tx = {
     return factory.removeCampaign(index);
   },
   setFactoryOwner: (signer, newOwner) => factoryContract(signer).transferOwnership(newOwner),
-  setMaterialMarket: (signer, materialMarket) => signerOrThrow(signer).setMaterialMarket(materialMarket),
+  setCircuitMarket: (signer, circuitMarket) => signerOrThrow(signer).setCircuitMarket(circuitMarket),
   // 无参：一次扫走所有可动 BNB（多余余额，或已无人可退时的整池）。
   recoverBnb: (signer, address) => signerOrThrow(signer, address).recoverBnb(),
-  recoverTransistors: (signer, token, id, amount) => signerOrThrow(signer).recoverTransistors(token, id, amount),
+  recoverCircuits: (signer, token, id) => signerOrThrow(signer).recoverCircuits(token, id),
   transferOwnership: (signer, newOwner) => signerOrThrow(signer).transferOwnership(newOwner),
 };
 
@@ -2058,24 +1999,24 @@ export async function readFactoryOwner() {
 
 
 /**
- * 读工厂的晶体管合约白名单（部署时写入、之后不可增删）。
+ * 读工厂的电路合约白名单（部署时写入、之后不可增删）。
  *
  * 这是安全边界，不是运营开关：主网上防止 owner 把期次指向
- * MockERC1155（其 mint 无访问控制，任何人能无限造晶体管，
- * 「晶体管已到账」的检查形同虚设）。所以开期表单的可选处理器
+ * MockCircuitNft（其 mint 无访问控制，任何人能无限造电路，
+ * 「电路已到账」的检查形同虚设）。所以开期表单的可选电路
  * 应该**从链上白名单生成**，而不是硬编码前端列表。
  *
  * 读不到就返回空数组，UI 如实显示「未配置白名单」，不拿前端列表冒充链上事实。
  */
-export async function readAllowedParts() {
+export async function readAllowedCircuits() {
   if (!isAddr(FACTORY_ADDRESS)) return [];
   try {
     return await withReadProvider(async (runner) => {
       const f = factoryContract(runner);
-      const n = Number(await f.allowedPartsCount());
+      const n = Number(await f.allowedCircuitsCount());
       if (!Number.isFinite(n) || n <= 0) return [];
       const out = [];
-      for (let i = 0; i < n; i++) out.push(await f.allowedPartsAt(i));
+      for (let i = 0; i < n; i++) out.push(await f.allowedCircuitsAt(i));
       return out;
     });
   } catch {
@@ -2083,29 +2024,24 @@ export async function readAllowedParts() {
   }
 }
 
+/** 兼容旧引用。 */
+export const readAllowedParts = readAllowedCircuits;
+
 /**
  * 开期：预检 Owner → staticCall → 发交易 → 解析新地址（事件失败则读 campaigns[n-1]）。
- * 返回 { hash, receipt, campaign }。
- */
-/**
- * 开期：预检 Owner → staticCall → 发交易 → 解析新地址（事件失败则读 campaigns[n-1]）。
- * 当前工厂开期需 份额单价 / 总份数 / 募集天数 / 晶体管合约 四个参数；
- * 晶体管市场由工厂默认写入（不可变）。
+ * 当前工厂开期需 份额单价 / 总份数 / 募集天数 / 电路合约 四个参数；
+ * 电路市场由工厂在部署时写入（不可变）。
  *
- * 晶体管合约（第 4 参 transistors）是**必选的处理器**：零地址一律 revert（工厂不再有默认晶体管），
- * 且必须在工厂白名单内（主网白名单 = 官方两件套 TapeOut / Behemoth 的晶体管合约）。
- * 白名单是安全边界：不在白名单里的 ERC1155 会被工厂直接拒绝。
- * 开期人必须在前端从白名单里显式选一个——前端不允许留空（见 App.chainCreateCampaign 的预校验）。
+ * 电路合约（第 4 参 circuits）是**必选的 ERC721 集合**：零地址一律 revert，
+ * 且必须在工厂白名单内（主网白名单 = 官方 TapeOut / Behemoth 电路合约）。
+ * 白名单是安全边界：不在白名单里的 ERC721 会被工厂直接拒绝。
  */
 const CREATE_CURRENT =
-  "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint64 fundingSeconds,address transistors) returns (address)";
+  "function createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint64 fundingSeconds,address circuits) returns (address)";
 
 const SECONDS_PER_DAY = 86400;
 
 function createArgs(params) {
-  // 开期需 份额单价 / 总份数 / 募集天数 / 晶体管合约。
-  // 单价以 BNB（十进制）传入，这里转 wei；
-  // 天数在这里换成秒——工厂收 fundingSeconds，不再自己做 × 1 days。
   const sharePriceWei = params.sharePriceWei != null
     ? BigInt(params.sharePriceWei)
     : parseBnb(String(params.sharePriceBnb ?? "0"));
@@ -2113,9 +2049,9 @@ function createArgs(params) {
   const fundingSeconds = params.fundingSeconds != null
     ? BigInt(params.fundingSeconds)
     : BigInt(Math.max(1, Math.trunc(days)) * SECONDS_PER_DAY);
-  // 晶体管合约（处理器）：必选，原样透传。空串/零地址会触发工厂 revert（前端已预校验必选）。
-  const transistorsArg = String(params.transistors || "").trim();
-  return [sharePriceWei, params.totalShares, fundingSeconds, transistorsArg];
+  // 电路合约：必选，原样透传。空串/零地址会触发工厂 revert（前端已预校验必选）。
+  const circuitsArg = String(params.circuits || "").trim();
+  return [sharePriceWei, params.totalShares, fundingSeconds, circuitsArg];
 }
 
 function createCampaignAbi() {
@@ -2254,15 +2190,15 @@ function explainParsed(parsed) {
   }
   if (parsed?.name === "AlreadyHalted") return "本期已熔断，无需重复操作。";
   if (parsed?.name === "NotHalted") return "本期未熔断，无需解除。";
-  if (parsed?.name === "NotSoldOutYet") return "份数还没售完，不能挂买单（placeTransistorOrder 要求 sold == totalShares）。";
+  if (parsed?.name === "NotSoldOutYet") return "份数还没售完，不能开始执行（需 sold == totalShares）。";
   if (parsed?.name === "UseReturnSurplus") {
-    return "晶体管已到账：不能退款或放弃挂单。可退余款 + 入池或卖入买单；确要结束本期，先改回待挂单。";
+    return "电路已到账：不能退款或放弃采购。可退余款 + 入池或挂回市场；确要结束本期，先改回待挂单。";
   }
   if (parsed?.name === "SurplusAlreadyReturned") {
     return "余款已按份退回，本金已在持份人手里。再退款会清零份额（合约拒绝），留着等入池即可。";
   }
-  if (parsed?.name === "AlreadyPooled") return "本期已入池（不可逆），不能重复入池，也不能再卖晶体管或退余款。";
-  if (parsed?.name === "NotListed") return "当前没有挂着的买单，无需撤单。";
+  if (parsed?.name === "AlreadyPooled") return "本期已入池（不可逆），不能重复入池，也不能再卖电路或退余款。";
+  if (parsed?.name === "NotListed") return "这张电路当前没有挂单，无需撤单。";
   if (parsed?.name === "ZeroShares") return "数量为 0：份数 / 份额 / 余款分母不能为 0。";
   if (parsed?.name === "ZeroPrice") return "金额或单价不能为 0。";
   if (parsed?.name === "FundingEnded") return "募集已过截止时间，不能再认筹。";
@@ -2282,42 +2218,44 @@ function explainParsed(parsed) {
   if (parsed?.name === "DirectTransferNotAllowed") {
     return "不能直接向本期合约转 BNB，请用页面按钮操作。";
   }
-  if (parsed?.name === "BadBidId") return "买单 ID 无效（不存在或不属于本期晶体管）。";
+  if (parsed?.name === "BadListingId") return "挂单 ID 无效（不存在或不属于本期电路）。";
+  if (parsed?.name === "BadListing") return "电路市场没有这张挂单（可能已成交或已撤销）。";
+  if (parsed?.name === "PriceMismatch") return "挂单价已变化：市场要求按最新价支付，刷新后重试。";
+  if (parsed?.name === "NothingOwed") return "电路市场没有可提取的卖出款。";
   if (parsed?.name === "TransferFailed") return "BNB 转账失败（收款地址拒收或 gas 不足），整笔回滚，可重试。";
-  // 注：BadFee / BadFeeShares 已从合约移除（合约没有服务费字段），不再解码——
-  // 留着会让用户看到「服务费须在 1–20%」，误以为链上有服务费机制。
   if (parsed?.name === "ZeroCampaignParam") return "每份价格或总份数不能为 0";
-  if (parsed?.name === "TransistorsNotReady") {
-    return "晶体管还没到账，不能确认或入池：买单需全部成交，晶体管要真在本期合约里。";
+  if (parsed?.name === "CircuitsNotReady") {
+    return "电路还没到账，不能确认或入池：先买入电路并确认本期合约真的持有 NFT。";
   }
-  if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步：挂单中请先取消；已到账的期次不能再下单或退款。";
-  if (parsed?.name === "AlreadyReady") return "本期已到账，晶体管锁在合约里。只能入池或卖入买单。";
+  if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步：有电路正在市场挂单，请先撤单。";
+  if (parsed?.name === "AlreadyReady") return "本期已到账，电路锁在合约里。只能入池或挂回市场。";
   if (parsed?.name === "ProceedsPending") return "市场还有未提取的卖出款，先提取（withdrawMarketProceeds）再继续。";
-  if (parsed?.name === "NotABid") return "这张买单不能卖：已成交或撤回、标的不是本期晶体管、或剩余量不够。";
-  if (parsed?.name === "PriceBelowCost") return "这张买单单价低于本期买入成本，不能亏本卖出。";
-  if (parsed?.name === "SelfTrade") return "不能把本期晶体管卖给本期自己挂的买单。";
-  if (parsed?.name === "OrderFilled") return "买单已全部成交，不能再取消。";
-  if (parsed?.name === "NoProceeds") return "这张买单成交后没有款项进本期，合约拒绝白送晶体管。";
-  if (parsed?.name === "InsufficientParts") return "合约里的晶体管数量不够。";
+  if (parsed?.name === "NotACircuit") return "这张挂单的标的不是本期白名单电路合约。";
+  if (parsed?.name === "NotACircuitOwner") return "本期合约不持有这张电路 NFT。";
+  if (parsed?.name === "CircuitNotDelivered") return "市场成交了，但电路 NFT 没有转到本期合约（CircuitNotDelivered）。";
+  if (parsed?.name === "TooManyCircuits") return "一次买入的电路张数超过合约上限（TooManyCircuits）。";
+  if (parsed?.name === "CircuitStillListed") return "还有电路挂在市场：先全部撤单再入池。";
+  if (parsed?.name === "PriceBelowCost") return "挂单价低于本期买入成本，合约拒绝亏本挂出。";
+  if (parsed?.name === "SelfTrade") return "不能买回本期自己挂出的电路。";
+  if (parsed?.name === "InsufficientCircuits") return "合约里的电路数量不够。";
   if (parsed?.name === "SharesOutstanding") {
-    return "还有持份人没结清，晶体管是他们的抵押，不能取出。先退款 / 领完，或入池。";
+    return "还有持份人没结清，电路是他们的抵押，不能取出。先退款 / 领完，或入池。";
   }
   if (parsed?.name === "HoldersNotMadeWhole") {
-    return "持份人还没按原价收回本金，晶体管不能交给 Owner。先补齐缺口再退款，或入池 / 卖出。";
+    return "持份人还没按原价收回本金，电路不能交给 Owner。先补齐缺口再退款，或入池 / 卖出。";
   }
-  if (parsed?.name === "PartsAreCollateral") {
-    return "晶体管还在合约里，池子不够按原价退完。先补齐本金，或入池 / 卖出。";
+  if (parsed?.name === "CircuitsAreCollateral") {
+    return "电路还在合约里，池子不够按原价退完。先补齐本金，或入池 / 卖出。";
   }
   if (parsed?.name === "RefundNotAvailable") {
-    return "当前状态不能退款：只有募集超时或待挂单可退。";
+    return "当前状态不能退款：只有募集超时或待采购可退。";
   }
-  if (parsed?.name === "ZeroAddress") return "地址不能为零地址（晶体管市场 / 晶体管合约 / 矿池 / 收款地址）";
+  if (parsed?.name === "ZeroAddress") return "地址不能为零地址（电路市场 / 电路合约 / 矿池 / 收款地址）";
   if (parsed?.name === "IndexOutOfBounds") return "索引越界：列表 / 页数超出范围，刷新后再试。";
-  if (parsed?.name === "EmptyWhitelist") return "白名单不能为空：至少填一个允许的晶体管合约地址。";
-  if (parsed?.name === "PartsNotAllowed") {
-    const p = parsed.args?.parts || parsed.args?.[0];
-    // 白名单在工厂部署时写死，链上没有增删入口 —— 只能换用白名单内的晶体管合约重新开期。
-    return `晶体管合约不在工厂白名单：${p ? `${String(p).slice(0, 10)}… ` : ""}白名单部署时已固化，请改选白名单内的处理器。`;
+  if (parsed?.name === "EmptyWhitelist") return "白名单不能为空：至少填一个允许的电路合约地址。";
+  if (parsed?.name === "CircuitsNotAllowed") {
+    const p = parsed.args?.circuits || parsed.args?.[0];
+    return `电路合约不在工厂白名单：${p ? `${String(p).slice(0, 10)}… ` : ""}白名单部署时已固化，请改选白名单内的 ERC721 电路合约。`;
   }
   if (parsed?.name === "WrongScene") {
     return "当前阶段不允许这一步（WrongScene）：按页面提示的下一步操作，或先撤单 / 确认到账。";
@@ -2391,56 +2329,15 @@ export async function send(promiseTx, onSigned) {
     if (/403|网络连接失败|data-seed-prebsc|bnbchain\.org/i.test(rawMsg)) {
       throw new Error("钱包 RPC 连不上。请把 BSC 测试网节点改成 https://bsc-testnet-rpc.publicnode.com 后重试。");
     }
-    const iface = new Interface([
+    const iface = new Interface(Array.from(new Set([
       ...FACTORY_ABI,
       ...CAMPAIGN_ABI,
+      ...CIRCUIT_MARKET_ABI,
+      // ABI 里没有的补充错误（旧版本 / 钱包转发时只给选择子）。
       "error NotOwner(address caller)",
-      "error ZeroAddress()",
-      "error ZeroCampaignParam()",
-      "error IndexOutOfBounds()",
-      "error EmptyWhitelist()",
-      "error PartsNotAllowed(address parts)",
-      "error Halted()",
-      "error AlreadyHalted()",
-      "error NotHalted()",
-      "error WrongScene()",
-      "error FundingEnded()",
-      "error TransistorsNotReady()",
-      "error RefundNotAvailable()",
-      "error ZeroShares()",
-      "error ZeroPrice()",
-      "error BadCount()",
-      "error InsufficientShares()",
-      "error SharesOutstanding()",
-      "error HoldersNotMadeWhole()",
-      "error PartsAreCollateral()",
-      "error ExceedsRemaining()",
-      "error WrongPayment()",
-      "error NoListing()",
-      "error NotSeller()",
-      "error CannotTakeOwnListing()",
-      "error AlreadyListed()",
-      "error NotListed()",
-      "error AlreadyReady()",
-      "error TransferFailed()",
-      "error OrderFilled()",
-      "error BadBidId()",
-      "error ProceedsPending()",
-      "error NotABid()",
-      "error PriceBelowCost()",
-      "error SelfTrade()",
-      "error NoProceeds()",
-      "error InsufficientParts()",
-      "error PoolNotSet()",
-      "error AlreadyPooled()",
-      "error SurplusAlreadyReturned()",
-      "error UseReturnSurplus()",
-      "error BadFeeConfig()",
-      "error ServiceFeeAlreadySet()",
-      "error ServiceFeeLocked()",
-      "error NotSoldOutYet()",
-      "error DirectTransferNotAllowed()",
-    ]);
+      "error AlreadyMinted()",
+      "error NotApproved()",
+    ])));
     let decoded = decodeRevert(err, iface);
     const txReq = err?.transaction;
     if (/钱包没有带回具体原因/.test(decoded) && txReq?.to && txReq?.data) {

@@ -1,47 +1,45 @@
 /**
- * 官方处理器与晶体管合约地址。
+ * 官方处理器与电路合约地址。
  *
  * ══════════════════════════════════════════════════════════════
  * 这里只有离线常量，不含价格读取，也不含题库。
  * ══════════════════════════════════════════════════════════════
  *
- * 价格读取（订单簿拉取、BNB 汇率、跨域代理、轮询）已全部删除：
- * 晶体管单价以链上 Campaign 记录的挂单/成交价为准，
- * 开期测算的基准价见 `prices.js` 的 NOMINAL_QUOTE（静态，不联网）。
+ * 电路市场（官方 0x6feE…B46f）交易的是 **ERC721 电路 NFT**：
+ * 每个处理器对应一个电路合约，一期在开期时锁定其中一个，之后从市场买入的
+ * 每张电路都属于该集合。合约与前端都按「张」计量，只有单一电路腿。
  *
- * 题库（题目 g / d / K / C、官方 tasks.json 拉取、本地兜底题表）已全部删除：
- * 链上从来没有题目参数，题目也不再参与任何测算。算力只由晶体管数量与处理器决定。
+ * 价格读取（订单簿拉取、BNB 汇率、跨域代理、轮询）已全部删除：
+ * 电路单价以电路市场的挂单为准（见 chain/client.js 的 readCircuitMarketSnapshot）。
  */
 import deployments from "./chain/deployments.json";
 
 /**
- * 官方处理器（晶体管市场支持的处理器）。
- *
- * TapeOut / Behemoth 取自 tapeout.net 前端 bundle 的 podCpus。
- * T-59：官方 Genesis CPU（创世基线，processorMultiplier = 0、永远不出矿）
- * 已从本项目整体移除，其 CPU / 晶体管地址一并清除。
+ * 官方处理器 → 电路合约（ERC721）。
+ * TapeOut / Behemoth 取自官方电路市场在售的两个集合。
  */
-export const OFFICIAL_CPUS = {
+export const OFFICIAL_CIRCUIT_COLLECTIONS = {
   TapeOut: "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C",
   Behemoth: "0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c",
 };
 
+/** 兼容旧引用：旧代码把这两个地址叫 CPU，实际就是电路合约。 */
+export const OFFICIAL_CPUS = OFFICIAL_CIRCUIT_COLLECTIONS;
+
 /**
- * 处理器各自的晶体管合约（NAND 与 LATCH 共用同一合约，用 tokenId 区分）。
+ * 处理器各自的电路合约。
  *
- * ⚠️ 这两个晶体管合约都是**真实存在的独立合约**，不是彼此的别名 ——
- * 用它们开期时 Campaign.transistors 会写对应地址，
- * 工厂白名单也必须包含它们，否则 createCampaign 会 revert PartsNotAllowed。
+ * ⚠️ 这两个合约都是**真实存在的独立 ERC721 集合**，不是彼此的别名 ——
+ * 用它们开期时 Campaign.circuits 会写对应地址，
+ * 工厂白名单也必须包含它们，否则 createCampaign 会 revert CircuitsNotAllowed。
  */
-export const OFFICIAL_PARTS = {
-  TAPE_OUT_NAND: { cpu: OFFICIAL_CPUS.TapeOut, contract: "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087", tokenId: 0 },
-  TAPE_OUT_LATCH: { cpu: OFFICIAL_CPUS.TapeOut, contract: "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087", tokenId: 1 },
-  BEHEMOTH_NAND: { cpu: OFFICIAL_CPUS.Behemoth, contract: "0xE2DfD802081C7a05341E20b6582b04b908e8550c", tokenId: 0 },
-  BEHEMOTH_LATCH: { cpu: OFFICIAL_CPUS.Behemoth, contract: "0xE2DfD802081C7a05341E20b6582b04b908e8550c", tokenId: 1 },
+export const OFFICIAL_CIRCUIT_MODELS = {
+  TAPE_OUT_CIRCUIT: { contract: OFFICIAL_CIRCUIT_COLLECTIONS.TapeOut },
+  BEHEMOTH_CIRCUIT: { contract: OFFICIAL_CIRCUIT_COLLECTIONS.Behemoth },
 };
 
-/** CPU 地址（小写）→ 处理器名。由 OFFICIAL_CPUS 自动生成，避免手写反查表漏项。 */
-const CPU_TO_PROCESSOR = Object.entries(OFFICIAL_CPUS).reduce(
+/** 电路合约地址（小写）→ 处理器名。 */
+const CIRCUIT_TO_PROCESSOR = Object.entries(OFFICIAL_CIRCUIT_COLLECTIONS).reduce(
   (acc, [name, addr]) => {
     acc[String(addr).toLowerCase()] = name;
     return acc;
@@ -49,75 +47,53 @@ const CPU_TO_PROCESSOR = Object.entries(OFFICIAL_CPUS).reduce(
   {},
 );
 
-/** 晶体管合约地址（小写）→ 处理器名。同一晶体管合约内所有 tokenId 共用一个处理器。 */
-const PARTS_CONTRACT_TO_PROCESSOR = Object.values(OFFICIAL_PARTS).reduce(
-  (acc, p) => {
-    acc[p.contract.toLowerCase()] = CPU_TO_PROCESSOR[String(p.cpu).toLowerCase()] || "";
-    return acc;
-  },
-  {},
-);
-
 /**
- * 部署记录里**非官方**的晶体管合约（测试网替身）。
+ * 部署记录里**非官方**的电路合约（测试网 MockCircuitNft）。
  *
- * T-79 起工厂不再有「默认晶体管」：白名单 allowedParts 里可以有多个地址，
- * 每期开期时由前端显式选一个。主网白名单 = 官方两件套 → 这里为空；
- * 测试网白名单 = MockERC1155 → 这里拿到那个 mock 地址。
+ * 工厂白名单在部署时固化：主网 = 官方两个集合 → 这里为空；
+ * 测试网 = MockCircuitNft → 这里拿到那个 mock 地址。
  */
-const LOCAL_PARTS = (() => {
-  const list = Array.isArray(deployments.allowedParts) ? deployments.allowedParts : [];
-  const official = new Set(Object.values(OFFICIAL_PARTS).map((p) => p.contract.toLowerCase()));
+const LOCAL_CIRCUITS = (() => {
+  const list = Array.isArray(deployments.allowedCircuits) ? deployments.allowedCircuits : [];
+  const official = new Set(Object.values(OFFICIAL_CIRCUIT_MODELS).map((p) => p.contract.toLowerCase()));
   return list.find((a) => !official.has(String(a).toLowerCase())) || "";
 })();
 
-/**
- * 处理器名 → 该处理器的晶体管 ERC1155 地址。
- * 由 OFFICIAL_PARTS 自动生成（NAND 与 LATCH 共用同一合约地址，取任一即可）。
- * 之所以要这张表：`partsContractForProcessor` 只认处理器名，得能一键查到地址。
- *
- * ⚠️ 声明顺序：必须在 `CPU_TO_PROCESSOR` **之后** —— 否则
- * `Cannot access 'CPU_TO_PROCESSOR' before initialization`，
- * 整个页面白屏（vite build 抓不到，只有运行时才暴露）。
- */
-export const OFFICIAL_PARTS_FOR_PROCESSOR = Object.entries(OFFICIAL_PARTS).reduce(
-  (acc, [id, p]) => {
-    const name = CPU_TO_PROCESSOR[String(p.cpu).toLowerCase()] || "";
+/** 处理器名 → 该处理器的电路合约地址。 */
+export const OFFICIAL_CIRCUIT_FOR_PROCESSOR = Object.entries(OFFICIAL_CIRCUIT_MODELS).reduce(
+  (acc, [, p]) => {
+    const name = CIRCUIT_TO_PROCESSOR[String(p.contract).toLowerCase()] || "";
     if (name && !acc[name]) acc[name] = p;
     return acc;
   },
   {},
 );
 
-
 /**
- * 处理器 → 晶体管 ERC1155 地址（挂单 placeBid 用同一个）。
+ * 处理器 → 电路合约地址。
  *
- * T-79 起工厂不再有「默认晶体管」：晶体管是**白名单**，每期开期时选其中一个锁定。
- * 所以这里必须只在「工厂白名单允许」的前提下返回地址：
- *   - 官方处理器 → 官方晶体管合约，但它得在白名单里，否则开期链上会 revert；
+ * 开期时从工厂白名单里选一个 ERC721 集合。这里必须只在「工厂白名单允许」的前提下返回：
+ *   - 官方处理器 → 官方电路合约，但它得在白名单里，否则开期链上会 revert；
  *   - 白名单里的非官方合约（测试网 Mock 替身）→ 直接用它。
- *
- * ⚠️ 绝不返回「不在白名单里的官方地址」：那会让期次指向一个工厂不认的晶体管合约。
  */
-export function partsContractForProcessor(processorId) {
+export function circuitContractForProcessor(processorId) {
   const allowed = new Set(
-    (Array.isArray(deployments.allowedParts) ? deployments.allowedParts : []).map((a) => String(a).toLowerCase()),
+    (Array.isArray(deployments.allowedCircuits) ? deployments.allowedCircuits : []).map((a) => String(a).toLowerCase()),
   );
-  const official = OFFICIAL_PARTS_FOR_PROCESSOR[processorId]?.contract || "";
+  const official = OFFICIAL_CIRCUIT_FOR_PROCESSOR[processorId]?.contract || "";
   if (official && (!allowed.size || allowed.has(official.toLowerCase()))) return official;
   // 官方地址不在白名单 → 退到白名单里的本地替身（测试网场景）。
-  if (LOCAL_PARTS) return LOCAL_PARTS;
+  if (LOCAL_CIRCUITS) return LOCAL_CIRCUITS;
   return "";
 }
 
-/** 链上 transistors 地址 → 处理器名。地址不在官方表也不在白名单里时返回空。 */
-export function processorFromPartsContract(address) {
+/** 链上 circuits 地址 → 处理器名。地址不在官方表也不在白名单里时返回空。 */
+export function processorFromCircuitContract(address) {
   const a = String(address || "").toLowerCase();
   if (!a || a === "0x0000000000000000000000000000000000000000") return "";
-  const official = PARTS_CONTRACT_TO_PROCESSOR[a];
+  const official = CIRCUIT_TO_PROCESSOR[a];
   if (official) return official;
   // 白名单里的本地替身（测试网 Mock）：没有官方处理器身份，按演示处理器标注。
-  if (LOCAL_PARTS && a === LOCAL_PARTS.toLowerCase()) return "TapeOut";
+  if (LOCAL_CIRCUITS && a === LOCAL_CIRCUITS.toLowerCase()) return "TapeOut";
   return "";
 }

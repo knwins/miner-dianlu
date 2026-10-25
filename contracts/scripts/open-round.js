@@ -29,37 +29,41 @@ async function main() {
   console.log(`\n开期参数：份额价 ${ethers.formatEther(sharePrice)} BNB · 总份数 ${totalShares} · 募集 ${fundingDays} 天（${fundingSeconds} 秒）`);
 
   /**
-   * 本期晶体管合约（= 处理器），createCampaign 第 4 参。**必选**。
+   * 本期 ERC721 电路合约（= 处理器），createCampaign 第 4 参。**必选**。
    *
-   * 工厂不再有「默认晶体管」：零地址一律 revert（ZeroAddress），
-   * 非零也必须在工厂白名单内，否则 revert PartsNotAllowed。
+   * 工厂没有「默认电路」：零地址一律 revert（ZeroAddress），
+   * 非零也必须在工厂白名单内，否则 revert CircuitsNotAllowed。
    * 白名单若只有一项，留空则自动用它；多项则必须显式指定。
    */
-  const campaignParts = (process.env.CAMPAIGN_PARTS_ADDRESS || "").trim();
-  const allowedCount = Number(await factory.allowedPartsCount());
-  if (allowedCount === 0) throw new Error("工厂晶体管白名单为空，无法指定晶体管合约");
-  if (campaignParts) {
-    const ok = await factory.isAllowedParts(campaignParts);
+  const campaignCircuits = (
+    process.env.CAMPAIGN_CIRCUITS_ADDRESS ||
+    process.env.CAMPAIGN_PARTS_ADDRESS ||
+    ""
+  ).trim();
+  const allowedCount = Number(await factory.allowedCircuitsCount());
+  if (allowedCount === 0) throw new Error("工厂电路白名单为空，无法指定电路合约");
+  if (campaignCircuits) {
+    const ok = await factory.isAllowedCircuits(campaignCircuits);
     if (!ok) {
       const list = [];
-      for (let i = 0; i < allowedCount; i++) list.push(await factory.allowedPartsAt(i));
+      for (let i = 0; i < allowedCount; i++) list.push(await factory.allowedCircuitsAt(i));
       throw new Error(
-        `CAMPAIGN_PARTS_ADDRESS ${campaignParts} 不在工厂白名单内。白名单：${list.join(" / ")}`,
+        `CAMPAIGN_CIRCUITS_ADDRESS ${campaignCircuits} 不在工厂白名单内。白名单：${list.join(" / ")}`,
       );
     }
   } else if (allowedCount === 1) {
-    campaignParts = await factory.allowedPartsAt(0);
+    campaignCircuits = await factory.allowedCircuitsAt(0);
   } else {
-    throw new Error("白名单有多项，必须用 CAMPAIGN_PARTS_ADDRESS 显式指定本期晶体管合约");
+    throw new Error("白名单有多项，必须用 CAMPAIGN_CIRCUITS_ADDRESS 显式指定本期电路合约");
   }
-  console.log(`晶体管合约  ：${campaignParts}`);
+  console.log(`电路合约    ：${campaignCircuits}`);
 
   const before = await factory.campaignCount();
   const tx = await factory.createCampaign(
     sharePrice,
     totalShares,
     fundingSeconds,
-    campaignParts,
+    campaignCircuits,
   );
   console.log(`交易已发出：${tx.hash}`);
   await tx.wait();
@@ -70,7 +74,7 @@ async function main() {
   console.log(`\n✓ 已开新期 #${idx}：${campaignAddr}`);
   console.log(`  工厂期次数：${before} → ${after}`);
   console.log(`  已注册    ：${await factory.isRegistered(campaignAddr)}`);
-  console.log(`  锁定晶体管  ：${await campaign.transistors()}`);
+  console.log(`  锁定电路    ：${await campaign.circuits()}`);
 
   /**
    * 服务费与分成表：**第二笔交易**（setServiceFee）。
@@ -104,8 +108,8 @@ async function main() {
     totalShares: Number(totalShares),
     fundingDays,
     fundingSeconds: Number(fundingSeconds),
-      /** 本期锁定的晶体管合约（= 处理器）；从白名单里显式选，必填。 */
-      campaignParts,
+    /** 本期锁定的 ERC721 电路合约（= 处理器）；从白名单里显式选，必填。 */
+    campaignCircuits,
   };
   dep.serviceFeeBps = Number(feeBps);
   dep.serviceFeeSet = feeBps > 0n;

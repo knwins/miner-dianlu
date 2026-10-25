@@ -1,5 +1,5 @@
 // 测试网开一期新期次（不重新部署基础设施），用来在前端手动走募资流程。
-// 开期只需份额价 / 总份数 / 募集秒数 / **晶体管合约（必选）**；晶体管合约从工厂白名单里选。
+// 开期只需份额价 / 总份数 / 募集秒数 / **电路合约（必选）**；电路合约从工厂白名单里选。
 // 运行：npx hardhat run scripts/testnet-open-round.js --network bscTestnet
 const { ethers } = require("hardhat");
 const { readFileSync, writeFileSync } = require("node:fs");
@@ -19,32 +19,36 @@ async function main() {
 
   console.log(`factory ${dep.factory}`);
   /**
-   * 本期晶体管合约（createCampaign 第 4 参）：**必选**。
-   * 工厂不再有默认晶体管：零地址直接 revert（ZeroAddress），
-   * 非零必须落在工厂白名单内，否则 revert PartsNotAllowed。
+   * 本期 ERC721 电路合约（createCampaign 第 4 参）：**必选**。
+   * 工厂没有默认电路：零地址直接 revert（ZeroAddress），
+   * 非零必须落在工厂白名单内，否则 revert CircuitsNotAllowed。
    */
-  const allowedCount = Number(await factory.allowedPartsCount());
-  if (allowedCount === 0) throw new Error("工厂晶体管白名单为空，无法指定晶体管合约");
-  let campaignParts = (process.env.CAMPAIGN_PARTS_ADDRESS || "").trim();
-  if (campaignParts) {
-    if (!(await factory.isAllowedParts(campaignParts))) {
+  const allowedCount = Number(await factory.allowedCircuitsCount());
+  if (allowedCount === 0) throw new Error("工厂电路白名单为空，无法指定电路合约");
+  let campaignCircuits = (
+    process.env.CAMPAIGN_CIRCUITS_ADDRESS ||
+    process.env.CAMPAIGN_PARTS_ADDRESS ||
+    ""
+  ).trim();
+  if (campaignCircuits) {
+    if (!(await factory.isAllowedCircuits(campaignCircuits))) {
       const list = [];
-      for (let i = 0; i < allowedCount; i++) list.push(await factory.allowedPartsAt(i));
-      throw new Error(`CAMPAIGN_PARTS_ADDRESS ${campaignParts} 不在白名单内。白名单：${list.join(" / ")}`);
+      for (let i = 0; i < allowedCount; i++) list.push(await factory.allowedCircuitsAt(i));
+      throw new Error(`CAMPAIGN_CIRCUITS_ADDRESS ${campaignCircuits} 不在白名单内。白名单：${list.join(" / ")}`);
     }
   } else if (allowedCount === 1) {
-    campaignParts = await factory.allowedPartsAt(0);
+    campaignCircuits = await factory.allowedCircuitsAt(0);
   } else {
-    throw new Error("白名单有多项，必须用 CAMPAIGN_PARTS_ADDRESS 显式指定本期晶体管合约");
+    throw new Error("白名单有多项，必须用 CAMPAIGN_CIRCUITS_ADDRESS 显式指定本期电路合约");
   }
-  console.log(`parts ${campaignParts}`);
+  console.log(`circuits ${campaignCircuits}`);
   console.log(`params price ${ethers.formatEther(sharePrice)} BNB shares ${totalShares} days ${fundingDays} (${fundingSeconds}s)`);
 
   const tx = await factory.createCampaign(
     sharePrice,
     totalShares,
     fundingSeconds,
-    campaignParts
+    campaignCircuits
   );
   const receipt = await tx.wait();
   const log = receipt.logs
@@ -84,8 +88,8 @@ async function main() {
       totalShares: Number(totalShares),
       fundingDays: Number(fundingDays),
       fundingSeconds: Number(fundingSeconds),
-      /** 本期锁定的晶体管合约（= 处理器）；从白名单里选，必填。 */
-      campaignParts,
+      /** 本期锁定的 ERC721 电路合约（= 处理器）；从白名单里选，必填。 */
+      campaignCircuits,
     },
     serviceFeeBps: Number(feeBps),
     serviceFeeSet: feeBps > 0n,

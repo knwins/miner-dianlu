@@ -5,15 +5,14 @@ import {
 import { SCENE } from "./roundState.js";
 
 import {
-  DEFAULT_TRANSISTOR,
-  TRANSISTORS,
+  DEFAULT_CIRCUIT,
   NOMINAL_QUOTE,
   NOMINAL_BNB_USDT,
-  findTransistor,
+  findCircuit,
   processorScale,
   isMineable,
   planTask,
-  transistorIdFor,
+  circuitIdFor,
   PROCESSOR_IDS,
   suggestPartRange,
 } from "./prices.js";
@@ -46,7 +45,7 @@ export const ROUND = {
    *
    * 募集直接以 BNB 计价，不再经 USDT 中转：
    * 募资总额 BNB = 份数 × 每份BNB，
-   * 而晶体管成本本来就是 BNB 计价，两者可直接比较，无需换算。
+   * 而电路成本本来就是 BNB 计价，两者可直接比较，无需换算。
    *
    * 份数在开期时写死，用户只能买整数份。
    */
@@ -72,17 +71,17 @@ export const ROUND = {
   miningDays: MINING_DAYS,
   /**
    * 售罄到可执行之间的观察期（小时）。
-   * 换币流片会把全部募集款换成 BNB 并烧掉晶体管，不可逆。
+   * 换币流片会把全部募集款换成 BNB 并烧掉电路，不可逆。
    * 给用户这段时间核对网表哈希与报价快照。
    */
   executeDelayHours: 48,
-  /** 挖矿用晶体管组合（处理器 × 晶体管），见 prices.js 的 TRANSISTORS */
-  transistorId: DEFAULT_TRANSISTOR,
+  /** 挖矿用电路组合（处理器 × 电路），见 prices.js 的 CIRCUITS */
+  circuitModelId: DEFAULT_CIRCUIT,
   /**
-   * 本期要烧的晶体管总数（NAND + LATCH），即链上 placeTransistorOrder 的数量。
+   * 本期要烧的电路总数，即链上 buyCircuits 买入的张数。
    *
-   * 晶体管数由本期募资总额按理想成本占比派生，不由人工填写，
-   * 权重 H = 晶体管数 × 处理器每颗算力（默认 Behemoth P=6 → 68 × 6 = 408）。
+   * 电路数由本期募资总额按理想成本占比派生，不由人工填写，
+   * 权重 H = 电路数 × 处理器每张算力（默认 Behemoth P=6 → 68 × 6 = 408）。
    * 68 是基准期次规模下的示例值，实际开期一律由当期募资总额反推。
    */
   partCount: 68,
@@ -114,7 +113,7 @@ export const OWNER = "0x0a11eE0000000000000000000000000000000A11";
 /**
  * 角色与权限模型。
  *
- * execute（换币+流片）会把全部募集款换成 BNB 并烧掉晶体管，**不可逆**，
+ * execute（换币+流片）会把全部募集款换成 BNB 并烧掉电路，**不可逆**，
  * 故权限收紧为**仅 Owner** 可触发——Owner 是实际执行 tape-out 的一方，
  * 持份用户不应能单方面把全期本金烧掉。为防 Owner 不作为，真实合约应再加
  * 时间锁 + 多签/投票兜底；本预览在「48h 观察期 + 价格快照锁定」基础上仅保留 Owner 门槛。
@@ -187,17 +186,17 @@ export const SCENE_COPY = {
   funding: {
     badge: SCENE.funding.label,
     tone: SCENE.funding.tone,
-    lead: "本期开放认筹，份额售罄后由 Owner 买入晶体管并投入矿池。",
+    lead: "本期开放认筹，份额售罄后由 Owner 买入电路并投入矿池。",
   },
   executing: {
     badge: SCENE.executing.label,
     tone: SCENE.executing.tone,
-    lead: "份数已售完。Owner 挂单买入晶体管、确认到账后投入矿池；入池前本金不动，可原路退款或改价重挂。",
+    lead: "份数已售完。Owner 挂单买入电路、确认到账后投入矿池；入池前本金不动，可原路退款或改价重挂。",
   },
   mining: {
     badge: SCENE.mining.label,
     tone: SCENE.mining.tone,
-    lead: "晶体管已入池，本期进入挖矿（不可逆）。分配合约接入前不产出发放；退出只能转让份额。",
+    lead: "电路已入池，本期进入挖矿（不可逆）。分配合约接入前不产出发放；退出只能转让份额。",
   },
 };
 
@@ -229,13 +228,13 @@ export function feeRate(round) {
 }
 
 /**
- * 晶体管数派生：按募资总额的理想成本占比反推能买多少颗晶体管。
- * 晶体管数不再是开期参数，只由规模决定（权重 H = 晶体管数 × P 仍成立）。
+ * 电路数派生：按募资总额的理想成本占比反推能买多少张电路。
+ * 电路数不再是开期参数，只由规模决定（权重 H = 电路数 × P 仍成立）。
  */
-export function derivePartCount({ hardCapBnb, transistorId, snapshot }) {
+export function derivePartCount({ hardCapBnb, circuitId, snapshot }) {
   const cap = Number(hardCapBnb);
   if (!(Number.isFinite(cap) && cap > 0)) return 1;
-  const ideal = suggestPartRange({ hardCapBnb: cap, snapshot, transistorId }).idealParts;
+  const ideal = suggestPartRange({ hardCapBnb: cap, snapshot, circuitId }).idealParts;
   return Math.max(1, Math.round(Number(ideal)) || 1);
 }
 
@@ -260,7 +259,7 @@ export function round4(value) {
 }
 
 /**
- * 五位小数：晶体管挂单价。挂单允许填 0.00001 BNB 级别，
+ * 五位小数：电路挂单价。挂单允许填 0.00001 BNB 级别，
  * 用四位会把用户输入静默改小，所以输入框与挂单价展示统一走这里。
  */
 export function round5(value) {
@@ -283,15 +282,15 @@ export function clampPriceInput(raw) {
 
 /**
  * 从链上 / 本地期次字段解析「目标处理器」。
- * - 处理器：新工厂开期写入 transistors（晶体管合约地址）；旧期次可用 setPlan 的
- *   estHashpower / transistorCount（或执行后 hashpower）反推 P≈H/晶体管数
+ * - 处理器：新工厂开期写入 circuits（电路合约地址）；旧期次可用 setPlan 的
+ *   estHashpower / circuitHeldCount（或执行后 hashpower）反推 P≈H/电路数
  */
 export function resolveCampaignDesign(round, book = null) {
   const chain = Boolean(book?._chain);
   // 链上只认合约字段。报价引擎的 estimate、以及 fixtures 里的默认 Behemoth，都不能当成本期处理器。
   const parts = chain
-    ? Number(book?.transistorCount) || 0
-    : Number(book?.transistorCount) || Number(book?.estimate?.usedParts) || Number(round?.transistorCount) || 0;
+    ? Number(book?.circuitHeldCount) || 0
+    : Number(book?.circuitHeldCount) || Number(book?.estimate?.usedParts) || Number(round?.circuitHeldCount) || 0;
   const hp = chain
     ? Number(book?.hashpower) || Number(book?.estHashpower) || 0
     : Number(book?.hashpower) || Number(book?.estHashpower) || Number(book?.estimate?.hashpower) || Number(round?.estHashpower) || 0;
@@ -299,12 +298,12 @@ export function resolveCampaignDesign(round, book = null) {
   let processorId = null;
   if (!chain && round?.processorId && PROCESSOR_IDS.includes(round.processorId)) {
     processorId = round.processorId;
-  } else if (!chain && round?.transistorId) {
-    const fromTr = findTransistor(round.transistorId)?.processor;
+  } else if (!chain && round?.circuitModelId) {
+    const fromCircuit = findCircuit(round.circuitModelId)?.processor;
     if (fromTr && PROCESSOR_IDS.includes(fromTr)) processorId = fromTr;
   }
   if (!processorId && hp > 0) {
-    // 旧期次没记处理器地址：用 H ÷ 晶体管数反推规模（P≈H/晶体管数），取标度最接近的处理器。
+    // 旧期次没记处理器地址：用 H ÷ 电路数反推规模（P≈H/电路数），取标度最接近的处理器。
     // 数据驱动：按标度查表匹配，不会把某个处理器误认成 Behemoth 或 TapeOut。
     if (parts > 0) {
       const scale = hp / parts;
@@ -315,19 +314,19 @@ export function resolveCampaignDesign(round, book = null) {
         PROCESSOR_IDS[0]);
     }
   }
-  // 开期写入的 transistors → round.processorId（见 adapter.roundFromState）
+  // 开期写入的 circuits → round.processorId（见 adapter.roundFromState）
   if (!processorId && PROCESSOR_IDS.includes(round?.processorId)) {
     processorId = round.processorId;
   }
   if (!processorId && !chain) processorId = PROCESSOR_IDS[0];
 
-  const transistorId = processorId ? transistorIdFor(processorId) : null;
+  const circuitId = processorId ? circuitIdFor(processorId) : null;
   return {
     processorId,
     processor: processorId,
     processorScale: processorId ? processorScale(processorId) : null,
-    transistorId,
-    /** 链上 setPlan / execute 写入了算力，处理器由 H÷晶体管数反推 */
+    circuitModelId,
+    /** 链上 setPlan / execute 写入了算力，处理器由 H÷电路数反推 */
     processorInferred: chain ? hp > 0 && Boolean(processorId) : hp > 0,
     processorKnown: Boolean(processorId),
     chainHashpower: hp,
@@ -348,7 +347,7 @@ export const PAST_ROUNDS = [
     tone: "done",
     shares: "100/100",
     raised: "68.5000 BNB",
-    transistorId: "BEHEMOTH_NAND",
+    circuitModelId: DEFAULT_CIRCUIT,
     quoteMult: 1.5,
     /** 权重 H = g81 × 6 = 486 */
     hashpower: "486",
@@ -371,11 +370,11 @@ export const PAST_ROUNDS = [
 /**
  * 募集期的预估分配权重。
  *
- * 权重只由「本期烧多少晶体管」决定：
- *   募资总额 BNB → ÷ 晶体管实时单价 → 能买多少晶体管；H = 晶体管数 × P
+ * 权重只由「本期烧多少电路」决定：
+ *   募资总额 BNB → ÷ 电路实时单价 → 能买多少电路；H = 电路数 × P
  *
- * 晶体管数由本期募资总额派生（round.partCount），开期后不可改，所以权重是确定的。
- * 实际入池数量以 Owner 在晶体管市场买入并确认到账的晶体管为准（买多少算多少），
+ * 电路数由本期募资总额派生（round.partCount），开期后不可改，所以权重是确定的。
+ * 实际入池数量以 Owner 在电路市场买入并确认到账的电路为准（买多少算多少），
  * 不再推算「需要几个」「募资总额够买几个」。
  *
  * 报价来自实时价格源（`prices.js`），同一期在不同时刻结果不同。
@@ -388,30 +387,30 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
   const bnbUsdt = quote.bnbUsdt || MARKET.bnbUsdt;
 
   /**
-   * 选晶体管型号：优先用期次上直接记的 transistorId；
-   * 否则按 processorId 查该处理器的代表型号（NAND）。
+   * 选电路型号：优先用期次上直接记的 circuitModelId；
+   * 否则按 processorId 查该处理器的代表型号。
    *
-   * ⚠️ 必须查表，不能写成 `processorId === "TapeOut" ? ... : "BEHEMOTH_NAND"`：
+   * ⚠️ 必须查表，不能写成 `processorId === "TapeOut" ? ... : "BEHEMOTH"`：
    * 那种二元写法在处理器数量变化后会让新处理器落到 Behemoth 的型号上
-   * （晶体管价差可达数千倍），且 processorScale 取错，算出「有产出」的假象。
+   * （电路价差可达数千倍），且 processorScale 取错，算出「有产出」的假象。
    */
-  const chosenTransistor =
-    round.transistorId ||
+  const chosenCircuitModel =
+    round.circuitModelId ||
     (round.processorId && PROCESSOR_IDS.includes(round.processorId)
-      ? transistorIdFor(round.processorId)
+      ? circuitIdFor(round.processorId)
       : "");
-  const model = findTransistor(chosenTransistor || DEFAULT_TRANSISTOR);
+  const model = findCircuit(chosenCircuitModel || DEFAULT_CIRCUIT);
   const priceBnb = quote.prices?.[model.id] ?? model.priceBnb;
   const P = processorScale(model.processor);
 
-  // 本期晶体管数：由募资总额反推，缺省按 1 个兜底
+  // 本期电路数：由募资总额反推，缺省按 1 个兜底
   const actual = planTask({
     parts: round.partCount ?? 1,
-    transistorId: model.id,
+    circuitId: model.id,
     snapshot: quote,
   });
 
-  // 晶体管数由募资总额反推，成本 = 晶体管数 × 报价（采购价随市场浮动，不反推需求）
+  // 电路数由募资总额反推，成本 = 电路数 × 报价（采购价随市场浮动，不反推需求）
   const usedParts = actual.totalParts;
   const needBnb = actual.partsCost;
 
@@ -425,13 +424,13 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
     /** 仅供需要 USDT 折算时参考（如 ROI 展示），不影响业务计算 */
     bnbUsdt,
     hardCapUsdt: round4(hardCapBnb * bnbUsdt),
-    transistorId: model.id,
-    transistorName: model.name,
-    processor: chosenTransistor ? model.processor : null,
-    processorScale: chosenTransistor ? P : null,
-    partType: model.part,
+    circuitModelId: model.id,
+    circuitName: model.name,
+    processor: chosenCircuitModel ? model.processor : null,
+    processorScale: chosenCircuitModel ? P : null,
+    partType: "CIRCUIT",
     priceBnb,
-    /** 本期晶体管数 —— 由募资总额反推，不再拆 NAND / LATCH 配比 */
+    /** 本期电路数 —— 由募资总额反推 */
     usedParts,
     hashpower: actual.hashpower || 0,
     /**
@@ -439,7 +438,7 @@ export function estimateHashpower(round, quote = QUOTE, sold = null) {
      * createScene 靠它决定 pool 归属，缺了会让超限期次按已验证池算收益，必须带上。
      */
     capped: actual.capped === true,
-    /** 预估采购成本（BNB）= 晶体管数 × 报价 */
+    /** 预估采购成本（BNB）= 电路数 × 报价 */
     needBnb: round4(needBnb),
     dailyBem,
     totalNet: round4(dailyBem * round.miningDays * (1 - feeRate(round))),
@@ -532,14 +531,14 @@ export function computeHarvest(round, book, address = book.selfAddress, network 
  * executed 标记本期是否已执行换币流片：
  *   - false（funding / executing）：实际算力未知，界面显示预估值
  *   - true（mining）：实际算力 =按 quoteMult 涨过价的报价算出
- * quoteMult 模拟执行时晶体管涨价，所以预估值与实际值会不一致。
+ * quoteMult 模拟执行时电路涨价，所以预估值与实际值会不一致。
  */
 const SCENE_SEED = {
   // 募集中：22/100 份 = 11,000 USDT
   funding: { sold: 22, mine: 3, harvestCount: 0, claimed: 0, executed: false, circuitId: "—", offset: 0, soldOutAgoHours: null },
   // 售罄 12 小时前 —— 观察期未满，任何人都还不能 execute
   executing: { sold: 100, mine: 13, harvestCount: 0, claimed: 0, executed: false, circuitId: "—", offset: 0, soldOutAgoHours: 12 },
-  // 执行时晶体管涨到 1.5x：权重由实际买入的晶体管数决定，与报价无关
+  // 执行时电路涨到 1.5x：权重由实际买入的电路数决定，与报价无关
   mining: { sold: 100, mine: 13, harvestCount: 12, claimedRatio: 0.72, executed: true, quoteMult: 1.5, circuitId: "#58241", offset: 1, soldOutAgoHours: 200 },
 };
 
@@ -551,9 +550,9 @@ export function createScene(id, round = ROUND, phase = null, expired = false, ex
   // executing 的 endsAt 不用于展示（倒计时显示「—」），保留 fundingEnd 占位无害。
   const endsAt = id === "mining" ? undefined : (expired && id === "funding" ? Date.now() - 86400_000 : fundingEnd);
 
-  // 预估算力按基准单价；实际权重按执行时成交价（晶体管涨价不影响权重，只影响买不买得起）
+  // 预估算力按基准单价；实际权重按执行时成交价（电路涨价不影响权重，只影响买不买得起）
   const est = estimateHashpower(round, QUOTE, seed.sold);
-  const model = findTransistor(round.transistorId || DEFAULT_TRANSISTOR);
+  const model = findCircuit(round.circuitModelId || DEFAULT_CIRCUIT);
   const actualQuote = {
     ...QUOTE,
     prices: { ...QUOTE.prices, [model.id]: QUOTE.prices[model.id] * (seed.quoteMult || 1) },
@@ -580,9 +579,9 @@ export function createScene(id, round = ROUND, phase = null, expired = false, ex
   return {
     scene: id,
     /**
-     * 待执行子状态：晶体管来自晶体管市场，须由 Owner 钱包发起链上交易去挂单买入并确认到账，
-     * 不能指望合约自动去晶体管市场操作——合约无法替人工下单。
-     * buying = 待挂单；listed = 挂单中（可取消）；ready = 晶体管已到账，待 execute 流片开矿。
+     * 待执行子状态：电路来自电路市场，须由 Owner 钱包发起链上交易去挂单买入并确认到账，
+     * 不能指望合约自动去电路市场操作——合约无法替人工下单。
+     * buying = 待挂单；listed = 挂单中（可取消）；ready = 电路已到账，待 execute 流片开矿。
      * 其他场景无意义，置 undefined。
      */
     executePhase: id === "executing" ? (phase || seed.executePhase || "buying") : undefined,
@@ -731,7 +730,7 @@ export function seedCalls(round = ROUND) {
     { time: now - 26 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，挖矿产出服务费 ${formatBem(h.fee)} BEM` },
     { time: now - 3 * 86400_000, method: "claim", ok: true, message: `${shortAddress(WALLET)} 领取 ${formatBem(book.claimable)} BEM` },
     { time: now - 5 * 86400_000, method: "claim", ok: true, message: "0x8b21…B21A 领取 18.60 BEM" },
-    { time: now - 12 * 86400_000, method: "execute", ok: true, message: `已买入晶体管并转入矿池，算力 ${book.hashpower}` },
+    { time: now - 12 * 86400_000, method: "execute", ok: true, message: `已买入电路并转入矿池，算力 ${book.hashpower}` },
     { time: now - 13 * 86400_000, method: "subscribe", ok: true, message: `0x8b21…B21A 认筹 6 份，支付 ${(6 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000, method: "subscribe", ok: true, message: `${shortAddress(WALLET)} 认筹 4 份，支付 ${(4 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000 - 3600_000, method: "createCampaign", ok: true, message: `第 ${round.id} 期创建，${round.totalShares} 份 × ${round.sharePriceBnb} BNB，挖矿产出服务费 ${feePercentOf(round)}%` },
@@ -765,7 +764,7 @@ export function applySubscribe(round, book, shares) {
       picked: 1,
       scene: filled ? "executing" : book.scene,
       // 问题①修复：自然售罄进入 executing 也补 executePhase="buying"，
-      // 迫使必须先去晶体管市场买入晶体管并确认到账，否则 applyExecute 会拒。
+      // 迫使必须先去电路市场买入电路并确认到账，否则 applyExecute 会拒。
       executePhase: filled ? "buying" : book.executePhase,
       approved: true,
       // 售罄即启动 execute 观察期倒计时
@@ -974,64 +973,64 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
 
 
 /**
- * Owner 调用 tapeout.net 晶体管挂单逻辑（链上交易）。
+ * Owner 从官方电路市场买入电路（模拟）。
  *
- * 晶体管来自 tapeout.net 晶体管市场，但合约无法替人工去平台操作，所以由 Owner（或 keeper）
- * 手动调用本函数发起链上交易：先 placeTransistorOrder 进入「挂单中」，成交后 confirmTransistors 确认到账。
- * 仅 Owner 可调，避免状态竞争；非 Owner 或已挂单/已到账均拒绝。
+ * 链上 buyCircuits 是原子交割：一笔交易从募集余额付钱、ERC721 立刻到本期合约，
+ * 没有「挂单等成交」的中间态。这里按同一口径记账：
+ *   - 买入张数累加 circuitCount（历史）与 circuitHeldCount（当前持有）；
+ *   - 采购款直接从 bnbPool 扣掉；钱不够就置 executionFailed，不产生持仓。
  */
-export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) {
+export function applyBuyCircuits(round, book, actor = null, args = {}) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Owner 能挂买单。" };
+    return { ok: false, message: "只有 Owner 能从电路市场买入。" };
   }
   if (book.scene !== "executing") {
-    return { ok: false, message: "只有待执行状态可以挂买单。" };
+    return { ok: false, message: "只有待执行状态可以买入电路。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "晶体管已到账，无需再挂单。若要重挂请先取消。" };
+    return { ok: false, message: "电路已确认到账，直接入池或挂回市场卖出。" };
   }
-  if (book.executePhase === "listed") {
-    return { ok: false, message: "已经有挂单，等成交或先取消。" };
-  }
-  // 退款后可改价重挂；若已退光本金则不可再挂（对齐合约：executionFailed && raisedBnb == 0）
   if (book.executionFailed && (book.bnbPool || 0) <= 0) {
-    return { ok: false, message: "本金已退光，不能再挂单。" };
+    return { ok: false, message: "本金已退光，不能再买入。" };
   }
-  const nand = Math.floor(Number(args.nandQty) || 0);
-  const latch = Math.floor(Number(args.latchQty) || 0);
-  const count = nand + latch || Math.floor(Number(
-    args.count ?? book.transistorCount ?? book.estimate?.usedParts ?? 0
-  ));
-  const unit = Number(
-    args.nandPrice ?? args.unitPriceBnb ?? (book.priceLock > 0 ? book.priceLock : quoteUnitFallback(book))
-  );
+  const count = Math.floor(Number(args.qty) || 0);
+  const unit = Number(args.maxPriceBnb ?? args.unitPriceBnb ?? quoteUnitFallback(book));
   if (!Number.isFinite(count) || count <= 0) {
-    return { ok: false, message: "挂单数量须为正整数。" };
+    return { ok: false, message: "买入张数须为正整数。" };
   }
   if (!Number.isFinite(unit) || unit <= 0) {
-    return { ok: false, message: "挂单单价须大于 0。" };
+    return { ok: false, message: "最高单价须大于 0。" };
   }
+  const cost = round4(count * unit);
+  const pool = Number(book.bnbPool || 0);
+  if (cost > pool) {
+    return {
+      ok: true,
+      message: `采购 ${count} 张 × ${round4(unit)} BNB 超过可用 ${round4(pool)} BNB，链上会置执行失败。`,
+      book: { ...book, executionFailed: true },
+    };
+  }
+  const held = (Number(book.circuitHeldCount) || 0) + count;
+  const bought = (Number(book.circuitCount) || 0) + count;
   return {
     ok: true,
-    message: book.executionFailed
-      ? `已降价重挂：${count} 颗 × ${round4(unit)} BNB，等待成交。`
-      : `已锁价挂单：${count} 颗 × ${round4(unit)} BNB，等待成交。`,
+    message: `已从电路市场买入 ${count} 张 × ${round4(unit)} BNB（模拟），持仓 ${held} 张。`,
     book: {
       ...book,
       executionFailed: false,
-      executePhase: "listed",
-      // 挂单量 ≠ 已买入量：挂出去只是下单，成交到账前晶体管数仍是 0。
-      nandQty: nand,
-      latchQty: latch,
-      transistorCount: 0,
+      executePhase: "buying",
+      circuitCount: bought,
+      circuitHeldCount: held,
+      orderFilled: true,
       priceLock: round4(unit),
+      bnbPool: round4(pool - cost),
     },
   };
 }
 
 /**
- * 挂单价缺省值：取报价里的晶体管单价，不写死常数。
+ * 挂单价缺省值：取报价里的电路单价，不写死常数。
  * 报价缺失时返回 0 —— 由调用方报「挂单单价须大于 0」，让用户自己填。
  */
 function quoteUnitFallback(book) {
@@ -1053,7 +1052,7 @@ export function applyOpenRefund(round, book, actor = null) {
     return { ok: false, message: "只有待执行可以由 Owner 发起退款。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "晶体管已到账，不能退款结束本期。用「退回剩余募集款」把没花完的 BNB 按份退给持份人。" };
+    return { ok: false, message: "电路已到账，不能退款结束本期。用「退回剩余募集款」把没花完的 BNB 按份退给持份人。" };
   }
   if (book.executePhase && book.executePhase !== "buying") {
     return { ok: false, message: "请先取消挂单，再发起退款。" };
@@ -1069,40 +1068,10 @@ export function applyOpenRefund(round, book, actor = null) {
 }
 
 /**
- * Owner 取消挂单或从 Ready 撤回，回到待挂单。对齐合约 cancelTransistorOrder。
+ * Owner 确认电路已经到账：本期合约持有 ERC721 → 进入 Ready。
+ * 链上对应 confirmCircuits()。
  */
-export function applyCancelTransistorOrder(round, book, actor = null) {
-  const who = actor || identify(WALLET, book);
-  if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Owner 能取消挂单。" };
-  }
-  if (book.scene !== "executing") {
-    return { ok: false, message: "只有待执行状态才有挂单可取消。" };
-  }
-  if (book.executePhase !== "listed" && book.executePhase !== "ready") {
-    return { ok: false, message: "当前没有进行中的挂单。" };
-  }
-  return {
-    ok: true,
-    message: book.executePhase === "ready"
-      ? "已回到待挂单状态。"
-      : "已取消挂单，回到待挂单状态。",
-    book: {
-      ...book,
-      executePhase: "buying",
-      transistorCount: 0,
-      priceLock: undefined,
-    },
-  };
-}
-
-/**
- * Owner 确认 tapeout.net 晶体管成交到账（链上确认交易）。
- *
- * 合约无法替人工确认平台成交，所以由 Owner（或 keeper）手动调用本函数发起链上交易确认成交到账。
- * 仅 Owner 可调，且必须先调用挂单逻辑（listed）才能确认到账——未挂单时拒绝。
- */
-export function applyConfirmTransistors(round, book, actor = null) {
+export function applyConfirmCircuits(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
     return { ok: false, message: "只有 Owner 能确认到账。" };
@@ -1111,48 +1080,48 @@ export function applyConfirmTransistors(round, book, actor = null) {
     return { ok: false, message: "只有待执行状态可以确认到账。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "晶体管已确认到账，可直接入池。" };
+    return { ok: false, message: "电路已确认到账，可直接入池。" };
   }
-  if (book.executePhase !== "listed") {
-    return { ok: false, message: "请先挂买单，再确认到账。" };
+  const held = Number(book.circuitHeldCount ?? 0) || 0;
+  if (held <= 0) {
+    return { ok: false, message: "本期合约还没有电路（CircuitsNotReady）：先买入电路。" };
   }
   return {
     ok: true,
-    message: "已确认晶体管成交并到账，可以入池。",
+    message: `已确认 ${held} 张电路到账，可以入池。`,
     book: {
       ...book,
       executePhase: "ready",
-      // 确认到账后，晶体管数才等于挂单量（成交口径）。
-      transistorCount: (Number(book.nandQty) || 0) + (Number(book.latchQty) || 0),
+      circuitHeldCount: held,
     },
   };
 }
 
 /**
- * 把晶体管投入矿池：预估变成实际的唯一地方。
+ * 把电路投入矿池：预估变成实际的唯一地方。
  *
- * 权限：仅 Owner。晶体管到账后即可执行，不再等待观察期。
- * 执行逻辑：直接按 Owner 在晶体管市场实际买入并确认到账的晶体管数量入池开矿。
- *          晶体管数不再由图纸推算、也不与募资总额做「买不买得起」的比较——
- *          买多少算多少，H = 实买晶体管数 × P。采购款之外的余量按份退回。
+ * 权限：仅 Owner。电路到账后即可执行，不再等待观察期。
+ * 执行逻辑：直接按 Owner 在电路市场实际买入并确认到账的电路数量入池开矿。
+ *          电路数不再由图纸推算、也不与募资总额做「买不买得起」的比较——
+ *          买多少算多少，H = 实买电路数 × P。采购款之外的余量按份退回。
  */
 export function applyExecute(round, book, quote = MARKET, actor = null) {
   if (book.scene !== "executing") return { ok: false, message: "只有售罄后的待执行状态可以 execute。" };
   if (book.sold < round.totalShares) return { ok: false, message: "份数尚未售罄，不能执行。" };
   /**
-   * 晶体管须已通过调用 tapeout.net 挂单逻辑并确认到账（executePhase === "ready"）才能流片。
+   * 电路须已通过调用 tapeout.net 挂单逻辑并确认到账（executePhase === "ready"）才能流片。
    * executePhase 缺失（旧数据/非 executing）按 ready 处理，避免误拦截；
    * 自然售罄进入 executing 时已补 executePhase="buying"（见 applySubscribe），故此处会正确拦住。
    */
   if (book.executePhase && book.executePhase !== "ready") {
-    return { ok: false, message: "晶体管还没到账。先挂买单并确认到账，再入池。" };
+    return { ok: false, message: "电路还没到账。先挂买单并确认到账，再入池。" };
   }
 
   const who = actor || identify(WALLET, book);
   const label = who.label || (who.role === ROLE.OWNER ? "Owner" : who.shares > 0 ? "持份用户" : "未持份地址");
   // F3：execute 不可逆（把全期募集款烧掉），权限收紧为仅 Owner
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Owner 能把晶体管投入矿池（不可逆）。" };
+    return { ok: false, message: "只有 Owner 能把电路投入矿池（不可逆）。" };
   }
 
   // 价格快照锁价——以本次执行的报价（或挂单时锁定的报价）结算，
@@ -1160,13 +1129,13 @@ export function applyExecute(round, book, quote = MARKET, actor = null) {
   const lockUsed = book.priceLock || quote;
   const est = estimateHashpower(round, lockUsed, book.sold);
   /**
-   * 入池晶体管数 = Owner 在晶体管市场实际买入并确认到账的数量（nandQty + latchQty）。
+   * 入池电路数 = Owner 从电路市场实际买入并确认到账的张数（circuitHeldCount）。
    * 不再拿它跟任何推算出来的需求配比或「募资总额能买几个」比较——买多少算多少。
    */
-  const bought = Math.max(0, Math.floor(Number(book.transistorCount) || 0));
+  const bought = Math.max(0, Math.floor(Number(book.circuitHeldCount ?? 0) || 0));
   const parts = bought > 0 ? bought : est.usedParts;
   const unit = Number(book.priceLock) > 0 ? Number(book.priceLock) : Number(est.priceBnb) || 0;
-  const actual = planTask({ parts, transistorId: est.transistorId, snapshot: est.quote });
+  const actual = planTask({ parts, circuitId: est.circuitModelId, snapshot: est.quote });
   const hashpower = actual.hashpower;
   const dailyBem = bemRate(hashpower);
 
@@ -1194,7 +1163,7 @@ export function applyExecute(round, book, quote = MARKET, actor = null) {
   return {
     ok: true,
     scene: "mining",
-    message: `${label}触发 execute：募集 ${est.hardCapBnb} BNB，购入 ${parts} 个${est.transistorName}，` +
+    message: `${label}触发 execute：募集 ${est.hardCapBnb} BNB，购入 ${parts} 张${est.circuitName}，` +
       `入池算力 ${hashpower}` +
       (surplus > 0 ? `；余量 ${surplus} BNB 已按份退回` : "") +
       `。`,
@@ -1213,7 +1182,8 @@ export function applyExecute(round, book, quote = MARKET, actor = null) {
       executionFailed: false,
       executePhase: undefined,
       priceLock: unit > 0 ? round5(unit) : undefined,
-      transistorCount: parts,
+      circuitCount: parts,
+      circuitHeldCount: 0,
       bnbPool: 0,
       refundedBnb: round4((book.refundedBnb || 0) + refundedExtra),
       endsAt: undefined,
@@ -1257,7 +1227,7 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
       sharePriceBnb: draft.sharePriceBnb,
       totalShares: draft.totalShares,
       feePercent: draft.feePercent,
-      transistorId: draft.transistorId,
+      circuitId: draft.circuitModelId,
       feeRecipient: draft.feeRecipient,
       feeShares: draft.feeShares,
     },
@@ -1267,7 +1237,7 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
   if (!review.ok) return { ok: false, message: review.issues[0] };
 
   const nextId = round.id + 1;
-  const model = findTransistor(draft.transistorId || DEFAULT_TRANSISTOR);
+  const model = findCircuit(draft.circuitModelId || DEFAULT_CIRCUIT);
   const feeShares = (Array.isArray(draft.feeShares) ? draft.feeShares : []).map((row) => {
     const percent =
       row.sharePercent != null && row.sharePercent !== ""
@@ -1283,13 +1253,13 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
     ...round,
     id: nextId,
     /**
-     * 本期要烧的晶体管总数（NAND + LATCH），开期后不可改。
-     * 权重 H = 晶体管数 × P，所以这就是算力的唯一来源。
+     * 本期要烧的电路总数，开期后不可改。
+     * 权重 H = 电路数 × P，所以这就是算力的唯一来源。
      * 不再是开期参数：由本期募资总额按理想成本占比反推。
      */
     partCount: derivePartCount({
       hardCapBnb: Number(draft.sharePriceBnb) * Number(draft.totalShares),
-      transistorId: draft.transistorId,
+      circuitId: draft.circuitModelId,
       snapshot,
     }),
     sharePriceBnb: Number(draft.sharePriceBnb),
@@ -1299,7 +1269,7 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
     miningDays: MINING_DAYS,
     /** 服务费：开期表单填多少就是多少，代码不给默认值 */
     feePercent: Number(draft.feePercent),
-    transistorId: model.id,
+    circuitModelId: model.id,
     processor: draft.processor,
     feeRecipient: feeShares[0]?.address || String(draft.feeRecipient || "").trim(),
     feeShares,
@@ -1313,7 +1283,7 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
   };
   return {
     ok: true,
-    message: `第 ${nextId} 期开始募集：${model.name}，募资 ${review.hardCapBnb} BNB，本期 ${review.needParts} 晶体管，权重 ${review.hashpower}`,
+    message: `第 ${nextId} 期开始募集：${model.name}，募资 ${review.hardCapBnb} BNB，本期 ${review.needParts} 电路，权重 ${review.hashpower}`,
     round: nextRound,
     book: createScene("funding", nextRound),
   };
@@ -1328,13 +1298,13 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
  *
  * 兼容旧调用：若不传 `hardCapBnb`，则沿用「每份 × 份数」推算募资总额。
  *
- * 晶体管数只由募资总额反推（不再拆 NAND / LATCH 配比），校验只管发行参数本身：
- * 募资总额、总份数、服务费与分成地址。晶体管在晶体管市场自由买卖，不再校验买不买得起。
+ * 电路数只由募资总额反推，校验只管发行参数本身：
+ * 募资总额、总份数、服务费与分成地址。电路在电路市场自由买卖，不再校验买不买得起。
  */
 export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
   const totalShares = Number(draft.totalShares);
 
-  const model = findTransistor(draft.transistorId || DEFAULT_TRANSISTOR);
+  const model = findCircuit(draft.circuitModelId || DEFAULT_CIRCUIT);
   const priceBnb = snapshot?.prices?.[model.id] ?? model.priceBnb;
   const bnbUsdt = snapshot?.bnbUsdt || MARKET.bnbUsdt;
 
@@ -1352,19 +1322,19 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
   }
 
   /**
-   * 本期晶体管数由募资总额反推，权重 H = 晶体管数 × P。
+   * 本期电路数由募资总额反推，权重 H = 电路数 × P。
    * 口径必须跟 applyCreate 一致（都用本次表单算出来的募资总额），
-   * 否则「预览 567 颗 / 实际写入 621 颗」会对不上。
+   * 否则「预览 567 张 / 实际写入 621 张」会对不上。
    */
   const capForParts =
     Number.isFinite(hardCapBnb) && hardCapBnb > 0 ? hardCapBnb : Number(base.hardCapBnb) || 0;
   const actual = planTask({
     parts: derivePartCount({
       hardCapBnb: capForParts,
-      transistorId: draft.transistorId ?? base.transistorId,
+      circuitId: draft.circuitModelId ?? base.circuitModelId,
       snapshot,
     }),
-    transistorId: model.id,
+    circuitId: model.id,
     snapshot,
   });
 
@@ -1450,14 +1420,14 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
     model,
     /** 兼容旧字段：等于该型号自身的价 */
     priceBnb,
-    /** 晶体管数只由募资总额派生，不再拆 NAND / LATCH 配比 */
+    /** 电路数只由募资总额派生 */
     needParts: actual.totalParts,
     /** 是否被挖矿闸门拦住（只能进未验证池） */
     capped: actual.capped,
     bnbUsdt,
     /** 日产：已含闸门判定（capped → 未验证池） */
     dailyBem: bemRate(actual.hashpower, { pool: actual.capped ? "unverified" : "verified" }),
-    /** 权重 H = 晶体管数 × 每颗算力 */
+    /** 权重 H = 电路数 × 每张算力 */
     hashpower: actual.hashpower,
     processorScale: actual.processorScale,
     /** 阻断性问题：不改就不能提交 */

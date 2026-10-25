@@ -41,8 +41,8 @@ function contractCatalog(round, book = {}) {
           name: "createCampaign",
           kind: "write",
           caller: "Owner",
-          signature: "createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint64 fundingSeconds,address transistors) returns (address)",
-          summary: "开一期众筹。四个参数：每份 BNB、总份数、募集天数、本期晶体管合约（必须来自工厂白名单）。",
+          signature: "createCampaign(uint256 sharePriceBnb,uint256 totalShares,uint64 fundingSeconds,address circuits) returns (address)",
+          summary: "开一期众筹。四个参数：每份 BNB、总份数、募集天数、本期电路合约（必须来自工厂白名单）。",
           fields: [
             ["sharePriceBnb", "每份 BNB", round.sharePriceBnb],
             ["totalShares", "总份数", round.totalShares],
@@ -66,19 +66,19 @@ function contractCatalog(round, book = {}) {
           fields: [["index", "索引", "0"]],
         },
         {
-          name: "allowedPartsCount",
+          name: "allowedCircuitsCount",
           kind: "read",
           caller: "任何人",
-          signature: "allowedPartsCount() view",
+          signature: "allowedCircuitsCount() view",
           summary: "白名单条数。白名单部署时写入，之后不可增删；开期时只能从这里选。",
           fields: [],
         },
         {
-          name: "allowedPartsAt",
+          name: "allowedCircuitsAt",
           kind: "read",
           caller: "任何人",
-          signature: "allowedPartsAt(uint256) view",
-          summary: "白名单第 index 项的晶体管合约地址（主网为 TapeOut / Behemoth）。",
+          signature: "allowedCircuitsAt(uint256) view",
+          summary: "白名单第 index 项的电路合约地址（主网为 TapeOut / Behemoth）。",
           fields: [["index", "索引", "0"]],
         },
         {
@@ -86,8 +86,8 @@ function contractCatalog(round, book = {}) {
           kind: "read",
           caller: "任何人",
           signature: "isAllowedParts(address) view",
-          summary: "该晶体管合约是否在名单内。不在名单里不能开期。",
-          fields: [["parts", "晶体管合约地址", "0x"]],
+          summary: "该电路合约是否在名单内。不在名单里不能开期。",
+          fields: [["parts", "电路合约地址", "0x"]],
         },
         {
           name: "setFactoryOwner",
@@ -119,12 +119,14 @@ function contractCatalog(round, book = {}) {
         { name: "pendingSurplus", kind: "read", caller: "任何人", signature: "pendingSurplus(address) view", summary: "该地址已记账、还没领的余款（BNB）。持份人自己调 claimSurplus 领取。", fields: [["account", "地址", "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"]] },
         { name: "totalPendingSurplus", kind: "read", caller: "任何人", signature: "totalPendingSurplus() view", summary: "全期待领余款总额，这部分不属于 Owner。", fields: [] },
         { name: "raisedBnb", kind: "read", caller: "任何人", signature: "raisedBnb() view", summary: "合约托管中的 BNB（募集款 + 卖出款 − 已支出）。", fields: [] },
-        { name: "transistors", kind: "read", caller: "任何人", signature: "transistors() view", summary: "开期锁定的晶体管合约。NAND 为 0，LATCH 为 1。", fields: [] },
-        { name: "materialMarket", kind: "read", caller: "任何人", signature: "materialMarket() view", summary: "本期使用的晶体管市场地址。", fields: [] },
+        { name: "circuits", kind: "read", caller: "任何人", signature: "circuits() view", summary: "开期锁定的 ERC721 电路集合。每张电路是该集合里的一个 tokenId。", fields: [] },
+        { name: "circuitMarket", kind: "read", caller: "任何人", signature: "circuitMarket() view", summary: "本期使用的官方电路市场地址（只有卖单侧）。", fields: [] },
+        { name: "circuitCount", kind: "read", caller: "任何人", signature: "circuitCount() view", summary: "累计买入的电路张数（历史事实，卖出/入池后不变）。", fields: [] },
+        { name: "circuitHeldCount", kind: "read", caller: "任何人", signature: "circuitHeldCount() view", summary: "本期合约当前持有的电路张数。卖出或入池后下降。", fields: [] },
         { name: "executionFailed", kind: "read", caller: "任何人", signature: "executionFailed() view", summary: "是否已判执行失败；为真时持份人可退款。", fields: [] },
         { name: "halted", kind: "read", caller: "任何人", signature: "halted() view", summary: "熔断中：认筹、挂单、卖出、入池、份额交易全停；退款、领款、撤单不受影响。", fields: [] },
         { name: "soldOutAt", kind: "read", caller: "任何人", signature: "soldOutAt() view", summary: "售罄时间。非 Owner 判失败须等售罄满 3 天。", fields: [] },
-        { name: "priceLock", kind: "read", caller: "任何人", signature: "priceLock() view", summary: "本次挂单锁定的晶体管成本与数量。", fields: [] },
+        { name: "priceLock", kind: "read", caller: "任何人", signature: "priceLock() view", summary: "累计采购成本（BNB，所有已买入电路的成本之和）。", fields: [] },
         { name: "holderCount", kind: "read", caller: "任何人", signature: "holderCount() view", summary: "持份地址数量。", fields: [] },
         {
           name: "sharesOf",
@@ -145,7 +147,7 @@ function contractCatalog(round, book = {}) {
         { name: "listShares", kind: "write", caller: "持份用户 / Owner", signature: "listShares(uint256,uint256)", summary: "发布份额出售挂单：份数与每份 BNB。挂出即锁定份额，成交或撤单后释放。", fields: [["shares", "份数", "3"], ["priceBnbPerShare", "每份 BNB", round.sharePriceBnb.toFixed(4)]] },
         { name: "cancelListing", kind: "write", caller: "挂单方 / Owner", signature: "cancelListing(uint256)", summary: "撤销自己发布的挂单，释放锁定份额回到可用余额。", fields: [["listingId", "挂单 ID", listingIdHint]] },
         { name: "takeListing", kind: "write", caller: "任一持份用户", signature: "takeListing(uint256,uint256)", summary: "按挂单价买入份额，BNB 当场付给卖方。不能买自己的挂单。", fields: [["listingId", "挂单 ID", listingIdHint], ["shares", "份数", "1"]] },
-        { name: "refund", kind: "write", caller: "持份用户 / Owner", signature: "refund()", summary: "退回本金并清零份额。只有募集超时、已判失败、或池子不足以按原价兑付时可用；晶体管已到账则不可退，只能退余款。", fields: [] },
+        { name: "refund", kind: "write", caller: "持份用户 / Owner", signature: "refund()", summary: "退回本金并清零份额。只有募集超时、已判失败、或池子不足以按原价兑付时可用；电路已到账则不可退，只能退余款。", fields: [] },
         { name: "claimSurplus", kind: "write", caller: "持份用户", signature: "claimSurplus()", summary: "领取你按份应得的余款与挖矿收益。钱已记账，随时可领，同一笔只能领一次。", fields: [] },
         { name: "claimFee", kind: "write", caller: "服务费收款方", signature: "claimFee()", summary: "服务费收款方领取属于自己那部分挖矿产出服务费。与认筹款无关。", fields: [] },
         {
@@ -160,56 +162,54 @@ function contractCatalog(round, book = {}) {
             ["sharesBps", "各地址份额（基点，合计 10000）", "[10000]"],
           ],
         },
-        { name: "markFailed", kind: "write", caller: "Owner 随时；其他人须售罄满 3 天", signature: "markFailed()", summary: "把本期判为执行失败，为所有持份人打开退款。Owner 随时可调，其他人须售罄满 3 天；晶体管已到账则不可用。", fields: [] },
+        { name: "markFailed", kind: "write", caller: "Owner 随时；其他人须售罄满 3 天", signature: "markFailed()", summary: "把本期判为执行失败，为所有持份人打开退款。Owner 随时可调，其他人须售罄满 3 天；电路已到账则不可用。", fields: [] },
         { name: "claim", kind: "write", caller: "用户", signature: "claim()", summary: "占位实现，当前不产出发放。", fields: [] },
         {
           name: "depositToPool",
           kind: "write",
           caller: "仅 Owner",
           signature: "depositToPool()",
-          summary: "把晶体管投入矿池，本期进入挖矿（不可逆）。没花完的募集款会先按份记账给持份人。",
+          summary: "把电路投入矿池，本期进入挖矿（不可逆）。没花完的募集款会先按份记账给持份人。",
           fields: [],
         },
         {
-          name: "confirmTransistors",
+          name: "confirmCircuits",
           kind: "write",
           caller: "任何人",
-          signature: "confirmTransistors()",
-          summary: "确认买单已成交、晶体管已到账。之后才能卖出或入池。任何人可调。",
+          signature: "confirmCircuits()",
+          summary: "确认本期已持有电路并进入 Ready。要求 circuitHeldCount > 0；之后才能挂回市场或入池。",
           fields: [],
         },
         {
-          name: "placeTransistorOrder",
+          name: "buyCircuits",
           kind: "write",
           caller: "仅 Owner",
-          signature: "placeTransistorOrder(uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
-          summary: "挂单买入 NAND / LATCH，保证金从募集款里出。只在待挂单时可调，一次只能有一张挂单。",
+          signature: "buyCircuits(uint256[] listingIds,uint256[] tokenIds,uint96[] prices)",
+          summary: "按市场卖单原子买入电路：采购款直接从募集余额扣，ERC721 成交即到本期合约。一次最多买到 100 张。",
           fields: [
-            ["nandQty", "NAND 数量（颗，可留空）", "100"],
-            ["nandPrice", "NAND 买价 BNB（最多 5 位小数）", "0.05610"],
-            ["latchQty", "LATCH 数量（颗，可留空）", "0"],
-            ["latchPrice", "LATCH 买价 BNB（最多 5 位小数）", "0"],
+            ["listingIds", "市场挂单 ID 数组", "[1]"],
+            ["tokenIds", "电路 tokenId 数组", "[0]"],
+            ["prices", "每张的成交价（wei）", "[0]"],
           ],
         },
         {
-          name: "cancelTransistorOrder",
-          kind: "write",
-          caller: "未成交仅 Owner；已有成交或已移除时任何人",
-          signature: "cancelTransistorOrder()",
-          summary: "撤掉未成交部分，保证金退回募集池。已成交的不能撤。",
-          fields: [],
-        },
-        {
-          name: "sellTransistors",
+          name: "listCircuit",
           kind: "write",
           caller: "Owner",
-          signature: "sellTransistors(uint256 bidId, uint8 tokenId, uint256 quantity)",
-          summary: "吃一张市场买单，把手里的晶体管按该单单价卖掉，成交款立即回本期。只在已到账后可用，单价不能低于本期买入成本。",
+          signature: "listCircuit(uint256 tokenId,uint96 price)",
+          summary: "把手里的一张电路挂回市场卖出。只做单张 ERC721 授权（不 setApprovalForAll），挂单价不得低于该张买入成本。",
           fields: [
-            ["bidId", "要吃的买单 ID", "1"],
-            ["tokenId", "0 = NAND，1 = LATCH", "0"],
-            ["quantity", "卖出数量（颗）", "1"],
+            ["tokenId", "电路 tokenId", "0"],
+            ["priceBnb", "挂单价 BNB（最多 5 位小数）", "0.05610"],
           ],
+        },
+        {
+          name: "cancelCircuitListing",
+          kind: "write",
+          caller: "Owner / 已移除期次任何人",
+          signature: "cancelCircuitListing(uint256 tokenId)",
+          summary: "撤销某张电路的挂单。入池前必须把所有挂单撤掉。",
+          fields: [["tokenId", "电路 tokenId", "0"]],
         },
         {
           name: "setPhase",
@@ -248,7 +248,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "Owner",
           signature: "openRefund()",
-          summary: "打开退款：本期判为执行失败，持份人各自领回本金。只在待挂单可用；晶体管已到账请改用 returnSurplus。",
+          summary: "打开退款：本期判为执行失败，持份人各自领回本金。只在待挂单可用；电路已到账请改用 returnSurplus。",
           fields: [],
         },
         {
@@ -256,7 +256,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Owner",
           signature: "abandonOrder()",
-          summary: "放弃本期：撤未成交买单、提取卖出款、打开退款。份额全清并退完后，剩余晶体管才退回 Owner。",
+          summary: "放弃本期：撤未成交买单、提取卖出款、打开退款。份额全清并退完后，剩余电路才退回 Owner。",
           fields: [],
         },
         {
@@ -274,7 +274,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Owner",
           signature: "setMiningPool(address)",
-          summary: "设定矿池地址，入池时晶体管转到这里。",
+          summary: "设定矿池地址，入池时电路转到这里。",
           fields: [["pool", "矿池地址", ""]],
         },
         {
@@ -286,12 +286,12 @@ function contractCatalog(round, book = {}) {
           fields: [],
         },
         {
-          name: "setMaterialMarket",
+          name: "setCircuitMarket",
           kind: "write",
           caller: "仅 Owner",
-          signature: "Campaign.setMaterialMarket(address)",
-          summary: "更换本期晶体管市场。挂单中不能换。",
-          fields: [["materialMarket", "晶体管市场地址", ""]],
+          signature: "Campaign.setCircuitMarket(address)",
+          summary: "更换本期电路市场。还有电路挂在旧市场时拒绝（AlreadyListed），换市场会先取回旧市场欠款。",
+          fields: [["circuitMarket", "电路市场地址", ""]],
         },
         {
           name: "recoverBnb",
@@ -302,15 +302,14 @@ function contractCatalog(round, book = {}) {
           fields: [],
         },
         {
-          name: "recoverTransistors",
+          name: "recoverCircuits",
           kind: "write",
           caller: "仅 Owner",
-          signature: "recoverTransistors(address,uint256,uint256)",
-          summary: "把本期持有的晶体管转给 Owner。挂单中不可转。",
+          signature: "recoverCircuits(address,uint256)",
+          summary: "把当期持有的某一张 ERC721 电路转给 Owner。已入池、挂单中或份额未结清时拒绝。",
           fields: [
-            ["token", "晶体管合约", book.transistors || ""],
+            ["token", "电路合约", book.circuits || ""],
             ["id", "tokenId", "0"],
-            ["amount", "数量", "1"],
           ],
         },
         {
@@ -341,31 +340,31 @@ function contractCatalog(round, book = {}) {
     },
     {
       id: "market",
-      name: "晶体管市场（只读 / 测试网模拟）",
-      address: book.market || "由本期合约 materialMarket() 读取",
+      name: "官方电路市场（ERC721 卖单侧）",
+      address: book.circuitMarket || "由本期合约 circuitMarket() 读取",
       methods: [
         {
           name: "marketOpenOrders",
           kind: "read",
           caller: "任何人",
-          signature: "nextBidId() / bids(id)",
-          summary: "列出市场里所有未成交的买单。",
+          signature: "nextListingId() / listings(id)",
+          summary: "列出市场里属于本期电路的未成交卖单。",
           fields: [],
         },
         {
-          name: "marketBids",
+          name: "marketListing",
           kind: "read",
           caller: "任何人",
-          signature: "bids(uint256) view",
-          summary: "单张买单详情：买家、晶体管、单价、剩余量。",
-          fields: [["id", "买单 ID", "1"]],
+          signature: "listings(uint256) view",
+          summary: "单张卖单详情：卖家、电路合约、tokenId、单价、手续费快照。",
+          fields: [["id", "挂单 ID", "1"]],
         },
         {
           name: "marketSellable",
           kind: "read",
           caller: "任何人",
-          signature: "nextBidId() / bids(id)（筛本期晶体管）",
-          summary: "列出本期能吃的外部买单，按单价从高到低。",
+          signature: "scan listings（筛本期电路）",
+          summary: "列出本期电路当前可买的卖单，按单价从低到高。",
           fields: [],
         },
         {
@@ -377,46 +376,37 @@ function contractCatalog(round, book = {}) {
           fields: [["account", "地址（留空 = 本期合约）", ""]],
         },
         {
-          name: "simulateFillBid",
+          name: "simulateBuyListing",
           kind: "write",
           caller: "任意调试钱包",
-          signature: "bids(id) → fillBid(id, quantity) → MockERC1155.mint(buyer)",
-          summary: "测试网模拟卖方成交，并把同数量测试晶体管铸给买家。",
-          fields: [["id", "买单 ID", "1"], ["quantity", "成交数量（留空 = 全部剩余）", ""]],
+          signature: "listings(id) → buy(id, price) payable",
+          summary: "测试网模拟外部买家吃单：按挂单价真实付款，ERC721 立刻转给买家家。",
+          fields: [["id", "挂单 ID", "1"]],
         },
         {
-          name: "simulateFillCampaignBids",
+          name: "simulateExternalListing",
           kind: "write",
           caller: "任意调试钱包",
-          signature: "nandBidId() / latchBidId() → fillBid + mint",
-          summary: "测试网一键撮合本期两张买单并补齐晶体管。",
-          fields: [],
-        },
-        {
-          name: "simulateExternalBid",
-          kind: "write",
-          caller: "任意调试钱包",
-          signature: "placeBid(transistors, tokenId, price, quantity) payable",
-          summary: "测试网模拟外部买家挂一张本期晶体管的买单。",
+          signature: "MockCircuitNft.mint → approve → list(circuits, tokenId, price)",
+          summary: "测试网模拟外部卖家：mint 一张测试电路并挂出卖单，供 buyCircuits 买入。",
           fields: [
-            ["tokenId", "0 = NAND，1 = LATCH", "0"],
+            ["tokenId", "电路 tokenId", "1"],
             ["price", "单价 BNB（最多 5 位小数）", "0.05600"],
-            ["quantity", "数量（颗）", "1"],
           ],
         },
       ],
     },
     {
       id: "upstream",
-      name: "上游合约",
+      name: "上游合约（由本期合约调用）",
       address: "由本期合约调用",
       methods: [
         {
-          name: "placeBid / fillBid",
+          name: "list / delist / buy",
           kind: "internal",
           caller: "仅本期合约",
-          signature: "placeBid / cancelBid / fillBid / withdraw",
-          summary: "官方晶体管市场只有买单侧：本期挂买单买晶体管，或吃别人的买单卖出。",
+          signature: "list(circuits,tokenId,price) / delist(id) / buy(id,expectedPrice) payable",
+          summary: "官方电路市场只有卖单侧：买入 = buy 吃卖单；卖出 = list 挂单、delist 撤单、withdraw 提款。",
           fields: [],
         },
       ],
@@ -436,7 +426,7 @@ export function ContractCalls({ round, book, connected, wallet, pending, onInvok
   // 表单默认值也要参与 gate：listingId 这类参数不能只看静态 fields 定义。
   const values = Object.fromEntries(fields.map(([key, , value]) => [key, value]));
   const gate = method ? callGate(method, book, round, connected, actor, values) : { ok: false, reason: "未选择函数" };
-  // 晶体管挂单价按五位小数限制输入，避免用户填的 0.00456 被静默截成 0.0045
+  // 电路挂单价按五位小数限制输入，避免用户填的 0.00456 被静默截成 0.0045
   const isPriceField = (key) => /price/i.test(key);
 
   function choose(id) {
@@ -611,14 +601,14 @@ function sameAddr(a, b) {
 
 /**
  * 被熔断（halted）挡住的写入口 —— 与合约 `whenLive` 完全对应：
- * subscribe / placeTransistorOrder / sellTransistors / depositToPool / listShares / takeListing。
- * refund / claimSurplus / claimFee / cancelListing / cancelTransistorOrder / withdrawMarketProceeds
+ * subscribe / buyCircuits / listCircuit / depositToPool / listShares / takeListing。
+ * refund / claimSurplus / claimFee / cancelListing / cancelCircuitListing / withdrawMarketProceeds
  * 以及各类管理取回都不在表内：熔断永远不能锁住退出与撤单。
  */
 const HALTED_BLOCKED = new Set([
   "subscribe",
-  "placeTransistorOrder",
-  "sellTransistors",
+  "buyCircuits",
+  "listCircuit",
   "depositToPool",
   "listShares",
   "takeListing",
@@ -627,20 +617,17 @@ const HALTED_BLOCKED = new Set([
 export function callGate(method, book, round, connected, actor = { role: "user", shares: 0 }, values = {}) {
   if (method.kind === "internal") return { ok: false, reason: "这个函数只允许本期合约内部调用。" };
   if (method.kind === "read") return { ok: true, reason: "" };
-  if (method.name.startsWith("simulateFill") || method.name === "simulateExternalBid") {
-    if (!connected) return { ok: false, reason: "模拟撮合需要连接钱包（任意测试网钱包都可以）。" };
-    // 这套入口靠 MockMaterialMarket.fillBid + MockERC1155.mint 才成立；主网官方合约没有公开 mint。
+  if (method.name === "simulateExternalListing" || method.name === "simulateBuyListing") {
+    if (!connected) return { ok: false, reason: "模拟需要连接钱包（任意测试网钱包都可以）。" };
+    // 这套入口靠 MockCircuitNft.mint + MockCircuitMarket 才成立；主网官方电路不能凭空铸币。
     if (CHAIN_ID !== 97 && CHAIN_ID !== 31337) {
-      return { ok: false, reason: "模拟撮合只在 BSC 测试网 / 本地可用：主网晶体管合约不能凭空铸币。" };
+      return { ok: false, reason: "模拟只在 BSC 测试网 / 本地可用：主网电路合约不能凭空铸币。" };
     }
-    if (book.scene === "mining") return { ok: false, reason: "挖矿中不再有晶体管挂单可撮合。" };
-    if (method.name === "simulateFillCampaignBids" && book.orderFilled) {
-      return { ok: false, reason: "本期买单已全部成交，直接「确认到账」即可。" };
+    if (book.scene === "mining") return { ok: false, reason: "挖矿中不再有电路可撮合。" };
+    if (method.name === "simulateExternalListing") {
+      return { ok: true, reason: "会以当前钱包 mint 一张测试电路、授权市场并挂出卖单。" };
     }
-    if (method.name === "simulateExternalBid") {
-      return { ok: true, reason: "会以当前钱包在 Mock 市场挂一张本期晶体管的买单，托管价 × 数量。" };
-    }
-    return { ok: true, reason: "测试网 Mock 撮合：会真实发交易；买单成交时额外 mint 测试晶体管给买家。" };
+    return { ok: true, reason: "测试网 Mock 撮合：当前钱包作为外部买家，按挂单价真实付款吃单。" };
   }
   if (book.halted && HALTED_BLOCKED.has(method.name)) {
     return {
@@ -666,46 +653,46 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     }
     return { ok: true, reason: "本期已无人可退：一次取走整池剩余 BNB。不用填数量。" };
   }
-  if (method.name === "recoverTransistors") {
+  if (method.name === "recoverCircuits") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
-    if (!canOperate(actor)) return { ok: false, reason: "仅 Owner 可以把晶体管转给自己。" };
+    if (!canOperate(actor)) return { ok: false, reason: "仅 Owner 可以把电路转给自己。" };
     // 合约四道闸：已入池（AlreadyPooled）、挂单中（AlreadyListed）、
-    // 本期晶体管还有份额未结清（SharesOutstanding）/ 持份人没按原价收回本金（HoldersNotMadeWhole）。
+    // 本期电路还有份额未结清（SharesOutstanding）/ 持份人没按原价收回本金（HoldersNotMadeWhole）。
     if (book.pooled) {
-      return { ok: false, reason: "本期已入池（AlreadyPooled）：晶体管已转给矿池，合约里没有可转出的余额。" };
+      return { ok: false, reason: "本期已入池（AlreadyPooled）：电路已转给矿池，合约里没有可转出的余额。" };
     }
-    if (book.executePhase === "listed") {
-      return { ok: false, reason: "挂单中不能转出晶体管（AlreadyListed），先撤单或确认到账。" };
+    if (Number(book.listedCircuits?.length || 0) > 0) {
+      return { ok: false, reason: "还有电路挂在市场（AlreadyListed）：先撤单才能转出。" };
     }
-    // 只在本期自己的晶体管上判抵押；转别的 ERC1155 不受这条限制。
-    if (sameAddr(values?.token, book.transistors)) {
+    // 只在本期自己的电路上判抵押；转别的 ERC721 不受这条限制。
+    if (sameAddr(values?.token, book.circuits)) {
       if (outstandingOf(book) > 0) {
         return {
           ok: false,
-          reason: "还有持份人没结清（SharesOutstanding）：本期晶体管是他们的抵押，不能取回。先退款或入池。",
+          reason: "还有持份人没结清（SharesOutstanding）：本期电路是他们的抵押，不能取回。先退款或入池。",
         };
       }
       if (Number(book.refundedTotal || 0) < Number(book.sold || 0) * Number(round.sharePriceBnb || 0)) {
         return {
           ok: false,
-          reason: "持份人还没按原价收回本金（HoldersNotMadeWhole），本期晶体管不能交给 Owner。先 topUpShortfall 补齐缺口。",
+          reason: "持份人还没按原价收回本金（HoldersNotMadeWhole），本期电路不能交给 Owner。先 topUpShortfall 补齐缺口。",
         };
       }
     }
     if (book.executePhase === "ready") {
       return { ok: true, reason: "取出后子状态仍是已到账。重新放回本期并确认后，才能 depositToPool 入池。" };
     }
-    return { ok: true, reason: "把本期持有的晶体管转给当前 Owner。" };
+    return { ok: true, reason: "把本期持有的电路转给当前 Owner。" };
   }
   if (
-    method.name === "setMaterialMarket" || method.name === "transferOwnership"
+    method.name === "setCircuitMarket" || method.name === "transferOwnership"
     || method.name === "setFactoryOwner"
   ) {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "仅 Owner 可更换外部依赖或转让所有权。" };
-    // 在途买单会把托管款留在旧市场：合约以 AlreadyListed 拒绝换市场。
-    if (method.name === "setMaterialMarket" && book.executePhase === "listed") {
-      return { ok: false, reason: "挂单中不能更换晶体管市场（AlreadyListed）：先撤单或确认到账。" };
+    // 还有电路挂在旧市场时合约以 AlreadyListed 拒绝换市场。
+    if (method.name === "setCircuitMarket" && Number(book.listedCircuits?.length || 0) > 0) {
+      return { ok: false, reason: "还有电路挂在市场（AlreadyListed）：先撤单才能更换电路市场。" };
     }
     return { ok: true, reason: "写入新地址后立即生效。" };
   }
@@ -771,13 +758,13 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (book.scene === "executing" && Number(book.surplusBase) > 0) {
       return { ok: false, reason: "余款已按份退回，本金已在你手里。此时退款会用 0 BNB 清掉份额，请留着等入池。" };
     }
-    // 合约先挡「晶体管还在合约手里、池子又不够按原价退完」：否则清零份额会把晶体管变成死资产。
+    // 合约先挡「电路还在合约手里、池子又不够按原价退完」：否则清零份额会把电路变成死资产。
     if (book.scene === "executing") {
-      const partsHeld = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0) > 0;
+      const partsHeld = Number(book.circuitHeldCount) > 0;
       const poolCovers = Number(book.bnbPool || 0)
         >= outstandingOf(book) * Number(round.sharePriceBnb || 0);
       if (partsHeld && !poolCovers) {
-        return { ok: false, reason: "晶体管还在合约手里，池子不够按原价退完。先让 Owner 补齐缺口，持份人才能退款。" };
+        return { ok: false, reason: "电路还在合约手里，池子不够按原价退完。先让 Owner 补齐缺口，持份人才能退款。" };
       }
     }
     const fundingExpired = book.scene === "funding" && Date.now() > (book.endsAt || Infinity);
@@ -805,7 +792,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
       return { ok: false, reason: "余款已经按份退回（returnSurplus），本金已回到持份人手里，链上会以 SurplusAlreadyReturned 拒绝 markFailed。" };
     }
     if (book.executePhase === "ready") {
-      return { ok: false, reason: "晶体管已到账，不能判失败。出口是退余款 + 入池。" };
+      return { ok: false, reason: "电路已到账，不能判失败。出口是退余款 + 入池。" };
     }
     if (canOperate(actor)) {
       return { ok: true, reason: "Owner 可随时判失败，为所有持份人打开退款。未成交买单会先撤掉。不可逆。" };
@@ -844,100 +831,84 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     }
     return { ok: true, reason: "费率上限 1000 bps（10%），分成地址最多 3 个，份额合计必须等于 10000 bps。设定后永久不可改。" };
   }
-  if (method.name === "sellTransistors") {
+  if (method.name === "listCircuit") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
-    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能把本期晶体管卖出去。" };
-    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态才有晶体管可卖。" };
-    if (book.executePhase !== "ready") return { ok: false, reason: "要先确认买单到账（Ready），才能吃外部买单卖出。" };
-    if (!(Number(book.partsNand) > 0 || Number(book.partsLatch) > 0)) {
-      return { ok: false, reason: "本期合约手上没有晶体管余额，没有可卖的东西。" };
+    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能把本期电路挂回市场。" };
+    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态才有电路可卖。" };
+    if (book.executePhase !== "ready") return { ok: false, reason: "要先确认电路到账（Ready），才能挂回市场卖出。" };
+    if (!(Number(book.circuitHeldCount) > 0)) {
+      return { ok: false, reason: "本期合约手上没有电路，没有可挂单的东西。" };
     }
-    if (!(book.sellBids || []).length) {
-      return { ok: false, reason: "市场里还没有标的是本期晶体管的买单。等外部买家挂单，或直接入池。" };
+    if (Number(book.listedCircuits?.length || 0) >= Number(book.circuitHeldCount)) {
+      return { ok: false, reason: "手里的电路已经全部挂在市场了，等成交或先撤单。" };
     }
-    return { ok: true, reason: "按所选买单的单价成交，成交款立即回本期。单价低于本期成本会被拒绝。" };
+    return { ok: true, reason: "单张 ERC721 授权后挂回市场；成交款进 market owed，需 withdrawMarketProceeds 提回。" };
   }
-  if (method.name === "placeTransistorOrder") {
-    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能挂单。" };
-    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态需要挂单买晶体管。" };
-    // 合约只允许 Buying：Listed / Ready / None 都会 revert WrongScene。
+  if (method.name === "buyCircuits") {
+    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能从电路市场买入。" };
+    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态需要买入电路。" };
+    // 合约只允许 Buying：Ready / None 都会 revert WrongScene。
     if (book.executePhase !== "buying") {
-      return { ok: false, reason: "只有待挂单（Buying）可挂买单；挂单中请先成交或撤单，已到账请直接入池。" };
+      return { ok: false, reason: "只有待挂单（Buying）可买入；已到账请直接入池或先 setPhase 回 1。" };
     }
     // 合约要求 sold == totalShares（NotSoldOutYet）：已退款清零份额不会撤销这道闸。
     if (Number(book.sold || 0) < Number(round.totalShares || 0)) {
       return { ok: false, reason: "份数还没售完（sold < totalShares），链上会以 NotSoldOutYet 回滚。" };
     }
-    return { ok: true, reason: "填写数量与单价后锁价；进入「挂单中」可取消未成交部分或确认到账。" };
+    if (!(Number(book.raisedBnb ?? book.bnbPool ?? 0) > 0)) {
+      return { ok: false, reason: "募集余额为 0，没有钱可以买入电路。" };
+    }
+    return { ok: true, reason: "按市场最低价挑单、单价不超过上限；一笔交易原子交割，买完可直接确认到账。" };
   }
-  if (method.name === "cancelTransistorOrder") {
-    // 与合约一致：orderFilled && _partsOnHand 时 revert OrderFilled，成交部分上链即不可撤。
-    const nothingOpen = [book.nandRemaining, book.latchRemaining]
-      .every((remaining) => remaining != null && Number(remaining) === 0);
-    if (book.orderFilled && nothingOpen) {
-      return { ok: false, reason: "已全部成交，晶体管已上链，不能取消。请点「确认到账」后入池。" };
+  if (method.name === "cancelCircuitListing") {
+    if (!connected) return { ok: false, reason: "需要连接钱包。" };
+    if (book.scene === "mining") return { ok: false, reason: "已入池，合约里没有可撤的挂单。" };
+    if (!(Number(book.listedCircuits?.length || 0) > 0)) {
+      return { ok: false, reason: "当前没有电路挂在市场（activeListingCount = 0），调用会回滚。" };
     }
-    // 新逻辑：已有成交，或该期已从工厂移除时，任何人可撤剩余买单（防止托管款卡死）。
-    const partial = (Number(book.nandQty) > 0 && Number(book.nandRemaining) < Number(book.nandQty))
-      || (Number(book.latchQty) > 0 && Number(book.latchRemaining) < Number(book.latchQty));
-    const anyone = partial || book.retired || book.orderFilled;
-    if (!anyone && !canOperate(actor)) {
-      return { ok: false, reason: "未成交时只有 Owner 能撤；有成交或该期已移除后，任何人都能撤剩余。" };
+    if (!canOperate(actor) && !book.retired) {
+      return { ok: false, reason: "在册期次只有 Owner 能撤单；工厂移除该期后任何人才可撤。" };
     }
-    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态有挂单可取消。" };
-    // 合约 cancelTransistorOrder 只接受 phase == Listed；Ready 的出口是 returnSurplus + depositToPool。
-    if (book.executePhase !== "listed") {
-      return { ok: false, reason: "只有挂单中（Listed）才能撤单；已到账（Ready）请直接退余款并入池，或卖入市场买单。" };
-    }
-    return { ok: true, reason: "只撤未成交部分；已成交的留在本期合约，随后确认到账或按比例退款。" };
+    return { ok: true, reason: "撤单后 NFT 仍在本期合约，随后可重新挂单或入池。" };
   }
   if (method.name === "withdrawMarketProceeds") {
     if (!connected) return { ok: false, reason: "需要连接钱包（虽然任何人可调）。" };
     if (!(Number(book.marketOwed) > 0)) {
-      return { ok: false, reason: "晶体管市场当前没有欠本期合约的款，调用是 no-op。" };
+      return { ok: false, reason: "电路市场当前没有欠本期合约的款，调用是 no-op。" };
     }
-    return { ok: true, reason: "把晶体管市场 owed 里的钱转进本期 raisedBnb，供退款或入池余量计算。" };
+    return { ok: true, reason: "把电路市场 owed 里的钱转进本期 raisedBnb，供退款或入池余量计算。" };
   }
   if (method.name === "setPhase") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "仅 Owner 可改子状态。" };
     if (book.scene === "mining" || book.scene === "funding") return { ok: false, reason: "只有待执行可以改子状态。" };
-    if (book.executePhase === "listed") return { ok: false, reason: "挂单中不能改子状态（AlreadyListed）：先撤单或确认到账，否则托管款会留在市场。" };
+    if (Number(book.listedCircuits?.length || 0) > 0) {
+      return { ok: false, reason: "还有电路挂在市场（AlreadyListed）：先撤单，否则挂单会和入池/退款交错。" };
+    }
     const nextPhase = Number(values?.next ?? 1);
-    if (![1, 2, 3].includes(nextPhase)) return { ok: false, reason: "子状态只能是 1 待挂单 / 2 挂单中 / 3 已到账（0 与非法值链上回滚）。" };
-    if (nextPhase === 2 && !book.orderFilled
-      && !(Number(book.nandRemaining) > 0 || Number(book.latchRemaining) > 0)) {
-      return { ok: false, reason: "改成「挂单中」需要市场里真有未成交买单（WrongScene）。" };
+    if (![1, 2, 3].includes(nextPhase)) return { ok: false, reason: "子状态只能是 1 待挂单 / 2 Ready / 3 已到账（0 与非法值链上回滚）。" };
+    if (nextPhase === 3 && !(Number(book.circuitHeldCount) > 0)) {
+      return { ok: false, reason: "改成「已到账」需要本期合约真的持有电路（CircuitsNotReady）。" };
     }
-    const settledPurchase = Number(book.priceLock) > 0 && book.orderFilled;
-    const heldParts = Number(book.partsNand) > 0 || Number(book.partsLatch) > 0;
-    if (nextPhase === 3 && !settledPurchase && !heldParts) {
-      return { ok: false, reason: "改成「已到账」需要买单已成交或手上有晶体管（TransistorsNotReady）。" };
+    if (Number(book.surplusBase) > 0 && nextPhase !== 3) {
+      return { ok: false, reason: "余款已按份退回后，只有改回「已到账」还能继续（WrongScene）。" };
     }
-    if (Number(book.surplusBase) > 0 && nextPhase !== 3 && !settledPurchase && !heldParts) {
-      return { ok: false, reason: "余款已按份退回后，只有改回「已到账」还能继续（WrongScene）：否则本期会卡在所有出口都回滚的待挂单。" };
-    }
-    return { ok: true, reason: "只改 phase。改成 1（待挂单）后可以取回晶体管，再退款。" };
+    return { ok: true, reason: "只改 phase。Ready → Buying 是取回电路、重新挂单的恢复路径。" };
   }
-  if (method.name === "confirmTransistors") {
-    // 合约里 confirmTransistors() 是 external，任何人可调；前端只做状态校验。
+  if (method.name === "confirmCircuits") {
+    // 合约里 confirmCircuits() 是 external，任何人可调；前端只做状态校验。
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态需要确认到账。" };
-    if (book.executePhase === "ready") return { ok: false, reason: "晶体管已确认到账，直接 depositToPool 入池，或 sellTransistors 卖入买单。" };
-    if (book.executePhase !== "listed") return { ok: false, reason: "请先挂单，再确认成交到账。" };
-    if (!book.orderFilled) return { ok: false, reason: "买单还没全部成交（bids.remaining > 0）。" };
-    // 合约还要求本期合约真的持有晶体管；只成交不发货会以 TransistorsNotReady 回滚。
-    const needNand = Number(book.nandQty) || 0;
-    const needLatch = Number(book.latchQty) || 0;
-    if ((Number(book.partsNand) || 0) < needNand || (Number(book.partsLatch) || 0) < needLatch) {
-      return { ok: false, reason: "买单已成交，但晶体管还没进本期合约（NAND / LATCH 余额不足）。" };
+    if (book.executePhase === "ready") return { ok: false, reason: "电路已确认到账，直接 depositToPool 入池，或 listCircuit 挂回市场。" };
+    if (!(Number(book.circuitHeldCount) > 0)) {
+      return { ok: false, reason: "本期合约还没持有电路（CircuitsNotReady）：先用 buyCircuits 买入。" };
     }
-    return { ok: true, reason: "确认后即可入池或卖入市场买单。任何人可调，不需要 Owner 签名。" };
+    return { ok: true, reason: "确认后即可挂回市场卖出或入池。任何人可调，不需要 Owner 签名。" };
   }
   if (method.name === "depositToPool") {
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以 depositToPool。" };
-    if (book.executePhase !== "ready") return { ok: false, reason: "晶体管尚未到账，请先由 Owner 买入晶体管并确认成交到账。" };
+    if (book.executePhase !== "ready") return { ok: false, reason: "电路尚未到账，请先由 Owner 买入电路并确认成交到账。" };
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 可以 depositToPool 入池（不可逆操作）。" };
-    // 合约硬门槛：未入池、矿池地址已设置、有到位依据、仍有未退份额、手里真的有晶体管。
+    // 合约硬门槛：未入池、矿池地址已设置、有到位依据、仍有未退份额、手里真的有电路。
     if (book.pooled) return { ok: false, reason: "本期已入池（AlreadyPooled），不能重复入池。" };
     if (book._chain && (!book.miningPool || /^0x0{40}$/i.test(String(book.miningPool)))) {
       return { ok: false, reason: "还没设置矿池地址（PoolNotSet）：先 setMiningPool，再 depositToPool。" };
@@ -948,8 +919,11 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (!(outstandingOf(book) > 0)) {
       return { ok: false, reason: "份额已全部退完（outstandingShares = 0），没有持有人可分产出，链上会以 ZeroShares 拒绝入池。" };
     }
-    if (!(Number(book.partsNand) > 0 || Number(book.partsLatch) > 0)) {
-      return { ok: false, reason: "本期合约手上没有晶体管（InsufficientParts）：先挂单买入并确认到账再入池。" };
+    if (!(Number(book.circuitHeldCount) > 0)) {
+      return { ok: false, reason: "本期合约手上没有电路（InsufficientCircuits）：先买入并确认到账再入池。" };
+    }
+    if (Number(book.listedCircuits?.length || 0) > 0) {
+      return { ok: false, reason: "还有电路挂在市场（CircuitStillListed）：先撤单才能入池。" };
     }
     /**
      * 合约在 depositToPool 内部就把没花完的募集款按份记账（_returnSurplus），
@@ -965,16 +939,16 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     }
     return {
       ok: true,
-      reason: `晶体管转入矿池，本期进入挖矿（不可逆）。${notes.length ? `注意：${notes.join("；")}。` : ""}`,
+      reason: `电路转入矿池，本期进入挖矿（不可逆）。${notes.length ? `注意：${notes.join("；")}。` : ""}`,
     };
   }
   if (method.name === "returnSurplus") {
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以退余款。" };
     if (book.executePhase !== "ready") {
-      return { ok: false, reason: "晶体管还没确认到账，合约 _requireReady 会以 WrongScene 回滚。" };
+      return { ok: false, reason: "电路还没确认到账，合约 _requireReady 会以 WrongScene 回滚。" };
     }
-    if (Number(book.bnbPool) <= 0) return { ok: false, reason: "募集款已全部用于买晶体管，没有可退的余款（ZeroShares）。" };
-    if (Number(book.marketOwed) > 0) return { ok: false, reason: "晶体管市场还有欠款没提取，先 withdrawMarketProceeds。" };
+    if (Number(book.bnbPool) <= 0) return { ok: false, reason: "募集款已全部用于买电路，没有可退的余款（ZeroShares）。" };
+    if (Number(book.marketOwed) > 0) return { ok: false, reason: "电路市场还有欠款没提取，先 withdrawMarketProceeds。" };
     if (!(outstandingOf(book) > 0)) return { ok: false, reason: "份额已全部退完，没有可退对象。" };
     // 合约允许任何人在宽限期（售罄 / 最后一次下单满 3 天）后调用，不只 Owner：团队失联的兜底。
     if (!canOperate(actor)) {
@@ -986,49 +960,46 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     }
     return {
       ok: true,
-      reason: "按份退回没花完的募集款：份额不变、晶体管留在合约，之后照样能入池。持份人各自领取。",
+      reason: "按份退回没花完的募集款：份额不变、电路留在合约，之后照样能入池。持份人各自领取。",
     };
   }
   if (method.name === "openRefund") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能 openRefund。" };
     if (Number(book.surplusBase) > 0) {
-      return { ok: false, reason: "余款已退过、本金已回持份人手里。再退款只会清零份额、把晶体管交给 Owner，之后只能入池。" };
+      return { ok: false, reason: "余款已退过、本金已回持份人手里。再退款只会清零份额、把电路交给 Owner，之后只能入池。" };
     }
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行可以打开退款。" };
     if (book.executePhase === "ready") {
-      return { ok: false, reason: "晶体管已到账，不能原路退款。只能退余款、把晶体管投入矿池；确要结束本期须先改回待挂单。" };
-    }
-    if (book.executePhase === "listed") {
-      return { ok: false, reason: "买单未确认，不能退款。" };
+      return { ok: false, reason: "电路已到账，不能原路退款。只能退余款、把电路投入矿池；确要结束本期须先 setPhase 回待挂单并取回电路。" };
     }
     if (book.executePhase && book.executePhase !== "buying") {
-      return { ok: false, reason: "请先取消挂单，再 openRefund。" };
+      return { ok: false, reason: "请先撤掉市场挂单，再 openRefund。" };
     }
     if (!(outstandingOf(book) > 0)) {
       return { ok: false, reason: "份额已全部退完，没有可退对象（合约会以 ZeroShares 回滚）。尾差用 recoverBnb 取回。" };
     }
     // 合约 openRefund 的两道附加闸：市场欠款未提取（ProceedsPending）、
-    // 晶体管还在合约里而池子不够按原价退完（PartsAreCollateral）。
+    // 电路还在合约里而池子不够按原价退完（PartsAreCollateral）。
     if (Number(book.marketOwed) > 0) {
       return { ok: false, reason: "市场还有未提取的卖出款（ProceedsPending），先 withdrawMarketProceeds 再打开退款。" };
     }
-    const partsHeld = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0) > 0;
+    const partsHeld = Number(book.circuitHeldCount) > 0;
     const poolCovers = Number(book.bnbPool || 0) >= outstandingOf(book) * Number(round.sharePriceBnb || 0);
     if (partsHeld && !poolCovers) {
-      return { ok: false, reason: "晶体管还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口。" };
+      return { ok: false, reason: "电路还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口。" };
     }
-    return { ok: true, reason: "打开退款：本期判为执行失败，持份人各自领回本金。若已买过晶体管且池子不够，先补齐缺口。" };
+    return { ok: true, reason: "打开退款：本期判为执行失败，持份人各自领回本金。若已买过电路且池子不够，先补齐缺口。" };
   }
   if (method.name === "topUpShortfall") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能补齐缺口。" };
-    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以补齐（入池后份额与晶体管都已经定局）。" };
+    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以补齐（入池后份额与电路都已经定局）。" };
     const need = outstandingOf(book) * Number(round.sharePriceBnb || 0) - Number(book.bnbPool || 0);
     const hint = need > 0 ? `按当前份额与池子，缺口约 ${need.toFixed(6)} BNB。` : "当前池子已能按原价覆盖全部份额，无需补齐（补齐的钱之后可用 recoverBnb 扫回）。";
     return {
       ok: true,
-      reason: `${hint}补齐后持份人能按原价退完，Owner 才能取走晶体管。多补的部分在份额清零后用 recoverBnb 取回。`,
+      reason: `${hint}补齐后持份人能按原价退完，Owner 才能取走电路。多补的部分在份额清零后用 recoverBnb 取回。`,
     };
   }
   if (method.name === "abandonOrder") {
@@ -1036,11 +1007,11 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能 abandonOrder。" };
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行可以放弃挂单并退款。" };
     if (book.executePhase === "ready") {
-      return { ok: false, reason: "晶体管已到账，不能放弃挂单（会退回 Owner）。只能退余款 + 入池。" };
+      return { ok: false, reason: "电路已到账，不能放弃挂单（会退回 Owner）。只能退余款 + 入池。" };
     }
     return {
       ok: true,
-      reason: "撤未成交买单、提取卖出款、打开退款；份额全清并退完后，剩余晶体管才退回 Owner。池子不够时先补齐。",
+      reason: "撤未成交买单、提取卖出款、打开退款；份额全清并退完后，剩余电路才退回 Owner。池子不够时先补齐。",
     };
   }
   if (method.name === "setMiningPool") {
@@ -1071,8 +1042,8 @@ export function callGate(method, book, round, connected, actor = { role: "user",
 }
 
 export function readCall(method, args, round, book, quote = QUOTE) {
-  if (/^market(OpenOrders|Bids|Sellable|Owed)$/.test(method) || method.startsWith("simulateFill") || method === "simulateExternalBid") {
-    return "仅链上模式可用：连接测试网钱包后读取 Mock 晶体管市场。";
+  if (/^market(OpenOrders|Listing|Sellable|Owed)$/.test(method) || method === "simulateExternalListing" || method === "simulateBuyListing") {
+    return "仅链上模式可用：连接测试网钱包后读取 Mock 电路市场。";
   }
   if (method === "scene" || method === "status") return SCENE_COPY[book.scene].badge;
   if (method === "phase" || method === "executePhase") {
@@ -1108,16 +1079,18 @@ export function readCall(method, args, round, book, quote = QUOTE) {
   if (method === "estHashpower") return `${estimateHashpower(round, quote, round.totalShares).hashpower.toLocaleString("zh-CN")} H`;
   if (method === "totalRefunded") return `${Number(book.refundedTotal || 0).toFixed(4)} BNB`;
   if (method === "raisedBnb") return `${(book.bnbPool || 0).toFixed(4)} BNB`;
-  if (method === "transistors") return book.transistors || "—";
-  if (method === "market" || method === "materialMarket") return book.market || "—";
+  if (method === "circuits") return book.circuits || "—";
+  if (method === "circuitCount") return `${Number(book.circuitCount) || 0} 张（累计买入）`;
+  if (method === "circuitHeldCount") return `${Number(book.circuitHeldCount) || 0} 张（当前持有）`;
+  if (method === "market" || method === "circuitMarket") return book.circuitMarket || "—";
   /**
-   * 工厂晶体管白名单读项（模拟模式）。
+   * 工厂电路白名单读项（模拟模式）。
    *
    * 模拟模式下没有链上工厂，链上事实不可得 —— 这里如实说明，
    * 不用前端硬编码的处理器列表冒充白名单（那不是链上事实）。
    */
-  if (method === "allowedPartsCount") return "仅链上模式可读（工厂晶体管白名单，部署时写入、不可增删）";
-  if (method === "allowedPartsAt") return "仅链上模式可读";
+  if (method === "allowedCircuitsCount") return "仅链上模式可读（工厂电路白名单，部署时写入、不可增删）";
+  if (method === "allowedCircuitsAt") return "仅链上模式可读";
   if (method === "isAllowedParts") return "仅链上模式可读";
   if (method === "executionFailed") return book.executionFailed ? "是（已判执行失败）" : "否";
   if (method === "halted") {
@@ -1130,7 +1103,7 @@ export function readCall(method, args, round, book, quote = QUOTE) {
   }
   if (method === "priceLock") {
     return Number(book.priceLock) > 0
-      ? `${Number(book.priceLock).toFixed(4)} BNB（${book.transistorCount || 0} 颗）`
+      ? `${Number(book.priceLock).toFixed(4)} BNB（${book.circuitHeldCount || 0} 张）`
       : "未锁价";
   }
   if (method === "holderCount") return `${book.wallets ? Object.keys(book.wallets).length : 0} 个地址（模拟）`;

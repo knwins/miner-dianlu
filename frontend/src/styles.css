@@ -470,7 +470,7 @@ h1, h2, h3, p { margin: 0; }
 .tone-done { color: var(--color-text-tertiary); background: var(--color-bg-spotlight); }
 
 /* 认筹状态徽标：认购中 / 已售罄 / 已流标 · 已结束。
-   这一层不用「成交」——成交专指晶体管在晶体管市场成交与挖矿份额转让。 */
+   这一层不用「成交」——成交专指电路在电路市场成交与挖矿份额转让。 */
 .deal-badge {
   display: inline-flex;
   align-items: center;
@@ -840,7 +840,7 @@ h1, h2, h3, p { margin: 0; }
   font-weight: 400;
   line-height: 1.4;
 }
-/* 官方晶体管市价面板 */
+/* 官方电路市价面板 */
 .official-price-card { margin-top: 12px; }
 /* 卡片头右侧的合成信息组（处理器数量 + 快照状态）：整体靠右 */
 .official-price-card-side {
@@ -856,7 +856,7 @@ h1, h2, h3, p { margin: 0; }
   gap: 14px;
 }
 /*
- * 合并后的晶体管市场模块里，每个处理器一节，节内含「价格表 + 事实格」。
+ * 合并后的电路市场模块里，每个处理器一节，节内含「价格表 + 事实格」。
  * 两节之间的 14px 间距在有事实格时显得挤（事实格是带边框的块，
  * 紧贴下一节的标题会读成同一组）—— 给非首节加一条分隔线 + 上边距。
  *
@@ -900,10 +900,10 @@ h1, h2, h3, p { margin: 0; }
 .official-price-table td:first-child { text-align: left; }
 .official-price-table tr:last-child td { border-bottom: 0; }
 
-/* ── 晶体管市场行情看板：价格是页面的主角 ─────────────────────────────
+/* ── 电路市场行情看板：价格是页面的主角 ─────────────────────────────
    每个处理器一张卡、两张并排，便于直接比价。
    价格 28px + tabular-nums；处理器名 / 算力 / 地址全部退到次级字号，
-   保证扫一眼就先看到「多少钱一颗」，而不是先读一堆地址。 */
+   保证扫一眼就先看到「多少钱一张」，而不是先读一堆地址。 */
 .price-board {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -984,12 +984,12 @@ h1, h2, h3, p { margin: 0; }
   font-variant-numeric: tabular-nums;
 }
 .price-cell-unit {
-  /* 单位承载含义（BNB / 颗），不跟纯装饰性文字一样淡 */
+  /* 单位承载含义（BNB / 张），不跟纯装饰性文字一样淡 */
   color: var(--color-text-tertiary);
   font-size: 11px;
   line-height: 1.4;
 }
-/* 卡脚事实（CPU / 晶体管合约 / 白名单）：与价格之间拉一条分隔线 */
+/* 卡脚事实（CPU / 电路合约 / 白名单）：与价格之间拉一条分隔线 */
 .price-board-card .market-page-facts {
   margin-top: 12px;
   padding-top: 10px;
@@ -1000,7 +1000,7 @@ h1, h2, h3, p { margin: 0; }
   .price-board { grid-template-columns: minmax(0, 1fr); }
 }
 
-/* 晶体管市场页（官方处理器并列视图） */
+/* 电路市场页（官方处理器并列视图） */
 .market-page { display: block; }
 /*
  * 期次表是文字表（处理器名 / 地址 / 状态），不是价格表。
@@ -1032,7 +1032,7 @@ h1, h2, h3, p { margin: 0; }
   color: var(--color-text-tertiary);
   font-size: 11px;
 }
-/* 晶体管名后缀的固定 tokenId（NAND #0 / LATCH #1） */
+/* 电路名后缀的固定 tokenId */
 .part-id {
   margin-left: 6px;
   color: var(--color-text-tertiary);
@@ -1685,7 +1685,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   line-height: 1.4;
 }
 /*
- * 不属于任何分组的常驻入口（晶体管市场）。
+ * 不属于任何分组的常驻入口（电路市场）。
  * 上面紧挨着「合约工作台」的卡组，靠这条分隔线+留白把两者断开，
  * 否则它会贴着子项列表，被读成工作台的第 4 个子项。
  */
@@ -2175,7 +2175,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 .param-hint.is-ok { color: var(--color-success); }
 .param-hint.is-muted { color: var(--color-text-tertiary); }
 .detail-split > .card { min-width: 0; }
-/* 右栏：链上参数 + 晶体管市场流水，纵向堆叠 */
+/* 右栏：链上参数 + 电路市场流水，纵向堆叠 */
 .detail-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .detail-col > .card { margin-top: 0; }
 
@@ -2744,7 +2744,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   background: #fff;
   box-sizing: border-box;
 }
-/* 晶体管挂单价要容纳 5 位小数（如 0.05610），右对齐更易逐位比对 */
+/* 电路挂单价要容纳 5 位小数（如 0.05610），右对齐更易逐位比对 */
 .flow-table input[step="0.00001"] {
   min-width: 0;
   font-variant-numeric: tabular-nums;
@@ -2784,7 +2784,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
  * 挂单表单（买 / 卖共用一张表）的列宽与数字对齐。
  *
  * 旧版靠 table-layout: fixed 把四列四等分（各 129.8px）：
- *   · 「晶体管」只有 NAND / LATCH 四五个字符，却白占 130px；
+ *   · 「电路」只有两个字，却白占 130px；
  *   · 「数量」「买价」表头左对齐，而框里的数字右对齐，同列上下错位约 38px；
  *   · 「数量」框内左对齐、「买价」框内右对齐，相邻两框方向相反；
  *   · 「官方市价」内容仅 40px，却从列左端起排，右侧空出 90px，看着像掉在表格中间。
@@ -2939,7 +2939,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   box-shadow: 0 0 0 2px rgba(13, 158, 168, 0.12);
 }
 /**
- * 输入非法（流片晶体管数填了 0/负数/非数字）。
+ * 输入非法（流片电路数填了 0/负数/非数字）。
  * 红色描边 + 红底，一眼能看出哪里填错了，
  * 不等到页面底部的 issues 列表才提示。
  */
@@ -2967,7 +2967,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 }
 
 /*
- * 「晶体管数不构成本期承诺」强制提示（C-1）。
+ * 「电路数不构成本期承诺」强制提示（C-1）。
  *
  * 认购是花钱动作，风险提示必须贴着按钮、醒目、不可折叠跳过。
  * 所以用警示色左边框 + 浅底，而不是普通 .fine 小字。
@@ -3054,7 +3054,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   color: var(--color-text);
 }
 
-/* ── 待执行：晶体管市场交易记录 ── */
+/* ── 待执行：电路市场交易记录 ── */
 .progress-card .bill strong.is-wait { color: var(--color-primary); }
 .market-card { margin-top: 16px; }
 .market-card .card-header {
@@ -3137,7 +3137,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 .trade-status.is-open { background: var(--color-primary-light); color: var(--color-primary); }
 .trade-status.is-partial { background: var(--color-warning-light); color: #a87400; }
 .trade-status.is-filled { background: var(--color-success-light); color: var(--color-success); }
-/* 晶体管市场交易记录：晶体管数项（挂出 / 成交）按挂单成交状态着色 */
+/* 电路市场交易记录：电路数项（挂出 / 成交）按挂单成交状态着色 */
 .qty-cell { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
 .qty-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--color-text-tertiary); }
 .qty-wait .qty-dot { background: var(--color-warning); }
@@ -3441,7 +3441,7 @@ tr:last-child td { border-bottom: 0; }
   .progress-card .bill { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
-/* ── 晶体管选型卡片 ── */
+/* ── 电路选型卡片 ── */
 
 
 /* ══════════════════════════════════════════════════════════
@@ -3593,7 +3593,7 @@ tr:last-child td { border-bottom: 0; }
 
 /* ── 自动选型 ── */
 
-/* 晶体管组合为自动计算所得，不接受手动编辑 */
+/* 电路组合为自动计算所得，不接受手动编辑 */
 input[readonly] {
   background: var(--color-bg-spotlight);
   color: var(--color-text-secondary);
@@ -3602,7 +3602,7 @@ input[readonly] {
 
 /* ── 手机屏（≤560px）收尾修正 ─────────────────────────────────────────
  * 1) 生命周期条：桌面是「圆圈 + 横向连接线」的横排，390px 下每个 step 的
- *    min-width:120px 放不下（「待挂单买晶体管」这条提示更宽），wrap 成三行、
+ *    min-width:120px 放不下（「待挂单买电路」这条提示更宽），wrap 成三行、
  *    每行各自 center，导致三个圆圈左右错位、横向连接线伸到文字右边。
  *    手机改成「三段等分」的紧凑横排：圆圈在上、标签在下，横线由每个 step
  *    的 ::after 直接画到下一个圆心（原来的 .life-line 只是夹在两个 step 之间
@@ -3659,7 +3659,7 @@ input[readonly] {
   .life-dot { width: 30px; height: 30px; font-size: 13px; }
   .life-text { padding-top: 0; gap: 2px; align-items: center; }
   .life-label { font-size: 14px; }
-  /* 副提示（「待挂单买晶体管」等）最长 11 个字，塞进 1/3 列宽会折成两三行，
+  /* 副提示（「待挂单买电路」等）最长 11 个字，塞进 1/3 列宽会折成两三行，
      最后一行只剩「入池」二字。改成不占列宽、以本步骤为轴居中单行，
      它落在标签下方那一行，左右不会碰到相邻步骤的文字。 */
   .life-phase {
@@ -3734,7 +3734,7 @@ input[readonly] {
   background: #fff;
   box-shadow: var(--shadow-card);
 }
-/* 只有第一张带主色描边：强调「本期真的拿到了多少晶体管」。
+/* 只有第一张带主色描边：强调「本期真的拿到了多少电路」。
    用 3px 左边框时把左内边距减 2px，保证四张卡的文字左边界仍在同一条竖线上。 */
 .mining-stat.is-accent { border-left: 3px solid var(--color-primary); padding-left: 16px; }
 
@@ -3801,7 +3801,7 @@ input[readonly] {
   background: currentColor;
 }
 /* 卡片头右侧的弱化标记：只作说明，不做第二个胶囊，免得与数值槽位抢注意力 */
-/* 旧的 .mining-chip（卡片头「晶体管已入池」）已删除：与「本期状态 · 已入池」重复。 */
+/* 旧的 .mining-chip（卡片头「电路已入池」）已删除：与「本期状态 · 已入池」重复。 */
 
 .mining-card .card-body { padding: 6px 20px 20px; }
 /* 键值明细：标签列定宽，右侧说明的左边界才严格对齐（换行也从同一条竖线开始） */

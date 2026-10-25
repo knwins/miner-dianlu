@@ -2,8 +2,8 @@
 // 使主页面（认购/份数/转让/概览）无需改动即可展示真实测试网数据。
 import { formatEther } from "ethers";
 import { ROUND } from "../fixtures.js";
-import { transistorIdFor } from "../prices.js";
-import { processorFromPartsContract } from "../tapeout.js";
+import { circuitIdFor } from "../prices.js";
+import { processorFromCircuitContract } from "../tapeout.js";
 import { getCampaignAddress } from "./client.js";
 import { rowState } from "../roundState.js";
 
@@ -44,7 +44,7 @@ export function roundFromDeployment(dep) {
     /** 分成表：链上有就优先用链上的 */
     feeShares: Array.isArray(dep.feeShares) ? dep.feeShares : [],
     netlistHash: null,
-    /** 同 roundFromState：链上期次的晶体管数不从 fixtures 继承，链上真值走 book.transistorCount */
+    /** 同 roundFromState：链上期次的电路数不从 fixtures 继承，链上真值走 book.circuitHeldCount */
     partCount: 0,
   };
 }
@@ -73,19 +73,19 @@ export function roundFromState(state, baseRound = ROUND, campaignIndex = 1) {
     feeShares: Array.isArray(state.feeShares) ? state.feeShares : [],
     netlistHash: null,
     /**
-     * 晶体管数：链上模式**不能**继承 fixtures 的默认值。
+     * 电路数：链上模式**不能**继承 fixtures 的默认值。
      *
      * `...baseRound` 把本地演示期次（ROUND.partCount = 68）一起带进来了，
-     * 于是链上每一期的估算都用 68 颗算——链上根本没这个数。
-     * 链上的晶体管数权威来源是 nandQty + latchQty（成交到账量），
-     * 由 book.transistorCount 承载；round 上这个字段只作测算种子，
+     * 于是链上每一期的估算都用 68 张算——链上根本没这个数。
+     * 链上的电路数权威来源是 circuitHeldCount（买入并确认到账量），
+     * 由 book.circuitHeldCount 承载；round 上这个字段只作测算种子，
      * 链上模式一律归零（planTask 会兜底到 1），不拿演示数据冒充链上事实。
      */
     partCount: 0,
-    // 开期写入的 transistors 地址 = 官方处理器的晶体管合约（TapeOut / Behemoth）；不能沿用 ROUND 默认 Behemoth。
-    processorId: processorFromPartsContract(state.transistors) || null,
-    transistorId: processorFromPartsContract(state.transistors)
-      ? transistorIdFor(processorFromPartsContract(state.transistors))
+    // 开期写入的 circuits 地址 = 官方 ERC721 电路集合（TapeOut / Behemoth）；不能沿用 ROUND 默认 Behemoth。
+    processorId: processorFromCircuitContract(state.circuits) || null,
+    circuitModelId: processorFromCircuitContract(state.circuits)
+      ? circuitIdFor(processorFromCircuitContract(state.circuits))
       : null,
   };
 }
@@ -183,47 +183,43 @@ export function bookFromState(state, account, extra = {}) {
     selfAddress: account,
     totalShares: Number(state.totalShares),
     /**
-     * 已成交到账的晶体管数（各腿 挂单量 − 市场 remaining）。
-     * 注意不是挂单量：nandQty/latchQty 是「下单要买多少」，成交前不等于已买到。
+     * 已成交到账的电路张数（circuitHeldCount）。
+     * 买入是原子交割，成交即到账；卖出 / 入池后持仓下降。
      */
-    transistorCount: Number(state.transistorCount),
-    nandFilled: Number(state.nandFilled ?? 0),
-    latchFilled: Number(state.latchFilled ?? 0),
+    circuitCount: Number(state.boughtCount ?? state.circuitCount ?? 0),
+    circuitHeldCount: Number(state.circuitHeldCount ?? 0),
     estHashpower: Number(state.estHashpower),
     priceLock: bem(state.priceLock),
-    /** 卖出侧读数：合约手里的晶体管、市场欠款、以及能吃的外部买单。 */
+    /** 卖出侧读数：本期持有哪些电路、已挂单的有哪些、市场欠款。 */
     sellSide: Boolean(state.sellSide),
+    listedCircuits: Array.isArray(state.listedCircuits) ? state.listedCircuits.map((c) => ({
+      tokenId: String(c.tokenId),
+      listingId: String(c.listingId),
+      price: bem(c.price),
+      cost: bem(c.cost || 0),
+    })) : [],
     sellBids: Array.isArray(state.sellBids) ? state.sellBids.map((b) => ({
       id: String(b.id),
       tokenId: Number(b.tokenId),
+      circuitTokenId: String(b.circuitTokenId ?? b.id),
       price: bem(b.price),
       remaining: Number(b.remaining),
       feeBps: Number(b.feeBps),
       buyer: b.buyer,
     })) : [],
-    // 本期买入成本（每颗，wei→BNB）：sellTransistors 的底价，低于它的买单卖不了。
-    nandCostBasis: bem(state.nandCostBasis || 0),
-    latchCostBasis: bem(state.latchCostBasis || 0),
+    /** 订单已成交（本期至少持有过一张电路）。 */
     orderFilled: Boolean(state.orderFilled),
-    nandBidId: state.nandBidId != null ? String(state.nandBidId) : "0",
-    latchBidId: state.latchBidId != null ? String(state.latchBidId) : "0",
-    nandQty: Number(state.nandQty || 0),
-    latchQty: Number(state.latchQty || 0),
-    nandPrice: bem(state.nandPrice || 0),
-    latchPrice: bem(state.latchPrice || 0),
-    nandRemaining: state.nandRemaining == null ? null : Number(state.nandRemaining),
-    latchRemaining: state.latchRemaining == null ? null : Number(state.latchRemaining),
+    /** 市场欠本期的 BNB（可 withdrawMarketProceeds）。 */
     marketOwed: bem(state.marketOwed || 0),
     /** 已记账、尚未发到持有人手里的余款（BNB）。 */
     surplusOutstanding: bem(state.surplusOutstanding || 0),
     surplusBase: Number(state.surplusBase || 0),
-    partsNand: Number(state.partsNand || 0),
-    partsLatch: Number(state.partsLatch || 0),
-    /** 晶体管是否已投入矿池（不可逆）。入池后合约余额归 0，展示要用 transistorCount。 */
+    /** 电路是否已投入矿池（不可逆）。入池后合约余额归 0，展示要用 circuitHeldCount。 */
     pooled: Boolean(state.pooled),
     /** 矿池地址（链上事实）：零地址 = 未设置。Owner 面板用它判断能否 depositToPool。 */
     miningPool: state.miningPool || "",
-    transistors: state.transistors || "",
+    /** 本期锁定的 ERC721 电路集合。 */
+    circuits: state.circuits || "",
     _sharePriceWei: state.sharePriceBnb,
     _netlistHash: null,
     netWeightVerified: 0,
@@ -233,7 +229,8 @@ export function bookFromState(state, account, extra = {}) {
     /** executing+buying 且池子已不足以按原价兑付 → 持有人可按比例退款 */
     refundShort: Boolean(state.refundShort),
     refundRatio: state.refundRatio ?? null,
-    market: state.market || "",
+    market: state.market || state.circuitMarket || "",
+    circuitMarket: state.circuitMarket || state.market || "",
     /** 工厂已移除该期：任何人可撤剩余买单 */
     retired: Boolean(state.retired),
     picked: extra.picked ?? 1,
@@ -254,7 +251,7 @@ export function bookFromState(state, account, extra = {}) {
     actualQuote: null,
     estimate: extra.estimate || {
       hashpower: Number(state.estHashpower),
-      usedParts: Number(state.transistorCount) || 0,
+      usedParts: Number(state.circuitHeldCount) || 0,
     },
   };
 }
@@ -273,7 +270,7 @@ export function campaignStatusOf(summary, nowSec = Math.floor(Date.now() / 1000)
   /*
    * 状态词一律从 roundState.js 取，本函数只负责把「链上摘要」翻译成那一层需要的字段。
    * note 不再是自由文案：它就是子状态行（与「我的资产」表、Owner 卡片同一份实现），
-   * 否则列表卡片上一句「待挂单买晶体管」、资产表上一句「待挂单」，同一期两个说法。
+   * 否则列表卡片上一句「待挂单买电路」、资产表上一句「待挂单」，同一期两个说法。
    */
   const scene = Number(summary?.scene) || 0;
   const state = rowState({
@@ -300,7 +297,7 @@ export function campaignStatusOf(summary, nowSec = Math.floor(Date.now() / 1000)
 export function historyRowFromSummary(summary, index) {
   const state = campaignStatusOf(summary);
   const tone = state.tone;
-  const processor = processorFromPartsContract(summary.transistors);
+  const processor = processorFromCircuitContract(summary.circuits);
   return {
     id: index,
     address: summary.address,
@@ -333,8 +330,9 @@ export function historyRowFromSummary(summary, index) {
     bem: "—",
     fee: "—",
     estHashpower: summary.estHashpower,
-    transistorCount: summary.transistorCount,
-    transistors: summary.transistors || "",
+    circuitCount: summary.circuitCount,
+    circuitHeldCount: summary.circuitHeldCount,
+    circuits: summary.circuits || "",
     processor: processor || null,
     fundingDeadline: Number(summary.fundingDeadline) || 0,
     executionFailed: Boolean(summary.executionFailed),

@@ -2,10 +2,10 @@
 const hre = require("hardhat");
 const { ethers, network } = hre;
 
-const OFFICIAL_MARKET = "0xA6a80C1919a8326022d7c601a488888C13aA16E4";
-const OFFICIAL_PARTS = [
-  "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087",
-  "0xE2DfD802081C7a05341E20b6582b04b908e8550c",
+const OFFICIAL_MARKET = "0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f";
+const OFFICIAL_CIRCUITS = [
+  "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C", // TapeOut
+  "0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c", // Behemoth
 ];
 
 function mask(v) {
@@ -21,9 +21,8 @@ async function main() {
   const api = process.env.BSCSCAN_API_KEY || "";
   console.log(`DEPLOYER_PRIVATE_KEY : ${mask(pk)}`);
   console.log(`BSCSCAN_API_KEY      : ${api ? mask(api) : "<未设置> — 退用 Sourcify 验证"}`);
-  console.log(`MINTER_ADDRESS       : ${process.env.MINTER_ADDRESS || "<默认官方市场>"}`);
-  console.log(`TRANSISTORS_ADDRESS  : ${process.env.TRANSISTORS_ADDRESS || "<默认 TapeOut>"}`);
-  console.log(`ALLOWED_PARTS_ADDRESSES: ${process.env.ALLOWED_PARTS_ADDRESSES || "<默认官方两件套>"}`);
+  console.log(`CIRCUIT_MARKET_ADDRESS: ${process.env.CIRCUIT_MARKET_ADDRESS || process.env.MINTER_ADDRESS || "<默认官方电路市场>"}`);
+  console.log(`ALLOWED_CIRCUITS_ADDRESSES: ${process.env.ALLOWED_CIRCUITS_ADDRESSES || process.env.ALLOWED_PARTS_ADDRESSES || "<默认官方两件套>"}`);
   console.log(`OPEN_CAMPAIGN        : ${process.env.OPEN_CAMPAIGN || "<未设=只部署工厂不开期>"}`);
 
   if (Number(net.chainId) !== 56) {
@@ -46,22 +45,23 @@ async function main() {
 
   // 预演 deploy-bsc.js 的主网硬断言
   console.log("\n--- 预演主网硬断言 ---");
-  if (process.env.MINTER_ADDRESS && process.env.MINTER_ADDRESS.toLowerCase() !== OFFICIAL_MARKET.toLowerCase()) {
-    console.log(`✗ MINTER_ADDRESS 非官方市场：收到 ${process.env.MINTER_ADDRESS}`);
-  } else console.log("✓ MINTER_ADDRESS 断言通过（默认官方市场）");
+  const marketEnv = process.env.CIRCUIT_MARKET_ADDRESS || process.env.MINTER_ADDRESS || "";
+  if (marketEnv && marketEnv.toLowerCase() !== OFFICIAL_MARKET.toLowerCase()) {
+    console.log(`✗ CIRCUIT_MARKET_ADDRESS 非官方市场：收到 ${marketEnv}`);
+  } else console.log("✓ CIRCUIT_MARKET_ADDRESS 断言通过（默认官方市场）");
 
-  const wl = String(process.env.ALLOWED_PARTS_ADDRESSES || "").trim();
+  const wl = String(process.env.ALLOWED_CIRCUITS_ADDRESSES || process.env.ALLOWED_PARTS_ADDRESSES || "").trim();
   if (wl) {
     const list = wl.split(",").map((s) => s.trim()).filter(Boolean);
-    const bad = list.filter((a) => !OFFICIAL_PARTS.some((o) => o.toLowerCase() === a.toLowerCase()));
-    const missing = OFFICIAL_PARTS.filter((o) => !list.some((a) => a.toLowerCase() === o.toLowerCase()));
+    const bad = list.filter((a) => !OFFICIAL_CIRCUITS.some((o) => o.toLowerCase() === a.toLowerCase()));
+    const missing = OFFICIAL_CIRCUITS.filter((o) => !list.some((a) => a.toLowerCase() === o.toLowerCase()));
     if (bad.length) console.log(`✗ 白名单含非官方地址：${bad.join(",")}`);
-    else if (missing.length) console.log(`✗ 白名单缺少官方晶体管：${missing.join(",")}`);
-    else console.log("✓ ALLOWED_PARTS_ADDRESSES 恰好是官方两件套");
+    else if (missing.length) console.log(`✗ 白名单缺少官方电路：${missing.join(",")}`);
+    else console.log("✓ ALLOWED_CIRCUITS_ADDRESSES 恰好是官方两件套");
   } else console.log("✓ 白名单将用官方两件套（默认）");
 
-  // 检查官方地址在主网是否有代码（晶体管市场 / 两个晶体管）
-  for (const [name, addr] of [["晶体管市场", OFFICIAL_MARKET], ...OFFICIAL_PARTS.map((a, i) => [`晶体管${i}`, a])]) {
+  // 检查官方地址在主网是否有代码（电路市场 / 两个 ERC721 电路合约）
+  for (const [name, addr] of [["电路市场", OFFICIAL_MARKET], ...OFFICIAL_CIRCUITS.map((a, i) => [`电路${i}`, a])]) {
     const code = await ethers.provider.getCode(addr);
     console.log(`  ${name} ${addr} → 代码 ${code === "0x" ? "缺失✗" : "存在✓"}`);
   }

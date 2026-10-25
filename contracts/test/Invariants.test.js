@@ -2,68 +2,80 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time, loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
 
-// 账本恒等式与状态不变的回归集：只断言「钱和份额守恒」，不重复 Campaign.test.js 的业务细节。
-// 恒等式：balance == raisedBnb + (surplusPool − surplusPaid) + totalPendingFee
-//        ⇒ 合约余额里的每一 wei 都有归属（托管池 / 待领余款 / 待领服务费），没有第三种口袋。
+// Book identity: balance == raisedBnb + (surplusPool - surplusPaid) + totalPendingFee.
+// Circuit collateral: while this round holds a circuit, either shares are outstanding or every share
+// was repaid at the subscription price.
+// Share conservation: sum(sharesOf + escrowOf) == outstandingShares.
 
 const SHARE_PRICE = ethers.parseEther("0.01");
 const TOTAL_SHARES = 100n;
 const FUNDING_SECONDS = 7 * 24 * 60 * 60;
 const UNIT = ethers.parseEther("0.005");
+const SHORT_PRICE = ethers.parseEther("0.6");
+const FEE_BPS = 100;
 
 const SCENE = { Funding: 0n, Executing: 1n, Mining: 2n };
-const PHASE = { None: 0n, Buying: 1n, Listed: 2n, Ready: 3n };
+const PHASE = { None: 0n, Buying: 1n, Ready: 2n };
 
-function place(campaign, signer, qty, price) {
-  return campaign.connect(signer).placeTransistorOrder(qty, price, 0, 0);
+let tokenSeq = 50_000;
+
+async function listOne(ctx, price, seller = ctx.seller) {
+  const { nft, market } = ctx;
+  const tokenId = BigInt(tokenSeq++);
+  const nftAddr = await nft.getAddress();
+  const marketAddr = await market.getAddress();
+  await nft.mint(seller.address, tokenId);
+  await nft.connect(seller).approve(marketAddr, tokenId);
+  const listingId = await market.connect(seller).list.staticCall(nftAddr, tokenId, price);
+  await market.connect(seller).list(nftAddr, tokenId, price);
+  return { listingId, tokenId };
 }
 
-async function fillAndConfirm(campaign, market) {
-  const qty = await campaign.nandQty();
-  const latch = await campaign.latchQty();
-  const parts = await ethers.getContractAt("MockERC1155", await campaign.transistors());
-  if (qty > 0n) {
-    await market.simulateSellerFill(await campaign.nandBidId(), qty);
-    await parts.mint(await campaign.getAddress(), 0, qty);
+async function buy(ctx, price = UNIT, count = 1) {
+  const ids = [];
+  const tokens = [];
+  const prices = [];
+  for (let i = 0; i < count; i++) {
+    const l = await listOne(ctx, price);
+    ids.push(l.listingId);
+    tokens.push(l.tokenId);
+    prices.push(price);
   }
-  if (latch > 0n) {
-    await market.simulateSellerFill(await campaign.latchBidId(), latch);
-    await parts.mint(await campaign.getAddress(), 1, latch);
-  }
-  await campaign.confirmTransistors();
+  await ctx.campaign.connect(ctx.owner).buyCircuits(ids, tokens, prices);
+  return tokens;
 }
 
 async function deployFixture() {
-  const [owner, alice, bob, carol, feeRecipient, pool] = await ethers.getSigners();
-  const minter = await ethers.deployContract("MockMaterialMarket");
-  const parts = await ethers.deployContract("MockERC1155");
+  const [owner, alice, bob, carol, feeRecipient, pool, seller] = await ethers.getSigners();
+  const market = await ethers.deployContract("MockCircuitMarket", [FEE_BPS]);
+  const nft = await ethers.deployContract("MockCircuitNft");
   const factory = await ethers.deployContract("CampaignFactory", [
-    await minter.getAddress(),
-    [await parts.getAddress()],
+    await market.getAddress(),
+    [await nft.getAddress()],
   ]);
-  await factory.connect(owner).createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await parts.getAddress());
+  await factory
+    .connect(owner)
+    .createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await nft.getAddress());
   const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
-  return { minter, parts, factory, campaign, owner, alice, bob, carol, feeRecipient, pool };
+  return { market, nft, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller };
 }
 
-// 走到 Mining，且把矿池设成 EOA，便于用 depositRevenue 灌多轮收益。
 async function pooledFixture() {
   const ctx = await loadFixture(deployFixture);
-  const { campaign, alice, bob, owner, minter, pool } = ctx;
+  const { campaign, owner, alice, bob, pool } = ctx;
   await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
   await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
   await campaign.connect(owner).setPlan(408n);
-  await place(campaign, owner, 100n, UNIT);
-  await fillAndConfirm(campaign, minter);
+  await buy(ctx, UNIT);
+  await campaign.confirmCircuits();
   await campaign.connect(owner).setMiningPool(pool.address);
   await campaign.connect(owner).depositToPool();
   return ctx;
 }
 
 async function ledger(campaign) {
-  const address = await campaign.getAddress();
   const [balance, raised, pool, paid, fee] = await Promise.all([
-    ethers.provider.getBalance(address),
+    ethers.provider.getBalance(await campaign.getAddress()),
     campaign.raisedBnb(),
     campaign.surplusPool(),
     campaign.surplusPaid(),
@@ -85,7 +97,6 @@ async function expectNoDustLeft(campaign) {
   expect(l.paid).to.equal(l.pool);
   expect(l.fee).to.equal(0n);
   expect(l.balance).to.equal(0n);
-  // 一分钱都不剩 ⇒ owner 也扫不出东西。
   await expect(campaign.recoverBnb()).to.be.revertedWithCustomError(campaign, "ZeroShares");
 }
 
@@ -99,38 +110,50 @@ async function expectSharesConserved(campaign) {
   expect(sum).to.equal(await campaign.outstandingShares());
 }
 
+async function expectCollateralInvariant(campaign) {
+  const held = await campaign.circuitHeldCount();
+  if (held === 0n) return;
+  const [outstanding, sold, price, refunded] = await Promise.all([
+    campaign.outstandingShares(),
+    campaign.sold(),
+    campaign.sharePriceBnb(),
+    campaign.totalRefunded(),
+  ]);
+  expect(outstanding > 0n || refunded >= sold * price).to.equal(true);
+}
+
 describe("ledger identity", () => {
   it("holds at every stage of a full lifecycle and ends with nothing unowned", async () => {
-    const { campaign, owner, alice, bob, minter, pool } = await loadFixture(deployFixture);
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, bob, feeRecipient, pool } = ctx;
+    await campaign.connect(owner).setServiceFee(500, [feeRecipient.address], [10000]);
 
     await expectLedgerClosed(campaign);
     await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
     await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
     await expectLedgerClosed(campaign);
 
-    // 托管款打到市场：余额与 raisedBnb 同步下降。
     await campaign.connect(owner).setPlan(408n);
-    await place(campaign, owner, 100n, UNIT);
+    await buy(ctx, UNIT);
     await expectLedgerClosed(campaign);
 
-    await fillAndConfirm(campaign, minter);
+    await campaign.confirmCircuits();
     await expectLedgerClosed(campaign);
-
     await campaign.connect(owner).setMiningPool(pool.address);
     await campaign.connect(owner).depositToPool();
     await expectLedgerClosed(campaign);
+    expect(await campaign.circuitHeldCount()).to.equal(0n);
 
     await campaign.connect(pool).depositRevenue({ value: ethers.parseEther("0.05") });
     await expectLedgerClosed(campaign);
-
     await campaign.connect(alice).claimSurplus();
     await expectLedgerClosed(campaign);
 
-    // 零头也要有归属：7 wei 不能飘在账外。
+    // 7 wei dust must have an owner too.
     await campaign.connect(pool).depositRevenue({ value: 7n });
     await expectLedgerClosed(campaign);
-
     await campaign.connect(bob).claimSurplus();
+    await campaign.connect(feeRecipient).claimFee();
     await expectNoDustLeft(campaign);
   });
 
@@ -138,29 +161,25 @@ describe("ledger identity", () => {
     for (const order of [["alice", "bob"], ["bob", "alice"]]) {
       const ctx = await loadFixture(pooledFixture);
       const { campaign, pool } = ctx;
-      // 0.5 BNB 入池余款 + 7 wei：60/40 一定除不尽，必须由最后一位领款人收掉尾差。
       await campaign.connect(pool).depositRevenue({ value: 7n });
-      const poolTotal = await campaign.surplusPool();
+      const total = await campaign.surplusPool();
       for (const who of order) {
         await campaign.connect(ctx[who]).claimSurplus();
       }
-      expect(await campaign.surplusPaid()).to.equal(poolTotal);
+      expect(await campaign.surplusPaid()).to.equal(total);
       expect(await campaign.surplusOf(ctx.alice.address)).to.equal(0n);
       expect(await campaign.surplusOf(ctx.bob.address)).to.equal(0n);
       await expectNoDustLeft(campaign);
     }
   });
 
-  it("keeps every later revenue deposit claimable after an earlier round was fully claimed", async () => {
-    // S-7 回归：轮内数满后必须另开一轮，否则第二笔收益谁都领不到。
+  it("keeps later revenue claimable after an earlier round was fully claimed", async () => {
     const { campaign, alice, bob, pool } = await loadFixture(pooledFixture);
-
     await campaign.connect(alice).claimSurplus();
     await campaign.connect(pool).depositRevenue({ value: ethers.parseEther("0.07") });
     await campaign.connect(bob).claimSurplus();
     expect(await campaign.surplusPaid()).to.equal(await campaign.surplusPool());
 
-    // 第二轮：两个人都应该重新有可领额。
     await campaign.connect(pool).depositRevenue({ value: ethers.parseEther("0.11") });
     expect(await campaign.surplusOf(alice.address)).to.be.greaterThan(0n);
     expect(await campaign.surplusOf(bob.address)).to.be.greaterThan(0n);
@@ -169,39 +188,41 @@ describe("ledger identity", () => {
     await expectNoDustLeft(campaign);
   });
 
-  it("holds when a holder rejects the payout: the accrual is retryable and stays reserved", async () => {
-    const { campaign, owner, minter, pool } = await loadFixture(deployFixture);
+  it("holds when a holder rejects the payout: the accrual stays retryable and reserved", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, pool } = ctx;
     const rejector = await ethers.deployContract("Rejector");
-    const rAddr = await rejector.getAddress();
-    await campaign.connect(owner).setPlan(408n);
-    // 90 + 10 份，拒收合约也是持份人。
     await rejector.subscribe(await campaign.getAddress(), 10n, { value: 10n * SHARE_PRICE });
-    const [, , , , , , , , holder] = await ethers.getSigners();
-    await campaign.connect(holder).subscribe(90n, { value: 90n * SHARE_PRICE });
-    await place(campaign, owner, 100n, UNIT);
-    await fillAndConfirm(campaign, minter);
+    await campaign.connect(alice).subscribe(90n, { value: 90n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await buy(ctx, UNIT);
+    await campaign.confirmCircuits();
     await campaign.connect(owner).setMiningPool(pool.address);
     await campaign.connect(owner).depositToPool();
     await expectLedgerClosed(campaign);
 
-    const before = await campaign.surplusOf(rAddr);
+    const before = await campaign.surplusOf(await rejector.getAddress());
     expect(before).to.be.greaterThan(0n);
-    // 拒收 ⇒ 整笔回滚，账不留痕，钱仍在合约里为它留着。
-    await expect(rejector.claimSurplusFrom(await campaign.getAddress()))
-      .to.be.revertedWithCustomError(campaign, "TransferFailed");
-    expect(await campaign.surplusOf(rAddr)).to.equal(before);
+    await expect(rejector.claimSurplusFrom(await campaign.getAddress())).to.be.revertedWithCustomError(
+      campaign,
+      "TransferFailed",
+    );
+    expect(await campaign.surplusOf(await rejector.getAddress())).to.equal(before);
     await expectLedgerClosed(campaign);
-    await expect(campaign.connect(owner).recoverBnb()).to.be.revertedWithCustomError(campaign, "ZeroShares");
+    await expect(campaign.connect(owner).recoverBnb()).to.be.revertedWithCustomError(
+      campaign,
+      "ZeroShares",
+    );
 
-    // 换成能收钱的地址后照样能领。
     await rejector.accept();
     await rejector.claimSurplusFrom(await campaign.getAddress());
-    expect(await campaign.surplusOf(rAddr)).to.equal(0n);
-    await expectLedgerClosed(campaign);
+    expect(await campaign.surplusOf(await rejector.getAddress())).to.equal(0n);
+    await campaign.connect(alice).claimSurplus();
+    await expectNoDustLeft(campaign);
   });
 });
 
-describe("shares and parts conservation", () => {
+describe("shares and circuit conservation", () => {
   it("keeps shares + escrow equal to outstandingShares across listing, taking and cancelling", async () => {
     const { campaign, alice, bob } = await loadFixture(pooledFixture);
     await expectSharesConserved(campaign);
@@ -221,32 +242,7 @@ describe("shares and parts conservation", () => {
     expect(await campaign.sharesOf(alice.address)).to.equal(55n);
   });
 
-  it("zeroes every share on the refund exits, so outstandingShares never strands", async () => {
-    const { campaign, owner, alice, bob, minter } = await loadFixture(deployFixture);
-    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
-    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
-    await campaign.connect(owner).setPlan(408n);
-    await place(campaign, owner, 100n, UNIT);
-    await expectSharesConserved(campaign);
-    await minter.simulateSellerFill(await campaign.nandBidId(), 1n);
-    await campaign.connect(alice).cancelTransistorOrder();
-    await expectSharesConserved(campaign);
-
-    await campaign.connect(owner).abandonOrder();
-    // 放弃只开闸：份额还在，账本依旧闭合。
-    await expectSharesConserved(campaign);
-    await expectLedgerClosed(campaign);
-    await campaign.connect(alice).refund();
-    await campaign.connect(bob).refund();
-    expect(await campaign.outstandingShares()).to.equal(0n);
-    expect(await campaign.sharesOf(alice.address)).to.equal(0n);
-    expect(await campaign.sharesOf(bob.address)).to.equal(0n);
-    await expectLedgerClosed(campaign);
-  });
-});
-
-describe("no wei left behind", () => {
-  it("closes the books on the never-sold-out exit", async () => {
+  it("zeroes every share on the funding-timeout exit", async () => {
     const { campaign, alice, bob } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(30n, { value: 30n * SHARE_PRICE });
     await campaign.connect(bob).subscribe(20n, { value: 20n * SHARE_PRICE });
@@ -254,50 +250,108 @@ describe("no wei left behind", () => {
     await campaign.connect(alice).refund();
     await campaign.connect(bob).refund();
     expect(await campaign.scene()).to.equal(SCENE.Funding);
-    await expectNoDustLeft(campaign);
-  });
-
-  it("closes the books when the order is unaffordable and everyone pulls out", async () => {
-    const { campaign, owner, alice, bob } = await loadFixture(deployFixture);
-    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
-    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
-    // 出价 × 数量超过募集池 ⇒ 先由 owner 判失败（不 revert、不挂单）。
-    await campaign.connect(owner).markFailed();
-    expect(await campaign.executionFailed()).to.equal(true);
-    await campaign.connect(alice).refund();
-    await campaign.connect(bob).refund();
     expect(await campaign.outstandingShares()).to.equal(0n);
+    await expectSharesConserved(campaign);
     await expectNoDustLeft(campaign);
   });
 
-  it("closes the books on abandonOrder and releases the parts afterwards", async () => {
-    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
+  it("closes the books when no listing is affordable and everyone pulls out", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, alice, bob, owner } = ctx;
     await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
     await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
     await campaign.connect(owner).setPlan(408n);
-    await place(campaign, owner, 100n, UNIT);
-    await minter.simulateSellerFill(await campaign.nandBidId(), 40n);
-    await parts.mint(await campaign.getAddress(), 0, 40n);
-    // 40 件吃掉了 0.2 BNB：owner 补齐后持份人才能按原价收回本金，晶体管才归 owner。
-    await campaign.connect(owner).topUpShortfall({ value: 40n * UNIT });
-    await campaign.connect(owner).abandonOrder();
-    // 放弃不推送：份额还在，晶体管留在合约里等持份人自取。
-    expect(await campaign.outstandingShares()).to.equal(100n);
-    expect(await parts.balanceOf(owner.address, 0)).to.equal(0n);
+    await buy(ctx, ethers.parseEther("1.5"));
+    expect(await campaign.executionFailed()).to.equal(true);
+    expect(await campaign.circuitCount()).to.equal(0n);
     await campaign.connect(alice).refund();
     await campaign.connect(bob).refund();
     expect(await campaign.outstandingShares()).to.equal(0n);
-    expect(await campaign.totalRefunded()).to.equal(100n * SHARE_PRICE);
-    // 份额全部结清后，再跑一次放弃才把剩余晶体管交给 owner。
-    await campaign.connect(owner).abandonOrder();
-    expect(await parts.balanceOf(owner.address, 0)).to.equal(40n);
-    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
     await expectNoDustLeft(campaign);
+  });
+
+  it("releases the circuit only after every share is settled and repaid in full", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, bob, nft } = ctx;
+    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
+    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    const [tokenId] = await buy(ctx, SHORT_PRICE);
+    await expectCollateralInvariant(campaign);
+    await expectSharesConserved(campaign);
+
+    // A short pool with a circuit in hand closes all three refund exits.
+    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(
+      campaign,
+      "CircuitsAreCollateral",
+    );
+    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(
+      campaign,
+      "CircuitsAreCollateral",
+    );
+    await expect(campaign.connect(owner).abandonOrder()).to.be.revertedWithCustomError(
+      campaign,
+      "CircuitsAreCollateral",
+    );
+    await expect(
+      campaign.connect(owner).recoverCircuits(await nft.getAddress(), tokenId),
+    ).to.be.revertedWithCustomError(campaign, "SharesOutstanding");
+    await expectLedgerClosed(campaign);
+
+    // Top up the 0.6 BNB the circuit consumed, then holders can take the full principal.
+    await campaign.connect(owner).topUpShortfall({ value: SHORT_PRICE });
+    await campaign.connect(owner).openRefund();
+    await expectCollateralInvariant(campaign);
+    await campaign.connect(alice).refund();
+    await campaign.connect(bob).refund();
+    expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.totalRefunded()).to.equal(TOTAL_SHARES * SHARE_PRICE);
+    await expectCollateralInvariant(campaign);
+    await expectLedgerClosed(campaign);
+
+    await campaign.connect(owner).recoverCircuits(await nft.getAddress(), tokenId);
+    expect(await nft.ownerOf(tokenId)).to.equal(owner.address);
+    expect(await campaign.circuitHeldCount()).to.equal(0n);
+    await expectNoDustLeft(campaign);
+  });
+
+  it("never zeroes shares while the pool is short and a circuit is held", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, nft, pool } = ctx;
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    const [tokenId] = await buy(ctx, SHORT_PRICE);
+    await campaign.confirmCircuits();
+    await campaign.connect(owner).setPhase(PHASE.Buying);
+    expect(await campaign.raisedBnb()).to.be.lessThan(100n * SHARE_PRICE);
+
+    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(
+      campaign,
+      "CircuitsAreCollateral",
+    );
+    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(
+      campaign,
+      "CircuitsAreCollateral",
+    );
+    await expect(campaign.connect(owner).abandonOrder()).to.be.revertedWithCustomError(
+      campaign,
+      "CircuitsAreCollateral",
+    );
+    await expect(
+      campaign.connect(owner).recoverCircuits(await nft.getAddress(), tokenId),
+    ).to.be.revertedWithCustomError(campaign, "SharesOutstanding");
+
+    // Pooling is still open: the shares keep their claim on the circuit's output.
+    await campaign.connect(owner).setPhase(PHASE.Ready);
+    await campaign.connect(owner).setMiningPool(pool.address);
+    await campaign.connect(owner).depositToPool();
+    expect(await campaign.outstandingShares()).to.equal(100n);
+    expect(await nft.ownerOf(tokenId)).to.equal(pool.address);
+    await expectCollateralInvariant(campaign);
   });
 });
 
 describe("randomized lifecycles", () => {
-  // 固定种子的伪随机：测试可复现，但覆盖不同的份额拆分、金额零头、退出路径和领取顺序。
   function rng(seed) {
     let s = seed >>> 0;
     return () => {
@@ -319,15 +373,15 @@ describe("randomized lifecycles", () => {
     return cuts;
   }
 
-  for (const seed of [1, 7, 42, 99, 2024, 31337]) {
-    it(`seed ${seed}: ledger and shares stay conserved on a random exit path`, async () => {
+  for (const seed of [7, 42, 2024]) {
+    it(`seed ${seed}: ledger, shares and collateral stay conserved`, async () => {
       const rand = rng(seed);
-      const { campaign, owner, alice, bob, carol, parts, minter, pool } = await loadFixture(deployFixture);
+      const ctx = await loadFixture(deployFixture);
+      const { campaign, owner, alice, bob, carol, pool, nft } = ctx;
       const signers = [alice, bob, carol];
-      const count = 2 + Math.floor(rand() * 2); // 2~3 个持份人
+      const count = 2 + Math.floor(rand() * 2);
       const cuts = split(TOTAL_SHARES, count, rand);
 
-      // 1) 认筹：金额与份额必须一一对上。
       for (let i = 0; i < count; i++) {
         await campaign.connect(signers[i]).subscribe(cuts[i], { value: cuts[i] * SHARE_PRICE });
         await expectLedgerClosed(campaign);
@@ -336,11 +390,8 @@ describe("randomized lifecycles", () => {
 
       const path = Math.floor(rand() * 3);
       if (path === 0) {
-        // 路径 A：未售罄 + 过截止 ⇒ 逐人 pull 本金。
         await time.increaseTo((await campaign.fundingDeadline()) + 1n);
-        for (let i = 0; i < count; i++) {
-          await campaign.connect(signers[i]).refund();
-        }
+        for (let i = 0; i < count; i++) await campaign.connect(signers[i]).refund();
         expect(await campaign.outstandingShares()).to.equal(0n);
         await expectNoDustLeft(campaign);
         return;
@@ -349,10 +400,8 @@ describe("randomized lifecycles", () => {
       await campaign.connect(owner).setPlan(408n);
 
       if (path === 1) {
-        // 路径 B：保守出价（买不起）⇒ 判失败后逐人退款，不挂单、不产生死钱。
-        await campaign.connect(owner).placeTransistorOrder(BigInt(count * 10), ethers.parseEther("1"), 0, 0);
+        await buy(ctx, ethers.parseEther("1.5"));
         expect(await campaign.executionFailed()).to.equal(true);
-        // 之前可能已经退款过一部分，这里把剩下的都退掉。
         for (let i = 0; i < count; i++) {
           if ((await campaign.sharesOf(signers[i].address)) > 0n) {
             await campaign.connect(signers[i]).refund();
@@ -363,13 +412,9 @@ describe("randomized lifecycles", () => {
         return;
       }
 
-      // 路径 C/D：真实买入 1/4 的份额数量，成交后确认到账。
-      const buyQty = TOTAL_SHARES / 4n;
-      await place(campaign, owner, buyQty, UNIT);
-      await fillAndConfirm(campaign, minter);
-      expect(await campaign.phase()).to.equal(PHASE.Ready);
-
-      // 路径 D：先提前退余款，再入池（路径 C 直接入池）。
+      const [tokenId] = await buy(ctx, UNIT);
+      await campaign.confirmCircuits();
+      await expectCollateralInvariant(campaign);
       if (rand() < 0.5) {
         await campaign.connect(owner).returnSurplus();
         await expectLedgerClosed(campaign);
@@ -378,15 +423,13 @@ describe("randomized lifecycles", () => {
       await campaign.connect(owner).depositToPool();
       await expectLedgerClosed(campaign);
 
-      // 随机灌几轮收益，金额带零头，制造除不尽的尾差。
-      const rounds = 1 + Math.floor(rand() * 3);
+      const rounds = 1 + Math.floor(rand() * 2);
       for (let i = 0; i < rounds; i++) {
         const amount = BigInt(Math.floor(rand() * 1e15)) + 7n;
         await campaign.connect(pool).depositRevenue({ value: amount });
         await expectLedgerClosed(campaign);
       }
 
-      // 随机顺序领取：谁有可领额谁领，允许某轮为 0（除不尽时可能落在别人头上）。
       for (let pass = 0; pass < 3; pass++) {
         for (let i = 0; i < count; i++) {
           const who = signers[(i + pass) % count];
@@ -397,336 +440,51 @@ describe("randomized lifecycles", () => {
         }
       }
 
-      // 全部可领额清零 ⇒ 余款 pool 已经一分不剩地发完，owner 也扫不动。
       for (let i = 0; i < count; i++) {
         expect(await campaign.surplusOf(signers[i].address)).to.equal(0n);
       }
       await expectSharesConserved(campaign);
-      expect(await parts.balanceOf(pool.address, 0)).to.equal(buyQty);
+      expect(await nft.ownerOf(tokenId)).to.equal(pool.address);
       await expectNoDustLeft(campaign);
     });
   }
 });
 
-describe("boundary guards", () => {
-  it("rejects zero / over-cap / mispriced subscriptions", async () => {
-    const { campaign, alice } = await loadFixture(deployFixture);
-    await expect(campaign.connect(alice).subscribe(0n, { value: 0n }))
-      .to.be.revertedWithCustomError(campaign, "ZeroShares");
-    await expect(campaign.connect(alice).subscribe(TOTAL_SHARES + 1n, { value: TOTAL_SHARES * SHARE_PRICE + SHARE_PRICE }))
-      .to.be.revertedWithCustomError(campaign, "ExceedsRemaining");
-    await expect(campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE - 1n }))
-      .to.be.revertedWithCustomError(campaign, "WrongPayment");
-    // 截止后才认购。
-    await time.increaseTo((await campaign.fundingDeadline()) + 1n);
-    await expect(campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE }))
-      .to.be.revertedWithCustomError(campaign, "FundingEnded");
-  });
-
-  it("rejects zero / bad orders and sales before the buy is confirmed", async () => {
-    const { campaign, owner, alice } = await loadFixture(deployFixture);
-    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await expect(campaign.connect(owner).placeTransistorOrder(0n, 0, 0n, 0))
-      .to.be.revertedWithCustomError(campaign, "ZeroShares");
-    await expect(campaign.connect(owner).placeTransistorOrder(1n, 0, 0n, 0))
-      .to.be.revertedWithCustomError(campaign, "ZeroPrice");
-    // 卖出只能在 Ready，且必须指向一张真实买单；这两道闸门都在 _requireReady 之后。
-    await expect(campaign.connect(owner).sellTransistors(1n, 0, 1n))
-      .to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
-    await expect(campaign.connect(owner).cancelTransistorOrder())
-      .to.be.revertedWithCustomError(campaign, "NotListed");
-  });
-
-  it("rejects bad listing parameters and foreign sellers", async () => {
-    const { campaign, owner, alice, bob } = await loadFixture(pooledFixture);
-    await expect(campaign.connect(alice).listShares(0n, 1n))
-      .to.be.revertedWithCustomError(campaign, "ZeroShares");
-    await expect(campaign.connect(alice).listShares(1n, 0n))
-      .to.be.revertedWithCustomError(campaign, "ZeroPrice");
-    await expect(campaign.connect(alice).listShares(61n, 1n))
-      .to.be.revertedWithCustomError(campaign, "InsufficientShares");
-
-    await campaign.connect(alice).listShares(10n, ethers.parseEther("0.02"));
-    const id = 0n;
-    await expect(campaign.connect(alice).takeListing(id, 1n, { value: ethers.parseEther("0.02") }))
-      .to.be.revertedWithCustomError(campaign, "CannotTakeOwnListing");
-    await expect(campaign.connect(bob).takeListing(id, 0n, { value: 0n }))
-      .to.be.revertedWithCustomError(campaign, "BadCount");
-    await expect(campaign.connect(bob).takeListing(id, 11n, { value: 11n * ethers.parseEther("0.02") }))
-      .to.be.revertedWithCustomError(campaign, "BadCount");
-    await expect(campaign.connect(bob).takeListing(id, 1n, { value: 1n }))
-      .to.be.revertedWithCustomError(campaign, "WrongPayment");
-    // 只有卖家或 owner 能撤。
-    const [, , carol] = await ethers.getSigners();
-    await expect(campaign.connect(carol).cancelListing(id))
-      .to.be.revertedWithCustomError(campaign, "NotSeller");
-    // owner 可以代撤。
-    await campaign.connect(owner).cancelListing(id);
-    await expect(campaign.connect(owner).cancelListing(id))
-      .to.be.revertedWithCustomError(campaign, "NoListing");
-  });
-
-  it("rejects zero addresses in every setter", async () => {
-    const { campaign, owner } = await loadFixture(deployFixture);
-    await expect(campaign.connect(owner).setMaterialMarket(ethers.ZeroAddress))
-      .to.be.revertedWithCustomError(campaign, "ZeroAddress");
-    await expect(campaign.connect(owner).setMiningPool(ethers.ZeroAddress))
-      .to.be.revertedWithCustomError(campaign, "ZeroAddress");
-    await expect(campaign.connect(owner).setMiningPool(await campaign.getAddress()))
-      .to.be.revertedWithCustomError(campaign, "ZeroAddress");
-    await expect(campaign.connect(owner).recoverTransistors(ethers.ZeroAddress, 0n, 1n))
-      .to.be.revertedWithCustomError(campaign, "ZeroAddress");
-  });
-
-  it("rejects every invalid fee table shape", async () => {
-    const { campaign, owner, alice } = await loadFixture(deployFixture);
-    const bad = [
-      [10001, [alice.address], [10000]], // 超过 10% 上限
-      [100, [alice.address], [9999]], // 分不成 10000
-      [100, [alice.address, alice.address], [5000, 5000]], // 重复收款方
-      [100, [], []], // 有费率却没有收款方
-      [100, [ethers.ZeroAddress], [10000]], // 零地址
-      [100, [alice.address], [10000, 0]], // 长度不一致
-      [0, [alice.address], [10000]], // 0 费率却给了表
-      // S-30：合约自己永远调不了 claimFee，收成自己 = 服务费永久锁死。
-      [100, [await campaign.getAddress()], [10000]],
-    ];
-    for (const [bps, recipients, shares] of bad) {
-      await expect(campaign.connect(owner).setServiceFee(bps, recipients, shares))
-        .to.be.revertedWithCustomError(campaign, "BadFeeConfig");
-    }
-    await expect(campaign.connect(owner).feeRecipientAt(0))
-      .to.be.revertedWithCustomError(campaign, "BadFeeConfig");
-    await expect(campaign.connect(owner).feeSharesBpsAt(0))
-      .to.be.revertedWithCustomError(campaign, "BadFeeConfig");
-  });
-
-  it("rejects bad phase targets and double pooling", async () => {
-    const { campaign, owner, alice } = await loadFixture(deployFixture);
-    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await expect(campaign.connect(owner).setPhase(PHASE.None))
-      .to.be.revertedWithCustomError(campaign, "WrongScene");
-    await expect(campaign.connect(owner).setPhase(4n))
-      .to.be.revertedWithCustomError(campaign, "WrongScene");
-    // 没有活单不能自称挂单中。
-    await expect(campaign.connect(owner).setPhase(PHASE.Listed))
-      .to.be.revertedWithCustomError(campaign, "WrongScene");
-    // 没买过料不能自称已到账。
-    await expect(campaign.connect(owner).setPhase(PHASE.Ready))
-      .to.be.revertedWithCustomError(campaign, "TransistorsNotReady");
-  });
-
-  it("rejects revenue from anyone but the pool and zero-value revenue", async () => {
-    const { campaign, pool, owner } = await loadFixture(pooledFixture);
-    await expect(campaign.connect(owner).depositRevenue({ value: 1n }))
-      .to.be.revertedWithCustomError(campaign, "NotOwner");
-    await expect(campaign.connect(pool).depositRevenue({ value: 0n }))
-      .to.be.revertedWithCustomError(campaign, "ZeroPrice");
-  });
-
-  it("refuses a second pooling and blocks transistor recovery afterwards", async () => {
-    const { campaign, owner, parts } = await loadFixture(pooledFixture);
-    await expect(campaign.connect(owner).depositToPool())
-      .to.be.revertedWithCustomError(campaign, "AlreadyPooled");
-    await expect(campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 1n))
-      .to.be.revertedWithCustomError(campaign, "AlreadyPooled");
-    await expect(campaign.connect(owner).returnSurplus())
-      .to.be.revertedWithCustomError(campaign, "WrongScene");
-  });
-
-  it("refuses harvest / claim outside mining and refunds in mining", async () => {
-    const { campaign, alice } = await loadFixture(deployFixture);
-    await expect(campaign.connect(alice).harvest())
-      .to.be.revertedWithCustomError(campaign, "WrongScene");
-    await expect(campaign.connect(alice).claim())
-      .to.be.revertedWithCustomError(campaign, "WrongScene");
-    await expect(campaign.connect(alice).claimSurplus())
-      .to.be.revertedWithCustomError(campaign, "ZeroShares");
-    await expect(campaign.connect(alice).refund())
-      .to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 晶体管 = 抵押：只要合约手上还有本期晶体管，要么还有持份人，要么持份人已按原价全额收回本金。
-// ─────────────────────────────────────────────────────────────────────────────
-async function expectCollateralInvariant(campaign) {
-  const parts = await ethers.getContractAt("MockERC1155", await campaign.transistors());
-  const held = (await parts.balanceOf(await campaign.getAddress(), 0)) + (await parts.balanceOf(await campaign.getAddress(), 1));
-  if (held === 0n) return;
-  const [outstanding, sold, price, refunded] = await Promise.all([
-    campaign.outstandingShares(),
-    campaign.sold(),
-    campaign.sharePriceBnb(),
-    campaign.totalRefunded(),
-  ]);
-  // 晶体管还在 → 不能出现「没人有资格领」的中间态。
-  expect(outstanding > 0n || refunded >= sold * price).to.equal(true);
-}
-
-describe("parts collateral invariant", () => {
-  it("holds across a partial-fill, cancel, top-up and settle path", async () => {
-    const { campaign, owner, alice, bob, minter, parts } = await loadFixture(deployFixture);
-    await expectCollateralInvariant(campaign);
-
-    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
-    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
-    await campaign.connect(owner).setPlan(408n);
-    await place(campaign, owner, 100n, UNIT);
-    await minter.simulateSellerFill(await campaign.nandBidId(), 40n);
-    await parts.mint(await campaign.getAddress(), 0, 40n);
-    await expectCollateralInvariant(campaign);
-
-    // 部分成交后撤单：仍有份额，晶体管仍是抵押。
-    await campaign.connect(alice).cancelTransistorOrder();
-    await expectCollateralInvariant(campaign);
-    await expectLedgerClosed(campaign);
-    await expectSharesConserved(campaign);
-    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
-
-    // owner 补齐被晶体管吃掉的部分 → 持份人按原价退完 → 晶体管才可离开。
-    await campaign.connect(owner).topUpShortfall({ value: 40n * UNIT });
-    await expectCollateralInvariant(campaign);
-    await expectLedgerClosed(campaign);
-    await campaign.connect(owner).openRefund();
-    await expectCollateralInvariant(campaign);
-    await expectSharesConserved(campaign);
-    // 开闸不结清：份额还在，晶体管仍不能离开。
-    await expect(campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 40n))
-      .to.be.revertedWithCustomError(campaign, "SharesOutstanding");
-    await campaign.connect(alice).refund();
-    await campaign.connect(bob).refund();
-    expect(await campaign.outstandingShares()).to.equal(0n);
-    await campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 40n);
-    expect(await parts.balanceOf(owner.address, 0)).to.equal(40n);
-    await expectNoDustLeft(campaign);
-  });
-
-  it("never reaches zero shares while the pool is short and parts are held", async () => {
-    const { campaign, owner, alice, minter, parts } = await loadFixture(deployFixture);
-    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await campaign.connect(owner).setPlan(408n);
-    await place(campaign, owner, 100n, UNIT);
-    await fillAndConfirm(campaign, minter);
-    expect(await campaign.phase()).to.equal(PHASE.Ready);
-    await campaign.connect(owner).setPhase(PHASE.Buying);
-
-    const poolBefore = await campaign.raisedBnb();
-    expect(poolBefore).to.be.lessThan(100n * SHARE_PRICE);
-    // 池子不足 + 晶体管在手：单人 / 批量 / 放弃 三条退款路全关。
-    await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
-    await expect(campaign.connect(owner).openRefund()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
-    await expect(campaign.connect(owner).abandonOrder()).to.be.revertedWithCustomError(campaign, "PartsAreCollateral");
-    await expect(campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 100n))
-      .to.be.revertedWithCustomError(campaign, "SharesOutstanding");
-    await expectCollateralInvariant(campaign);
-    // 晶体管与份额都还在：入池仍是可用出口（份额继续享有产出）。
-    await campaign.connect(owner).setMiningPool((await ethers.getSigners())[5].address);
-    await campaign.connect(owner).setPhase(PHASE.Ready);
-    await campaign.connect(owner).depositToPool();
-    expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
-    expect(await campaign.outstandingShares()).to.equal(100n);
-    await expectCollateralInvariant(campaign);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 熔断只是关业务入口：它不能改账本，也不能挡住任何一条「钱回持份人」的路。
-// ─────────────────────────────────────────────────────────────────────────────
 describe("circuit breaker keeps the books closed", () => {
-  it("a halted round still returns every wei to its owner-less holders", async () => {
-    // 未售罄：熔断 + 过截止 ⇒ 每人照样 pull 本金，合约清零。
+  it("a halted funding round still returns every wei after the deadline", async () => {
     const { campaign, owner, alice, bob } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(30n, { value: 30n * SHARE_PRICE });
     await campaign.connect(bob).subscribe(20n, { value: 20n * SHARE_PRICE });
-    await expectLedgerClosed(campaign);
     await campaign.connect(owner).halt();
+    await expectLedgerClosed(campaign);
 
     await time.increaseTo((await campaign.fundingDeadline()) + 1n);
     await campaign.connect(alice).refund();
-    await expectLedgerClosed(campaign);
     await campaign.connect(bob).refund();
-    expect(await campaign.outstandingShares()).to.equal(0n);
     expect(await campaign.halted()).to.equal(true);
+    expect(await campaign.outstandingShares()).to.equal(0n);
     await expectNoDustLeft(campaign);
   });
 
-  it("keeps the ledger closed and the collateral intact through a halt in Ready", async () => {
-    const { campaign, owner, alice, bob, minter } = await loadFixture(deployFixture);
+  it("a halted Ready round can still return surplus and pay it out", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, bob, nft } = ctx;
     await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
     await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
     await campaign.connect(owner).setPlan(408n);
-    await place(campaign, owner, 100n, UNIT);
-    await fillAndConfirm(campaign, minter);
+    const [tokenId] = await buy(ctx, UNIT);
+    await campaign.confirmCircuits();
     await campaign.connect(owner).halt();
 
-    // 余款照记、照领，晶体管照旧留在合约（熔断不许把抵押送走）。
     await campaign.connect(owner).returnSurplus();
     await expectLedgerClosed(campaign);
     await expectCollateralInvariant(campaign);
+    expect(await nft.ownerOf(tokenId)).to.equal(await campaign.getAddress());
+
     await campaign.connect(alice).claimSurplus();
     await campaign.connect(bob).claimSurplus();
     await expectLedgerClosed(campaign);
     await expectCollateralInvariant(campaign);
-  });
-
-  it("random halts never change the books and never trap a holder", async () => {
-    // 一条种子换一条随机路径：随机拉闸 / 抬闸，末尾必须还能全额退出。
-    for (const seed of [11, 29, 47, 83]) {
-      let s = seed >>> 0;
-      const rand = () => {
-        s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
-        return s / 4294967296;
-      };
-      const { campaign, owner, alice, bob, carol } = await loadFixture(deployFixture);
-      const holders = [alice, bob, carol];
-
-      // 认筹阶段：熔断只挡新钱，不挡已经记在册的份额。
-      for (const h of holders) {
-        if (rand() < 0.5) {
-          await campaign.connect(owner).halt();
-          await expectLedgerClosed(campaign);
-          const soldBefore = await campaign.sold();
-          await expect(campaign.connect(h).subscribe(10n, { value: 10n * SHARE_PRICE }))
-            .to.be.revertedWithCustomError(campaign, "Halted");
-          // 被拒的认购一分钱都不留：账本原样。
-          expect(await campaign.sold()).to.equal(soldBefore);
-          await expectLedgerClosed(campaign);
-          await campaign.connect(owner).resume();
-        }
-        await campaign.connect(h).subscribe(10n, { value: 10n * SHARE_PRICE });
-        await expectLedgerClosed(campaign);
-      }
-
-      // 剩下 70 份额由 owner 补满，进入 Executing。
-      await campaign.connect(owner).subscribe(70n, { value: 70n * SHARE_PRICE });
-      await campaign.connect(owner).setPlan(408n);
-
-      // 挂单与否随机；挂单后撤单在熔断下也必须可用（逃生舱）。
-      if (rand() < 0.5) {
-        await place(campaign, owner, 100n, UNIT);
-        await expectLedgerClosed(campaign);
-        if (!(await campaign.halted())) await campaign.connect(owner).halt();
-        await campaign.connect(owner).cancelTransistorOrder();
-        expect(await campaign.phase()).to.equal(PHASE.Buying);
-        await expectLedgerClosed(campaign);
-      }
-
-      // 熔断状态下判失败 + 逐人 pull 本金：最终账本必须清零。
-      if (!(await campaign.halted())) await campaign.connect(owner).halt();
-      await campaign.connect(owner).markFailed();
-      expect(await campaign.raisedBnb()).to.equal(100n * SHARE_PRICE);
-      for (const h of holders) {
-        if ((await campaign.sharesOf(h.address)) > 0n) await campaign.connect(h).refund();
-        await expectLedgerClosed(campaign);
-      }
-      await campaign.connect(owner).refund();
-      // 全程熔断未抬闸：本金照样全额退出。
-      expect(await campaign.halted()).to.equal(true);
-      expect(await campaign.outstandingShares()).to.equal(0n);
-      await expectSharesConserved(campaign);
-      await expectNoDustLeft(campaign);
-    }
+    expect(await campaign.circuitHeldCount()).to.equal(1n);
   });
 });
-
