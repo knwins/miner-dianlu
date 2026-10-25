@@ -942,9 +942,6 @@ export default function App() {
       }
       case "claimMiningRewards": return chainTx.claimMiningRewards(signer, args?.campaign);
       case "claimBem": return chainTx.claimBem(signer, args?.campaign);
-      case "setMiningPool":
-      case "depositToPool":
-        throw new Error("入池流程已删除：请直接用「开启挖矿」（startMining）调用官方挖矿合约。");
       case "returnSurplus":
         // 无参：把当前 raisedBnb 按份记账退回持份人，期次继续、仍然可以开矿。
         return chainTx.returnSurplus(signer);

@@ -70,7 +70,7 @@ async function deployFixture() {
 }
 
 /// Sell out, buy one circuit and enter Mining through the official mining contract.
-async function pooledFixture() {
+async function miningFixture() {
   const ctx = await loadFixture(deployFixture);
   const { campaign, owner, alice, bob } = ctx;
   await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
@@ -82,7 +82,7 @@ async function pooledFixture() {
   return { ...ctx, tokenId: tokens[0] };
 }
 
-/// Same as pooledFixture, with the service fee frozen before the first subscription.
+/// Same as miningFixture, with the service fee frozen before the first subscription.
 async function feeFixture() {
   const ctx = await loadFixture(deployFixture);
   const { campaign, owner, alice, bob, feeRecipient } = ctx;
@@ -97,7 +97,7 @@ async function feeFixture() {
 }
 
 /// Mining round where a BNB-rejecting contract holds 40 shares.
-async function rejectorPooledFixture() {
+async function rejectorminingFixture() {
   const ctx = await loadFixture(deployFixture);
   const { campaign, owner, alice } = ctx;
   const rejector = await ethers.deployContract("Rejector");
@@ -437,7 +437,7 @@ describe("startMining", () => {
   });
 
   it("keeps the circuit and refuses to start it twice", async () => {
-    const { campaign, owner, alice, tokenId } = await loadFixture(pooledFixture);
+    const { campaign, owner, alice, tokenId } = await loadFixture(miningFixture);
     await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
     await expect(
       campaign.connect(owner).recoverCircuits(await campaign.circuits(), tokenId),
@@ -461,7 +461,7 @@ describe("startMining", () => {
   });
 
   it("a late market credit after mining starts is booked as surplus", async () => {
-    const { campaign, owner, market } = await loadFixture(pooledFixture);
+    const { campaign, owner, market } = await loadFixture(miningFixture);
     const campaignAddr = await campaign.getAddress();
     await market.creditOwed(campaignAddr, ethers.parseEther("0.02"), { value: ethers.parseEther("0.02") });
     await campaign.connect(owner).withdrawMarketProceeds();
@@ -470,7 +470,7 @@ describe("startMining", () => {
   });
 
   it("books the leftover BNB as surplus and lets holders pull it", async () => {
-    const { campaign, alice, bob } = await loadFixture(pooledFixture);
+    const { campaign, alice, bob } = await loadFixture(miningFixture);
     const surplus = await campaign.surplusPool();
     expect(surplus).to.be.greaterThan(0n);
     await campaign.connect(alice).claimSurplus();
@@ -512,7 +512,7 @@ describe("startMining", () => {
 
 describe("official mining rewards", () => {
   it("harvests BEM and splits it pro-rata by shares", async () => {
-    const { campaign, owner, alice, bob, pod, tokenId } = await loadFixture(pooledFixture);
+    const { campaign, owner, alice, bob, pod, tokenId } = await loadFixture(miningFixture);
     const key = await campaign.miningKey(tokenId);
     const gross = ethers.parseEther("1000");
     await pod.accrue(key, gross);
@@ -526,7 +526,7 @@ describe("official mining rewards", () => {
   });
 
   it("stopMining settles the reward before the miner goes cooling", async () => {
-    const { campaign, owner, alice, pod, tokenId } = await loadFixture(pooledFixture);
+    const { campaign, owner, alice, pod, tokenId } = await loadFixture(miningFixture);
     await pod.accrue(await campaign.miningKey(tokenId), ethers.parseEther("50"));
     await expect(campaign.connect(owner).stopMining(tokenId)).to.emit(campaign, "MiningStopped");
     expect(await campaign.miningStatus(tokenId)).to.equal(3n);
@@ -534,7 +534,7 @@ describe("official mining rewards", () => {
   });
 
   it("claimBem pays the holder and cannot pay twice", async () => {
-    const { campaign, owner, alice, pod, tokenId } = await loadFixture(pooledFixture);
+    const { campaign, owner, alice, pod, tokenId } = await loadFixture(miningFixture);
     await pod.accrue(await campaign.miningKey(tokenId), ethers.parseEther("100"));
     await campaign.connect(owner).claimMiningRewards();
     await expect(campaign.connect(alice).claimBem())
@@ -545,7 +545,7 @@ describe("official mining rewards", () => {
   });
 
   it("settles the seller before shares move, so resale cannot steal earned BEM", async () => {
-    const { campaign, owner, alice, bob, pod, tokenId } = await loadFixture(pooledFixture);
+    const { campaign, owner, alice, bob, pod, tokenId } = await loadFixture(miningFixture);
     await pod.accrue(await campaign.miningKey(tokenId), ethers.parseEther("100"));
     await campaign.connect(owner).claimMiningRewards();
     await campaign.connect(alice).listShares(60n, ethers.parseEther("0.02"));
@@ -654,7 +654,7 @@ describe("refund / abort", () => {
   });
 
   it("a holder that rejects BNB keeps a claimable surplus", async () => {
-    const { campaign, owner, rejector } = await loadFixture(rejectorPooledFixture);
+    const { campaign, owner, rejector } = await loadFixture(rejectorminingFixture);
     await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.05") });
     await expect(rejector.claimSurplusFrom(await campaign.getAddress())).to.be.revertedWithCustomError(
       campaign,
@@ -708,7 +708,7 @@ describe("refund / abort", () => {
     await campaign.connect(owner).withdrawMarketProceeds();
     expect(await campaign.raisedBnb()).to.equal(ethers.parseEther("0.994"));
 
-    // Ready â†’ Buying recovery path, then open the pro-rata gate.
+    // Ready â†?Buying recovery path, then open the pro-rata gate.
     await campaign.connect(owner).setPhase(1);
     await campaign.connect(owner).openRefund();
     await campaign.connect(alice).refund();
@@ -830,7 +830,7 @@ describe("circuit listing (sell side)", () => {
 
 describe("share transfer (Mining only)", () => {
   it("list / cancel / take keeps shares and BNB conserved", async () => {
-    const { campaign, alice, bob } = await loadFixture(pooledFixture);
+    const { campaign, alice, bob } = await loadFixture(miningFixture);
     await campaign.connect(alice).listShares(10n, ethers.parseEther("0.02"));
     expect(await campaign.escrowOf(alice.address)).to.equal(10n);
     await expect(
@@ -1003,7 +1003,7 @@ describe("circuit breaker", () => {
   });
 
   it("a halted seller can still cancel a share listing", async () => {
-    const { campaign, alice, owner } = await loadFixture(pooledFixture);
+    const { campaign, alice, owner } = await loadFixture(miningFixture);
     await campaign.connect(alice).listShares(1n, ethers.parseEther("0.02"));
     await campaign.connect(owner).halt();
     await campaign.connect(alice).cancelListing(0n);

@@ -2,7 +2,7 @@
  * 探针：流程状态 / 子状态**词表唯一性**。
  *
  * 背景：状态词原来散在 8 个地方各写一套，同一个子状态最多四种写法
- * （补不补买入动作、加不加「· 待入池」后缀、中间要不要空格，各写各的；
+ * （补不补买入动作、加不加「· 待开矿」后缀、中间要不要空格，各写各的；
  * 旧文案里还用过「颗」这个量词），
  * 同一屏上下两处描述同一件事、措辞还不一样。改一次要翻 8 个文件，漏一个就自相矛盾。
  *
@@ -43,12 +43,13 @@ const trades = codeOnly(read("MarketTrades.jsx"));
 const adapter = codeOnly(read("chain/adapter.js"));
 
 // ── 1. 字面量：只能出现在 roundState.js / dealStatus.js ─────────────────────
+// 只列「同一件事的第二种写法」。裸的「电路已到账」是 hero 正文与报错句里的自然措辞，
+// 不是状态徽标，所以不在此列 —— 要挡的是带「待入池」后缀的旧状态词。
 const FORBIDDEN = [
   "待挂单买",
   "挂单中 · 待成交",
   "已挂单 · 待成交",
   "电路到账 · 待入池",
-  "电路已到账",
   "已到账 · 待入池",
   "已到账·待入池",
   "已失败原路退款",
@@ -58,8 +59,10 @@ for (const [file, text] of [["App.jsx", app], ["Owner.jsx", owner], ["MarketTrad
   check(`${file}：不再写重复 / 变体的状态文案`, hits.length === 0, hits.join("、"));
 }
 
-/** 阶段词与子状态词本身也不许在页面里硬编码（必须来自 roundState.js）。 */
-const STATE_WORDS = ["募集中", "待执行", "挖矿中", "已结束", "执行失败", "待挂单", "挂单中", "已到账", "认购中", "已售罄", "认筹中"];
+/** 阶段词与子状态词本身也不许在页面里硬编码（必须来自 roundState.js）。
+ *  「挖矿中」不在此列：它同时是官方 PoD 状态标签（MINING_STATUS_LABEL）和正文里的
+ *  「当前没有挖矿中的电路」，属于描述而非阶段徽标。 */
+const STATE_WORDS = ["募集中", "待执行", "已结束", "执行失败", "待挂单", "挂单中", "已到账", "认购中", "已售罄", "认筹中"];
 for (const [file, text] of [["App.jsx", app], ["Owner.jsx", owner]]) {
   const hits = STATE_WORDS.filter((word) => text.includes(`"${word}"`) || text.includes(`>${word}<`));
   check(`${file}：阶段 / 子状态词不写死（改从 roundState.js 取）`, hits.length === 0, hits.join("、"));
@@ -123,16 +126,16 @@ for (const [name, row] of cases) {
 // 终态与失败态的标签必须来自词表，且不再出现「已流标 + 已结束」两个徽标
 const ended = rowState(cases[1][1], now / 1000, dealStatus);
 check("流标：阶段=已结束，认购徽标为空（原因写在子状态）", ended.label === ENDED.label && !ended.deal.label, `${ended.label} / ${ended.deal.label}`);
-check("流标：原因只有一处「已流标 · 认筹款可原路退回」", ended.substate === "已流标 · 认筹款可原路退回", ended.substate);
+check("流标：原因只有一处「募集超时 · 认筹款可原路退回」", ended.substate === "募集超时 · 认筹款可原路退回", ended.substate);
 
 const settled = rowState(cases[7][1], now / 1000, dealStatus);
 check("退款完成：阶段=已结束，徽标为空", settled.label === ENDED.label && !settled.deal.label);
 
 const mining = rowState(cases[8][1], now / 1000, dealStatus);
-check("挖矿中：不再重复「已售罄」徽标（入池必然售罄）", mining.label === SCENE.mining.label && !mining.deal.label);
+check("挖矿中：不再重复「已售罄」徽标（开矿必然售罄）", mining.label === SCENE.mining.label && !mining.deal.label);
 
 const ready = rowState(cases[4][1], now / 1000, dealStatus);
-check("已到账：表格用全称、卡片用下一步（两种口径都来自同一张表）", ready.substate === PHASE.ready.full && ready.substateCompact === "待入池", `${ready.substate} / ${ready.substateCompact}`);
+check("已到账：表格用全称、卡片用下一步（两种口径都来自同一张表）", ready.substate === PHASE.ready.full && ready.substateCompact === PHASE.ready.sub, `${ready.substate} / ${ready.substateCompact}`);
 
 const failed = rowState(cases[6][1], now / 1000, dealStatus);
 check("执行失败：阶段词是「执行失败」而不是「待执行」", failed.label === FAILED.label, failed.label);

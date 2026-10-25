@@ -3660,7 +3660,7 @@ input[readonly] {
   .life-text { padding-top: 0; gap: 2px; align-items: center; }
   .life-label { font-size: 14px; }
   /* 副提示（「待挂单买电路」等）最长 11 个字，塞进 1/3 列宽会折成两三行，
-     最后一行只剩「入池」二字。改成不占列宽、以本步骤为轴居中单行，
+     最后一行只剩两个字。改成不占列宽、以本步骤为轴居中单行，
      它落在标签下方那一行，左右不会碰到相邻步骤的文字。 */
   .life-phase {
     position: absolute;

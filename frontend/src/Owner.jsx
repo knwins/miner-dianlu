@@ -56,7 +56,7 @@ const EMPTY_FORM = {
    * 服务费与分成（**链上参数**，口径：服务费真正上链）。
    *
    * ⚠️ **服务费是什么（口径澄清）**：
-   *   本期的「服务费」是**挖矿产出奖励的服务费** —— 从矿池打进来的挖矿收益里按比例计提，
+   *   本期的「服务费」是**挖矿产出奖励的服务费** —— 从 Owner 打进来的挖矿收益里按比例计提，
    *   分给下面的分成地址。**认筹款不收服务费**：认购人付的 BNB 全额进认购托管池，
    *   只用于买电路，链上不存在从认筹款抽服务费的路径。
    *
@@ -1072,7 +1072,7 @@ export function OwnerOverview({
               /*
                * 阶段 / 认购徽标 / 子状态一次算完，全部来自 ./roundState.js。
                * `substateCompact` 在 ready 时只给「待开矿」——hero 已经写了「成交电路已到账」，
-               * 子状态再写「已到账 · 待入池」就是同一句话印两遍。
+               * 子状态再写「已到账 · 待开矿」就是同一句话印两遍。
                */
               const state = rowState(item, Date.now() / 1000, dealStatus);
               const sub = state.substateCompact;
@@ -1102,7 +1102,7 @@ export function OwnerOverview({
                        * 三层各印一次，且互不重复：
                        *   deal 徽标（认购中 / 已售罄，阶段词已说过时为空）
                        *   阶段徽标
-                       *   子状态（待挂单 / 挂单中 / 待入池 / 失败原因）
+                       *   子状态（待挂单 / 挂单中 / 待开矿 / 失败原因）
                        * 旧版这里多印一句「本期已结束」之类的 statusNote 兜底文案，
                        * 与左侧徽标撞词。
                        */}
@@ -1518,7 +1518,7 @@ export function OwnerOverview({
  *
  * 与「本期操作」分工：
  *   - 本期操作 = 日常运营（setPlan、挂买单、撤单、卖出、退款…）
- *   - 高级配置 = 换市场 / 矿池、改子状态、取回资产、熔断与抬闸
+ *   - 高级配置 = 换市场 / 改子状态、取回资产、熔断与抬闸
  * 两页都是 Owner 的入口 —— 合约里只有一把钥匙（原则上是多签），没有二级管理角色。
  *
  * 页头与「挖矿份额转让」同构：左边标题、右边期次切换（PeriodNav），
@@ -1634,7 +1634,7 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
           )}
         </div>
         <p className="round-hero-lead">
-          只有本期 Owner 能写的治理与安全入口：抬闸、改子状态、换市场 / 矿池、取回资产。
+          只有本期 Owner 能写的治理与安全入口：抬闸、改子状态、换市场、取回资产。
           日常运营（挂买单 / 卖出 / 退款 / 开矿）在「众筹挖矿列表」。
         </p>
         <span className={`adv-gate ${gate.tone}`}>{gate.text}</span>

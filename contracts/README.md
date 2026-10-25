@@ -162,8 +162,9 @@ function claimBem() external
 - `stopMining`：停止某张电路的挖矿，官方合约当场结算产出（COOLING 状态）。
 - `claimMiningRewards`：把官方合约里已产出的 BEM 领回本期，按 `bemAccPerShare` 记账。
 - `claimBem`：持份人按份额领取 `pendingBem`。
-- 已删除：`setMiningPool` / `depositToPool` / `miningPool` / `pooled` / `depositRevenue` /
-  `harvest` / `claim`。挖矿产出只来自官方合约，不存在外部矿池打款。
+- `depositRevenue`：Owner 手动把链下挖矿收益以 BNB 打进来，按 `serviceFeeBps` 计提服务费。
+- 已删除：`setMiningPool` / `depositToPool` / `miningPool` / `pooled` / `harvest` / `claim`。
+  期次就是矿工（电路 NFT 始终留在 Campaign），挖矿产出只来自官方合约，不存在矿池转账。
 
 ### 5.5 退款与余款
 
@@ -269,8 +270,9 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-bscscan
 ## 11. 已知边界
 
 - **官方市场是信任前提**：市场代理若被升级成拒绝服务，挂单中的电路无法成交，
-  但 Campaign 仍持有未挂单的电路，仍可入池或等待市场恢复。
-- **`harvest` / `claim` 尚未实现**：BEM 分发不在本合约内；不要在前端承诺投池即见 BEM 收益。
+  但 Campaign 仍持有未挂单的电路，仍可开矿或等待市场恢复。
+- **BEM 产出依赖官方合约**：算式与结算节奏由官方 PoD 决定；本合约只做「领奖 → 按份记账
+  → 持份人 `claimBem` 自领」。挖矿未结算前，前端只显示 `miningPending`，不承诺收益。
 - **owner 单钥匙**：必须使用多签；合约内没有 timelock。
 - **旧工厂期次**：保留在 `legacyFactories`，ABI 可能有旧 getter（`market()` 等），
   前端读取时做降级，不要用新期次的假设套旧期次。

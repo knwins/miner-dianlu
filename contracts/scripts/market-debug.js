@@ -44,7 +44,7 @@ const CAMPAIGN_ABI = [
   "function listCircuit(uint256 tokenId, uint96 price)",
   "function cancelCircuitListing(uint256 tokenId)",
   "function withdrawMarketProceeds()",
-  "function pooled() view returns (bool)",
+  "function miningStatus(uint256) view returns (uint8)",
 ];
 
 const PHASE = ["None", "Buying", "Ready"];
@@ -195,7 +195,7 @@ async function main() {
   await printHeld();
   await printListings();
   console.log(`市场欠本期合约：${ethers.formatEther(await market.owed(campaignAddr))} BNB`);
-  console.log(`本期挂单数：${await campaign.activeListingCount()}  已入池：${await campaign.pooled()}`);
+  console.log(`本期挂单数：${await campaign.activeListingCount()}`);
 }
 
 main().catch((e) => {

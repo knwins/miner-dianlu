@@ -154,7 +154,7 @@ cancelCircuitListing(tokenId) → 撤回挂卖
 ```
 
 - 挂卖价不得低于 `circuitCostBasis(tokenId)`。
-- 先撤掉全部挂卖，才能 `depositToPool`。
+- 先撤掉全部挂卖，才能 `startMining`（开矿）。
 
 ## 8. 模拟模式
 

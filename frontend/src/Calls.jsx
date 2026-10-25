@@ -199,7 +199,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "任何人",
           signature: "confirmCircuits()",
-          summary: "确认本期已持有电路并进入 Ready。要求 circuitHeldCount > 0；之后才能挂回市场或入池。",
+          summary: "确认本期已持有电路并进入 Ready。要求 circuitHeldCount > 0；之后才能挂回市场或开矿。",
           fields: [],
         },
         {
@@ -230,7 +230,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "Owner / 已移除期次任何人",
           signature: "cancelCircuitListing(uint256 tokenId)",
-          summary: "撤销某张电路的挂单。入池前必须把所有挂单撤掉。",
+          summary: "撤销某张电路的挂单。开矿前必须把所有挂单撤掉。",
           fields: [["tokenId", "电路 tokenId", "0"]],
         },
         {
@@ -759,7 +759,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (method.name === "refund") {
     // 余款已经提前按份退回（returnSurplus）：池子是 0，这时退款只会把份额清零、白送挖矿权益。
     if (book.scene === "executing" && Number(book.surplusBase) > 0) {
-      return { ok: false, reason: "余款已按份退回，本金已在你手里。此时退款会用 0 BNB 清掉份额，请留着等入池。" };
+      return { ok: false, reason: "余款已按份退回，本金已在你手里。此时退款会用 0 BNB 清掉份额，请留着等开矿。" };
     }
     // 合约先挡「电路还在合约手里、池子又不够按原价退完」：否则清零份额会把电路变成死资产。
     if (book.scene === "executing") {
@@ -795,7 +795,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
       return { ok: false, reason: "余款已经按份退回（returnSurplus），本金已回到持份人手里，链上会以 SurplusAlreadyReturned 拒绝 markFailed。" };
     }
     if (book.executePhase === "ready") {
-      return { ok: false, reason: "电路已到账，不能判失败。出口是退余款 + 入池。" };
+      return { ok: false, reason: "电路已到账，不能判失败。出口是退余款 + 开矿。" };
     }
     if (canOperate(actor)) {
       return { ok: true, reason: "Owner 可随时判失败，为所有持份人打开退款。未成交买单会先撤掉。不可逆。" };
@@ -965,18 +965,18 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     }
     return {
       ok: true,
-      reason: "按份退回没花完的募集款：份额不变、电路留在合约，之后照样能入池。持份人各自领取。",
+      reason: "按份退回没花完的募集款：份额不变、电路留在合约，之后照样能开矿。持份人各自领取。",
     };
   }
   if (method.name === "openRefund") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能 openRefund。" };
     if (Number(book.surplusBase) > 0) {
-      return { ok: false, reason: "余款已退过、本金已回持份人手里。再退款只会清零份额、把电路交给 Owner，之后只能入池。" };
+      return { ok: false, reason: "余款已退过、本金已回持份人手里。再退款只会清零份额、把电路交给 Owner，之后只能开矿。" };
     }
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行可以打开退款。" };
     if (book.executePhase === "ready") {
-      return { ok: false, reason: "电路已到账，不能原路退款。只能退余款、把电路投入矿池；确要结束本期须先 setPhase 回待挂单并取回电路。" };
+      return { ok: false, reason: "电路已到账，不能原路退款。只能退余款、用 startMining 直接开矿；确要结束本期须先 setPhase 回待挂单并取回电路。" };
     }
     if (book.executePhase && book.executePhase !== "buying") {
       return { ok: false, reason: "请先撤掉市场挂单，再 openRefund。" };
@@ -999,7 +999,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (method.name === "topUpShortfall") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能补齐缺口。" };
-    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以补齐（入池后份额与电路都已经定局）。" };
+    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以补齐（开矿后份额与电路都已经定局）。" };
     const need = outstandingOf(book) * Number(round.sharePriceBnb || 0) - Number(book.bnbPool || 0);
     const hint = need > 0 ? `按当前份额与池子，缺口约 ${need.toFixed(6)} BNB。` : "当前池子已能按原价覆盖全部份额，无需补齐（补齐的钱之后可用 recoverBnb 扫回）。";
     return {
@@ -1012,7 +1012,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能 abandonOrder。" };
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行可以放弃挂单并退款。" };
     if (book.executePhase === "ready") {
-      return { ok: false, reason: "电路已到账，不能放弃挂单（会退回 Owner）。只能退余款 + 入池。" };
+      return { ok: false, reason: "电路已到账，不能放弃挂单（会退回 Owner）。只能退余款 + 开矿。" };
     }
     return {
       ok: true,

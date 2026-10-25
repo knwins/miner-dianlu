@@ -67,7 +67,7 @@ async function deployFixture() {
   return { market, nft, bem, pod, deployer, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller };
 }
 
-async function pooledFixture() {
+async function miningFixture() {
   const ctx = await loadFixture(deployFixture);
   const { campaign, owner, alice, bob } = ctx;
   await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
@@ -164,7 +164,7 @@ describe("ledger identity", () => {
 
   it("pays the surplus pool out to the last wei in either claim order", async () => {
     for (const order of [["alice", "bob"], ["bob", "alice"]]) {
-      const ctx = await loadFixture(pooledFixture);
+      const ctx = await loadFixture(miningFixture);
       const { campaign, owner } = ctx;
       await campaign.connect(owner).depositRevenue({ value: 7n });
       const total = await campaign.surplusPool();
@@ -179,7 +179,7 @@ describe("ledger identity", () => {
   });
 
   it("keeps later revenue claimable after an earlier round was fully claimed", async () => {
-    const { campaign, alice, bob, owner } = await loadFixture(pooledFixture);
+    const { campaign, alice, bob, owner } = await loadFixture(miningFixture);
     await campaign.connect(alice).claimSurplus();
     await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.07") });
     await campaign.connect(bob).claimSurplus();
@@ -228,7 +228,7 @@ describe("ledger identity", () => {
 
 describe("shares and circuit conservation", () => {
   it("keeps shares + escrow equal to outstandingShares across listing, taking and cancelling", async () => {
-    const { campaign, alice, bob } = await loadFixture(pooledFixture);
+    const { campaign, alice, bob } = await loadFixture(miningFixture);
     await expectSharesConserved(campaign);
 
     await campaign.connect(alice).listShares(20n, ethers.parseEther("0.02"));

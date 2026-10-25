@@ -2,11 +2,12 @@
 //
 // 目的：主网部署前，先在真链上验证「电路市场」形态能走通全程：
 //   工厂部署 → 开期（显式指定 ERC721 电路） → 认购售罄 → 从市场买入电路 →
-//   确认到账 → 挂回市场卖出并提取货款 → 撤单清账 → 设矿池入池（不可逆） →
-//   挖矿份额挂单与转让 → 余款领取 → 挖矿产出服务费计提与领取
+//   确认到账 → 挂回市场卖出并提取货款 → 撤单清账 → 官方 PoD 开矿（start） →
+//   领取挖矿奖励（BEM）→ 挖矿份额挂单与转让 → 余款 / BEM 领取 → 停矿
 //
 // 测试网没有官方电路市场与官方电路合约（那些地址在 chainId 97 上没有代码），
 // 所以用 MockCircuitMarket + MockCircuitNft 替身；两者都有 chainId 56 部署即 revert 的护栏。
+// 官方 PoD 挖矿同样用 MockPodMining + MockBem 替身（同样禁止上主网）。
 //
 // 运行：node scripts/testnet-drill.js
 const { ethers, network } = require("hardhat");
@@ -17,7 +18,8 @@ const TOTAL_SHARES = 100n;
 const FUNDING_SECONDS = 7n * 86400n;
 const CIRCUIT_PRICE = ethers.parseEther("0.000005");
 const RESALE_PRICE = ethers.parseEther("0.00002");
-const REVENUE = ethers.parseEther("0.01");
+// 演练用 BEM 产出：不追求真实产出规模，够验证「领奖 → 按份额记账 → 持份人自领」即可。
+const BEM_PER_CIRCUIT = ethers.parseEther("100");
 const FUNDING = ethers.parseEther("0.02");
 
 const SCENE = { Funding: 0, Executing: 1, Mining: 2 };
@@ -67,25 +69,42 @@ async function main() {
   // 测试网只配了一个私钥账户，其余角色用随机钱包，由部署者转测试币过去。
   const alice = ethers.Wallet.createRandom().connect(ethers.provider);
   const bob = ethers.Wallet.createRandom().connect(ethers.provider);
-  const poolWallet = ethers.Wallet.createRandom().connect(ethers.provider);
   const feeRecipient = ethers.Wallet.createRandom().connect(ethers.provider);
-  for (const w of [alice, bob, poolWallet, feeRecipient]) {
+  for (const w of [alice, bob, feeRecipient]) {
     await (await owner.sendTransaction({ to: w.address, value: FUNDING })).wait();
   }
-  console.log(`  参与钱包已注资：alice / bob / 矿池 / 服务费收款方`);
+  console.log(`  参与钱包已注资：alice / bob / 服务费收款方`);
 
-  section("基础设施：Mock 电路市场 + Mock 电路 NFT + 工厂");
+  section("基础设施：Mock 电路市场 + Mock 电路 NFT + Mock 官方 PoD 挖矿 + 工厂");
   // 市场费 2.5%：从卖方所得里扣（官方市场收卖方费）。
   const market = await ethers.deployContract("MockCircuitMarket", [250]);
   await market.waitForDeployment();
   const circuits = await ethers.deployContract("MockCircuitNft");
   await circuits.waitForDeployment();
+  const bem = await ethers.deployContract("MockBem");
+  await bem.waitForDeployment();
+  const pod = await ethers.deployContract("MockPodMining", [await bem.getAddress()]);
+  await pod.waitForDeployment();
   const marketAddr = await market.getAddress();
   const circuitsAddr = await circuits.getAddress();
   console.log(`  MockCircuitMarket ${marketAddr}`);
   console.log(`  MockCircuitNft    ${circuitsAddr}`);
+  console.log(`  MockBem           ${await bem.getAddress()}`);
+  console.log(`  MockPodMining     ${await pod.getAddress()}`);
 
-  const factory = await ethers.deployContract("CampaignFactory", [marketAddr, [circuitsAddr]]);
+  // 电路合约在官方挖矿里要有算力倍率，否则 start 会被拒（NotEligible）。
+  await (await pod.setProcessor(circuitsAddr, 1)).wait();
+
+  const campaignDeployer = await ethers.deployContract("CampaignDeployer");
+  await campaignDeployer.waitForDeployment();
+
+  const factory = await ethers.deployContract("CampaignFactory", [
+    marketAddr,
+    [circuitsAddr],
+    await pod.getAddress(),
+    await bem.getAddress(),
+    await campaignDeployer.getAddress(),
+  ]);
   await factory.waitForDeployment();
   const factoryAddr = await factory.getAddress();
   console.log(`  CampaignFactory   ${factoryAddr}`);
@@ -219,22 +238,43 @@ async function main() {
   assert(Number(await market.owed(campaignAddr)) === 0, "提取后市场欠款应为 0");
   ok("货款已提取", `+${ethers.formatEther(netExpected)} BNB 进 raisedBnb`);
 
-  // 已成交的挂单仍需撤单清账：activeListingCount 不归零就无法入池。
+  // 已成交的挂单仍需撤单清账：activeListingCount 不归零就无法开启挖矿。
   await (await campaign.cancelCircuitListing(resaleToken)).wait();
   assert(Number(await campaign.activeListingCount()) === 0, "撤单后挂单数应为 0");
   assert(Number(await campaign.circuitHeldCount()) === 2, "卖出 1 张后应持有 2 张");
   ok("已成交挂单已清账", "activeListingCount = 0，持有 2 张");
 
-  section("设矿池 → 入池（不可逆）");
-  await (await campaign.connect(owner).setMiningPool(poolWallet.address)).wait();
-  await (await campaign.connect(owner).depositToPool()).wait();
-  assert(await campaign.pooled(), "入池后 pooled 应为 true");
-  assert(Number(await campaign.scene()) === SCENE.Mining, "入池后应进入 Mining");
-  assert(Number(await circuits.balanceOf(poolWallet.address)) === 2, "2 张电路应全部转入矿池");
-  assert(Number(await campaign.circuitHeldCount()) === 0, "入池后期次不再持有电路");
-  ok("入池完成", "Mining（不可逆）");
+  section("官方 PoD 开矿：电路仍留在期次，由期次自己当矿工");
+  // 期次持有 NFT 才能 start：电路永远不出期次，所以不设矿池、不转 NFT。
+  const heldTokenIds = [];
+  for (const l of listings) {
+    if ((await circuits.ownerOf(l.tokenId)) === campaignAddr) heldTokenIds.push(l.tokenId);
+  }
+  assert(heldTokenIds.length === 2, "应有 2 张电路仍由期次持有");
 
-  section("挖矿份额转让（仅 Mining 开放）");
+  // taskId = 0：官方未验证池，一次调用即可开矿（不必先 arm）。
+  for (const tokenId of heldTokenIds) {
+    await (await campaign.connect(owner).startMining(tokenId, 0, 0, [], [], [])).wait();
+    assert(Number(await campaign.miningStatus(tokenId)) === 1, `token #${tokenId} 应处于挖矿中`);
+  }
+  assert(Number(await campaign.scene()) === SCENE.Mining, "开矿后应进入 Mining");
+  assert(Number(await campaign.circuitHeldCount()) === 2, "开矿后电路仍应由期次持有");
+  ok("2 张电路已开矿", "Mining（电路不出期次）");
+
+  section("挖矿奖励：官方结算到 BEM，按期次份额记账后持份人自领");
+  for (const tokenId of heldTokenIds) {
+    await (await pod.accrue(await campaign.miningKey(tokenId), BEM_PER_CIRCUIT)).wait();
+  }
+  assert(
+    (await campaign.miningPending(heldTokenIds[0])) === BEM_PER_CIRCUIT,
+    "官方待结算 BEM 应可读",
+  );
+  await (await campaign.claimMiningRewards()).wait();
+  const bemInRound = await bem.balanceOf(campaignAddr);
+  assert(bemInRound === BEM_PER_CIRCUIT * 2n, "领奖后 BEM 应全部进期次");
+  ok("挖矿奖励已领取", `${ethers.formatEther(bemInRound)} BEM 进期次`);
+
+  section("挖矿份额转让（Mining 才开放）");
   await (await campaign.connect(alice).listShares(20n, CIRCUIT_PRICE)).wait();
   const listing = await campaign.getListing(0);
   assert(String(listing.seller).toLowerCase() === alice.address.toLowerCase(), "挂单方不对");
@@ -249,7 +289,7 @@ async function main() {
   assert(Number(await campaign.escrowOf(alice.address)) === 15, "Alice 托管应剩 15 份");
   ok("Bob 接收 5 份", "份额过户 + BNB 原子支付");
 
-  section("余款领取（入池后按份 pull）");
+  section("余款与 BEM 领取：都是按份 pull");
   const surplusBefore = await campaign.surplusPaid();
   await (await campaign.connect(alice).claimSurplus()).wait();
   const surplusAfter = await campaign.surplusPaid();
@@ -257,15 +297,40 @@ async function main() {
   assert(Number(await campaign.pendingSurplus(alice.address)) === 0, "Alice 的 pendingSurplus 应清零");
   ok("余款已领取", `累计发放 ${ethers.formatEther(surplusAfter)} BNB`);
 
-  section("挖矿产出服务费：只有矿池能打款，计提后收款方自行领取");
+  // BEM 在转账之前就已按份记账：Alice 当时 60 份，所以这 200 BEM 里归她 60%（120），
+  // Bob 的 5 份只从接收那一刻起计息（他的 debt 被抬到当前累计值），不会重复分走 Alice 的既往产出。
+  const aliceBem = await campaign.bemPendingOf(alice.address);
+  assert(aliceBem > 0n, "Alice 应有可领 BEM");
+  assert(aliceBem === (bemInRound * 60n) / 100n, "Alice 的 BEM 应为转账前 60 份对应份额");
+  assert(
+    (await campaign.bemPendingOf(bob.address)) === (bemInRound * 40n) / 100n,
+    "Bob 的 BEM 应为 40 份对应份额（既往产出不随份额转移）",
+  );
+  const aliceBemExpected = aliceBem;
+  await (await campaign.connect(alice).claimBem()).wait();
+  assert((await bem.balanceOf(alice.address)) === aliceBemExpected, "领取后 BEM 应到 Alice 钱包");
+  assert((await campaign.bemPendingOf(alice.address)) === 0n, "领取后应无可领余额");
+  ok("BEM 已领取", `${ethers.formatEther(aliceBemExpected)} BEM 到 Alice 钱包`);
+
+  section("停矿：结算剩余奖励，NFT 仍留期次");
+  await (await campaign.connect(owner).stopMining(heldTokenIds[0])).wait();
+  assert(Number(await campaign.miningStatus(heldTokenIds[0])) === 3, "停矿后应进入冷却");
+  assert(
+    String(await circuits.ownerOf(heldTokenIds[0])).toLowerCase() === campaignAddr.toLowerCase(),
+    "停矿后电路仍应由期次持有",
+  );
+  ok("已停矿", "status = 3（cooling），NFT 不出期次");
+
+  section("挖矿产出服务费：只有 Owner 能打款，计提后收款方自行领取");
+  const REVENUE = ethers.parseEther("0.01");
   await expectRevert(
     campaign.connect(alice).depositRevenue({ value: ethers.parseEther("0.001") }),
     campaign.interface,
     "NotOwner",
   );
-  ok("非矿池调用被拒", "depositRevenue 权限边界正确");
+  ok("非 Owner 调用被拒", "depositRevenue 权限边界正确");
 
-  await (await campaign.connect(poolWallet).depositRevenue({ value: REVENUE })).wait();
+  await (await campaign.connect(owner).depositRevenue({ value: REVENUE })).wait();
   const expectedFee = (REVENUE * BigInt(feeBps)) / 10000n;
   assert(
     ethers.formatEther(await campaign.pendingFee(feeRecipient.address)) === ethers.formatEther(expectedFee),
@@ -287,9 +352,9 @@ async function main() {
   section("结果");
   console.log(`  工厂      ${factoryAddr}`);
   console.log(`  期次      ${campaignAddr}`);
-  console.log(`  场景/子态 Mining / Ready，pooled=${await campaign.pooled()}`);
+  console.log(`  场景/子态 Mining / Ready，电路由期次持有 ${await campaign.circuitHeldCount()} 张`);
   console.log(`  售出      ${await campaign.sold()} 份，托管 ${ethers.formatEther(await campaign.raisedBnb())} BNB`);
-  console.log(`  电路      矿池持有 ${await circuits.balanceOf(poolWallet.address)} 张`);
+  console.log(`  挖矿      1 张挖矿中 / 1 张冷却，累计产出 ${ethers.formatEther(await campaign.totalBemRewards())} BEM`);
   console.log(`  份额      Alice ${await campaign.sharesOf(alice.address)} / Bob ${await campaign.sharesOf(bob.address)}`);
   console.log(`  收益池    ${ethers.formatEther(await campaign.revenuePool())} BNB`);
   console.log(`\n✓ 测试网完整生命周期演练通过（${step} 项检查）`);
