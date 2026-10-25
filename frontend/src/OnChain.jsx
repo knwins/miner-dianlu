@@ -44,13 +44,8 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
   const account = embedded && embeddedConnected ? embeddedAccount : (wallet?.account || null);
   const activeSigner = embeddedSigner || wallet?.signer || null;
   const isOwner = useMemo(() => state && account && state.owner?.toLowerCase() === account.toLowerCase(), [state, account]);
-  /** 操作员热钱包（owner 也具备全部操作员权限）。零地址 = 未分配 / 旧期次。 */
-  const isOperator = useMemo(() => Boolean(
-    state && account && state.operator
-    && !/^0x0{40}$/i.test(state.operator)
-    && state.operator.toLowerCase() === account.toLowerCase(),
-  ), [state, account]);
-  const canOperate = isOwner || isOperator;
+  /** 只有一把钥匙：所有写入口都只认 Owner（合约里没有操作员角色）。 */
+  const canOperate = isOwner;
   const halted = Boolean(state?.halted);
 
   const refresh = useCallback(async () => {
@@ -124,6 +119,32 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
   const partsShort = Boolean(s) && (
     Number(s.partsNand || 0) < Number(s.nandQty || 0) || Number(s.partsLatch || 0) < Number(s.latchQty || 0)
   );
+  // openRefund / depositToPool 的链上门槛，逐条对应合约里的 revert（挡在签名之前，省 gas）。
+  const marketOwedNum = s ? Number(formatEther(s.marketOwed || 0n)) : 0;
+  const surplusBooked = Number(s?.surplusBase || 0) > 0;
+  const outstandingNum = s ? Number(s.outstandingShares || 0n) : 0;
+  const partsHeld = s ? Number(s.partsNand || 0) + Number(s.partsLatch || 0) : 0;
+  const poolSet = s
+    ? /^0x[0-9a-fA-F]{40}$/.test(String(s.miningPool || "")) && !/^0x0{40}$/i.test(String(s.miningPool || ""))
+    : false;
+  const poolCoversShares = s
+    ? raisedBnbNum + 1e-12 >= outstandingNum * Number(formatEther(s.sharePriceBnb))
+    : false;
+  const refundGate = !s ? ""
+    : surplusBooked ? "余款已按份退回，本金已在持份人手里（SurplusAlreadyReturned）"
+    : s.phase !== 1 ? "只有待挂单（Buying）能打开退款（WrongScene）"
+    : outstandingNum <= 0 ? "份额已全部退完，没有可退对象（ZeroShares）"
+    : marketOwedNum > 0 ? "晶体管市场还欠本期卖出款（ProceedsPending）：先提取"
+    : partsHeld > 0 && !poolCoversShares ? "晶体管还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall"
+    : "";
+  const poolGate = !s ? ""
+    : s.pooled ? "本期已入池（AlreadyPooled）"
+    : s.phase !== 3 ? "先确认晶体管到账（Ready）再入池"
+    : !poolSet ? "还没写矿池地址（PoolNotSet）：在「合约工作台」里先 setMiningPool"
+    : outstandingNum <= 0 ? "份额已全部退完（ZeroShares），没有持有人可分产出"
+    : partsHeld <= 0 ? "合约手上没有晶体管（InsufficientParts）"
+    : halted ? "本期已熔断，入池已暂停"
+    : "";
   // 挂买单参数与成本预览。
   // 链上 placeTransistorOrder 在 cost > raisedBnb 时只置 executionFailed、不真正挂单，
   // 等于用一次失败把整期标记为「执行失败」。前端必须先把超余额挡在签名之外。
@@ -152,9 +173,8 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
           <dl className="chain-kv">
             <div><dt>Campaign</dt><dd><a href={explorerAddress(getCampaignAddress())} target="_blank" rel="noreferrer">{short(getCampaignAddress())}</a></dd></div>
             <div><dt>Owner</dt><dd>{short(s?.owner)}</dd></div>
-            <div><dt>操作员</dt><dd>{s?.operator && !/^0x0{40}$/i.test(s.operator) ? short(s.operator) : "未设置"}</dd></div>
             <div><dt>熔断</dt><dd>{halted ? "已熔断（halted）" : "运行中"}</dd></div>
-            <div><dt>我的钱包</dt><dd>{account ? `${short(account)}${isOwner ? " · Owner" : isOperator ? " · 操作员" : ""}` : "未连接"}</dd></div>
+            <div><dt>我的钱包</dt><dd>{account ? `${short(account)}${isOwner ? " · Owner" : ""}` : "未连接"}</dd></div>
             <div><dt>我的 tBNB</dt><dd>{bnb !== null ? `${fmt(bnb)} tBNB` : "—"}</dd></div>
           </dl>
           <div className="chain-actions">
@@ -243,7 +263,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                             className="btn btn-primary"
                             type="button"
                             disabled={busy || !canPlaceBuy}
-                            title={!isOwner ? "仅 Factory Owner 可挂买单" : !buyHasLeg ? "至少填一条腿的数量" : !buyLegOk ? "有数量的腿必须填单价" : buyOverBudget ? "托管超过募集余额，链上不会挂出" : undefined}
+                            title={!isOwner ? "仅 Owner 可挂买单" : !buyHasLeg ? "至少填一条腿的数量" : !buyLegOk ? "有数量的腿必须填单价" : buyOverBudget ? "托管超过募集余额，链上不会挂出" : undefined}
                             onClick={() => run("挂买单", (sg) => tx.placeTransistorOrder(
                               sg,
                               BigInt(buyNandN), buyNandN > 0 ? parseBnb(form.nandPrice) : 0n,
@@ -251,9 +271,19 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                             ))}>挂买单</button>
                         </div>
                       )}
-                      {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("打开退款", (sg) => tx.openRefund(sg))}>打开退款</button>}
+                      {s.phase === 1 && (
+                        <button
+                          className="btn btn-inline"
+                          type="button"
+                          disabled={busy || Boolean(refundGate)}
+                          title={refundGate || undefined}
+                          onClick={() => run("打开退款", (sg) => tx.openRefund(sg))}
+                        >
+                          打开退款
+                        </button>
+                      )}
                       {!s.executionFailed && Number(s.surplusBase || 0) === 0 && s.phase !== 3 && (() => {
-                        // 合约 FAIL_GRACE = 3 天：非 Owner / 操作员只能等售罄满 3 天；Owner / 操作员随时可判。
+                        // 合约 FAIL_GRACE = 3 天：非 Owner 只能等售罄满 3 天；Owner 随时可判。
                         const waitMs = !canOperate && s.markFailedAt ? Number(s.markFailedAt) - Date.now() : 0;
                         const locked = waitMs > 0;
                         return (
@@ -262,15 +292,15 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                             type="button"
                             disabled={busy || locked}
                             title={locked
-                              ? `非 Owner / 操作员须等售罄满 3 天（约 ${new Date(Number(s.markFailedAt)).toLocaleString("zh-CN")} 后）；Owner 现在就能用「发起退款 / 放弃挂单」立即退款。`
+                              ? `非 Owner 须等售罄满 3 天（约 ${new Date(Number(s.markFailedAt)).toLocaleString("zh-CN")} 后）；Owner 现在就能用「发起退款 / 放弃挂单」立即退款。`
                               : canOperate
-                                ? "Owner / 操作员可随时判失败，为持份人开放退款。"
+                                ? "Owner 可随时判失败，为持份人开放退款。"
                                 : "已过 3 天宽限期：任何地址都可判失败并开放退款。"}
                             onClick={() => run("判失败", (sg) => tx.markFailed(sg))}
                           >
                             {locked
                               ? `markFailed · 还需 ${formatRemaining(waitMs)}`
-                              : canOperate ? "markFailed（Owner / 操作员随时）" : "markFailed（已过 3 天）"}
+                              : canOperate ? "markFailed（Owner 随时）" : "markFailed（已过 3 天）"}
                           </button>
                         );
                       })()}
@@ -287,7 +317,15 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                       )}
                       {s.phase === 2 && !cancelBlockedByFill && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("取消挂单", (sg) => tx.cancelTransistorOrder(sg))}>取消挂单</button>}
                       {s.phase === 3 && !s.executionFailed && isOwner && (
-                        <button className="btn btn-primary" type="button" disabled={busy} onClick={() => run("depositToPool", (sg) => tx.depositToPool(sg))}>depositToPool 进入挖矿</button>
+                        <button
+                          className="btn btn-primary"
+                          type="button"
+                          disabled={busy || Boolean(poolGate)}
+                          title={poolGate || undefined}
+                          onClick={() => run("depositToPool", (sg) => tx.depositToPool(sg))}
+                        >
+                          depositToPool 进入挖矿
+                        </button>
                       )}
                     </div>
                   )}

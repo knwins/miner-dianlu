@@ -13,6 +13,8 @@
     "testnet:deploy": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-bsc.js --network bscTestnet",
     "testnet:open-round": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/testnet-open-round.js --network bscTestnet",
     "market:debug": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/market-debug.js --network bscTestnet",
+    "verify:sourcify": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-sourcify.js --network bsc",
+    "verify:bscscan": "node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-bscscan.js --network bsc",
     "node": "node ./node_modules/hardhat/internal/cli/bootstrap.js node"
   },
   "devDependencies": {

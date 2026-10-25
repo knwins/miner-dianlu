@@ -138,8 +138,8 @@ export function OwnerOverview({
   }, [hasPoolOnChain, poolOnChain]);
   /**
    * 熔断闸门（链上事实）。
-   * 拉闸 Owner / 操作员都能做，抬闸只有 Owner（合约 onlyOwner）——所以「解除熔断」
-   * 收在「高级配置」里，这里只保留日常运营需要的拉闸与状态提示。
+   * 拉闸与抬闸都只认 Owner（合约 onlyOwner）——「解除熔断」收在「高级配置」里，
+   * 这里只保留日常运营需要的拉闸与状态提示。
    */
   const halted = Boolean(book.halted);
   /**
@@ -282,10 +282,10 @@ export function OwnerOverview({
 
   const isOwner = actor?.role === "owner";
   /**
-   * 操作员权限（合约 `_isOperator()`）：owner 天然拥有，operator 热钱包也有。
-   * 日常运营入口用它判定；入池 / 改子态 / 取回资产 / 抬闸 / 换操作员仍然只认 isOwner。
+   * 唯一的管理身份就是 Owner：合约里没有操作员 / 管理员之类的二级角色，
+   * 所以「能不能写」与「是不是 Owner」是同一件事。
    */
-  const canOperate = isOwner || actor?.role === "operator";
+  const canOperate = isOwner;
   // 取消挂单后合约回到待挂单；未重新挂单前不可 execute（priceLock/晶体管数已清）
   const canExecute = isOwner && !book.executionFailed && Number(book.priceLock || 0) > 0 && Number(book.transistorCount || 0) > 0;
   const planWritten = Number(book.estHashpower) > 0 || Number(book.transistorCount) > 0;
@@ -405,7 +405,7 @@ export function OwnerOverview({
                     </div>
                     <p className="fine">
                       认筹入口在「BEM挖矿认筹」；算力计划写在链上，认购前可核对。
-                      {!canOperate && " 当前钱包不是 Owner / 操作员，无法写 setPlan。"}
+                      {!canOperate && " 当前钱包不是 Owner，无法写 setPlan。"}
                     </p>
                   </>
                 )}
@@ -504,7 +504,7 @@ export function OwnerOverview({
                   ].filter(Boolean).join(" + ");
                   // 托管额超过 raisedBnb 时不允许点提交（链上也不会真正挂出）。
                   const overBudget = orderCostRaw > raised;
-                  // 合约 placeTransistorOrder 是 operator 级：Owner 与操作员都能挂，入池才是 owner 专属。
+                  // 合约 placeTransistorOrder 只认 Owner（唯一管理角色）。
                   const canPlaceBuy = canOperate && canBuy && !overBudget && !halted
                     && (nandN > 0 || latchN > 0)
                     && (nandN === 0 || nandP > 0)
@@ -533,8 +533,16 @@ export function OwnerOverview({
                   // 卖出款由 sellTransistors 立即提回；市场还欠款时可手工提取（入池/退余款前必须清零）。
                   const marketOwed = marketOwedEarly;
                   const canWithdraw = canOperate && marketOwed > 0;
+                  /**
+                   * openRefund 的三道闸：市场不欠款、晶体管不在手里（或池子够按原价退完）、份额未退完。
+                   * 晶体管在手里而池子不够时，合约以 PartsAreCollateral 拒绝 —— 先补齐缺口。
+                   */
+                  const partsCollateral = partsEnough
+                    && raised + 1e-12 < outstanding * Number(round.sharePriceBnb || 0);
                   const canRefund = canOperate && marketOwed <= 0
                     && outstanding > 0
+                    && Number(book.surplusBase || 0) === 0
+                    && !partsCollateral
                     && book.executePhase === "buying";
                   const dustOnly = isOwner && outstanding === 0 && Number(book.bnbPool || 0) > 0;
                   /**
@@ -544,10 +552,10 @@ export function OwnerOverview({
                     && raised > 0 && marketOwed <= 0 && outstanding > 0;
                   const surplusBooked = Number(book.surplusOutstanding || 0) > 0;
                   /**
-                   * 入池前必须先把余款按份退回（余额=0 时无需退）。
-                   * 已记账（surplusBase > 0）即算满足。
+                   * 入池不再要求先单独退余款：合约在 depositToPool 内部就调 _returnSurplus
+                   * 把没花完的募集款按份记账，并先尽力提取市场欠款（_pullOwedSoft）。
+                   * 「退回剩余募集款」保留为可选的提前一步（持份人更早能领）。
                    */
-                  const surplusBeforePool = raised <= 0 || Number(book.surplusBase || 0) > 0;
                   const surplusReturnHint = marketOwed > 0
                     ? "晶体管市场还有卖出款没提回本期，先提取再退剩余募集款"
                     : raised <= 0
@@ -557,7 +565,17 @@ export function OwnerOverview({
                     ? "晶体管已到账，不能打开退款。用「退回剩余募集款」把没花完的 BNB 按份退给持份人；确要结束本期，先把子状态改回待挂单。"
                     : outstanding === 0
                       ? "份额已全部退完，没有可退对象；池子里的尾差用「取回剩余 BNB」扫出"
-                      : "标记执行失败，持份人各自领回本金。重复点击安全。";
+                      : Number(book.surplusBase || 0) > 0
+                        ? "余款已按份退回、本金已在持份人手里（SurplusAlreadyReturned）；再退款只会清零份额"
+                        : marketOwed > 0
+                          ? "晶体管市场还欠本期卖出款（ProceedsPending）：先「提取卖出款」"
+                          : partsCollateral
+                            ? "晶体管还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口"
+                            : !canOperate
+                              ? "仅 Owner 可打开退款"
+                              : book.executePhase !== "buying"
+                                ? "只有待挂单（Buying）能打开退款"
+                                : "标记执行失败，持份人各自领回本金。重复点击安全。";
                   // 放弃挂单：一次撤销买单剩余 + 提取卖出款 + 打开退款闸门，不需要逐项操作；
                   // 退款本身是 pull，各持份人自己去领。
                   // 成交的部分已上链不可撤；只有还剩未成交时才允许放弃。
@@ -565,7 +583,8 @@ export function OwnerOverview({
                     .some((remaining) => remaining == null || Number(remaining) > 0);
                   // 晶体管事先确认到账（Ready）后 abandonOrder 会以 UseReturnSurplus 回滚：
                   // 那个状态只允许「退余款 + 入池 / 卖入买单」，晶体管不能被退回 Owner。
-                  const canAbandon = isOwner && !ready && buyOpen && hasOpenLeg;
+                  const canAbandon = isOwner && !ready && buyOpen && hasOpenLeg
+                    && Number(book.surplusBase || 0) === 0 && !partsCollateral;
                   const nextHint = ready
                     ? (partsEnough
                       ? "买单已确认，晶体管在合约里。可卖入市场买单（款立即提回），或先「退回剩余募集款」按份退给持份人；之后设矿池并入池（不可逆）。"
@@ -587,7 +606,7 @@ export function OwnerOverview({
                             ? "上次挂单超余额未挂出，改低单价重试或退款。"
                             : "当前不能挂单。";
                   /**
-                   * 撤单权限与合约一致：未成交时只有 Owner / 操作员；
+                   * 撤单权限与合约一致：未成交时只有 Owner；
                    * 已有成交或该期已从工厂移除后，任何人都能撤剩余（托管款不能卡死）。
                    */
                   const canCancelOrder = canOperate
@@ -683,7 +702,7 @@ export function OwnerOverview({
                             disabled={!canPlaceBuy || Boolean(pending)}
                             title={
                               !canOperate
-                                ? "只有 Owner / 操作员能挂买单"
+                                ? "只有 Owner 能挂买单"
                                 : halted
                                   ? "本期已熔断：挂单暂停，等 Owner 解除"
                                   : !canBuy
@@ -931,7 +950,7 @@ export function OwnerOverview({
                                           className="btn btn-inline"
                                           type="button"
                                           disabled={!canCancelOrder || Boolean(pending)}
-                                          title={canCancelOrder ? undefined : "未成交时仅 Owner / 操作员能撤单"}
+                                          title={canCancelOrder ? undefined : "未成交时仅 Owner 能撤单"}
                                           onClick={onCancelTransistorOrder}
                                         >
                                           {pending === "cancelTransistorOrder" ? "取消中…" : "取消买单"}
@@ -1111,18 +1130,20 @@ export function OwnerOverview({
                               <button
                                 className="btn btn-primary"
                                 type="button"
-                                disabled={!isOwner || Boolean(pending) || halted || !hasPoolOnChain || !surplusBeforePool || marketOwed > 0 || !partsEnough}
+                                disabled={!isOwner || Boolean(pending) || halted || !hasPoolOnChain || !partsEnough || outstanding <= 0}
                                 title={
                                   halted
                                     ? "本期已熔断：入池已暂停，等 Owner 解除"
-                                    : !partsEnough
+                                    : outstanding <= 0
+                                      ? "份额已全部退完（ZeroShares）：没有持有人可分产出，合约拒绝入池"
+                                      : !partsEnough
                                       ? "本期合约手上没有晶体管（InsufficientParts）：先挂单买入并确认到账"
                                       : !hasPoolOnChain
                                       ? "请先设置矿池地址（链上 depositToPool 要求 miningPool 非零）"
                                       : marketOwed > 0
-                                        ? "市场还欠本期卖出款，先点上面的「提取卖出款」再入池"
-                                        : !surplusBeforePool
-                                          ? "入池前先把剩余募集款按份退回持份人：点上面的「退回剩余募集款」"
+                                        ? "市场还欠本期卖出款：入池时会先尽力提取，提不动的部分之后进账仍会按份记账"
+                                        : raised > 0 && !(Number(book.surplusBase || 0) > 0)
+                                          ? "入池会在同一笔交易里把没花完的募集款按份记账给持份人（也可先点「退回剩余募集款」）"
                                           : undefined
                                 }
                                 onClick={() => submitDepositToPool()}
@@ -1137,7 +1158,7 @@ export function OwnerOverview({
                       {(book.executionFailed && idle) || !canOperate ? (
                         <p className="fine ops-note">
                           {book.executionFailed && idle && "上次挂单托管超过募集余额，交易上链但没真正挂出。请降低数量或单价重挂，或直接退款。"}
-                          {!canOperate && " 当前钱包不是 Owner / 操作员，无法执行写操作。"}
+                          {!canOperate && " 当前钱包不是 Owner，无法执行写操作。"}
                         </p>
                       ) : null}
                     </div>
@@ -1762,11 +1783,12 @@ export function OwnerOverview({
 }
 
 /**
- * 高级配置：只收**只有 Owner 能调**的入口（权限 / 熔断 / 参数 / 子状态 / 资产取回）。
+ * 高级配置：只收**只有 Owner 能调**的入口（熔断 / 参数 / 子状态 / 资产取回）。
  *
  * 与「本期操作」分工：
- *   - 本期操作 = 日常运营（Owner 与操作员都能做：setPlan、挂买单、撤单、卖出、退款…；入池只有 Owner）
- *   - 高级配置 = 改权限、换市场、改子状态、取回资产、抬闸 —— 合约里全是 onlyOwner
+ *   - 本期操作 = 日常运营（setPlan、挂买单、撤单、卖出、退款…）
+ *   - 高级配置 = 换市场 / 矿池、改子状态、取回资产、熔断与抬闸
+ * 两页都是 Owner 的入口 —— 合约里只有一把钥匙（原则上是多签），没有二级管理角色。
  *
  * 页头与「挖矿份额转让」同构：左边标题、右边期次切换（PeriodNav），
  * 下面一行说明 + 一个可写/只读徽标。主体是「左标签、右控件」的设置行：
@@ -1783,8 +1805,6 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
   const ZERO = /^0x0{40}$/i;
 
   const ownerOnChain = String(book.owner || "");
-  const operatorOnChain = String(book.operator || "");
-  const hasOperatorOnChain = validAddr(operatorOnChain) && !ZERO.test(operatorOnChain);
   const marketOnChain = String(book.market || "");
   const halted = Boolean(book.halted);
   const executing = book.scene === "executing";
@@ -1792,13 +1812,6 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
   const feeLocked = Boolean(book.serviceFeeSet);
   const feePercent = Number(book.serviceFeeBps ?? 0) / 100;
   const feeRows = Array.isArray(round.feeShares) ? round.feeShares : [];
-
-  /** 操作员：零地址 = 撤销，写回读到的链上值方便直接改。 */
-  const [operatorAddr, setOperatorAddr] = useState("");
-  useEffect(() => {
-    if (!hasOperatorOnChain) return;
-    setOperatorAddr((cur) => (cur ? cur : operatorOnChain));
-  }, [hasOperatorOnChain, operatorOnChain]);
 
   /** 本期 Owner 转移与市场地址：一律留空手填，避免误点把所有权发出去。 */
   const [newOwnerAddr, setNewOwnerAddr] = useState("");
@@ -1826,6 +1839,31 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
   const [tokenId, setTokenId] = useState("0");
   const [tokenAmount, setTokenAmount] = useState("1");
 
+  /**
+   * 「取回晶体管」的合约闸门（与 recoverTransistors 一一对应）：
+   * 已入池 AlreadyPooled / 挂单中 AlreadyListed /
+   * 本期自己的晶体管还有份额没结清 SharesOutstanding 或本金没退完 HoldersNotMadeWhole。
+   */
+  const outstandingNow = Number(book.outstandingShares ?? book.sold ?? 0);
+  const heldParts = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0) > 0;
+  const ownPartsSelected = validAddr(tokenAddr)
+    && String(tokenAddr).trim().toLowerCase() === String(book.transistors || "").toLowerCase();
+  const ownPartsBlocked = Boolean(book.pooled)
+    || book.executePhase === "listed"
+    || (ownPartsSelected && outstandingNow > 0)
+    || (ownPartsSelected && heldParts && outstandingNow === 0
+      && Number(book.refundedTotal || 0) < Number(book.sold || 0) * Number(round.sharePriceBnb || 0));
+  const ownPartsBlockReason = book.pooled
+    ? "本期已入池（AlreadyPooled）：晶体管在矿池里，合约没有可转出的余额"
+    : book.executePhase === "listed"
+      ? "挂单中不能转出晶体管（AlreadyListed）：先撤单或确认到账"
+      : ownPartsSelected && outstandingNow > 0
+        ? "还有持份人没结清（SharesOutstanding）：晶体管是他们的抵押，先退款或入池"
+        : ownPartsSelected && heldParts && outstandingNow === 0
+          && Number(book.refundedTotal || 0) < Number(book.sold || 0) * Number(round.sharePriceBnb || 0)
+          ? "持份人还没按原价收回本金（HoldersNotMadeWhole）：先 topUpShortfall 补齐"
+          : "数量必须大于 0，且合约手上要有这么多晶体管";
+
   const write = (method, args) => onInvoke?.(method, args);
 
   /** 可写性徽标：先判身份，再判模式 —— 两种「只读」的原因不同，不能合并成一句话。 */
@@ -1837,7 +1875,6 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
 
   /** 每张卡右上角的「当前值」，与卡片内的动作一一对应，正文里不再复述一遍。 */
   const ownerLabel = validAddr(ownerOnChain) ? shortAddress(ownerOnChain) : "—";
-  const operatorLabel = hasOperatorOnChain ? shortAddress(operatorOnChain) : "未设置";
   const marketLabel = validAddr(marketOnChain) ? shortAddress(marketOnChain) : "—";
   const feeLabel = feeLocked ? `${feePercent}%` : "未设定";
 
@@ -1870,8 +1907,8 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
           )}
         </div>
         <p className="round-hero-lead">
-          只有本期 Owner 能写的治理与安全入口：改权限、抬闸、改子状态、换市场、取回资产。
-          日常运营（挂买单 / 卖出 / 退款）在「众筹挖矿列表」；入池只有 Owner。
+          只有本期 Owner 能写的治理与安全入口：抬闸、改子状态、换市场 / 矿池、取回资产。
+          日常运营（挂买单 / 卖出 / 退款 / 入池）在「众筹挖矿列表」。
         </p>
         <span className={`adv-gate ${gate.tone}`}>{gate.text}</span>
       </header>
@@ -1885,38 +1922,14 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
           <div className="card-body adv-rows">
             <div className="adv-row">
               <div className="adv-row-label">
-                <strong>操作员</strong>
+                <strong>唯一管理角色</strong>
                 <span>
-                  {hasOperatorOnChain ? `当前 ${operatorLabel}。` : "未设置。"}
-                  热钱包可做日常运营：改计划、挂买单、撤单、卖出晶体管、退余款、开退款、熔断。
-                  入池、改子状态、取回资产、抬闸与换操作员仍归 Owner。
+                  Owner 是合约里唯一的钥匙，所有写入口（含熔断 / 抬闸）都只认它；
+                  没有操作员或管理员之类的二级角色。Owner 应当是多签，日常运营直接由多签确认。
                 </span>
               </div>
               <div className="adv-control">
-                <input
-                  className="adv-addr"
-                  aria-label="操作员地址"
-                  placeholder={hasOperatorOnChain ? operatorOnChain : "0x…（填零地址 = 撤销）"}
-                  value={operatorAddr}
-                  onChange={(e) => setOperatorAddr(e.target.value)}
-                />
-                <button
-                  className="btn btn-outline"
-                  type="button"
-                  disabled={!canWrite || !validAddr(operatorAddr)}
-                  title={
-                    !chainMode
-                      ? "仅链上模式可用"
-                      : !isOwner
-                        ? "只有 Owner 能分配操作员"
-                        : !validAddr(operatorAddr)
-                          ? "请填写有效的 20 字节地址"
-                          : undefined
-                  }
-                  onClick={() => write("setOperator", { operator: operatorAddr.trim() })}
-                >
-                  {pending === "setOperator" ? "写入中…" : "写入"}
-                </button>
+                <span className="adv-addr" aria-label="本期 Owner 地址">{ownerOnChain || "—"}</span>
               </div>
             </div>
             <div className="adv-row">
@@ -2020,7 +2033,19 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
                 <button
                   className="btn btn-outline"
                   type="button"
-                  disabled={!canWrite || !executing}
+                  disabled={
+                    !canWrite
+                    || !executing
+                    || book.executePhase === "listed"
+                    || (nextPhase === "2" && !(Number(book.nandRemaining) > 0 || Number(book.latchRemaining) > 0))
+                    || (nextPhase === "3"
+                      && !(Number(book.priceLock) > 0 && book.orderFilled)
+                      && !(Number(book.partsNand) + Number(book.partsLatch) > 0))
+                    || (Number(book.surplusBase || 0) > 0
+                      && nextPhase !== "3"
+                      && !(Number(book.priceLock) > 0 && book.orderFilled)
+                      && !(Number(book.partsNand) + Number(book.partsLatch) > 0))
+                  }
                   title={
                     !chainMode
                       ? "仅链上模式可用"
@@ -2028,11 +2053,15 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
                         ? "只有 Owner 能改子状态"
                         : !executing
                           ? "只有「待执行」阶段能改子状态"
-                          : nextPhase === "2"
-                            ? "挂单中必须真的有未成交买单，否则合约拒绝"
-                            : nextPhase === "3"
-                              ? "已到账需要已成交或手上有晶体管"
-                              : undefined
+                          : book.executePhase === "listed"
+                            ? "挂单中不能改子状态（AlreadyListed）：先撤单"
+                            : nextPhase === "2"
+                              ? "挂单中必须真的有未成交买单，否则合约拒绝"
+                              : nextPhase === "3"
+                                ? "已到账需要已成交或手上有晶体管，否则合约拒绝"
+                                : Number(book.surplusBase || 0) > 0
+                                  ? "余款已按份退回后，只有改回「已到账」能继续，其他值会以 WrongScene 回滚"
+                                  : undefined
                   }
                   onClick={() => write("setPhase", { next: nextPhase })}
                 >
@@ -2068,6 +2097,8 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
                   disabled={
                     !canWrite
                     || !validAddr(marketAddr)
+                    || ZERO.test(marketAddr.trim())
+                    || book.executePhase === "listed"
                     || (validAddr(marketOnChain) && marketAddr.trim().toLowerCase() === marketOnChain.toLowerCase())
                   }
                   title={
@@ -2077,9 +2108,13 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
                         ? "只有 Owner 能换市场"
                         : !validAddr(marketAddr)
                           ? "请填写有效的 20 字节地址"
-                          : validAddr(marketOnChain) && marketAddr.trim().toLowerCase() === marketOnChain.toLowerCase()
-                            ? "与当前市场相同，无需更换"
-                            : "在途买单会挡下这次更换"
+                          : ZERO.test(marketAddr.trim())
+                            ? "市场地址不能是零地址"
+                            : book.executePhase === "listed"
+                              ? "挂单中不能更换市场：先撤单或确认到账"
+                              : validAddr(marketOnChain) && marketAddr.trim().toLowerCase() === marketOnChain.toLowerCase()
+                                ? "与当前市场相同，无需更换"
+                                : "会先取回旧市场欠款并撤销旧市场的晶体管授权"
                   }
                   onClick={() => write("setMaterialMarket", { materialMarket: marketAddr.trim() })}
                 >
@@ -2214,8 +2249,10 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
                     disabled={
                       !canWrite
                       || !validAddr(tokenAddr)
+                      || ZERO.test(tokenAddr.trim())
                       || !/^\d+$/.test(tokenId.trim())
                       || !/^\d+$/.test(tokenAmount.trim())
+                      || ownPartsBlocked
                     }
                     title={
                       !chainMode
@@ -2224,7 +2261,11 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
                           ? "只有 Owner 能取回晶体管"
                           : !validAddr(tokenAddr)
                             ? "请填写有效的 20 字节地址"
-                            : "数量必须大于 0，且合约手上要有这么多晶体管"
+                            : ZERO.test(tokenAddr.trim())
+                              ? "晶体管合约地址不能是零地址"
+                              : ownPartsBlocked
+                                ? ownPartsBlockReason
+                                : "数量必须大于 0，且合约手上要有这么多晶体管"
                     }
                     onClick={() =>
                       write("recoverTransistors", {
@@ -2442,7 +2483,7 @@ export function OwnerCreate({
     : chainMode && !connectedAccount
       ? "请先连接 Owner 钱包"
       : chainMode && !isFactoryOwner
-        ? "需 Factory Owner 钱包"
+        ? "需 Owner 钱包"
         : "发布众筹挖矿";
 
   return (
@@ -2482,8 +2523,8 @@ export function OwnerCreate({
           <div className="publish-auth">
             <p>
               {!connectedAccount
-                ? "当前未连接钱包。发布需要 Factory Owner 签名。"
-                : `当前钱包不是 Factory Owner（${shortAddress(factoryOwner)}）。`}
+                ? "当前未连接钱包。发布需要 Owner 签名。"
+                : `当前钱包不是 Owner（${shortAddress(factoryOwner)}）。`}
             </p>
             {!connectedAccount && (
               <button className="btn btn-primary btn-inline" type="button" onClick={onConnect}>

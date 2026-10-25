@@ -178,8 +178,6 @@ export function bookFromState(state, account, extra = {}) {
     bnb,
     capped: false,
     owner: state.owner,
-    /** 操作员热钱包（owner 也拥有全部操作员权限）；未设置时是零地址。 */
-    operator: state.operator || "",
     /** 熔断中：入口（认筹/挂单/卖出/入池/份额市场）全停，pull 与撤单仍可用。 */
     halted: Boolean(state.halted),
     selfAddress: account,

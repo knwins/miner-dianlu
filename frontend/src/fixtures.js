@@ -115,7 +115,7 @@ export const OWNER = "0x0a11eE0000000000000000000000000000000A11";
  * 角色与权限模型。
  *
  * execute（换币+流片）会把全部募集款换成 BNB 并烧掉晶体管，**不可逆**，
- * 故权限收紧为**仅 Factory Owner** 可触发——Owner 是实际执行 tape-out 的一方，
+ * 故权限收紧为**仅 Owner** 可触发——Owner 是实际执行 tape-out 的一方，
  * 持份用户不应能单方面把全期本金烧掉。为防 Owner 不作为，真实合约应再加
  * 时间锁 + 多签/投票兜底；本预览在「48h 观察期 + 价格快照锁定」基础上仅保留 Owner 门槛。
  * 其余写操作（harvest / 份额转让 / 退款）仍对持份用户开放。
@@ -139,7 +139,7 @@ export const ROLE = { USER: "user", HOLDER: "holder", OWNER: "owner" };
 export function identify(address, book, state = null) {
   const addr = String(address || "").toLowerCase();
   if (addr && addr === OWNER.toLowerCase()) {
-    return { role: ROLE.OWNER, label: "Factory Owner", shares: 0, address };
+    return { role: ROLE.OWNER, label: "Owner", shares: 0, address };
   }
   // 优先用账本：任一地址都可查到自己的可用 + 锁定份额（挂出仍属自己，算持份）
   let shares = 0;
@@ -785,7 +785,7 @@ export function applySubscribe(round, book, shares) {
 export function applyRefund(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER && who.shares <= 0) {
-    return { ok: false, message: "只有持份用户 Factory Owner 可以退款。" };
+    return { ok: false, message: "只有持份用户 Owner 可以退款。" };
   }
   const selfKey = String(book.selfAddress || WALLET).toLowerCase();
   const selfWallet = book.wallets[selfKey] || { mine: 0, listingShares: 0 };
@@ -862,7 +862,7 @@ export function applyListShares(round, book, { shares, priceBnbPerShare }, actor
   const price = Number(priceBnbPerShare);
   if (!(price > 0)) return { ok: false, message: "单价必须大于 0 BNB" };
   if (who.role !== ROLE.OWNER && who.shares <= 0) {
-    return { ok: false, message: "只有持份用户 Factory Owner 可以发布出售。" };
+    return { ok: false, message: "只有持份用户 Owner 可以发布出售。" };
   }
   const total = round4(count * price);
   const listing = {
@@ -978,12 +978,12 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
  *
  * 晶体管来自 tapeout.net 晶体管市场，但合约无法替人工去平台操作，所以由 Owner（或 keeper）
  * 手动调用本函数发起链上交易：先 placeTransistorOrder 进入「挂单中」，成交后 confirmTransistors 确认到账。
- * 仅 Factory Owner 可调，避免状态竞争；非 Owner 或已挂单/已到账均拒绝。
+ * 仅 Owner 可调，避免状态竞争；非 Owner 或已挂单/已到账均拒绝。
  */
 export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Factory Owner 能挂买单。" };
+    return { ok: false, message: "只有 Owner 能挂买单。" };
   }
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行状态可以挂买单。" };
@@ -1040,14 +1040,14 @@ function quoteUnitFallback(book) {
 }
 
 /**
- * 待挂单时由 Factory Owner 决定开放退款，不判断当前报价买不买得起。
+ * 待挂单时由 Owner 决定开放退款，不判断当前报价买不买得起。
  * 持份人再到「我的资产」原路退还。已挂单、非 Owner 均拒绝。
  */
 
 export function applyOpenRefund(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Factory Owner 能发起退款。" };
+    return { ok: false, message: "只有 Owner 能发起退款。" };
   }
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行可以由 Owner 发起退款。" };
@@ -1074,7 +1074,7 @@ export function applyOpenRefund(round, book, actor = null) {
 export function applyCancelTransistorOrder(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Factory Owner 能取消挂单。" };
+    return { ok: false, message: "只有 Owner 能取消挂单。" };
   }
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行状态才有挂单可取消。" };
@@ -1100,12 +1100,12 @@ export function applyCancelTransistorOrder(round, book, actor = null) {
  * Owner 确认 tapeout.net 晶体管成交到账（链上确认交易）。
  *
  * 合约无法替人工确认平台成交，所以由 Owner（或 keeper）手动调用本函数发起链上交易确认成交到账。
- * 仅 Factory Owner 可调，且必须先调用挂单逻辑（listed）才能确认到账——未挂单时拒绝。
+ * 仅 Owner 可调，且必须先调用挂单逻辑（listed）才能确认到账——未挂单时拒绝。
  */
 export function applyConfirmTransistors(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Factory Owner 能确认到账。" };
+    return { ok: false, message: "只有 Owner 能确认到账。" };
   }
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行状态可以确认到账。" };
@@ -1131,7 +1131,7 @@ export function applyConfirmTransistors(round, book, actor = null) {
 /**
  * 把晶体管投入矿池：预估变成实际的唯一地方。
  *
- * 权限：仅 Factory Owner。晶体管到账后即可执行，不再等待观察期。
+ * 权限：仅 Owner。晶体管到账后即可执行，不再等待观察期。
  * 执行逻辑：直接按 Owner 在晶体管市场实际买入并确认到账的晶体管数量入池开矿。
  *          晶体管数不再由图纸推算、也不与募资总额做「买不买得起」的比较——
  *          买多少算多少，H = 实买晶体管数 × P。采购款之外的余量按份退回。
@@ -1149,10 +1149,10 @@ export function applyExecute(round, book, quote = MARKET, actor = null) {
   }
 
   const who = actor || identify(WALLET, book);
-  const label = who.label || (who.role === ROLE.OWNER ? "Factory Owner" : who.shares > 0 ? "持份用户" : "未持份地址");
-  // F3：execute 不可逆（把全期募集款烧掉），权限收紧为仅 Factory Owner
+  const label = who.label || (who.role === ROLE.OWNER ? "Owner" : who.shares > 0 ? "持份用户" : "未持份地址");
+  // F3：execute 不可逆（把全期募集款烧掉），权限收紧为仅 Owner
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Factory Owner 能把晶体管投入矿池（不可逆）。" };
+    return { ok: false, message: "只有 Owner 能把晶体管投入矿池（不可逆）。" };
   }
 
   // 价格快照锁价——以本次执行的报价（或挂单时锁定的报价）结算，

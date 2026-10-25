@@ -1,27 +1,28 @@
 {
   "network": "bsc",
   "chainId": 56,
-  "deployedAt": "2026-10-25T06:35:26.887Z",
+  "deployedAt": "2026-10-25T10:25:48.625Z",
   "materialMarket": "0xA6a80C1919a8326022d7c601a488888C13aA16E4",
   "allowedParts": [
     "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087",
     "0xE2DfD802081C7a05341E20b6582b04b908e8550c"
   ],
-  "factory": "0x9a6760934648C3794e51b45e3778768e99E54236",
+  "factory": "0xad36f1387661e0F596781993A9E952955Da7c2Ba",
   "legacyFactories": [
     "0x19a47311FC280f146D1992dD99DC7Fa5735e10BA",
     "0x638744e7308D8dCe3444d6991137f7405f5Ab2ED",
     "0xB4315F55CD614d09092f0Fcf75ef34C5ee252c3b",
     "0x29f4A37509ac1CB556562398240446D7168Fdc2f",
     "0x2a27334bca2b1a04e4cd369a4e9bd945d9afce55",
-    "0x6bf44c46b60d631b2ebee490d6ea6fba032be399"
+    "0x6bf44c46b60d631b2ebee490d6ea6fba032be399",
+    "0x9a6760934648C3794e51b45e3778768e99E54236"
   ],
   "campaign": "",
   "campaignParams": null,
   "deployer": "0xebA1B24d36487a75C533233A07D6899a268Bb9AA",
-  "factoryDeploymentTx": "0xfc548edff2b377f4d90efac0b359c88631285eb0e55937c8a0163b85811e885f",
-  "factoryDeploymentBlock": 129658232,
-  "factoryDeploymentGasUsed": 5144966,
-  "factoryRuntimeBytes": 23079,
-  "notes": "BSC 主网工厂重新部署（tx 0xfc548edf…885f，块 129,658,232，gasUsed 5,144,966，约 0.00037 BNB）。本版源码 = Operator 热钱包（setOperator）+ 熔断（halt / resume，whenLive 只挡 6 个入口）+ 全 PULL 退款/余款 + 卖出走官方买单（已删挂卖侧）之后的新版。构造参数链上读回校验：owner=部署者、materialMarket=官方市场、白名单=官方两件套 2 项、runtime 23,079 字节（上限 24,576，余量 1,497）。Sourcify exact_match（creation / runtime 双 exact）。新工厂尚未开期（campaignCount=0）；上一版工厂 0x6bf44c46…（名下 #0 0xE92D2f94… Executing/Buying、#1 0x1D931505… Mining/Ready）已移入 legacyFactories——合约仍可调用，但不再出现在主列表，前端需在新工厂重新开期后才有期次可操作。"
+  "factoryDeploymentTx": "0x37355c1dae4d60ca1f9ee0cfb3e4c43513bb2f0aff488ac8e36ccd539af8b227",
+  "factoryDeploymentBlock": 129689174,
+  "factoryDeploymentGasUsed": 5121162,
+  "factoryRuntimeBytes": 22969,
+  "notes": "单钥匙（只有 owner，无 operator/admin）+ S-35 卖出收款修复版：sellTransistors 判据是 raisedBnb 增量（主网 fillBid 当场 CALL 净额进 receive()），halt/resume 均为 onlyOwner。构造 [官方晶体管市场, 官方两件套白名单]，runtime 22,969 字节。尚未开期（campaignCount = 0）。"
 }

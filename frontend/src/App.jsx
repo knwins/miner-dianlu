@@ -193,16 +193,11 @@ export default function App() {
   /** 当前连接地址是不是 Owner（未连接钱包一律不是） */
   const isOwnerAddress = Boolean(account) && ownerAddresses.includes(String(account).toLowerCase());
   /**
-   * 本期操作员热钱包（setOperator 写入）。旧期次 / 未分配时读到零地址，这里判 false。
-   * 操作员可以进工作台做日常运营（setPlan / 撤单 / 卖出 / 退余款 / 开退款 / 补缺口 / 拉闸），
-   * 但入池、改子态、取回资产、抬闸、换操作员这些仍然只有 Owner 能成。
+   * 合约工作台入口：只有 Owner。
+   * 合约里只有一把钥匙（owner，原则上是多签）：没有操作员 / 管理员之类的二级角色，
+   * 所以不存在「能进工作台但不能开期」的身份。
    */
-  const isOperatorAddress = Boolean(account)
-    && Boolean(chain.book?.operator)
-    && String(chain.book.operator).toLowerCase() !== "0x0000000000000000000000000000000000000000"
-    && String(account).toLowerCase() === String(chain.book.operator).toLowerCase();
-  /** 合约工作台入口：Owner 与本期操作员都可见 */
-  const canEnterOwnerDesk = isOwnerAddress || isOperatorAddress;
+  const canEnterOwnerDesk = isOwnerAddress;
   /**
    * 当前身份：Owner 走统一地址判定，其余按持份判定。
    *
@@ -215,7 +210,7 @@ export default function App() {
     const shares = (book.mine || 0) + (book.listingShares || 0);
     if (!chain.active) {
       const who = identify(account, book);
-      // 本地演示没有操作员热钱包概念：只有 Owner 具备操作员权限。
+      // 本地演示同样只有一把钥匙。
       return { ...who, canOperate: who.role === "owner" };
     }
     // ⚠️ 链上空态时 book 是本地 fixtures（simBook），owner 字段不可信，
@@ -226,20 +221,7 @@ export default function App() {
       && campaignOwner
       && String(account).toLowerCase() === String(campaignOwner).toLowerCase(),
     );
-    if (isCampaignOwner) return { role: "owner", label: "Factory Owner", shares, address: account, canOperate: true };
-    /**
-     * 操作员热钱包：owner 之外的日常运营身份。
-     * 合约里 operator 的全部入口 owner 也能调，所以 canOperate 对 owner 恒为 true。
-     * 零地址 = 未分配（旧期次同样读成零地址），不构成身份。
-     */
-    const campaignOperator = chain.book?.operator;
-    const isCampaignOperator = Boolean(
-      account
-      && campaignOperator
-      && String(campaignOperator).toLowerCase() !== "0x0000000000000000000000000000000000000000"
-      && String(account).toLowerCase() === String(campaignOperator).toLowerCase(),
-    );
-    if (isCampaignOperator) return { role: "operator", label: "操作员", shares, address: account, canOperate: true };
+    if (isCampaignOwner) return { role: "owner", label: "Owner", shares, address: account, canOperate: true };
     return shares > 0
       ? { role: "holder", label: "持份用户", shares, address: account, canOperate: false }
       : { role: "user", label: "未持份地址", shares: 0, address: account, canOperate: false };
@@ -310,8 +292,8 @@ export default function App() {
       "createCampaign", "openRefund", "abandonOrder", "markFailed", "removeCampaign", "removeCampaignAt",
       "setMaterialMarket", "recoverBnb", "recoverTransistors", "transferOwnership",
       "setFactoryOwner", "claimFee", "setServiceFee",
-      // 权限与熔断：操作员热钱包 / 拉闸 / 抬闸（抬闸只有 Owner 能成）
-      "setOperator", "halt", "resume",
+      // 熔断：拉闸 / 抬闸都只认 Owner
+      "halt", "resume",
     ];
     // harvest / claim 在合约里是占位空实现（no-op / 返回 0），不产出发放：
     // 前端不再提供任何入口，也不发真实交易（白付 gas）。
@@ -319,7 +301,7 @@ export default function App() {
       return { ok: false, message: "harvest / claim 暂为占位，不产出发放。" };
     }
     if (chain.active && WRITE_METHODS.includes(method)) return chainInvoke(method, args);
-    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "transistors", "market", "materialMarket", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf", "operator", "halted"].includes(method)) {
+    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "transistors", "market", "materialMarket", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf", "halted"].includes(method)) {
       return { ok: true, message: readCall(method, args, round, book, quote) };
     }
     if (/^market(OpenOrders|Bids|Sellable|Owed)$/.test(method) || method.startsWith("simulateFill") || method === "simulateExternalBid") {
@@ -368,11 +350,6 @@ export default function App() {
             message: "模拟：已标记执行失败，持有人现在可以原路退款",
             book: { ...book, executionFailed: true },
           };
-    }
-    else if (method === "setOperator") {
-      result = args?.operator
-        ? { ok: true, message: "模拟：操作员已设定（本地演示没有热钱包角色，写操作仍以 Owner 身份执行）" }
-        : { ok: false, message: "请填写操作员地址" };
     }
     else if (method === "halt") {
       result = book.halted
@@ -448,7 +425,6 @@ export default function App() {
     recoverTransistors: "取回晶体管",
     transferOwnership: "转移所有权",
     setFactoryOwner: "转移工厂所有权",
-    setOperator: "设定操作员",
     halt: "熔断（halt）",
     resume: "解除熔断（resume）",
   };
@@ -483,6 +459,33 @@ export default function App() {
         if (method === "createCampaign") {
           await chainCreateCampaign(args, signer, onSigned);
           return;
+        }
+        /**
+         * 与合约硬闸门对齐的前置校验：状态不合就别发一笔注定 revert 的交易。
+         * 只做「合约一定会拒绝」的判断，不替合约决定业务策略。
+         */
+        if (book?._chain) {
+          const outstanding = Number(book.outstandingShares ?? book.sold ?? 0);
+          const pool = Number(book.bnbPool || 0);
+          const need = outstanding * Number(round.sharePriceBnb || 0);
+          const partsHeld = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0) > 0;
+          if (method === "openRefund" || method === "abandonOrder") {
+            if (Number(book.surplusBase) > 0) {
+              throw new Error("余款已按份退回（SurplusAlreadyReturned）：本金已在持份人手里，不能再打开退款。");
+            }
+            if (book.executePhase === "ready") {
+              throw new Error("晶体管已到账（UseReturnSurplus）：出口是退余款 + 入池，不能放弃挂单。");
+            }
+            if (partsHeld && pool + 1e-12 < need) {
+              throw new Error("晶体管还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口。");
+            }
+            if (method === "openRefund" && Number(book.marketOwed) > 0) {
+              throw new Error("市场还有未提取的卖出款（ProceedsPending）：先 withdrawMarketProceeds 再打开退款。");
+            }
+            if (method === "openRefund" && outstanding <= 0) {
+              throw new Error("份额已全部退完，没有可退对象（ZeroShares）：尾差用 recoverBnb 取回。");
+            }
+          }
         }
         if (method === "removeCampaign" || method === "removeCampaignAt") {
           const removed = args?.campaign || args?.address;
@@ -559,10 +562,8 @@ export default function App() {
                     ? "已模拟卖方成交：市场剩余已扣减，晶体管已铸给买家（本期合约）。"
                     : method === "simulateExternalBid"
                       ? "已模拟外部买家挂单：BNB 已托管到 Mock 晶体管市场，本期可以吃这张买单。"
-                    : method === "setOperator"
-                      ? "已设定操作员：可代 Owner 执行日常运营，Owner 权限不变。填零地址即撤销。"
                     : method === "halt"
-                      ? "已熔断：认筹、挂单、卖出、入池与份额交易暂停；退款与撤单仍可用。抬闸只有 Owner 能做。"
+                      ? "已熔断：认筹、挂单、卖出、入池与份额交易暂停；退款与撤单仍可用。抬闸同样由 Owner 执行。"
                     : method === "resume"
                       ? "已解除熔断，相关入口恢复。"
                       : `已确认：${method} ✓`);
@@ -847,9 +848,23 @@ export default function App() {
         if (!/^0x[0-9a-fA-F]{40}$/.test(pool)) throw new Error("矿池地址无效");
         // 零地址格式合法，但 depositToPool 会把晶体管转进黑洞且不可逆。
         if (/^0x0{40}$/i.test(pool)) throw new Error("矿池地址不能是零地址");
+        // 合约同样拒绝 pool_ == address(this)。
+        if (book._chain && String(book.campaign || "").toLowerCase() === pool.toLowerCase()) {
+          throw new Error("矿池地址不能是本期合约自己（ZeroAddress）");
+        }
         return chainTx.setMiningPool(signer, pool);
       }
       case "depositToPool":
+        // 合约门槛：未入池、Ready、矿池已设、仍有未退份额、手里真有晶体管（任一不满足都会 revert）。
+        if (book._chain) {
+          if (book.pooled) throw new Error("本期已入池（AlreadyPooled）");
+          if (book.executePhase !== "ready") throw new Error("晶体管还没确认到账，不能入池（WrongScene）");
+          const mp = String(book.miningPool || "");
+          if (!/^0x[0-9a-fA-F]{40}$/.test(mp) || /^0x0{40}$/i.test(mp)) throw new Error("还没设置矿池地址（PoolNotSet）");
+          if (String(book.campaign || "").toLowerCase() === mp.toLowerCase()) throw new Error("矿池地址是本期合约自己（ZeroAddress）");
+          if (!(Number(book.outstandingShares ?? book.sold ?? 0) > 0)) throw new Error("份额已全部退完，没有持有人可分产出（ZeroShares）");
+          if (!(Number(book.partsNand) > 0 || Number(book.partsLatch) > 0)) throw new Error("合约手上没有晶体管（InsufficientParts）");
+        }
         return chainTx.depositToPool(signer);
       case "returnSurplus":
         // 无参：把当前 raisedBnb 按份记账退回持份人，期次继续、仍然可以入池。
@@ -861,11 +876,40 @@ export default function App() {
         if (amount <= 0n) throw new Error("补齐金额必须大于 0");
         return chainTx.topUpShortfall(signer, amount);
       }
-      case "setMaterialMarket": return chainTx.setMaterialMarket(signer, args.materialMarket);
+      case "setMaterialMarket": {
+        const market = String(args?.materialMarket || "").trim();
+        if (!/^0x[0-9a-fA-F]{40}$/.test(market) || /^0x0{40}$/i.test(market)) {
+          throw new Error("晶体管市场地址无效（不能是零地址）");
+        }
+        // 在途买单会把托管款留在旧市场：合约以 AlreadyListed 拒绝换市场。
+        if (book._chain && book.executePhase === "listed") {
+          throw new Error("挂单中不能更换晶体管市场（AlreadyListed）：先撤单或确认到账。");
+        }
+        return chainTx.setMaterialMarket(signer, market);
+      }
       case "setPhase": {
         const next = Number(args?.next);
         // 0 (None) 只在开期前存在；Executing 里设它会同时关掉挂单与退款，合约直接拒绝。
         if (!Number.isInteger(next) || next < 1 || next > 3) throw new Error("子状态只能是 1、2、3");
+        if (book._chain) {
+          // 合约 setPhase：Listed 一律 AlreadyListed；2 需要市场里真有未成交买单；3 需要已成交或手上有晶体管。
+          if (book.executePhase === "listed") {
+            throw new Error("挂单中不能改子状态（AlreadyListed）：先撤单。");
+          }
+          const openLeft = Number(book.nandRemaining) > 0 || Number(book.latchRemaining) > 0;
+          if (next === 2 && !openLeft) {
+            throw new Error("改成「挂单中」需要市场里真的有未成交买单（WrongScene）。");
+          }
+          const settled = Number(book.priceLock) > 0 && book.orderFilled;
+          const heldParts = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0) > 0;
+          if (next === 3 && !settled && !heldParts) {
+            throw new Error("改成「已到账」需要买单已成交或手上有晶体管（TransistorsNotReady）。");
+          }
+          // 余款已按份退回（surplusBase != 0）后，离开 Ready 会把本期卡在「所有出口都回滚」的待挂单。
+          if (Number(book.surplusBase || 0) > 0 && next !== 3 && !settled && !heldParts) {
+            throw new Error("余款已按份退回，只有改回「已到账」能继续（WrongScene）。");
+          }
+        }
         return chainTx.setPhase(signer, next);
       }
       case "recoverBnb": {
@@ -878,20 +922,23 @@ export default function App() {
         const amount = uintField(args?.amount ?? 0, "转出数量");
         if (!/^0x[0-9a-fA-F]{40}$/.test(token)) throw new Error("晶体管合约地址无效");
         if (amount <= 0n) throw new Error("转出数量必须大于 0");
+        if (book._chain) {
+          // 合约四道闸：已入池、挂单中、份额未结清、持份人未按原价收回本金。
+          if (book.pooled) throw new Error("本期已入池（AlreadyPooled）：晶体管已转给矿池，合约里没有可转出的余额。");
+          if (book.executePhase === "listed") throw new Error("挂单中不能转出晶体管（AlreadyListed）：先撤单或确认到账。");
+          if (String(token).toLowerCase() === String(book.transistors || "").toLowerCase()) {
+            if (Number(book.outstandingShares ?? book.sold ?? 0) > 0) {
+              throw new Error("还有持份人没结清（SharesOutstanding）：本期晶体管是他们的抵押，不能取回。先退款或入池。");
+            }
+            if (Number(book.refundedTotal || 0) + 1e-12 < Number(book.sold || 0) * Number(round.sharePriceBnb || 0)) {
+              throw new Error("持份人还没按原价收回本金（HoldersNotMadeWhole）：先 topUpShortfall 补齐再退款。");
+            }
+          }
+        }
         return chainTx.recoverTransistors(signer, token, id, amount);
       }
       case "transferOwnership": return chainTx.transferOwnership(signer, args.newOwner);
       case "setFactoryOwner": return chainTx.setFactoryOwner(signer, args.newOwner);
-      case "setOperator": {
-        const next = String(args?.operator ?? "").trim();
-        if (!/^0x[0-9a-fA-F]{40}$/.test(next)) throw new Error("操作员地址必须是 20 字节的 0x 地址");
-        // 合约拒绝把自身设为操作员（它无法发起调用，设了等于没有操作员）。
-        const selfAddr = String(chain.campaignAddress || book.address || "").toLowerCase();
-        if (selfAddr && selfAddr === next.toLowerCase()) {
-          throw new Error("不能把本期合约自己设为操作员");
-        }
-        return chainTx.setOperator(signer, next);
-      }
       case "halt": return chainTx.halt(signer);
       case "resume": return chainTx.resume(signer);
       default: throw new Error("链上模式暂不支持：" + method);
@@ -994,7 +1041,7 @@ export default function App() {
   function handleCreate(draft, review) {
     if (chain.active) {
       if (!chain.account && !chain.signer) {
-        setNotice("请先连 Factory Owner 钱包再发布");
+        setNotice("请先连 Owner 钱包再发布");
         handleConnect();
         return;
       }
@@ -1003,7 +1050,7 @@ export default function App() {
         chain.account &&
         String(chain.account).toLowerCase() !== String(factoryOwner).toLowerCase()
       ) {
-        setNotice(`发布须 Factory Owner 签名：${shortAddress(factoryOwner)}（当前 ${shortAddress(chain.account)}）`);
+        setNotice(`发布须 Owner 签名：${shortAddress(factoryOwner)}（当前 ${shortAddress(chain.account)}）`);
         return;
       }
       invokeCall("createCampaign", { ...draft, _review: review });
@@ -1024,9 +1071,9 @@ export default function App() {
   }
 
   function openPage(id, ownerSub) {
-    // 合约工作台只对 Owner / 本期操作员开放：其它身份连入口都不给（侧边栏已隐藏，这里再兜一层）。
+    // 合约工作台只对 Owner 开放：其它身份连入口都不给（侧边栏已隐藏，这里再兜一层）。
     if (id === "owner" && !canEnterOwnerDesk) {
-      setNotice("合约工作台仅 Factory Owner 与本期操作员可见");
+      setNotice("合约工作台仅 Owner 可见");
       return;
     }
     setPage(id);
@@ -1059,7 +1106,7 @@ export default function App() {
         <nav className="sidebar-menu">
           <div className="menu-group-title">生命周期</div>
           {LIFE_PAGES.map((item) => {
-            // 合约工作台只对 Owner / 本期操作员展示：其它身份连入口都不给。
+            // 合约工作台只对 Owner 展示：其它身份连入口都不给。
             if (item.id === "owner" && !canEnterOwnerDesk) return null;
             if (item.id === "owner") {
               const onOwner = page === "owner";
@@ -1155,7 +1202,7 @@ export default function App() {
                   {chain.account ? (
                     <>
                       <button className="wallet-chip" type="button">
-                        <span className="topbar-role">{chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Factory Owner" : "已连接"}</span>
+                        <span className="topbar-role">{chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Owner" : "已连接"}</span>
                         {shortAddress(chain.account)}
                       </button>
                       <div className="wallet-pop" role="dialog" aria-label="钱包详情">
@@ -1167,7 +1214,7 @@ export default function App() {
                           <div className="wallet-addr">
                             <div className="wallet-addr-top">
                               <div>
-                                <span>当前钱包 · {chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Factory Owner" : "已连接"}</span>
+                                <span>当前钱包 · {chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Owner" : "已连接"}</span>
                                 <strong>{shortAddress(chain.account)}</strong>
                               </div>
                               <button
@@ -1289,7 +1336,7 @@ export default function App() {
                 aria-label="切换预览身份"
               >
                 <option value={WALLET}>持份用户（当前钱包）</option>
-                <option value={OWNER}>Factory Owner</option>
+                <option value={OWNER}>Owner</option>
                 <option value="0x00000000000000000000000000000000DEAD01">未持份地址</option>
                 {ROSTER.map((person) => (
                   <option key={person.address} value={person.address}>
@@ -1314,11 +1361,11 @@ export default function App() {
           <section>
             <div className="empty">
               <p>主网工厂已部署，还没有开期。认筹、资产和转让都会在开期后出现。</p>
-              {/* 发布是 Factory Owner 的专属动作，非 Owner 不给入口 */}
+              {/* 发布是 Owner 的专属动作，非 Owner 不给入口 */}
               {isOwnerAddress ? (
                 <button className="btn btn-primary" type="button" onClick={() => openPage("owner", "create")}>去发布众筹挖矿</button>
               ) : (
-                <p className="empty-muted">开期后这里会出现认筹入口。发布众筹挖矿由 Factory Owner 操作。</p>
+                <p className="empty-muted">开期后这里会出现认筹入口。发布众筹挖矿由 Owner 操作。</p>
               )}
             </div>
           </section>
@@ -1399,7 +1446,7 @@ export default function App() {
                   {isOwnerAddress ? (
                     <button className="btn btn-primary" type="button" onClick={() => openPage("owner", "create")}>发布众筹挖矿</button>
                   ) : (
-                    <p className="empty-muted">操作员不能开期；等 Factory Owner 发布后再进来做日常运营。</p>
+                    <p className="empty-muted">只有 Owner 能开期：等 Owner 发布后再回来操作。</p>
                   )}
                 </>
               ) : (
@@ -1408,7 +1455,7 @@ export default function App() {
                   {isOwnerAddress ? (
                     <button className="btn btn-primary" type="button" onClick={() => openPage("owner", "create")}>发布众筹挖矿</button>
                   ) : (
-                    <p className="empty-muted">操作员不能开期；等 Factory Owner 发布后再进来做日常运营。</p>
+                    <p className="empty-muted">只有 Owner 能开期：等 Owner 发布后再回来操作。</p>
                   )}
                 </>
               )}
@@ -2176,7 +2223,7 @@ function OwnerDesk({
 }) {
   /**
    * 子页面由左侧导航切换（众筹挖矿列表 / 发布众筹挖矿 / 高级配置），这里不再有横排页签。
-   * 高级配置全是 onlyOwner 入口：钱包从 Owner 切成操作员时若还停在这一页，回落到列表。
+   * 高级配置全是 onlyOwner 入口：钱包换成非 Owner 时若还停在这一页，回落到列表。
    */
   const isOwner = actor?.role === "owner";
   const activeTab = tab === "advanced" && !isOwner ? "overview" : tab;
@@ -2957,8 +3004,7 @@ function RulesPage({ campaigns = [] }) {
     ["任何人", "查看状态；挖矿中可接收他人挂单、查看进度；售罄满 3 天可判失败或退余款"],
     ["认筹用户", "认筹；超时或失败时退款；领取自己的募集款余款"],
     ["持份用户", "挖矿中发布 / 撤销份额挂单，领取余款与挖矿产出服务费"],
-    ["操作员（operator）", "日常运营：改计划、撤单、卖出、退余款、开退款、补缺口、熔断（不能入池、改子状态、取回资产、解除熔断、换操作员）"],
-    ["Owner", "开期、设操作员 / 矿池、入池、改子状态、取回资产、解除熔断、转移所有权；含全部操作员权限"],
+    ["Owner（唯一管理角色）", "开期、改计划、下单 / 撤单、卖出、退余款、开退款 / 补缺口、熔断与抬闸、入池、改子状态、取回资产、转移所有权；Owner 应当是多签"],
   ];
   const sharedContracts = [
     {

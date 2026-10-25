@@ -13,8 +13,11 @@ pragma solidity ^0.8.24;
 ///           - cancelBid(uint256), nextBidId(), feeBps(), owed(address), withdraw()
 ///           - fillBid(uint256,uint256) = fillBid(bidId, qty), called by a seller holding the parts;
 ///             the market pulls the ERC1155 parts from the seller, sends them to the bid's buyer and
-///             credits price × qty minus feeBps to owed(seller). This is the ONLY sell path: Campaign
-///             calls it from sellTransistors() and then withdraw()s the proceeds.
+///             pays the seller price × qty minus feeBps. This is the ONLY sell path.
+///             Payment shape: mainnet CALLs the net BNB to the seller inside fillBid (so `owed()`
+///             stays 0 forever and the BNB lands in Campaign.receive()); the test mock instead credits
+///             owed(seller) for a later withdraw(). Campaign.sellTransistors accepts both — it requires
+///             raisedBnb to grow, never owed().
 ///
 ///         Absent (swallowed by the proxy fallback → missing revert data):
 ///           placeAsk / asks / nextAskId / cancelAsk / fillAsk
@@ -25,9 +28,10 @@ pragma solidity ^0.8.24;
 ///            the buyer pays price × quantity and the seller receives 99%. Campaign's priceLock =
 ///            qty × price therefore matches the escrow exactly.
 ///         2. Because there is no ask book, Campaign must not expose any place-ask call (it used to);
-///            selling is sellTransistors → fillBid → withdraw.
-///         3. Cancellation and sale proceeds return via receive() (or owed() + withdraw()), which
-///            is why receive() only accepts a known market (see Campaign._isKnownMarket).
+///            selling is sellTransistors → fillBid, with the proceeds arriving in receive().
+///         3. Cancellation and sale proceeds come back through receive(): cancel refunds and fill
+///            payouts are CALLed to this contract, which is why receive() only accepts a known market
+///            (see Campaign._isKnownMarket). owed() + withdraw() is the mock-only path.
 interface IMaterialMarket {
     /// @notice Place a buy order; msg.value must equal price × quantity exactly.
     /// @param transistors Parts contract the bid targets.
@@ -45,7 +49,8 @@ interface IMaterialMarket {
     function cancelBid(uint256 id) external;
 
     /// @notice Fill a resting bid as the seller: pulls `quantity` parts from the caller, sends them to
-    ///         the bid's buyer and credits the net proceeds to owed(caller).
+    ///         the bid's buyer and pays the seller the net proceeds (mainnet: BNB inside the fill;
+    ///         mock: credited to owed(caller) for a later withdraw()).
     /// @param id Market bid id.
     /// @param quantity Units to sell; must be > 0 and <= the bid's remaining.
     function fillBid(uint256 id, uint256 quantity) external;

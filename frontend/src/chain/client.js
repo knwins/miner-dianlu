@@ -504,7 +504,7 @@ async function readStateOn(runner, account, campaignAddr) {
   const [
     scene, phase, sold, totalShares, sharePriceBnb, estHashpower,
     nandQty, latchQty, priceLock, soldOutAt, executionFailed, raisedBnb, totalRefunded,
-    fundingDeadline, transistorsAddr, marketAddr, factoryAddr, owner, operatorAddr, halted, pooled, miningPool,
+    fundingDeadline, transistorsAddr, marketAddr, factoryAddr, owner, halted, pooled, miningPool,
     listingCount, totalPendingSurplus, orderFilled,
     outstandingShares, serviceFeeBps, serviceFeeSet, feeRecipientCount,
     revenuePool, surplusPool, lastOrderAt, surplusBase, surplusPaid,
@@ -519,7 +519,6 @@ async function readStateOn(runner, account, campaignAddr) {
     withDefault(c.totalRefunded(), 0n),
     c.fundingDeadline(), c.transistors(), c.materialMarket(), c.factory(),
     c.owner(),
-    withDefault(c.operator(), ZeroAddress),
     withDefault(c.halted(), false),
     withDefault(c.pooled(), false),
     withDefault(c.miningPool(), ZeroAddress),
@@ -621,8 +620,6 @@ async function readStateOn(runner, account, campaignAddr) {
      */
     transistorCount: Number(order.nandFilled ?? 0n) + Number(order.latchFilled ?? 0n), capped: false,
     owner, fundingDeadline: Number(fundingDeadline),
-    /** 操作员热钱包（owner 也可执行全部操作员权限）；未设置为零地址。 */
-    operator: operatorAddr,
     /** 熔断状态：true 时认筹/挂单/卖晶体管/入池/份额挂单与接单全部停，pulls 与撤单不受影响。 */
     halted: Boolean(halted),
     listings,
@@ -747,10 +744,6 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       return withReadProvider((runner) => readMarketOwedView(runner, campaignAddr, args.account));
     case "executionFailed":
       return state.executionFailed ? "是（已判执行失败）" : "否";
-    case "operator":
-      return state.operator && state.operator !== ZeroAddress
-        ? state.operator
-        : "未设置操作员（Owner 尚未分配；Owner 始终保留全部操作员权限）";
     case "halted":
       return state.halted
         ? "已熔断：认筹、挂单、卖出、入池与份额交易已停"
@@ -2008,7 +2001,7 @@ export const tx = {
    */
   returnSurplus: (signer) => signerOrThrow(signer).returnSurplus(),
   /**
-   * Owner / 操作员自掏腰包补齐「被晶体管吃掉」的本金缺口，让池子重新能按原价退完所有份额。
+   * Owner 自掏腰包补齐「被晶体管吃掉」的本金缺口，让池子重新能按原价退完所有份额。
    * 买入之后想收摊（openRefund / abandonOrder）必须先走这一步，否则链上 PartsAreCollateral。
    */
   topUpShortfall: (signer, value) => signerOrThrow(signer).topUpShortfall({ value }),
@@ -2018,7 +2011,6 @@ export const tx = {
   confirmTransistors: (signer) => signerOrThrow(signer).confirmTransistors(),
   setPhase: (signer, next) => signerOrThrow(signer).setPhase(next),
   setPlan: (signer, est) => signerOrThrow(signer).setPlan(est),
-  setOperator: (signer, next) => signerOrThrow(signer).setOperator(next),
   halt: (signer) => signerOrThrow(signer).halt(),
   resume: (signer) => signerOrThrow(signer).resume(),
   setMiningPool: (signer, pool) => signerOrThrow(signer).setMiningPool(pool),
@@ -2057,7 +2049,7 @@ export function parseBnb(value) {
   return parseEther(clipped.length ? `${whole}.${clipped}` : whole);
 }
 
-/** 读 Factory Owner。 */
+/** 读 Owner。 */
 export async function readFactoryOwner() {
   if (!isAddr(FACTORY_ADDRESS)) return "";
   const f = factoryContract(getReadProvider());
@@ -2148,7 +2140,7 @@ export async function createCampaignOnChain(signer, params, onSigned) {
   const owner = await withReadProvider((provider) => factoryContract(provider).owner());
   if (String(caller).toLowerCase() !== String(owner).toLowerCase()) {
     throw new Error(
-      `需 Factory Owner 钱包签名。当前 ${caller.slice(0, 6)}…${caller.slice(-4)}，Owner 为 ${owner.slice(0, 6)}…${owner.slice(-4)}`
+      `需 Owner 钱包签名。当前 ${caller.slice(0, 6)}…${caller.slice(-4)}，Owner 为 ${owner.slice(0, 6)}…${owner.slice(-4)}`
     );
   }
 
@@ -2255,11 +2247,7 @@ function explainParsed(parsed) {
     const caller = parsed.args?.caller || parsed.args?.[0];
     // 同一个错误既可能来自工厂（开期/移除），也可能来自某期合约（本期 owner-only 入口），
     // 所以不能像旧文案那样写死「无法开期」。
-    return `当前钱包${caller ? `（${String(caller).slice(0, 10)}…）` : ""}不是 Owner：工厂级操作只允许 Factory Owner，本期操作只允许本期 owner。`;
-  }
-  if (parsed?.name === "NotOperator") {
-    const caller = parsed.args?.caller || parsed.args?.[0];
-    return `当前钱包${caller ? `（${String(caller).slice(0, 10)}…）` : ""}既不是 Owner 也不是操作员。Owner 可用 setOperator 指定操作员。`;
+    return `当前钱包${caller ? `（${String(caller).slice(0, 10)}…）` : ""}不是 Owner：工厂级操作只允许 Owner，本期操作只允许本期 owner。`;
   }
   if (parsed?.name === "Halted") {
     return "本期已熔断：认筹、挂单、卖出、入池与份额交易暂停；退款、领款、撤单不受影响。等 Owner 解除后再试。";
@@ -2328,7 +2316,14 @@ function explainParsed(parsed) {
   if (parsed?.name === "EmptyWhitelist") return "白名单不能为空：至少填一个允许的晶体管合约地址。";
   if (parsed?.name === "PartsNotAllowed") {
     const p = parsed.args?.parts || parsed.args?.[0];
-    return `晶体管合约不在允许名单：${p ? `${String(p).slice(0, 10)}… ` : ""}先用 setPartsAllowed 放行。`;
+    // 白名单在工厂部署时写死，链上没有增删入口 —— 只能换用白名单内的晶体管合约重新开期。
+    return `晶体管合约不在工厂白名单：${p ? `${String(p).slice(0, 10)}… ` : ""}白名单部署时已固化，请改选白名单内的处理器。`;
+  }
+  if (parsed?.name === "WrongScene") {
+    return "当前阶段不允许这一步（WrongScene）：按页面提示的下一步操作，或先撤单 / 确认到账。";
+  }
+  if (parsed?.name === "Reentrancy") {
+    return "重入保护触发（Reentrancy）：上一笔还在处理中，等确认后再试。";
   }
   if (parsed?.name) return `合约拒绝：${parsed.name}`;
   return "";
@@ -2400,7 +2395,6 @@ export async function send(promiseTx, onSigned) {
       ...FACTORY_ABI,
       ...CAMPAIGN_ABI,
       "error NotOwner(address caller)",
-      "error NotOperator(address caller)",
       "error ZeroAddress()",
       "error ZeroCampaignParam()",
       "error IndexOutOfBounds()",

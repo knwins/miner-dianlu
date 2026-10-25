@@ -50,7 +50,6 @@ export const CAMPAIGN_ABI = [
   "function miningPool() view returns (address)",
   "function factory() view returns (address)",
   "function owner() view returns (address)",
-  "function operator() view returns (address)",
   "function halted() view returns (bool)",
   // ── 显式 view ──
   "function sharesOf(address) view returns (uint256)",
@@ -94,11 +93,9 @@ export const CAMPAIGN_ABI = [
   "function recoverBnb()",
   "function recoverTransistors(address token, uint256 id, uint256 amount)",
   "function transferOwnership(address newOwner)",
-  "function setOperator(address operator_)",
   "function halt()",
   "function resume()",
   // ── 事件 ──
-  "event OperatorSet(address indexed previous, address indexed next)",
   "event HaltChanged(address indexed by, bool halted)",
   "event Subscribed(address indexed subscriber, uint256 count, uint256 paidBnb)",
   "event Refunded(address indexed holder, uint256 amountBnb)",
@@ -133,7 +130,6 @@ export const CAMPAIGN_ABI = [
   "error Halted()",
   "error AlreadyHalted()",
   "error NotHalted()",
-  "error NotOperator(address caller)",
   "error NotOwner(address caller)",
   "error WrongScene()",
   "error FundingEnded()",

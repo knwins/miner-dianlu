@@ -67,9 +67,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     // ─────────────────────── mutable state ───────────────────────
     Scene public scene;
     Phase public phase;
-    /// @notice Hot wallet for routine operations. Always a strict subset of the owner; 0 = disabled.
-    address public operator;
-    /// @notice Circuit breaker. Stops money-in and irreversible-out; NEVER stops a holder exit.
+    /// @notice Circuit breaker. Stops money-in and irreversible-out; NEVER stops a holder exit. Owner-only,
+    ///         like every other entry point: the owner is expected to be a multisig, not a hot wallet.
     bool public halted;
     /// @notice Cumulative shares ever sold; monotonic, so refunding cannot undo the sold-out gate.
     uint256 public sold;
@@ -167,8 +166,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     mapping(address => bool) private _marketSeen;
 
     // ─────────────────────── events ───────────────────────
-    /// @notice Operator hot wallet replaced; the owner always keeps every operator right.
-    event OperatorSet(address indexed previous, address indexed next);
     /// @notice Circuit breaker toggled. `by` is whoever halted or resumed.
     event HaltChanged(address indexed by, bool halted);
     event Subscribed(address indexed subscriber, uint256 count, uint256 paidBnb);
@@ -197,7 +194,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     event RefundsOpened(uint256 outstandingShares, uint256 escrowBnb);
     event PlanUpdated(uint256 estHashpower);
     event MaterialMarketUpdated(address indexed previous, address indexed next);
-    /// @notice Operator approval of a former material market was revoked.
+    /// @notice ERC1155 approval of a former material market was revoked.
     event MaterialMarketApprovalRevoked(address indexed market);
     /// @notice BNB swept by recoverBnb; `to` is always the owner.
     event BnbRecovered(uint256 amount, address indexed to);
@@ -232,8 +229,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     error AlreadyHalted();
     /// @notice resume() on a live round.
     error NotHalted();
-    /// @notice Caller is neither the owner nor the current operator.
-    error NotOperator(address caller);
     error WrongScene();
     error FundingEnded();
     error TransistorsNotReady();
@@ -316,44 +311,23 @@ contract Campaign is Ownable, ReentrancyGuard {
         phase = Phase.None;
     }
 
-    // ─────────────────────────── roles and circuit breaker ───────────────────────────
+    // ─────────────────────────── circuit breaker ───────────────────────────
 
-    /// @notice Set the operator hot wallet. Owner only; address(0) disables the role.
-    ///         The owner always keeps every operator right, so granting cannot be a one-way door.
-    /// @param operator_ Hot wallet; the contract itself is refused (it cannot originate a call).
-    function setOperator(address operator_) external onlyOwner {
-        if (operator_ == address(this)) revert ZeroAddress();
-        emit OperatorSet(operator, operator_);
-        operator = operator_;
-    }
-
-    /// @notice Trip the circuit breaker. Owner or operator.
+    /// @notice Trip the circuit breaker. Owner only — one role, one key (a multisig in practice).
     ///         Blocks money-in (`subscribe`), irreversible-out (`depositToPool`), parts-out
-    ///         (`sellTransistors`), ordering, and the secondary market. Holder exits are never blocked.
-    function halt() external {
-        _requireOperator();
+    ///         (`sellTransistors` / `recoverTransistors`), ordering, and the secondary market.
+    ///         Holder exits are never blocked.
+    function halt() external onlyOwner {
         if (halted) revert AlreadyHalted();
         halted = true;
         emit HaltChanged(msg.sender, true);
     }
 
-    /// @notice Lift the circuit breaker. Owner only: a compromised operator must not undo its own brake.
+    /// @notice Lift the circuit breaker. Owner only.
     function resume() external onlyOwner {
         if (!halted) revert NotHalted();
         halted = false;
         emit HaltChanged(msg.sender, false);
-    }
-
-    /// @dev True for the owner and the current operator. Every onlyOperator entry point also accepts the
-    ///      owner, so the operator is a strict subset and can never lock the owner out.
-    /// @return Whether the caller may use operator-level entry points.
-    function _isOperator() internal view returns (bool) {
-        return msg.sender == owner || (operator != address(0) && msg.sender == operator);
-    }
-
-    /// @dev Revert unless the caller is the owner or the current operator.
-    function _requireOperator() internal view {
-        if (!_isOperator()) revert NotOperator(msg.sender);
     }
 
     /// @dev Circuit breaker for business entry points. Never applied to refund / surplus / fee pulls,
@@ -433,10 +407,9 @@ contract Campaign is Ownable, ReentrancyGuard {
         miningPool = pool_;
     }
 
-    /// @notice Store the display-only hashpower estimate. Funding and Executing/Buying only.
+    /// @notice Store the display-only hashpower estimate. Owner only; Funding and Executing/Buying only.
     /// @param estHashpower_ Read by the UI only.
-    function setPlan(uint256 estHashpower_) external {
-        _requireOperator();
+    function setPlan(uint256 estHashpower_) external onlyOwner {
         if (scene == Scene.Mining) revert WrongScene();
         if (scene == Scene.Executing && phase != Phase.Buying) revert WrongScene();
         estHashpower = estHashpower_;
@@ -593,11 +566,10 @@ contract Campaign is Ownable, ReentrancyGuard {
         _refundOne(msg.sender);
     }
 
-    /// @notice Owner or operator tops the escrow up so every outstanding share can be repaid at the
+    /// @notice Owner tops the escrow up so every outstanding share can be repaid at the
     ///         subscription price. This is how the parts may leave after a partial purchase: holders are
     ///         repaid first, then the owner takes the parts at cost. Excess is sweepable with recoverBnb.
-    function topUpShortfall() external payable nonReentrant {
-        _requireOperator();
+    function topUpShortfall() external payable onlyOwner nonReentrant {
         if (scene != Scene.Executing) revert WrongScene();
         if (msg.value == 0) revert ZeroPrice();
         raisedBnb += msg.value;
@@ -704,13 +676,12 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── secondary-market bids (owner) ───────────────────────────
 
-    /// @notice Place both legs of a buy order. Owner or operator, Executing/Buying only. NAND is id 0,
+    /// @notice Place both legs of a buy order. Owner only, Executing/Buying only. NAND is id 0,
     ///         LATCH is id 1. Each leg sends qty × price from `raisedBnb`; a zero-qty leg is skipped
     ///         (bid id 0). One order at a time. If the total cost exceeds `raisedBnb` it sets
     ///         `executionFailed` and places nothing — no revert.
-    /// @dev Operator-level because ordering is the daily step that produces `Ready` (cancel / confirm /
-    ///      sell are already operator-level); the spend is reversible via `cancelTransistorOrder`.
-    ///      `depositToPool` stays owner-only — that one is irreversible.
+    /// @dev The spend is reversible via `cancelTransistorOrder`, but ordering still moves the whole
+    ///      `raisedBnb` to a market, so it stays on the single owner key.
     /// @param nandQty_ NAND quantity; 0 skips the leg.
     /// @param nandPrice_ NAND price per unit in wei; ignored when nandQty_ is 0.
     /// @param latchQty_ LATCH quantity; 0 skips the leg.
@@ -720,8 +691,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         uint96 nandPrice_,
         uint256 latchQty_,
         uint96 latchPrice_
-    ) external nonReentrant whenLive {
-        _requireOperator();
+    ) external onlyOwner nonReentrant whenLive {
         _requireExecuting();
         if (phase != Phase.Buying) revert WrongScene();
         _requireLegParams(nandQty_, nandPrice_, latchQty_, latchPrice_);
@@ -760,12 +730,12 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice Book the leftover subscription BNB as holder-claimable surplus without ending the round:
     ///         parts stay, `phase` stays Ready, depositToPool stays available. No holder loop — each holder
     ///         pulls with claimSurplus. Requires nothing owed by the market, and closes openRefund / abandon.
-    ///         Owner or operator any time; anyone else after FAIL_GRACE, so a vanished team cannot lock BNB.
+    ///         Owner any time; anyone else after FAIL_GRACE, so a vanished team cannot lock BNB.
     function returnSurplus() external nonReentrant {
         _requireReady();
         if (pooled) revert AlreadyPooled();
         if (_owed() > 0) revert ProceedsPending();
-        if (!_isOperator() && block.timestamp < _graceBase() + FAIL_GRACE) revert RefundNotAvailable();
+        if (msg.sender != owner && block.timestamp < _graceBase() + FAIL_GRACE) revert RefundNotAvailable();
         if (outstandingShares == 0) revert ZeroShares();
         if (raisedBnb == 0) revert ZeroShares();
         _returnSurplus();
@@ -775,9 +745,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice Open refunds. Buying only — in Ready the exit is returnSurplus. Closed once returnSurplus
     ///         booked the principal. Moves no BNB: it flags the round failed and every holder pulls with
     ///         refund, so gas stays flat and no holder can block the call.
-    ///         Owner or operator: an abort switch, never a payout, and never halted.
-    function openRefund() external nonReentrant {
-        _requireOperator();
+    ///         Owner: an abort switch, never a payout, and never halted.
+    function openRefund() external onlyOwner nonReentrant {
         _requireExecuting();
         if (surplusBase != 0) revert SurplusAlreadyReturned();
         if (phase == Phase.Ready) revert UseReturnSurplus();
@@ -809,8 +778,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (outstandingShares == 0 && _holdersMadeWhole()) _returnHeldParts();
     }
 
-    /// @notice Cancel the open remainder of the bid and return to Buying. Owner or operator while nothing
-    ///         has filled; once anything filled, anyone may cancel the rest. Refused when fully filled and
+    /// @notice Cancel the open remainder of the bid and return to Buying. Owner while nothing has filled;
+    ///         once anything filled, anyone may cancel the rest. Refused when fully filled and
     ///         delivered. Filled quantity stays spent; a round dropped from the registry is cancellable by
     ///         anyone. Never halted: this is the escape hatch that returns escrow to the pool.
     ///         This is the only right a retired round opens up: pooling and selling stay owner-only.
@@ -818,11 +787,11 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (phase != Phase.Listed) revert NotListed();
         bool touched = _filledSome(nandBidId, nandQty) || _filledSome(latchBidId, latchQty);
         if (orderFilled() && _partsOnHand()) revert OrderFilled();
-        if (!touched && !_isOperator() && !_retired()) revert NotOperator(msg.sender);
+        if (!touched && msg.sender != owner && !_retired()) revert NotOwner(msg.sender);
         _cancelLiveOrder();
     }
 
-    /// @notice Flag the round as failed so holders can refund. Owner or operator any time; anyone else after
+    /// @notice Flag the round as failed so holders can refund. Owner any time; anyone else after
     ///         FAIL_GRACE. Cancels the unfilled legs first so their escrow returns to `raisedBnb`. Refused in
     ///         Ready, where the parts are already the holders' asset. No-op when already failed or not
     ///         Executing. Never halted: it only opens the refund gate and moves no BNB.
@@ -831,7 +800,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         // returnSurplus already returned the principal; flagging a refund would burn shares for 0 BNB.
         if (surplusBase != 0) revert SurplusAlreadyReturned();
         if (phase == Phase.Ready) revert UseReturnSurplus();
-        if (!_isOperator() && block.timestamp < _graceBase() + FAIL_GRACE) {
+        if (msg.sender != owner && block.timestamp < _graceBase() + FAIL_GRACE) {
             revert RefundNotAvailable();
         }
         executionFailed = true; // CEI: set before the market callback; a revert rolls it back.
@@ -841,7 +810,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit ExecutionFailed(0, raisedBnb);
     }
 
-    /// @notice Sell held parts into a resting buy order. Owner or operator; Ready only — the market has no
+    /// @notice Sell held parts into a resting buy order. Owner only; Ready only — the market has no
     ///         ask book, so this is the only sell path. The market pulls the parts and pays this round
     ///         inside the fill: the official one sends BNB straight to receive(), the mock credits owed()
     ///         for a withdraw. Both paths end with the proceeds in `raisedBnb`.
@@ -854,10 +823,10 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @param quantity Units to sell; at most the bid's remaining and this contract's balance.
     function sellTransistors(uint256 bidId, uint8 tokenId, uint256 quantity)
         external
+        onlyOwner
         nonReentrant
         whenLive
     {
-        _requireOperator();
         _requireReady();
         if (pooled) revert AlreadyPooled();
         if (bidId == 0 || quantity == 0) revert NotABid();
@@ -932,7 +901,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     // ─────────────────────────── mining pool (commit) ───────────────────────────
 
     /// @notice Commit the round's parts to the mining pool. IRREVERSIBLE. Owner only, Ready only.
-    ///         Never delegated: the factory dropping the round opens only the reversible cancel, because
+    ///         Never public: the factory dropping the round opens only the reversible cancel, because
     ///         pooling would let a third party decide "mine vs sell" for the holders.
     ///         Halted stops it: the breaker must be able to hold the irreversible step.
     ///         1. Book the leftover BNB as holder-claimable surplus, before the parts leave.

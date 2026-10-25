@@ -206,7 +206,7 @@ describe("escrow can never be stranded", () => {
 
     // 宽限期内非 Owner 仍然不能杀期，也不能撤单。
     await expect(campaign.connect(alice).markFailed()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
-    await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "NotOperator");
+    await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "NotOwner");
 
     await time.increase(3 * 24 * 3600);
     // 逃生口：markFailed 先把未成交的买单撤掉，押金退回 raisedBnb，退款口径不变。
@@ -260,7 +260,7 @@ describe("escrow can never be stranded", () => {
 
     await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(
       campaign,
-      "NotOperator",
+      "NotOwner",
     );
     expect(await factory.isRegistered(await campaign.getAddress())).to.equal(true);
     await factory.connect(owner).removeCampaign(0);
@@ -290,7 +290,7 @@ describe("escrow can never be stranded", () => {
       .to.be.revertedWithCustomError(campaign, "NotOwner")
       .withArgs(alice.address);
     await expect(campaign.connect(alice).sellTransistors(1n, 0, 1n))
-      .to.be.revertedWithCustomError(campaign, "NotOperator")
+      .to.be.revertedWithCustomError(campaign, "NotOwner")
       .withArgs(alice.address);
     await expect(campaign.connect(alice).recoverTransistors(await parts.getAddress(), 0, 1n))
       .to.be.revertedWithCustomError(campaign, "NotOwner")
@@ -514,10 +514,10 @@ describe("transistor order + deposit to pool", () => {
     const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: SHARE_PRICE * 100n });
     await campaign.connect(owner).setPlan(408n);
-    await expect(place(campaign, alice, 100n, UNIT)).to.be.revertedWithCustomError(campaign, "NotOperator");
+    await expect(place(campaign, alice, 100n, UNIT)).to.be.revertedWithCustomError(campaign, "NotOwner");
     await place(campaign, owner, 100n, UNIT);
     expect(await campaign.phase()).to.equal(PHASE.Listed);
-    await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "NotOperator");
+    await expect(campaign.connect(alice).cancelTransistorOrder()).to.be.revertedWithCustomError(campaign, "NotOwner");
     expect(await campaign.nandBidId()).to.not.equal(0n);
     const raisedAfterBid = await campaign.raisedBnb();
     expect(raisedAfterBid).to.equal(SHARE_PRICE * 100n - 100n * UNIT);
@@ -875,9 +875,9 @@ describe("transistor order + deposit to pool", () => {
     await minter.connect(bob).placeBid(await campaign.transistors(), 0, UNIT - 1n, 1n, { value: UNIT - 1n });
     await expect(campaign.connect(owner).sellTransistors(cheap, 0, 1n))
       .to.be.revertedWithCustomError(campaign, "PriceBelowCost");
-    // 非 owner 且非操作员不能卖。
+    // 非 owner 不能卖。
     await expect(campaign.connect(alice).sellTransistors(bidId, 0, 1n))
-      .to.be.revertedWithCustomError(campaign, "NotOperator");
+      .to.be.revertedWithCustomError(campaign, "NotOwner");
     // 手里数量不够（LATCH 一颗都没有）。
     const latchBid = await placeBuyBid(minter, bob, campaign, 1, UNIT, 1n);
     await expect(campaign.connect(owner).sellTransistors(latchBid, 1, 1n))
@@ -1364,7 +1364,7 @@ describe("transistor order + deposit to pool", () => {
     const { campaign, owner, alice, bob } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: SHARE_PRICE * 60n });
     await campaign.connect(bob).subscribe(40n, { value: SHARE_PRICE * 40n });
-    await expect(campaign.connect(alice).openRefund()).to.be.revertedWithCustomError(campaign, "NotOperator");
+    await expect(campaign.connect(alice).openRefund()).to.be.revertedWithCustomError(campaign, "NotOwner");
     const aliceBefore = await ethers.provider.getBalance(alice.address);
     const bobBefore = await ethers.provider.getBalance(bob.address);
     // 开闸这一笔不动钱：既不发 Refunded，也不改变任何人的余额。
@@ -2392,62 +2392,78 @@ describe("audit round 3: Ready has a permissionless failsafe", () => {
   });
 });
 
-describe("operator hot wallet", () => {
-  it("setOperator is owner-only, refuses the contract itself, and can be cleared", async () => {
-    const { campaign, owner, alice, carol } = await loadFixture(deployFixture);
-    await expect(campaign.connect(alice).setOperator(alice.address))
-      .to.be.revertedWithCustomError(campaign, "NotOwner")
-      .withArgs(alice.address);
-    // 合约自己发不出交易，设成自己只会假装有操作员。
-    await expect(campaign.connect(owner).setOperator(await campaign.getAddress()))
-      .to.be.revertedWithCustomError(campaign, "ZeroAddress");
-    await expect(campaign.connect(owner).setOperator(carol.address))
-      .to.emit(campaign, "OperatorSet")
-      .withArgs(ethers.ZeroAddress, carol.address);
-    expect(await campaign.operator()).to.equal(carol.address);
-    // 清零 = 一键收回全部操作权
-    await campaign.connect(owner).setOperator(ethers.ZeroAddress);
-    expect(await campaign.operator()).to.equal(ethers.ZeroAddress);
+describe("single owner key", () => {
+  it("has no operator role left: no setOperator, no operator getter", async () => {
+    const { campaign } = await loadFixture(deployFixture);
+    // 单钥匙：角色只剩 owner。旧的操作员入口必须彻底消失，否则等于留了一条没人负责的后门。
+    expect(campaign.operator).to.equal(undefined);
+    expect(campaign.setOperator).to.equal(undefined);
   });
 
-  it("operator runs the routine steps while the owner keeps every one of them", async () => {
-    const { campaign, owner, alice, carol, minter } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
+  it("a stranger cannot reach a single owner step, before or after the grace window", async () => {
+    const { campaign, owner, alice, parts } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    const partsAddr = await parts.getAddress();
+
+    // 下单把整池 BNB 交给市场，只有 owner 能按。
+    await expect(place(campaign, alice, 1n, UNIT)).to.be.revertedWithCustomError(campaign, "NotOwner");
+    // 宽限期内的开闸 / 判失败也不行。
+    await expect(campaign.connect(alice).openRefund()).to.be.revertedWithCustomError(campaign, "NotOwner");
+    await expect(campaign.connect(alice).markFailed()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
+    await expect(campaign.connect(alice).halt()).to.be.revertedWithCustomError(campaign, "NotOwner");
+
+    await place(campaign, owner, 1n, UNIT);
+    const denied = [
+      () => campaign.connect(alice).setPlan(1n),
+      () => campaign.connect(alice).cancelTransistorOrder(),
+      () => campaign.connect(alice).setMiningPool(alice.address),
+      () => campaign.connect(alice).setMaterialMarket(alice.address),
+      () => campaign.connect(alice).setServiceFee(100, [alice.address], [10000]),
+      () => campaign.connect(alice).recoverBnb(),
+      () => campaign.connect(alice).recoverTransistors(partsAddr, 0, 0n),
+      () => campaign.connect(alice).depositToPool(),
+      () => campaign.connect(alice).abandonOrder(),
+      () => campaign.connect(alice).setPhase(PHASE.Buying),
+      () => campaign.connect(alice).topUpShortfall({ value: 1n }),
+      () => campaign.connect(alice).transferOwnership(alice.address),
+    ];
+    for (const call of denied) {
+      await expect(call()).to.be.revertedWithCustomError(campaign, "NotOwner");
+    }
+    expect(await campaign.owner()).to.equal(owner.address);
+  });
+
+  it("the owner runs every routine step alone, end to end", async () => {
+    const { campaign, owner, alice, minter } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
 
-    // 计划只是展示字段：操作员可改。
-    await expect(campaign.connect(carol).setPlan(408n)).to.emit(campaign, "PlanUpdated").withArgs(408n);
-    // 挂买单是日常步骤（撤单 / 确认 / 卖出本来就在操作员手里）：操作员可下单，托管从池子里扣。
-    await place(campaign, carol, 100n, UNIT);
+    // 计划只是展示字段。
+    await expect(campaign.connect(owner).setPlan(408n)).to.emit(campaign, "PlanUpdated").withArgs(408n);
+    // 挂买单：托管从池子里扣。
+    await place(campaign, owner, 100n, UNIT);
     expect(await campaign.nandQty()).to.equal(100n);
-    // 未成交的撤单 = 把托管退回池子，操作员可以做。
-    await expect(campaign.connect(carol).cancelTransistorOrder()).to.emit(campaign, "TransistorOrderCancelled");
+    // 未成交的撤单 = 把托管退回池子。
+    await expect(campaign.connect(owner).cancelTransistorOrder()).to.emit(campaign, "TransistorOrderCancelled");
     expect(await campaign.phase()).to.equal(PHASE.Buying);
-    // owner 仍保有同一项权利：授权不构成单向门。
     await place(campaign, owner, 100n, UNIT);
     await fillAndConfirm(campaign, minter);
-    // 不用等宽限期：操作员立刻可以把余款记到持份人名下（只多发钱，不多收钱）。
-    await expect(campaign.connect(carol).returnSurplus()).to.emit(campaign, "SurplusReturned");
+    // 不用等宽限期：owner 立刻可以把余款记到持份人名下（只多发钱，不多收钱）。
+    await expect(campaign.connect(owner).returnSurplus()).to.emit(campaign, "SurplusReturned");
     await expect(campaign.connect(alice).claimSurplus()).to.emit(campaign, "SurplusClaimed");
 
-    // 入池不可逆：永远只认 owner。
     const pool = await ethers.deployContract("MockERC1155");
     await campaign.connect(owner).setMiningPool(await pool.getAddress());
-    await expect(campaign.connect(carol).depositToPool())
-      .to.be.revertedWithCustomError(campaign, "NotOwner")
-      .withArgs(carol.address);
     await campaign.connect(owner).depositToPool();
     expect(await campaign.scene()).to.equal(SCENE.Mining);
   });
 
-  it("operator can abort on its own: markFailed cancels the bid and opens refunds", async () => {
-    const { campaign, owner, alice, carol } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
+  it("the owner can abort on its own: markFailed cancels the bid and opens refunds", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
     await place(campaign, owner, 100n, UNIT);
 
-    // 宽限期只约束第三方；操作员必须能立刻刹车。
-    await expect(campaign.connect(carol).markFailed()).to.emit(campaign, "ExecutionFailed");
+    // 宽限期只约束第三方；owner 必须能立刻刹车。
+    await expect(campaign.connect(owner).markFailed()).to.emit(campaign, "ExecutionFailed");
     expect(await campaign.phase()).to.equal(PHASE.Buying);
     // 撤单押金已回到池子，退款口径不变。
     expect(await campaign.raisedBnb()).to.equal(100n * SHARE_PRICE);
@@ -2455,90 +2471,49 @@ describe("operator hot wallet", () => {
     expect(await campaign.outstandingShares()).to.equal(0n);
   });
 
-  it("operator can open refunds from Buying without waiting for the grace period", async () => {
-    const { campaign, owner, alice, carol } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
+  it("the owner can open refunds from Buying without waiting for the grace period", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
 
-    // openRefund 只开闸不动钱：操作员按得动，但也带不走任何 BNB。
-    await expect(campaign.connect(carol).openRefund()).to.emit(campaign, "RefundsOpened");
+    // openRefund 只开闸不动钱：能按，但带不走任何 BNB。
+    await expect(campaign.connect(owner).openRefund()).to.emit(campaign, "RefundsOpened");
     expect(await campaign.executionFailed()).to.equal(true);
     await expect(campaign.connect(alice).refund()).to.emit(campaign, "Refunded");
   });
 
-  it("operator never reaches an owner-only lever", async () => {
-    const { campaign, owner, alice, carol, minter, parts } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
+  it("control never leaves the owner key while a round is running", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    // 做出一张活单，让 sell / cancel 有东西可操作。
     await campaign.connect(owner).setPlan(408n);
-    await place(campaign, owner, 1n, UNIT);
 
-    const partsAddr = await parts.getAddress();
-    // 非操作员的第三方连下单都进不来（NotOperator，而不是 NotOwner）。
-    await expect(place(campaign, alice, 1n, UNIT))
-      .to.be.revertedWithCustomError(campaign, "NotOperator")
+    await expect(campaign.connect(alice).setPlan(409n))
+      .to.be.revertedWithCustomError(campaign, "NotOwner")
       .withArgs(alice.address);
-    const denied = [
-      () => campaign.connect(carol).setMiningPool(carol.address),
-      () => campaign.connect(carol).setMaterialMarket(carol.address),
-      () => campaign.connect(carol).setServiceFee(100, [carol.address], [10000]),
-      () => campaign.connect(carol).recoverBnb(),
-      () => campaign.connect(carol).recoverTransistors(partsAddr, 0, 0n),
-      () => campaign.connect(carol).depositToPool(),
-      () => campaign.connect(carol).abandonOrder(),
-      () => campaign.connect(carol).setPhase(PHASE.Buying),
-      () => campaign.connect(carol).setOperator(carol.address),
-      () => campaign.connect(carol).transferOwnership(carol.address),
-    ];
-    for (const call of denied) {
-      await expect(call()).to.be.revertedWithCustomError(campaign, "NotOwner");
-    }
-    // 控制权还在 owner 手里，操作员动不了账本。
-    expect(await campaign.owner()).to.equal(owner.address);
-    expect(await campaign.operator()).to.equal(carol.address);
-  });
-
-  it("clearing the operator revokes every delegated right at once", async () => {
-    const { campaign, owner, alice, carol } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
-    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await campaign.connect(carol).setPlan(408n);
-
-    await campaign.connect(owner).setOperator(ethers.ZeroAddress);
-    await expect(campaign.connect(carol).setPlan(409n))
-      .to.be.revertedWithCustomError(campaign, "NotOperator")
-      .withArgs(carol.address);
-    await expect(campaign.connect(carol).openRefund())
-      .to.be.revertedWithCustomError(campaign, "NotOperator")
-      .withArgs(carol.address);
-    await expect(campaign.connect(carol).halt())
-      .to.be.revertedWithCustomError(campaign, "NotOperator")
-      .withArgs(carol.address);
+    await expect(campaign.connect(alice).openRefund())
+      .to.be.revertedWithCustomError(campaign, "NotOwner")
+      .withArgs(alice.address);
+    await expect(campaign.connect(alice).resume()).to.be.revertedWithCustomError(campaign, "NotOwner");
     // owner 不受影响。
     await campaign.connect(owner).setPlan(410n);
     expect(await campaign.estHashpower()).to.equal(410n);
+    expect(await campaign.owner()).to.equal(owner.address);
   });
 });
 
 describe("circuit breaker", () => {
-  it("either can halt, only the owner can resume, so a leaked operator key cannot undo its brake", async () => {
-    const { campaign, owner, alice, carol } = await loadFixture(deployFixture);
+  it("owner-only halt and resume: no third party can run the brake", async () => {
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
     await expect(campaign.connect(alice).halt())
-      .to.be.revertedWithCustomError(campaign, "NotOperator")
-      .withArgs(alice.address);
-    await campaign.connect(owner).setOperator(carol.address);
-
-    await expect(campaign.connect(carol).halt())
-      .to.emit(campaign, "HaltChanged")
-      .withArgs(carol.address, true);
-    expect(await campaign.halted()).to.equal(true);
-    await expect(campaign.connect(carol).halt()).to.be.revertedWithCustomError(campaign, "AlreadyHalted");
-
-    // 热钱包只负责拉闸；抬闸必须回到冷钱包。
-    await expect(campaign.connect(carol).resume())
       .to.be.revertedWithCustomError(campaign, "NotOwner")
-      .withArgs(carol.address);
+      .withArgs(alice.address);
+
+    await expect(campaign.connect(owner).halt())
+      .to.emit(campaign, "HaltChanged")
+      .withArgs(owner.address, true);
+    expect(await campaign.halted()).to.equal(true);
+    await expect(campaign.connect(owner).halt()).to.be.revertedWithCustomError(campaign, "AlreadyHalted");
+
+    // 抬闸同样只认 owner（这里的 owner 应当是多签）。
     await expect(campaign.connect(alice).resume())
       .to.be.revertedWithCustomError(campaign, "NotOwner")
       .withArgs(alice.address);
@@ -2547,15 +2522,11 @@ describe("circuit breaker", () => {
       .withArgs(owner.address, false);
     expect(await campaign.halted()).to.equal(false);
     await expect(campaign.connect(owner).resume()).to.be.revertedWithCustomError(campaign, "NotHalted");
-
-    // owner 自己也能拉闸。
-    await expect(campaign.connect(owner).halt()).to.emit(campaign, "HaltChanged").withArgs(owner.address, true);
   });
 
   it("a halt stops money-in and ordering, and nothing else changes state", async () => {
-    const { campaign, owner, alice, carol } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
-    await campaign.connect(carol).halt();
+    const { campaign, owner, alice } = await loadFixture(deployFixture);
+    await campaign.connect(owner).halt();
 
     await expect(campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE }))
       .to.be.revertedWithCustomError(campaign, "Halted");
@@ -2563,7 +2534,7 @@ describe("circuit breaker", () => {
 
     await campaign.connect(owner).resume();
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await campaign.connect(carol).halt();
+    await campaign.connect(owner).halt();
     // 下单会把托管 BNB 交给市场：熔断期间不许。
     await expect(place(campaign, owner, 100n, UNIT)).to.be.revertedWithCustomError(campaign, "Halted");
     expect(await campaign.phase()).to.equal(PHASE.Buying);
@@ -2574,14 +2545,13 @@ describe("circuit breaker", () => {
   });
 
   it("a halt freezes parts-out and pooling but never freezes the holders' BNB", async () => {
-    const { campaign, owner, alice, carol, minter, bob } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
+    const { campaign, owner, alice, minter, bob } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
     await place(campaign, owner, 100n, UNIT);
     await fillAndConfirm(campaign, minter);
     const bidId = await placeBuyBid(minter, bob, campaign, 0, ethers.parseEther("0.01"), 10n);
 
-    await campaign.connect(carol).halt();
+    await campaign.connect(owner).halt();
     // 晶体管是本期的抵押：熔断期间既不许卖，也不许入池。
     await expect(campaign.connect(owner).sellTransistors(bidId, 0, 10n))
       .to.be.revertedWithCustomError(campaign, "Halted");
@@ -2589,7 +2559,7 @@ describe("circuit breaker", () => {
     await expect(campaign.connect(owner).depositToPool())
       .to.be.revertedWithCustomError(campaign, "Halted");
     // 但余款照旧记到持份人名下，并且照旧可以自己领走 —— 熔断不是没收。
-    await expect(campaign.connect(carol).returnSurplus()).to.emit(campaign, "SurplusReturned");
+    await expect(campaign.connect(owner).returnSurplus()).to.emit(campaign, "SurplusReturned");
     await expect(campaign.connect(alice).claimSurplus()).to.emit(campaign, "SurplusClaimed");
 
     // 抬闸后一切恢复，且账本没被熔断改过。
@@ -2598,13 +2568,12 @@ describe("circuit breaker", () => {
   });
 
   it("a halt never blocks a refund, even when the round is killed while halted", async () => {
-    const { campaign, owner, alice, bob, carol } = await loadFixture(deployFixture);
-    await campaign.connect(owner).setOperator(carol.address);
+    const { campaign, owner, alice, bob } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
     await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
     await place(campaign, owner, 100n, UNIT);
 
-    await campaign.connect(carol).halt();
+    await campaign.connect(owner).halt();
     // 撤单是逃生舱：熔断期间依然可用，托管可以回到池子。
     await expect(campaign.connect(owner).cancelTransistorOrder()).to.emit(campaign, "TransistorOrderCancelled");
     await campaign.connect(owner).markFailed();
