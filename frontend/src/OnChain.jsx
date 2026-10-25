@@ -349,7 +349,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                     <label className="field"><span>单价 BNB/份</span><input inputMode="decimal" value={form.listPrice} onChange={(e) => setForm({ ...form, listPrice: e.target.value })} /></label>
                   </div>
                   <div className="chain-actions">
-                    <button className="btn btn-primary" type="button" disabled={busy || !account || halted} title={halted ? "本期已熔断：份额挂单已暂停" : undefined} onClick={() => run("挂牌", (sg) => tx.listShares(sg, BigInt(form.listCount), parseEther(form.listPrice)))}>{halted ? "已熔断 · 挂牌暂停" : "挂牌"}</button>
+                    <button className="btn btn-primary" type="button" disabled={busy || !account || halted} title={halted ? "本期已熔断：份额挂单已暂停" : undefined} onClick={() => run("挂牌", (sg) => tx.listShares(sg, BigInt(form.listCount), parseBnb(form.listPrice)))}>{halted ? "已熔断 · 挂牌暂停" : "挂牌"}</button>
                   </div>
                 </div>
               </article>

@@ -300,7 +300,7 @@ export function resolveCampaignDesign(round, book = null) {
     processorId = round.processorId;
   } else if (!chain && round?.circuitModelId) {
     const fromCircuit = findCircuit(round.circuitModelId)?.processor;
-    if (fromTr && PROCESSOR_IDS.includes(fromTr)) processorId = fromTr;
+    if (fromCircuit && PROCESSOR_IDS.includes(fromCircuit)) processorId = fromCircuit;
   }
   if (!processorId && hp > 0) {
     // 旧期次没记处理器地址：用 H ÷ 电路数反推规模（P≈H/电路数），取标度最接近的处理器。
@@ -325,7 +325,7 @@ export function resolveCampaignDesign(round, book = null) {
     processorId,
     processor: processorId,
     processorScale: processorId ? processorScale(processorId) : null,
-    circuitModelId,
+    circuitModelId: circuitId,
     /** 链上 setPlan / execute 写入了算力，处理器由 H÷电路数反推 */
     processorInferred: chain ? hp > 0 && Boolean(processorId) : hp > 0,
     processorKnown: Boolean(processorId),

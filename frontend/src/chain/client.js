@@ -1073,6 +1073,8 @@ const MARKET_LOG_WINDOWS = 6; // 最多回看 6 × 50k 块（约 10 天）；凑
 const MARKET_LOG_SPAN = 50_000;
 /** 历史交易记录只保留最近这么多条（窄栏放不下更多，也不该翻旧账）。 */
 export const MARKET_TRADE_LIMIT = 5;
+/** 成交记录缓存（按期次分期次存 lastBlock + rows），避免每次刷新重扫。 */
+const TRADE_MARKS_KEY = "tapeout.circuitMarket.tradeMarks.v1";
 const blockTimeCache = new Map();
 /** 每个市场已扫到哪个块，避免每次刷新都重扫历史区间（旧版 Mock 没有任何事件）。 */
 const marketScanCursor = new Map();
