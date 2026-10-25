@@ -4,8 +4,8 @@ import { explorerAddress, explorerTx } from "./chain/config.js";
 import { round4, shortAddress } from "./fixtures.js";
 
 /**
- * 原路退款记录：读 Campaign 的 Refunded / RefundSendFailed 事件。
- * 读取失败（旧节点 / 旧合约）时退回调用方传入的汇总值，并注明只能看到累计数。
+ * 原路退款记录：读 Campaign 的 Refunded 事件。
+ * 读取失败时退回调用方传入的汇总值，并注明只能看到累计数。
  */
 export function RefundRecords({ campaignAddr, refreshKey, account, compact = false, fallback }) {
   const [data, setData] = useState(null);
@@ -30,14 +30,13 @@ export function RefundRecords({ campaignAddr, refreshKey, account, compact = fal
     pool: Number(fallback?.pool || 0),
     count: 0,
     holders: 0,
-    failed: 0,
   };
   const rows = useMemo(
     () => (mineOnly && me ? events.filter((row) => String(row.holder).toLowerCase() === me) : events),
     [events, mineOnly, me],
   );
 
-  const eventMineSum = mine.reduce((acc, row) => acc + (row.failed ? 0 : row.amount), 0);
+  const eventMineSum = mine.reduce((acc, row) => acc + row.amount, 0);
   // 合约的 refundedOf 是权威值；事件窗口没覆盖到的旧退款用 fallback 补足。
   const mineSum = Math.max(eventMineSum, Number(fallback?.mine || 0));
   const pool = Number(totals.pool) || 0;
@@ -79,7 +78,7 @@ export function RefundRecords({ campaignAddr, refreshKey, account, compact = fal
               <strong className={consistent ? undefined : "refund-mismatch"}>
                 {events.length ? (consistent ? "明细一致" : "明细待补") : "暂无明细"}
               </strong>
-              <small>{totals.failed ? `${totals.failed} 笔转账失败` : "按认筹地址原路退回"}</small>
+              <small>按认筹地址原路退回</small>
             </li>
           </ul>
         )}
@@ -106,8 +105,7 @@ export function RefundRecords({ campaignAddr, refreshKey, account, compact = fal
 
         {failed || (data && !data.scanned) ? (
           <p className="fine">
-            节点不支持查询这期的事件日志，只能看到累计已退 {round4(totals.totalRefunded || 0)} BNB。
-            换用支持 `eth_getLogs` 历史区间的节点后可显示逐笔记录。
+            节点不支持查历史事件，只能看到累计已退 {round4(totals.totalRefunded || 0)} BNB。换支持 `eth_getLogs` 的节点可看逐笔记录。
           </p>
         ) : rows.length > 0 ? (
           <ul className="refund-list">
@@ -118,7 +116,6 @@ export function RefundRecords({ campaignAddr, refreshKey, account, compact = fal
                   <span className="refund-holder">
                     {isMine ? <b>你</b> : null}
                     <em className="mono">{shortAddress(row.holder)}</em>
-                    {row.failed ? <i className="refund-failed">转账失败</i> : null}
                   </span>
                   <strong className="refund-amount">{round4(row.amount)} BNB</strong>
                   <span className="refund-time">{row.ts ? new Date(row.ts).toLocaleString("zh-CN") : `区块 ${row.blockNumber}`}</span>
@@ -131,14 +128,13 @@ export function RefundRecords({ campaignAddr, refreshKey, account, compact = fal
           </ul>
         ) : (
           <p className="fine">
-            {data ? "还没有原路退款记录。持份人在「我的资产」发起退款后，这里会按时间列出每一笔。" : "正在读取退款记录…"}
+            {data ? "还没有原路退款记录。持份人在「我的资产」退款后，这里会按时间列出。" : "正在读取退款记录…"}
           </p>
         )}
 
         {!compact && (
           <p className="fine">
-            退款直接读 Campaign 的 `Refunded` 事件，与「我的资产」里的原路退款是同一份链上记录；
-            `RefundSendFailed` 会单独标出，合约仍保留这笔待退金额。
+            数据来自 Campaign 的 `Refunded` 事件，与「我的资产」是同一份记录；退款失败会整笔回滚，这里只显示成功的记录。
           </p>
         )}
       </div>

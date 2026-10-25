@@ -178,6 +178,10 @@ export function bookFromState(state, account, extra = {}) {
     bnb,
     capped: false,
     owner: state.owner,
+    /** 操作员热钱包（owner 也拥有全部操作员权限）；未设置时是零地址。 */
+    operator: state.operator || "",
+    /** 熔断中：入口（认筹/挂单/卖出/入池/份额市场）全停，pull 与撤单仍可用。 */
+    halted: Boolean(state.halted),
     selfAddress: account,
     totalShares: Number(state.totalShares),
     /**
@@ -189,7 +193,6 @@ export function bookFromState(state, account, extra = {}) {
     latchFilled: Number(state.latchFilled ?? 0),
     estHashpower: Number(state.estHashpower),
     priceLock: bem(state.priceLock),
-    marketOrders: Boolean(state.marketOrders),
     /** 卖出侧读数：合约手里的晶体管、市场欠款、以及能吃的外部买单。 */
     sellSide: Boolean(state.sellSide),
     sellBids: Array.isArray(state.sellBids) ? state.sellBids.map((b) => ({
@@ -213,10 +216,6 @@ export function bookFromState(state, account, extra = {}) {
     nandRemaining: state.nandRemaining == null ? null : Number(state.nandRemaining),
     latchRemaining: state.latchRemaining == null ? null : Number(state.latchRemaining),
     marketOwed: bem(state.marketOwed || 0),
-    /** 这期合约有 sellTransistors()：ready 阶段可以吃外部买单把晶体管卖掉。 */
-    readyExit: state.readyExit !== false,
-    /** 这期合约有 returnSurplus()：确认到账后可提前把剩余募集款按份退回，且不影响入池。 */
-    surplusExit: Boolean(state.surplusExit),
     /** 已记账、尚未发到持有人手里的余款（BNB）。 */
     surplusOutstanding: bem(state.surplusOutstanding || 0),
     surplusBase: Number(state.surplusBase || 0),
@@ -224,6 +223,8 @@ export function bookFromState(state, account, extra = {}) {
     partsLatch: Number(state.partsLatch || 0),
     /** 晶体管是否已投入矿池（不可逆）。入池后合约余额归 0，展示要用 transistorCount。 */
     pooled: Boolean(state.pooled),
+    /** 矿池地址（链上事实）：零地址 = 未设置。Owner 面板用它判断能否 depositToPool。 */
+    miningPool: state.miningPool || "",
     transistors: state.transistors || "",
     _sharePriceWei: state.sharePriceBnb,
     _netlistHash: null,

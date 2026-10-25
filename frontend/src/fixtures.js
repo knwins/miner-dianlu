@@ -192,12 +192,12 @@ export const SCENE_COPY = {
   executing: {
     badge: SCENE.executing.label,
     tone: SCENE.executing.tone,
-    lead: "本期份数已售完。Owner 在晶体管市场挂单买入晶体管、确认到账后投入矿池；入池前本金不动，持份人可原路退还，Owner 也可改价重挂。",
+    lead: "份数已售完。Owner 挂单买入晶体管、确认到账后投入矿池；入池前本金不动，可原路退款或改价重挂。",
   },
   mining: {
     badge: SCENE.mining.label,
     tone: SCENE.mining.tone,
-    lead: "晶体管已投入矿池，本期进入挖矿（不可逆）。BEM 分配合约接入前不产出发放；退出只能把份额挂到转让市场。",
+    lead: "晶体管已入池，本期进入挖矿（不可逆）。分配合约接入前不产出发放；退出只能转让份额。",
   },
 };
 
@@ -538,7 +538,7 @@ const SCENE_SEED = {
   // 募集中：22/100 份 = 11,000 USDT
   funding: { sold: 22, mine: 3, harvestCount: 0, claimed: 0, executed: false, circuitId: "—", offset: 0, soldOutAgoHours: null },
   // 售罄 12 小时前 —— 观察期未满，任何人都还不能 execute
-  executing: { sold: 100, mine: 13, harvestCount: 0, claimed: 0, executed: false, circuitId: "待流片", offset: 0, soldOutAgoHours: 12 },
+  executing: { sold: 100, mine: 13, harvestCount: 0, claimed: 0, executed: false, circuitId: "—", offset: 0, soldOutAgoHours: 12 },
   // 执行时晶体管涨到 1.5x：权重由实际买入的晶体管数决定，与报价无关
   mining: { sold: 100, mine: 13, harvestCount: 12, claimedRatio: 0.72, executed: true, quoteMult: 1.5, circuitId: "#58241", offset: 1, soldOutAgoHours: 200 },
 };
@@ -731,7 +731,7 @@ export function seedCalls(round = ROUND) {
     { time: now - 26 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，挖矿产出服务费 ${formatBem(h.fee)} BEM` },
     { time: now - 3 * 86400_000, method: "claim", ok: true, message: `${shortAddress(WALLET)} 领取 ${formatBem(book.claimable)} BEM` },
     { time: now - 5 * 86400_000, method: "claim", ok: true, message: "0x8b21…B21A 领取 18.60 BEM" },
-    { time: now - 12 * 86400_000, method: "execute", ok: true, message: `购入晶体管完成流片，权重 ${book.hashpower}，电路 ${book.circuitId}` },
+    { time: now - 12 * 86400_000, method: "execute", ok: true, message: `已买入晶体管并转入矿池，算力 ${book.hashpower}` },
     { time: now - 13 * 86400_000, method: "subscribe", ok: true, message: `0x8b21…B21A 认筹 6 份，支付 ${(6 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000, method: "subscribe", ok: true, message: `${shortAddress(WALLET)} 认筹 4 份，支付 ${(4 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000 - 3600_000, method: "createCampaign", ok: true, message: `第 ${round.id} 期创建，${round.totalShares} 份 × ${round.sharePriceBnb} BNB，挖矿产出服务费 ${feePercentOf(round)}%` },
@@ -804,7 +804,7 @@ export function applyRefund(round, book, actor = null) {
   if (!fundingExpired && !executeFailed && !poolShort) {
     if (book.scene === "funding") return { ok: false, message: "募集尚未结束，不能退款。" };
     if (book.scene === "executing") return { ok: false, message: "本期尚未判执行失败，且池子仍够按原价兑付，不能退款。" };
-    return { ok: false, message: "只有在「募集超时未售罄」「流片失败」或「池子不足以按原价兑付」时才能原路退款。" };
+    return { ok: false, message: "只有在「募集超时未售罄」「执行失败」或「池子不足以按原价兑付」时才能原路退款。" };
   }
 
   const refundBnb = poolShort
@@ -983,16 +983,16 @@ export function applyTakeListing(round, book, listingId, shares, actor = null) {
 export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只 Factory Owner 能调用 tapeout.net 挂单逻辑。" };
+    return { ok: false, message: "只有 Factory Owner 能挂买单。" };
   }
   if (book.scene !== "executing") {
-    return { ok: false, message: "只有待执行状态需要调用 tapeout.net 挂单逻辑。" };
+    return { ok: false, message: "只有待执行状态可以挂买单。" };
   }
   if (book.executePhase === "ready") {
     return { ok: false, message: "晶体管已到账，无需再挂单。若要重挂请先取消。" };
   }
   if (book.executePhase === "listed") {
-    return { ok: false, message: "已经调用挂单逻辑，待成交或取消。" };
+    return { ok: false, message: "已经有挂单，等成交或先取消。" };
   }
   // 退款后可改价重挂；若已退光本金则不可再挂（对齐合约：executionFailed && raisedBnb == 0）
   if (book.executionFailed && (book.bnbPool || 0) <= 0) {
@@ -1007,10 +1007,10 @@ export function applyPlaceTransistorOrder(round, book, actor = null, args = {}) 
     args.nandPrice ?? args.unitPriceBnb ?? (book.priceLock > 0 ? book.priceLock : quoteUnitFallback(book))
   );
   if (!Number.isFinite(count) || count <= 0) {
-    return { ok: false, message: "挂单数量须为正整数（与 tapeout.net 一致）。" };
+    return { ok: false, message: "挂单数量须为正整数。" };
   }
   if (!Number.isFinite(unit) || unit <= 0) {
-    return { ok: false, message: "挂单单价须大于 0（与 tapeout.net 一致）。" };
+    return { ok: false, message: "挂单单价须大于 0。" };
   }
   return {
     ok: true,
@@ -1047,48 +1047,23 @@ function quoteUnitFallback(book) {
 export function applyOpenRefund(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只 Factory Owner 能发起退款。" };
+    return { ok: false, message: "只有 Factory Owner 能发起退款。" };
   }
   if (book.scene !== "executing") {
     return { ok: false, message: "只有待执行可以由 Owner 发起退款。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "晶体管已确认到账：这个状态不能退款结束本期（晶体管只能进矿池）。用「退回剩余募集款」把没花完的 BNB 按份退给持份人。" };
+    return { ok: false, message: "晶体管已到账，不能退款结束本期。用「退回剩余募集款」把没花完的 BNB 按份退给持份人。" };
   }
   if (book.executePhase && book.executePhase !== "buying") {
     return { ok: false, message: "请先取消挂单，再发起退款。" };
   }
-  // 对齐 openRefund：同笔交易按钱包退光仍持有的本金
-  let next = { ...book, executionFailed: true, wallets: { ...book.wallets } };
-  let paid = 0;
-  let pool = Number(book.bnbPool || 0);
-  let sold = Number(book.sold || 0);
-  for (const [addr, wallet] of Object.entries(book.wallets || {})) {
-    const free = Number(wallet.mine || 0);
-    if (free <= 0 || Number(wallet.listingShares || 0) > 0) continue;
-    const refundBnb = round4(free * Number(round.sharePriceBnb || 0));
-    if (refundBnb <= 0) continue;
-    paid = round4(paid + refundBnb);
-    pool = round4(Math.max(0, pool - refundBnb));
-    sold = Math.max(0, sold - free);
-    next.wallets[addr] = {
-      ...wallet,
-      mine: 0,
-      refunded: round4((wallet.refunded || 0) + refundBnb),
-      bnb: round4((wallet.bnb || 0) + refundBnb),
-    };
-  }
-  next = recomputeSelf({
-    ...next,
-    sold,
-    bnbPool: pool,
-    refundedBnb: round4((book.refundedBnb || 0) + paid),
-  });
+  // 对齐链上 openRefund：只开闸（标记执行失败），一分钱都不推送；
+  // 各钱包随后在自己的「我的资产」里 pull 领取，和真实合约一样。
+  const next = recomputeSelf({ ...book, executionFailed: true });
   return {
     ok: true,
-    message: paid > 0
-      ? `已退款。认筹 BNB 已按认筹地址原路退回（共 ${paid} BNB）。`
-      : "已标记流片失败；没有可退份额（可能已全部自助退款）。",
+    message: "已打开退款：本期判为执行失败，持份人各自「原路退款」领回本金。",
     book: next,
   };
 }
@@ -1099,19 +1074,19 @@ export function applyOpenRefund(round, book, actor = null) {
 export function applyCancelTransistorOrder(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只 Factory Owner 能取消 tapeout.net 晶体管挂单。" };
+    return { ok: false, message: "只有 Factory Owner 能取消挂单。" };
   }
   if (book.scene !== "executing") {
-    return { ok: false, message: "只有待执行状态有 tapeout.net 晶体管挂单可取消。" };
+    return { ok: false, message: "只有待执行状态才有挂单可取消。" };
   }
   if (book.executePhase !== "listed" && book.executePhase !== "ready") {
-    return { ok: false, message: "当前没有进行中的 tapeout.net 晶体管挂单。" };
+    return { ok: false, message: "当前没有进行中的挂单。" };
   }
   return {
     ok: true,
     message: book.executePhase === "ready"
-      ? "已从待流片撤回，回到待挂单状态。"
-      : "已取消 tapeout.net 晶体管挂单，回到待挂单状态。",
+      ? "已回到待挂单状态。"
+      : "已取消挂单，回到待挂单状态。",
     book: {
       ...book,
       executePhase: "buying",
@@ -1130,20 +1105,20 @@ export function applyCancelTransistorOrder(round, book, actor = null) {
 export function applyConfirmTransistors(round, book, actor = null) {
   const who = actor || identify(WALLET, book);
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只 Factory Owner 能确认 tapeout.net 晶体管成交到账。" };
+    return { ok: false, message: "只有 Factory Owner 能确认到账。" };
   }
   if (book.scene !== "executing") {
-    return { ok: false, message: "只有待执行状态需要确认 tapeout.net 晶体管到账。" };
+    return { ok: false, message: "只有待执行状态可以确认到账。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "晶体管已确认到账，直接执行流片开矿即可。" };
+    return { ok: false, message: "晶体管已确认到账，可直接入池。" };
   }
   if (book.executePhase !== "listed") {
-    return { ok: false, message: "请先调用 tapeout.net 挂单逻辑，再确认成交到账。" };
+    return { ok: false, message: "请先挂买单，再确认到账。" };
   }
   return {
     ok: true,
-    message: "已确认 tapeout.net 晶体管成交并到账，解锁流片开矿。",
+    message: "已确认晶体管成交并到账，可以入池。",
     book: {
       ...book,
       executePhase: "ready",
@@ -1154,7 +1129,7 @@ export function applyConfirmTransistors(round, book, actor = null) {
 }
 
 /**
- * 执行换币 + 流片。这是「预估」变成「实际」的唯一地方。
+ * 把晶体管投入矿池：预估变成实际的唯一地方。
  *
  * 权限：仅 Factory Owner。晶体管到账后即可执行，不再等待观察期。
  * 执行逻辑：直接按 Owner 在晶体管市场实际买入并确认到账的晶体管数量入池开矿。
@@ -1170,14 +1145,14 @@ export function applyExecute(round, book, quote = MARKET, actor = null) {
    * 自然售罄进入 executing 时已补 executePhase="buying"（见 applySubscribe），故此处会正确拦住。
    */
   if (book.executePhase && book.executePhase !== "ready") {
-    return { ok: false, message: "晶体管尚未到位，请先由 Owner 调用 tapeout.net 挂单逻辑并确认成交到账后再执行流片。" };
+    return { ok: false, message: "晶体管还没到账。先挂买单并确认到账，再入池。" };
   }
 
   const who = actor || identify(WALLET, book);
   const label = who.label || (who.role === ROLE.OWNER ? "Factory Owner" : who.shares > 0 ? "持份用户" : "未持份地址");
   // F3：execute 不可逆（把全期募集款烧掉），权限收紧为仅 Factory Owner
   if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只 Factory Owner 可以执行换币流片（不可逆操作）。" };
+    return { ok: false, message: "只有 Factory Owner 能把晶体管投入矿池（不可逆）。" };
   }
 
   // 价格快照锁价——以本次执行的报价（或挂单时锁定的报价）结算，
@@ -1220,7 +1195,7 @@ export function applyExecute(round, book, quote = MARKET, actor = null) {
     ok: true,
     scene: "mining",
     message: `${label}触发 execute：募集 ${est.hardCapBnb} BNB，购入 ${parts} 个${est.transistorName}，` +
-      `流片权重 ${hashpower}` +
+      `入池算力 ${hashpower}` +
       (surplus > 0 ? `；余量 ${surplus} BNB 已按份退回` : "") +
       `。`,
     book: recomputeSelf({

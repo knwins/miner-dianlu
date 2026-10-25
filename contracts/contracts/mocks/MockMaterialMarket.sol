@@ -12,8 +12,8 @@ interface IMockPartsMint {
 /// @notice Testnet stand-in with the official BUY-side ABI. There is no ask book, exactly like mainnet.
 ///         placeBid escrows BNB. cancelBid refunds the unfilled part to the buyer.
 ///         fillBid is the seller path: it pulls the parts from msg.sender, hands them to the bid's buyer
-///         and credits price × quantity minus feeBps to owed(msg.sender) — the same shape as the official
-///         market, so Campaign.sellTransistors() → fillBid → withdraw() is exercised end to end.
+///         and pays price × quantity minus feeBps — credited to owed(msg.sender) by default, or sent to
+///         the seller inside the fill when setPushProceeds(true) (the mainnet shape).
 ///         simulateSellerFill only decreases remaining (test helper for "somebody delivered to our bid").
 ///         deliverBid / deliverBidAll also hand the parts to the buyer, so a debug session can walk
 ///         Buying -> Listed -> Ready -> depositToPool without a separate mint transaction.
@@ -67,6 +67,21 @@ contract MockMaterialMarket is IMaterialMarket {
         blockCancel = on;
     }
 
+    /// @dev Test switch: pay the seller inside fillBid (what the mainnet market does) instead of
+    ///      crediting owed(). Campaign.sellTransistors must accept both shapes.
+    bool public pushProceeds;
+
+    function setPushProceeds(bool on) external {
+        pushProceeds = on;
+    }
+
+    /// @dev Test switch: fillBid moves the parts but pays the seller nothing (a broken market).
+    bool public payNothing;
+
+    function setPayNothing(bool on) external {
+        payNothing = on;
+    }
+
     function setReturnZeroId(bool on) external {
         returnZeroId = on;
     }
@@ -118,8 +133,9 @@ contract MockMaterialMarket is IMaterialMarket {
         if (!ok) revert BadBid();
     }
 
-    /// @notice Official seller path: pull the parts from the caller, send them to the buyer, credit the
-    ///         net proceeds (price × quantity − feeBps) to owed(caller).
+    /// @notice Official seller path: pull the parts from the caller, send them to the buyer, pay out the
+    ///         net proceeds (price × quantity − feeBps). Mainnet sends the BNB right away; the default
+    ///         mock shape credits owed(caller) for withdraw().
     function fillBid(uint256 id, uint256 quantity) external {
         if (!orderVault) revert BadBid();
         Bid storage b = _bids[id];
@@ -127,10 +143,15 @@ contract MockMaterialMarket is IMaterialMarket {
         b.remaining -= quantity;
         uint256 gross = quantity * uint256(b.price);
         uint256 fee = (gross * b.feeBps) / 10_000;
-        _owed[msg.sender] += gross - fee;
+        uint256 net = payNothing ? 0 : gross - fee;
+        if (!pushProceeds && net != 0) _owed[msg.sender] = _owed[msg.sender] + net;
         emit BidFilled(id, quantity, b.remaining);
         // The real market moves the parts with safeTransferFrom from the seller to the buyer.
         IERC1155(b.transistors).safeTransferFrom(msg.sender, b.buyer, b.tokenId, quantity, "");
+        if (pushProceeds && net != 0) {
+            (bool ok, ) = msg.sender.call{value: net}("");
+            if (!ok) revert BadBid();
+        }
     }
 
     /// @dev Test helper that simulates "someone else delivered to this bid". Proceeds stay in the market

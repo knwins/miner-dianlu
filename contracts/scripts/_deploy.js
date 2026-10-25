@@ -20,6 +20,36 @@ function createAddress(sender, nonce) {
 }
 
 /**
+ * 上面那个 bug 在部分节点上不是「抛出被 catch」而是「detached 的未处理拒绝」——
+ * checkTx 是 fire-and-forget，rejection 直接冒到进程顶层，try/catch 拦不住，
+ * 进程在「交易其实已广播」之后崩掉（2026-10-25 主网换工厂就踩了：工厂上链了但记录没写）。
+ * 这里在部署窗口内临时吞掉这一条已知错误，让流程继续走 CREATE 地址找回执。
+ */
+const CREATE_TX_READBACK_BUG = /invalid value for value\.to/;
+
+function withReadbackBugGuard(fn) {
+  const handler = (reason) => {
+    const msg = String((reason && reason.message) || reason || "");
+    if (CREATE_TX_READBACK_BUG.test(msg)) return; // 已知：广播成功，只是回读崩溃
+    throw reason; // 其他未处理拒绝照旧炸
+  };
+  process.on("unhandledRejection", handler);
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => process.off("unhandledRejection", handler));
+}
+
+/** 轮询等 CREATE 地址长出代码（交易可能还在打包中，回执按块扫需要它先落块）。 */
+async function waitForCode(address, attempts = 60, intervalMs = 2000) {
+  for (let i = 0; i < attempts; i++) {
+    const code = await ethers.provider.getCode(address);
+    if (code && code !== "0x") return code;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return "0x";
+}
+
+/**
  * 部署合约并等待链上确认。
  * @param {string} contractName
  * @param {any[]} args 构造参数
@@ -38,12 +68,13 @@ async function deployContract(contractName, args = [], opts = {}) {
 
   let hash;
   try {
-    const sent = await signer.sendTransaction(deployTx);
+    const sent = await withReadbackBugGuard(() => signer.sendTransaction(deployTx));
     hash = sent.hash;
   } catch (e) {
-    // 已知 bug：广播已成功、回读崩溃（见文件头）。按 CREATE 地址在最近块里找回执——
-    // 那个地址只可能由这笔部署交易获得代码，匹配上就是它。
-    const found = await findReceiptByContractAddress(address);
+    // 已知 bug：广播已成功、回读崩溃（见文件头）。先等 CREATE 地址长出代码（交易可能还在打包），
+    // 再按 CREATE 地址在最近块里找回执——那个地址只可能由这笔部署交易获得代码，匹配上就是它。
+    await waitForCode(address);
+    const found = await findReceiptByContractAddress(address, 4000);
     if (!found) {
       throw new Error(`部署 ${contractName} 广播失败（链上未找到 ${address} 的创建回执）：${e.message}`);
     }

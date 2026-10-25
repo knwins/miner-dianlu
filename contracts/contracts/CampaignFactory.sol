@@ -5,32 +5,23 @@ import {Ownable} from "./access/Ownable.sol";
 import {Campaign} from "./Campaign.sol";
 
 /// @title CampaignFactory — opens each crowdfunding round
-/// @notice Only the factory owner may create a round or drop one from the list. Economic params are
-///         fixed at creation. The shared material-market address (materialMarket) is immutable; a
-///         replacement market is set per round via Campaign.setMaterialMarket.
-///         The parts contract (processor) is NOT fixed here: each round MUST name it explicitly at
-///         createCampaign time, so one factory can open rounds for any whitelisted processor
-///         (TapeOut / Behemoth) and carries no "default parts".
-///         Allowed parts are a deploy-time security boundary, not an operational switch: the official
-///         market circulates the parts of several processors, each a separate ERC1155 contract. Without
-///         the whitelist the owner could point a round at a permissionless mock (anyone can mint
-///         unlimited parts), which would make the "parts arrived" checks meaningless. The whitelist is
-///         written at construction and can never be edited afterwards.
-///         removeCampaign only edits the registry list; the Campaign itself stays callable.
+/// @notice Owner-only creation and registry removal. Economic params are fixed at creation; the shared
+///         materialMarket is immutable (a round may replace its own via setMaterialMarket).
+///         The parts contract is NOT fixed here: every round must name a whitelisted one, so one factory
+///         serves several processors and carries no "default parts". The whitelist is a deploy-time
+///         security boundary — an open choice would allow a mock that mints unlimited parts — and can
+///         never be edited.
+///         removeCampaign only edits the registry; the Campaign itself stays callable.
 contract CampaignFactory is Ownable {
-    /// @notice Material-market address (the placeBid target). Immutable.
+    /// @notice Shared material market (the placeBid target). Immutable.
     address public immutable materialMarket;
 
-    /// @notice Whitelist of parts contracts a round may lock. Written at construction and never
-    ///         editable afterwards (security boundary, not an operational switch).
+    /// @notice Parts contracts a round may lock; written once at construction and never editable.
     address[] private _allowedParts;
 
     address[] public campaigns;
 
-    /// @notice O(1) membership set. Mirrors `campaigns[]` for registry lookups so that
-    ///         `isRegistered` (and thus Campaign._retired / the third-party escape hatch in
-    ///         cancelTransistorOrder) stays constant-gas instead of scanning the array.
-    ///         Set true on createCampaign, cleared on removeCampaign.
+    /// @notice O(1) membership set mirroring `campaigns[]`, so isRegistered stays constant-gas.
     mapping(address campaign => bool) private _registered;
 
     event CampaignCreated(
@@ -40,24 +31,21 @@ contract CampaignFactory is Ownable {
         uint256 totalShares,
         uint64 fundingDeadline
     );
-    /// @notice Removed from the factory registry only. The Campaign stays callable at its address.
+    /// @notice Removed from the registry only; the Campaign stays callable.
     event CampaignRemoved(uint256 indexed index, address indexed campaign);
 
     error ZeroCampaignParam();
     error IndexOutOfBounds();
-    /// @notice The whitelist (allowedParts_) was empty at construction.
+    /// @notice The whitelist was empty at construction.
     error EmptyWhitelist();
-    /// @notice The parts contract requested for the round is not in the factory's whitelist.
+    /// @notice The parts contract is not whitelisted.
     error PartsNotAllowed(address parts);
 
-    /// @param materialMarket_ Material market. Immutable: a replacement market is set per round via Campaign.setMaterialMarket.
-    /// @param allowedParts_ Whitelist of parts contracts a round may lock. Must contain at least one
-    ///        official processor part. On mainnet this is the two official processor part contracts
-    ///        (TapeOut / Behemoth). On testnets it is the mock parts contract.
+    /// @param materialMarket_ Shared market; immutable. Rounds may replace it individually.
+    /// @param allowedParts_ Whitelisted parts contracts; at least one, all with code.
     constructor(address materialMarket_, address[] memory allowedParts_) Ownable(msg.sender) {
         if (materialMarket_ == address(0)) revert ZeroAddress();
-        // A codeless market or parts contract would make every external call revert with empty
-        // returndata, bricking cancels / refunds for every round. Reject it at deploy time.
+        // A codeless target would revert every market call with empty returndata, bricking every round.
         if (materialMarket_.code.length == 0) revert ZeroAddress();
         if (allowedParts_.length == 0) revert EmptyWhitelist();
         materialMarket = materialMarket_;
@@ -72,9 +60,9 @@ contract CampaignFactory is Ownable {
         return _allowedParts.length;
     }
 
-    /// @notice The index-th whitelisted parts contract. Feeds the frontend's processor picker.
+    /// @notice The index-th whitelisted parts contract.
     /// @param index Position in the whitelist.
-    /// @return Parts contract at `index`; reverts IndexOutOfBounds when out of range.
+    /// @return Parts contract at `index`; reverts when out of range.
     function allowedPartsAt(uint256 index) external view returns (address) {
         if (index >= _allowedParts.length) revert IndexOutOfBounds();
         return _allowedParts[index];
@@ -87,7 +75,7 @@ contract CampaignFactory is Ownable {
         return _isAllowed(parts);
     }
 
-    /// @dev Linear scan of the whitelist; it is written once at construction and is tiny.
+    /// @dev Linear scan; the whitelist is tiny and fixed.
     /// @param parts Parts contract to test.
     /// @return Whether `parts` is whitelisted.
     function _isAllowed(address parts) internal view returns (bool) {
@@ -97,33 +85,27 @@ contract CampaignFactory is Ownable {
         return false;
     }
 
-    /// @notice Create one round. Share price, supply, and the parts contract are then immutable.
-    ///         The material market comes from the factory's immutable; the parts contract MUST be named
-    ///         explicitly here — there is no factory default. The round owner may replace the material
-    ///         market later via Campaign.setMaterialMarket.
-    /// @param sharePriceBnb Price of one share in wei; 0 reverts ZeroCampaignParam.
-    /// @param totalShares Share cap and sell-out threshold; 0 reverts ZeroCampaignParam.
+    /// @notice Create one round. Share price, supply and the parts contract are then immutable.
+    ///         The market comes from the factory; the parts contract must be named explicitly (no default).
+    /// @param sharePriceBnb Price of one share in wei; 0 reverts.
+    /// @param totalShares Share cap and sell-out threshold; 0 reverts.
     /// @param fundingSeconds Funding length in seconds; deadline = block.timestamp + fundingSeconds.
-    ///        Seconds, not days: the deadline is packed into uint64 at creation, so the caller does the
-    ///        unit conversion and no `× 1 days` can overflow before the narrowing cast.
-    /// @param transistors_ Parts contract (processor). REQUIRED: address(0) reverts (no factory default)
-    ///        and it must be in the whitelist. On mainnet that is the TapeOut / Behemoth parts contract.
-    /// @return campaign Address of the newly deployed round.
+    /// @param transistors_ Parts contract; required, non-zero and whitelisted.
+    /// @return campaign Address of the new round.
     function createCampaign(
         uint256 sharePriceBnb,
         uint256 totalShares,
         uint64 fundingSeconds,
         address transistors_
     ) external onlyOwner returns (address campaign) {
-        // The parts contract (processor) is required: no factory default, otherwise every round would
-        // be locked to the same processor.
+        // A factory default would lock every round to the same processor.
         if (transistors_ == address(0)) revert ZeroAddress();
         if (!_isAllowed(transistors_)) revert PartsNotAllowed(transistors_);
         if (totalShares == 0 || sharePriceBnb == 0) revert ZeroCampaignParam();
 
         address mi = materialMarket;
         address ow = owner;
-        // Explicit uint64 arithmetic: both operands already fit, and the sum is checked before packing.
+        // Both operands fit in uint64, and the checked sum is validated before the narrowing cast.
         uint64 deadline = uint64(block.timestamp) + fundingSeconds;
 
         Campaign c = new Campaign(
@@ -146,19 +128,17 @@ contract CampaignFactory is Ownable {
         return campaigns.length;
     }
 
-    /// @notice True while `campaign` is in the registry. A retired Campaign lets anyone reclaim a stuck order.
-    ///         O(1): membership is tracked in `_registered`, so gas does not grow with the number of campaigns.
+    /// @notice True while `campaign` is registered; a retired round lets anyone reclaim a stuck order.
     /// @param campaign Round to look up.
     /// @return Whether the round is still registered.
     function isRegistered(address campaign) external view returns (bool) {
         return _registered[campaign];
     }
 
-    /// @notice Remove a round by index. Factory owner only.
-    ///         Does not selfdestruct the Campaign. Holders can still use the original address.
-    ///         Swap-and-pop: the last address may move into the removed index. Do not cache indexes —
-    ///         look a campaign up by scanning campaigns(0..campaignCount()), not by a stored index.
-    /// @param index Position in `campaigns`; reverts IndexOutOfBounds when out of range.
+    /// @notice Remove a round by index. Factory owner only; the Campaign stays callable for holders.
+    ///         Swap-and-pop moves the last address into the removed index, so never cache indexes —
+    ///         scan campaigns(0..campaignCount()).
+    /// @param index Position in `campaigns`; reverts when out of range.
     function removeCampaign(uint256 index) external onlyOwner {
         uint256 len = campaigns.length;
         if (index >= len) revert IndexOutOfBounds();

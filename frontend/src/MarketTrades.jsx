@@ -220,7 +220,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
             </tbody>
           </table>
         ) : (
-          <p className="fine">还没有向晶体管市场挂过单。Owner 挂出买单后，这里会显示挂价与成交进度。</p>
+          <p className="fine">还没有挂过买单。Owner 挂出后，这里会显示挂价与成交进度。</p>
         )}
 
         {events && events.length > 0 && (
@@ -243,7 +243,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
         <p className="fine">
           {failed
             ? "读取市场失败：节点暂不可用，先按本地状态展示。"
-            : "成交进度读晶体管市场的 bids / owed；买单挂出、成交与撤回时间取市场合约的链上事件，卖出记录取本期的 TransistorsSold。"}
+            : "成交进度读市场合约，时间取链上事件。"}
         </p>
       </div>
     </article>

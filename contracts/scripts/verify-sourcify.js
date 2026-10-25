@@ -33,16 +33,40 @@ function readDeployment() {
  * 找出与链上 runtime 字节数一致的那份编译产物。
  * 仓库里 build-info 会有多份（源码改过就会新增），字节数对不上的那份提交必然失败。
  * 注意按「本次要验证的合约」取字节码——验证 Campaign 时不能拿 CampaignFactory 的比。
+ *
+ * ⚠️ 先认 artifact 自己指向的 build-info（<Contract>.dbg.json 的 buildInfo 字段）：
+ * 只按字节数挑的话，多份 build-info 的 runtime 长度会撞在一起（改注释不改体积），
+ * 提交错那份 → metadata hash 不同 → Sourcify 只能给 match（归一化后匹配），拿不到 exact_match。
  */
 function pickBuildInfo(targetBytes, sourceName, contractName) {
   const dir = join(__dirname, "..", "artifacts", "build-info");
   if (!existsSync(dir)) throw new Error("找不到 artifacts/build-info，请先 compile");
+
+  const load = (file) => {
+    const bi = JSON.parse(readFileSync(join(dir, file), "utf8"));
+    const cf = bi.output?.contracts?.[sourceName]?.[contractName];
+    if (!cf?.evm?.deployedBytecode?.object) return null;
+    return { file, bi, bytes: cf.evm.deployedBytecode.object.length / 2 };
+  };
+
+  // 1) artifact 的 dbg.json 指向哪份 build-info，就是它生成了本次部署用的字节码。
+  const dbgFile = join(
+    __dirname, "..", "artifacts", sourceName, `${contractName}.dbg.json`
+  );
+  if (existsSync(dbgFile)) {
+    const dbg = JSON.parse(readFileSync(dbgFile, "utf8"));
+    const linked = dbg.buildInfo ? dbg.buildInfo.split(/[\\/]/).pop() : null;
+    if (linked) {
+      const hit = load(linked);
+      if (hit && hit.bytes === targetBytes) return hit;
+    }
+  }
+
+  // 2) 退回按字节数扫描（多份命中时取文件名序最后一份，仅作兜底）。
   const cands = [];
   for (const f of readdirSync(dir)) {
-    const bi = JSON.parse(readFileSync(join(dir, f), "utf8"));
-    const cf = bi.output?.contracts?.[sourceName]?.[contractName];
-    if (!cf?.evm?.deployedBytecode?.object) continue;
-    cands.push({ file: f, bi, bytes: cf.evm.deployedBytecode.object.length / 2 });
+    const c = load(f);
+    if (c) cands.push(c);
   }
   const exact = cands.filter((c) => c.bytes === targetBytes);
   if (exact.length === 0) {
@@ -119,9 +143,14 @@ async function pollVerification(verificationId, attempts = 30, intervalMs = 5000
   throw new Error(`Sourcify 验证超时（${attempts} 次轮询仍未完成）`);
 }
 
-/** 直接读 Sourcify 上该地址的验证档案（用于「已验证」场景的确认）。 */
+/**
+ * 直接读 Sourcify 上该地址的验证档案（用于「已验证」场景的确认）。
+ *
+ * ⚠️ 必须带 `fields=all`：精简响应会被 CDN 缓存，同一地址先后有两次提交（先 match、后 exact_match）时，
+ * 精简端点可能一直返回旧的 `match` —— 一度让人误判成「exact_match 没生效」。
+ */
 async function confirmVerified(chainId, address) {
-  const r = await fetch(`${SOURCIFY_V2}/contract/${chainId}/${address}`);
+  const r = await fetch(`${SOURCIFY_V2}/contract/${chainId}/${address}?fields=all`);
   if (!r.ok) return null;
   const j = await r.json();
   return j?.match ? j : null;

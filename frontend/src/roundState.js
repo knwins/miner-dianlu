@@ -102,7 +102,7 @@ export function roundState(row, now = Date.now()) {
       ...ENDED,
       sceneKey,
       failed: false,
-      reason: "已流标 · 认筹款可原路退回",
+      reason: "募集超时 · 认筹款可原路退回",
       phase,
       phaseKey: "",
     };
@@ -185,7 +185,7 @@ export function nextActionOf(row) {
   const state = roundState(row);
   if (state.key === "ended") return "查看退款记录";
   if (state.key === "failed") return "原路退款 / 降价重挂";
-  if (state.sceneKey === "funding") return "补 setPlan / 等待售罄";
+  if (state.sceneKey === "funding") return "等待售罄";
   if (state.sceneKey === "executing") {
     if (state.phaseKey === "listed") return "等成交 → 确认到账 → 入池";
     if (state.phaseKey === "ready") return "退余款 → 入池";

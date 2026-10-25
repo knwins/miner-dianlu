@@ -136,7 +136,10 @@ async function main() {
     campaign: "",
     campaignParams: null,
     deployer: deployer.address,
-    notes: `工厂已换新（${tx.hash}），尚未开期。旧工厂的期次仍可调用，但不出现在新列表里。`,
+    factoryDeploymentTx: factoryDeployed.hash,
+    factoryDeploymentBlock: factoryDeployed.blockNumber,
+    factoryRuntimeBytes: runtimeBytes,
+    notes: `工厂已换新（${(factoryDeployed && factoryDeployed.hash) || ""}），尚未开期。旧工厂的期次仍可调用，但不出现在新列表里。`,
   };
   writeDeploymentRecords(network.name, out);
   console.log("地址已写入 deployments 与 frontend/src/chain/deployments.json");

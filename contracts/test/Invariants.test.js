@@ -233,6 +233,11 @@ describe("shares and parts conservation", () => {
     await expectSharesConserved(campaign);
 
     await campaign.connect(owner).abandonOrder();
+    // 放弃只开闸：份额还在，账本依旧闭合。
+    await expectSharesConserved(campaign);
+    await expectLedgerClosed(campaign);
+    await campaign.connect(alice).refund();
+    await campaign.connect(bob).refund();
     expect(await campaign.outstandingShares()).to.equal(0n);
     expect(await campaign.sharesOf(alice.address)).to.equal(0n);
     expect(await campaign.sharesOf(bob.address)).to.equal(0n);
@@ -276,9 +281,15 @@ describe("no wei left behind", () => {
     // 40 件吃掉了 0.2 BNB：owner 补齐后持份人才能按原价收回本金，晶体管才归 owner。
     await campaign.connect(owner).topUpShortfall({ value: 40n * UNIT });
     await campaign.connect(owner).abandonOrder();
+    // 放弃不推送：份额还在，晶体管留在合约里等持份人自取。
+    expect(await campaign.outstandingShares()).to.equal(100n);
+    expect(await parts.balanceOf(owner.address, 0)).to.equal(0n);
+    await campaign.connect(alice).refund();
+    await campaign.connect(bob).refund();
     expect(await campaign.outstandingShares()).to.equal(0n);
     expect(await campaign.totalRefunded()).to.equal(100n * SHARE_PRICE);
-    // 份额全部结清后，剩余晶体管在同一个调用里就交给 owner 了。
+    // 份额全部结清后，再跑一次放弃才把剩余晶体管交给 owner。
+    await campaign.connect(owner).abandonOrder();
     expect(await parts.balanceOf(owner.address, 0)).to.equal(40n);
     expect(await parts.balanceOf(await campaign.getAddress(), 0)).to.equal(0n);
     await expectNoDustLeft(campaign);
@@ -477,6 +488,8 @@ describe("boundary guards", () => {
       [100, [ethers.ZeroAddress], [10000]], // 零地址
       [100, [alice.address], [10000, 0]], // 长度不一致
       [0, [alice.address], [10000]], // 0 费率却给了表
+      // S-30：合约自己永远调不了 claimFee，收成自己 = 服务费永久锁死。
+      [100, [await campaign.getAddress()], [10000]],
     ];
     for (const [bps, recipients, shares] of bad) {
       await expect(campaign.connect(owner).setServiceFee(bps, recipients, shares))
@@ -578,6 +591,12 @@ describe("parts collateral invariant", () => {
     await campaign.connect(owner).openRefund();
     await expectCollateralInvariant(campaign);
     await expectSharesConserved(campaign);
+    // 开闸不结清：份额还在，晶体管仍不能离开。
+    await expect(campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 40n))
+      .to.be.revertedWithCustomError(campaign, "SharesOutstanding");
+    await campaign.connect(alice).refund();
+    await campaign.connect(bob).refund();
+    expect(await campaign.outstandingShares()).to.equal(0n);
     await campaign.connect(owner).recoverTransistors(await parts.getAddress(), 0, 40n);
     expect(await parts.balanceOf(owner.address, 0)).to.equal(40n);
     await expectNoDustLeft(campaign);
@@ -610,3 +629,104 @@ describe("parts collateral invariant", () => {
     await expectCollateralInvariant(campaign);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 熔断只是关业务入口：它不能改账本，也不能挡住任何一条「钱回持份人」的路。
+// ─────────────────────────────────────────────────────────────────────────────
+describe("circuit breaker keeps the books closed", () => {
+  it("a halted round still returns every wei to its owner-less holders", async () => {
+    // 未售罄：熔断 + 过截止 ⇒ 每人照样 pull 本金，合约清零。
+    const { campaign, owner, alice, bob } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(30n, { value: 30n * SHARE_PRICE });
+    await campaign.connect(bob).subscribe(20n, { value: 20n * SHARE_PRICE });
+    await expectLedgerClosed(campaign);
+    await campaign.connect(owner).halt();
+
+    await time.increaseTo((await campaign.fundingDeadline()) + 1n);
+    await campaign.connect(alice).refund();
+    await expectLedgerClosed(campaign);
+    await campaign.connect(bob).refund();
+    expect(await campaign.outstandingShares()).to.equal(0n);
+    expect(await campaign.halted()).to.equal(true);
+    await expectNoDustLeft(campaign);
+  });
+
+  it("keeps the ledger closed and the collateral intact through a halt in Ready", async () => {
+    const { campaign, owner, alice, bob, minter } = await loadFixture(deployFixture);
+    await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
+    await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
+    await campaign.connect(owner).setPlan(408n);
+    await place(campaign, owner, 100n, UNIT);
+    await fillAndConfirm(campaign, minter);
+    await campaign.connect(owner).halt();
+
+    // 余款照记、照领，晶体管照旧留在合约（熔断不许把抵押送走）。
+    await campaign.connect(owner).returnSurplus();
+    await expectLedgerClosed(campaign);
+    await expectCollateralInvariant(campaign);
+    await campaign.connect(alice).claimSurplus();
+    await campaign.connect(bob).claimSurplus();
+    await expectLedgerClosed(campaign);
+    await expectCollateralInvariant(campaign);
+  });
+
+  it("random halts never change the books and never trap a holder", async () => {
+    // 一条种子换一条随机路径：随机拉闸 / 抬闸，末尾必须还能全额退出。
+    for (const seed of [11, 29, 47, 83]) {
+      let s = seed >>> 0;
+      const rand = () => {
+        s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+        return s / 4294967296;
+      };
+      const { campaign, owner, alice, bob, carol } = await loadFixture(deployFixture);
+      const holders = [alice, bob, carol];
+
+      // 认筹阶段：熔断只挡新钱，不挡已经记在册的份额。
+      for (const h of holders) {
+        if (rand() < 0.5) {
+          await campaign.connect(owner).halt();
+          await expectLedgerClosed(campaign);
+          const soldBefore = await campaign.sold();
+          await expect(campaign.connect(h).subscribe(10n, { value: 10n * SHARE_PRICE }))
+            .to.be.revertedWithCustomError(campaign, "Halted");
+          // 被拒的认购一分钱都不留：账本原样。
+          expect(await campaign.sold()).to.equal(soldBefore);
+          await expectLedgerClosed(campaign);
+          await campaign.connect(owner).resume();
+        }
+        await campaign.connect(h).subscribe(10n, { value: 10n * SHARE_PRICE });
+        await expectLedgerClosed(campaign);
+      }
+
+      // 剩下 70 份额由 owner 补满，进入 Executing。
+      await campaign.connect(owner).subscribe(70n, { value: 70n * SHARE_PRICE });
+      await campaign.connect(owner).setPlan(408n);
+
+      // 挂单与否随机；挂单后撤单在熔断下也必须可用（逃生舱）。
+      if (rand() < 0.5) {
+        await place(campaign, owner, 100n, UNIT);
+        await expectLedgerClosed(campaign);
+        if (!(await campaign.halted())) await campaign.connect(owner).halt();
+        await campaign.connect(owner).cancelTransistorOrder();
+        expect(await campaign.phase()).to.equal(PHASE.Buying);
+        await expectLedgerClosed(campaign);
+      }
+
+      // 熔断状态下判失败 + 逐人 pull 本金：最终账本必须清零。
+      if (!(await campaign.halted())) await campaign.connect(owner).halt();
+      await campaign.connect(owner).markFailed();
+      expect(await campaign.raisedBnb()).to.equal(100n * SHARE_PRICE);
+      for (const h of holders) {
+        if ((await campaign.sharesOf(h.address)) > 0n) await campaign.connect(h).refund();
+        await expectLedgerClosed(campaign);
+      }
+      await campaign.connect(owner).refund();
+      // 全程熔断未抬闸：本金照样全额退出。
+      expect(await campaign.halted()).to.equal(true);
+      expect(await campaign.outstandingShares()).to.equal(0n);
+      await expectSharesConserved(campaign);
+      await expectNoDustLeft(campaign);
+    }
+  });
+});
+

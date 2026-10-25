@@ -7,20 +7,15 @@ import {IERC1155} from "./interfaces/IERC1155.sol";
 import {IMaterialMarket} from "./interfaces/IMaterialMarket.sol";
 
 /// @title Campaign — one BEM crowdfunding round
-/// @notice Scenes: Funding → Executing → Mining. Executing phases: Buying → Listed → Ready.
-///
-/// Money flow:
-///  - Subscription BNB is held in `raisedBnb`; subscribing is allowed up to and including the deadline.
-///  - `placeTransistorOrder` spends it on the material market. Filled legs arrive as ERC1155; an
-///    unaffordable order sets `executionFailed` and places no bid (it does not revert).
-///  - Only a market that ever served this round may send BNB in (see receive()).
-///  - Share transfer (listShares / takeListing / cancelListing) is Mining-only and pays the seller
-///    directly, never through `raisedBnb`.
-///
-/// Mining: `depositToPool` commits the held parts to `miningPool` and is IRREVERSIBLE; unspent BNB is
-/// booked as holder-claimable surplus first (shares are kept). harvest() / claim() are placeholders.
-/// Business rules (fee scope, monotonic `sold`, refund denominators, exit paths) live in
-/// contracts/README.md §8.
+/// @notice Scenes: Funding → Executing → Mining; Executing phases: Buying → Listed → Ready.
+///         Funding:   subscription BNB accumulates in `raisedBnb`.
+///         Executing: `placeTransistorOrder` spends it on parts; an unaffordable order sets
+///                    `executionFailed` without reverting.
+///         Mining:    `depositToPool` sends the parts to `miningPool` (IRREVERSIBLE) after booking the
+///                    leftover BNB as holder-claimable surplus. harvest / claim are placeholders.
+///         Holder payouts are pulls (refund / claimSurplus / claimFee); share sales are Mining-only and
+///         pay the seller directly. Only a market that served this round may send BNB in (see receive).
+///         Rules: contracts/README.md §8.
 interface IFactory {
     /// @param campaign Round to look up.
     /// @return True while the factory still lists the round.
@@ -28,7 +23,7 @@ interface IFactory {
 }
 
 contract Campaign is Ownable, ReentrancyGuard {
-    /// @notice Factory that created this round. Read for registry membership (see receive / cancelTransistorOrder).
+    /// @notice Factory that created this round; used for the registry check.
     address public immutable factory;
 
     // ─────────────────────────── state machine ───────────────────────────
@@ -38,10 +33,10 @@ contract Campaign is Ownable, ReentrancyGuard {
         Mining
     }
     enum Phase {
-        None, // creation-time value; setPhase() refuses it
-        Buying, // ready to place transistor bids
-        Listed, // bids live; cancel still allowed
-        Ready // parts filled; waiting for returnSurplus / depositToPool
+        None, // unused; setPhase refuses it
+        Buying, // may place bids
+        Listed, // bids live
+        Ready // parts received
     }
 
     struct Listing {
@@ -53,223 +48,207 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Grace period before a non-owner may flag the round as failed.
     uint256 internal constant FAIL_GRACE = 3 days;
-    /// @notice Service-fee hard ceiling in bps (1000 = 10%). Charged on mining output only,
-    ///         never on subscription BNB (README §8 rule 1).
+    /// @notice Service-fee cap in bps (1000 = 10%). Charged on mining output only, never on subscriptions.
     uint16 internal constant MAX_SERVICE_FEE_BPS = 1000;
-    /// @notice Max service-fee recipients; keeps the accrual loop and storage bounded.
+    /// @notice Max fee recipients; bounds the accrual loop and storage.
     uint256 internal constant MAX_FEE_RECIPIENTS = 3;
 
     // ─────────────────────── immutable config (fixed at creation) ───────────────────────
     uint256 public immutable sharePriceBnb; // price per share (wei)
     uint256 public immutable totalShares; // share cap
     uint64 public immutable fundingDeadline; // funding deadline (unix seconds)
-    /// @notice Parts contract (ERC1155) locked at create; every bid of this round targets it.
+    /// @notice Parts contract (ERC1155); every bid targets it.
     address public immutable transistors;
-    /// @notice Market used for placeBid / cancelBid / bids. Replaceable via setMaterialMarket; every
-    ///         market that ever served this round stays an accepted BNB sender (async settlement).
+    /// @notice Market for bids. Replaceable via setMaterialMarket; past markets stay accepted BNB senders.
     IMaterialMarket public materialMarket;
-    /// @notice Destination of depositToPool(). Must implement onERC1155Received. Irreversible once pooled.
+    /// @notice Destination of depositToPool().
     address public miningPool;
 
     // ─────────────────────── mutable state ───────────────────────
     Scene public scene;
     Phase public phase;
-    /// @notice Cumulative shares ever sold. Monotonic: refunds never decrease it.
-    ///         The owner's "must have sold out" gate reads this, so a refund can never
-    ///         permanently revoke the owner's ordering right — see README §8 rule 5.
+    /// @notice Hot wallet for routine operations. Always a strict subset of the owner; 0 = disabled.
+    address public operator;
+    /// @notice Circuit breaker. Stops money-in and irreversible-out; NEVER stops a holder exit.
+    bool public halted;
+    /// @notice Cumulative shares ever sold; monotonic, so refunding cannot undo the sold-out gate.
     uint256 public sold;
-    /// @notice Shares sold and not yet refunded. Decreases on refund; it is the pro-rata
-    ///         refund denominator. `sold` is history, `outstandingShares` is current debt.
+    /// @notice Shares sold but not yet refunded: current debt, and the refund denominator.
     uint256 public outstandingShares;
-    /// @notice Service-fee rate in bps (1/10000). Settable once while `sold == 0`, then frozen.
-    ///         Mining-output fee only (README §8 rule 1).
+    /// @notice Service-fee rate in bps. Writable once while `sold == 0`, then frozen.
     uint16 public serviceFeeBps;
-    /// @notice Service-fee recipients (split table). Length = feeRecipientCount().
+    /// @notice Fee recipients, length = feeRecipientCount().
     address[] private _feeRecipients;
-    /// @notice Per-recipient share (bps). Sums to 10000; index-aligned with _feeRecipients.
+    /// @notice Per-recipient share in bps, sums to 10000; aligned with _feeRecipients.
     uint16[] private _feeSharesBps;
-    /// @notice Accrued-but-unclaimed service fee per recipient; pulled via claimFee().
+    /// @notice Accrued-but-unclaimed fee per recipient; pulled via claimFee().
     mapping(address => uint256) public pendingFee;
-    /// @notice Sum of pendingFee. recoverBnb must reserve it, or the owner would swallow
-    ///         the recipients' fees.
+    /// @notice Sum of pendingFee; reserved by recoverBnb.
     uint256 public totalPendingFee;
-    /// @notice True once the fee table was written. Frozen forever once set (even at 0 bps).
+    /// @notice Fee table already written; frozen forever after that (even at 0 bps).
     bool public serviceFeeSet;
-    /// @notice When the round sold out. 0 means it never did (it is set as the scene turns Executing).
+    /// @notice When the round sold out; 0 = never sold out.
     uint64 public soldOutAt;
     /// @notice Timestamp of the last placeTransistorOrder; part of the markFailed grace base.
     uint64 public lastOrderAt;
-    /// @notice Set by an unaffordable order or markFailed(); cleared by a successful order.
+    /// @notice Set by an unaffordable order or markFailed; cleared by a successful order.
     bool public executionFailed;
-    /// @notice True once the held transistors have been committed to the mining pool. Irreversible:
-    ///         no function pulls them back, and refund / abandon / recover escape hatches are closed.
+    /// @notice Parts were committed to the mining pool. Irreversible: refund / abandon / recover are closed.
     bool public pooled;
 
-    /// @notice Subscription escrow. Bids debit it; market refunds credit it via receive().
+    /// @notice Subscription escrow. Bids debit it; receive credits market refunds and proceeds.
     uint256 public raisedBnb;
-    /// @notice Cumulative principal refunded to holders. Never mixed with surplus payouts, which
-    ///         only move `surplusPaid`.
+    /// @notice Cumulative principal refunded; surplus payouts move `surplusPaid` instead.
     uint256 public totalRefunded;
-    /// @notice Cumulative service fee paid out (wei).
+    /// @notice Cumulative service fee paid out.
     uint256 public totalFeesPaid;
-    /// @notice Cumulative mining revenue net of the service fee. Display only: the money is booked into
-    ///         the holders' pull-claimable surplus (claimSurplus), never held in a separate locked pot.
+    /// @notice Cumulative mining revenue net of fee. Display only; the money is booked into surplus.
     uint256 public revenuePool;
 
-    /// @notice Total bid escrow paid for the order (wei), not a unit price. 0 means no paid order, which
-    ///         is what stops Ready / Mining from being faked without a purchase (see _readyInvariant).
+    /// @notice Escrow paid for the current order, not a unit price. 0 = no paid order, so Ready / Mining
+    ///         cannot be faked without a purchase.
     uint256 public priceLock;
-    /// @notice NAND bid id on the market; 0 when there is no live order or the leg was skipped.
+    /// @notice NAND bid id; 0 when there is no live order or the leg was skipped.
     uint256 public nandBidId;
-    /// @notice LATCH bid id on the market; 0 when the leg was skipped.
+    /// @notice LATCH bid id; 0 when the leg was skipped.
     uint256 public latchBidId;
-    /// @notice NAND quantity of the live order; 0 when the leg was skipped.
+    /// @notice NAND quantity ordered; 0 when the leg was skipped.
     uint256 public nandQty;
-    /// @notice LATCH quantity of the live order; 0 when the leg was skipped.
+    /// @notice LATCH quantity ordered; 0 when the leg was skipped.
     uint256 public latchQty;
-    /// @notice Locked NAND bid price. Display only: never read by on-chain logic.
+    /// @notice Locked NAND bid price. Display only.
     uint96 public nandPrice;
-    /// @notice Locked LATCH bid price. Display only: never read by on-chain logic.
+    /// @notice Locked LATCH bid price. Display only.
     uint96 public latchPrice;
-    /// @notice Unit cost the round paid for NAND (wei). Written when an order is placed and never
-    ///         cleared, so sellTransistors() can refuse to sell below cost — an owner self-dealing
-    ///         into a 1-wei bid would otherwise strip the holders' collateral.
+    /// @notice Highest unit price ever paid for NAND; the sell floor, never cleared.
     uint96 public nandCostBasis;
-    /// @notice Unit cost the round paid for LATCH (wei). See nandCostBasis.
+    /// @notice Highest unit price ever paid for LATCH. See nandCostBasis.
     uint96 public latchCostBasis;
-    /// @notice Design hashpower estimate. Display only: never read by on-chain logic.
+    /// @notice Design hashpower estimate. Display only.
     uint256 public estHashpower;
 
     // ─────────────────────── per-wallet ledger ───────────────────────
     mapping(address => uint256) private _shares; // available shares
     mapping(address => uint256) private _escrow; // shares locked in a listing
-    /// @notice Principal refunded to this wallet; excludes surplus claims.
+    /// @notice Principal refunded to this wallet; excludes surplus.
     mapping(address => uint256) private _refunded;
-    /// @notice Surplus this wallet has claimed through claimSurplus().
+    /// @notice Surplus this wallet already claimed.
     mapping(address => uint256) private _surplusClaimed;
-    /// @notice Surplus accrued at pool time but not yet transferred; claimable via claimSurplus().
+    /// @notice Surplus booked but not yet transferred; pulled via claimSurplus.
     mapping(address => uint256) public pendingSurplus;
 
-    /// @notice Sum of pendingSurplus. Covered by the (surplusPool − surplusPaid) reserve in recoverBnb,
-    ///         which is a superset: adding it again there would double-reserve.
+    /// @notice Sum of pendingSurplus; already inside the surplus reserve, so never add it again.
     uint256 public totalPendingSurplus;
-    /// @notice Cumulative BNB ever booked for holders. Display / reserve total: unclaimed is
-    ///         `surplusPool − surplusPaid`.
+    /// @notice Cumulative surplus ever booked; unclaimed = surplusPool − surplusPaid.
     uint256 public surplusPool;
-    /// @notice BNB booked in the CURRENT round; the numerator of this round's split.
-    ///         Only BNB can change it, never holder churn, so an entitlement never shrinks.
+    /// @notice Surplus booked in the current round; the numerator of its split.
     uint256 public surplusRoundPool;
-    /// @notice Round index of the surplus ledger. A new round starts when the previous one has counted
-    ///         every base share and more BNB arrives (another revenue deposit, a late settlement).
-    ///         Without it the fresh money would be unclaimable: the counted-shares cursor stays at the
-    ///         base and `surplusCounted[holder]` already equals their shares, so every claim would pay 0.
+    /// @notice Surplus round index. A new round opens once every base share is counted, so fresh BNB
+    ///         stays claimable instead of paying 0 to everyone.
     uint256 public surplusRound;
-    /// @notice Surplus denominator (= outstandingShares at the first booking of the round). Later holder
-    ///         churn does not move an already-fixed base.
+    /// @notice Denominator of the current round (outstandingShares at its first booking); fixed for it.
     uint256 public surplusBase;
-    /// @notice Shares already counted toward the current round's split (the rounding dust goes to the
-    ///         last claimant, so the pool is paid out to the last wei).
+    /// @notice Shares counted in the current round; the last claimant takes the rounding dust.
     uint256 public surplusClaimedShares;
-    /// @notice Total surplus already allocated in the CURRENT round (accrued to holders, transferred or
-    ///         not). Allocation (accrue) and payout (claim) are deliberately separate ledgers.
+    /// @notice Surplus allocated in the current round (booked, paid or not).
     uint256 public surplusAllocated;
-    /// @notice Cumulative surplus transferred to holders by claimSurplus(), written together with the
-    ///         payout. Still owed = surplusPool − surplusPaid, which recoverBnb reserves.
+    /// @notice Cumulative surplus transferred; still owed = surplusPool − surplusPaid.
     uint256 public surplusPaid;
-    /// @notice Shares already counted into the current round's split per holder; prevents double claims.
+    /// @notice Shares counted into the current round per holder; prevents double claims.
     mapping(address => uint256) public surplusCounted;
-    /// @notice Round in which surplusCounted[holder] was written. A stale round counts as 0.
+    /// @notice Round in which surplusCounted[holder] was written; a stale round counts as 0.
     mapping(address => uint256) public surplusCountedRound;
-    /// @notice Subscribers and listing buyers, append-only (indexes are exposed via holderAt).
-    /// @dev `_refundAll` walks the whole array (~2.1k gas per cold SLOAD), so a round with tens of
-    ///      thousands of holders would need a batched pull refund instead.
+    /// @notice Subscribers and listing buyers, append-only. Frontend / tests only: no payout loops over it.
     address[] private _holders;
     mapping(address => bool) private _holderSeen;
 
     Listing[] private _listings;
-    /// @dev Markets that ever served this round, other than the current one. receive() accepts BNB from
-    ///      all of them: market settlement / bid cancellation is asynchronous, and recognizing only the
-    ///      current market would permanently reject late-arriving funds.
-    ///      A mapping (not an array) keeps _isKnownMarket O(1): it runs on the receive() path of every
-    ///      cancel refund and withdraw, so an owner-grown list would eventually make those run out of gas
-    ///      and strand the round's escrow.
+    /// @dev Markets that ever served this round; receive accepts their BNB. Mapping keeps the check O(1).
     mapping(address => bool) private _marketSeen;
 
     // ─────────────────────── events ───────────────────────
+    /// @notice Operator hot wallet replaced; the owner always keeps every operator right.
+    event OperatorSet(address indexed previous, address indexed next);
+    /// @notice Circuit breaker toggled. `by` is whoever halted or resumed.
+    event HaltChanged(address indexed by, bool halted);
     event Subscribed(address indexed subscriber, uint256 count, uint256 paidBnb);
     event Refunded(address indexed holder, uint256 amountBnb);
-    /// @notice Surplus paid out by claimSurplus(). Kept apart from Refunded: surplus is not principal.
+    /// @notice Surplus paid by claimSurplus; not principal.
     event SurplusClaimed(address indexed holder, uint256 amountBnb);
     event Listed(uint256 indexed id, address indexed seller, uint256 count, uint256 priceBnbPerShare);
     event ListingCancelled(uint256 indexed id, address indexed seller, uint256 shares);
     event ListingTaken(uint256 indexed id, address indexed buyer, address indexed seller, uint256 count, uint256 paidBnb);
-    /// @notice `escrowBnb` is the total escrowed BNB for both legs, not a unit price.
     /// @param count Total units across both legs.
-    /// @param escrowBnb Total escrow debited from raisedBnb.
+    /// @param escrowBnb Total escrow debited from raisedBnb (not a unit price).
     event TransistorOrderPlaced(uint256 count, uint256 escrowBnb);
     event TransistorOrderCancelled();
-    /// @notice Held transistors were sold into a resting market bid (the only sell path: the official
-    ///         market has no ask book). `proceeds` is the BNB credited to the round after the market fee.
-    /// @param bidId Resting bid that was filled.
+    /// @notice Parts sold into a resting market bid (the only sell path: no ask book exists).
+    /// @param bidId Bid that was filled.
     /// @param tokenId 0 NAND, 1 LATCH.
     /// @param quantity Units sold.
-    /// @param proceeds BNB received into `raisedBnb`.
+    /// @param proceeds BNB credited to raisedBnb after the market fee.
     event TransistorsSold(uint256 indexed bidId, uint8 indexed tokenId, uint256 quantity, uint256 proceeds);
     event TransistorsConfirmed();
-    /// @notice needBnb is the bid cost that could not be afforded (0 when markFailed flags the round).
-    ///         raisedBnb is the escrow available at that point. Neither path reverts.
+    /// @notice needBnb = unaffordable cost (0 for markFailed); raisedBnb = escrow then. Neither reverts.
     event ExecutionFailed(uint256 needBnb, uint256 raisedBnb);
-    event RefundSendFailed(address indexed holder, uint256 amountBnb);
+    /// @notice Refunds are open; nothing was transferred, each holder pulls with refund.
+    /// @param outstandingShares Shares still owed.
+    /// @param escrowBnb Pool the pro-rata split divides.
+    event RefundsOpened(uint256 outstandingShares, uint256 escrowBnb);
     event PlanUpdated(uint256 estHashpower);
     event MaterialMarketUpdated(address indexed previous, address indexed next);
-    /// @notice The operator approval granted to a former material market was revoked.
+    /// @notice Operator approval of a former material market was revoked.
     event MaterialMarketApprovalRevoked(address indexed market);
-    /// @notice BNB swept out of the round by recoverBnb(). `to` is always the owner.
+    /// @notice BNB swept by recoverBnb; `to` is always the owner.
     event BnbRecovered(uint256 amount, address indexed to);
-    /// @notice ERC1155 tokens moved out by recoverTransistors(). `to` is always the owner.
+    /// @notice ERC1155 tokens moved by recoverTransistors; `to` is always the owner.
     event TransistorsRecovered(address indexed token, uint256 indexed id, uint256 amount, address indexed to);
-    /// @notice Mining pool address was set / changed by the owner.
+    /// @notice Mining pool address was set.
     event MiningPoolSet(address indexed previous, address indexed next);
-    /// @notice The round's transistors were committed to the mining pool. IRREVERSIBLE.
+    /// @notice Parts were committed to the mining pool. IRREVERSIBLE.
     event DepositedToPool(address indexed pool, uint256 nandAmount, uint256 latchAmount);
-    /// @notice The Executing sub-phase changed. Emitted by _setPhase(), the only writer of `phase`.
+    /// @notice Executing sub-phase changed; _setPhase is the only writer.
     event PhaseChanged(uint8 indexed previous, uint8 indexed next);
-    /// @notice Surplus was accrued to a holder. Amount is now claimable via claimSurplus().
+    /// @notice Surplus booked for a holder; claimable via claimSurplus.
     event SurplusAccrued(address indexed holder, uint256 amountBnb);
-    /// @notice The unspent subscription BNB was booked for pro-rata return right after the parts were
-    ///         confirmed (returnSurplus). Holders pull their cut via claimSurplus(); the round keeps going.
+    /// @notice Leftover subscription BNB booked for pro-rata return (returnSurplus); the round keeps going.
     event SurplusReturned(uint256 amountBnb, uint256 baseShares);
-    /// @notice Service-fee configuration was set. Only settable while nobody has subscribed yet.
+    /// @notice Fee table set; only possible while nobody has subscribed.
     event ServiceFeeSet(uint16 feeBps, address[] recipients, uint16[] sharesBps);
-    /// @notice A service-fee share was accrued to a recipient. The recipient pulls it via claimFee().
+    /// @notice Fee share booked for a recipient; pulled via claimFee.
     event FeeAccrued(address indexed to, uint256 amount);
-    /// @notice Mining revenue was deposited into the round. `fee` was withheld, `net` went to the revenue pool.
+    /// @notice Mining revenue deposited; `fee` withheld, `net` booked for holders.
     event RevenueDeposited(uint256 gross, uint256 fee, uint256 net);
-    /// @notice A service-fee share was paid out at claimFee() time.
+    /// @notice Fee share paid out by claimFee.
     event FeePaid(address indexed to, uint256 amount);
-    /// @notice The owner added BNB so every outstanding share can be repaid at the subscription price.
-    ///         Only then may the round's parts leave the contract (see recoverTransistors).
+    /// @notice Owner added BNB so every outstanding share can be repaid at the subscription price.
     event ShortfallToppedUp(uint256 amount, uint256 raisedBnb);
 
     // ─────────────────────── errors ───────────────────────
     error DirectTransferNotAllowed();
+    /// @notice Business entry refused by the circuit breaker. Holder exits are never halted.
+    error Halted();
+    /// @notice halt() on an already halted round.
+    error AlreadyHalted();
+    /// @notice resume() on a live round.
+    error NotHalted();
+    /// @notice Caller is neither the owner nor the current operator.
+    error NotOperator(address caller);
     error WrongScene();
     error FundingEnded();
     error TransistorsNotReady();
     error RefundNotAvailable();
-    /// @dev Reused as "nothing to settle": zero quantity, zero amount, or nothing left to pay out.
+    /// @dev Reused as "nothing to settle": zero quantity, zero amount, or nothing left to pay.
     error ZeroShares();
     error ZeroPrice();
     error BadCount();
     error InsufficientShares();
-    /// @notice The round's own parts still back outstanding shares; settle the holders first.
+    /// @notice Parts still back outstanding shares; settle the holders first.
     error SharesOutstanding();
-    /// @notice The holders were not repaid at the subscription price, so the parts are still their
-    ///         collateral. Top up the pool (topUpShortfall) and refund first, or pool/sell the parts.
+    /// @notice Holders were not repaid at the subscription price, so the parts are still their collateral.
     error HoldersNotMadeWhole();
-    /// @notice The round holds parts bought with the pool, which is too small to repay every share.
-    ///         Refunding now would zero the shares and leave the parts with nobody entitled to them,
-    ///         so this exit is closed until the pool covers every share in full.
+    /// @notice The pool cannot repay every share, so the parts in hand are their collateral. Refunding
+    ///         would zero the shares and leave the parts with no claimant.
     error PartsAreCollateral();
     error ExceedsRemaining();
     error WrongPayment();
@@ -282,36 +261,29 @@ contract Campaign is Ownable, ReentrancyGuard {
     error TransferFailed();
     error OrderFilled();
     error BadBidId();
-    /// @notice Market proceeds are still sitting in owed(). Pull them (withdrawMarketProceeds) first, so
-    ///         the pool a refund or surplus booking divides is final.
+    /// @notice Market proceeds are still in owed(); pull them first so the refund pool is final.
     error ProceedsPending();
-    /// @notice sellTransistors: the id is not a fillable bid for this round (closed, wrong parts
-    ///         contract, wrong token id, or not enough remaining quantity).
+    /// @notice sellTransistors: not a fillable bid for this round (closed, wrong parts, id or quantity).
     error NotABid();
-    /// @notice sellTransistors: the bid price is below the unit price this round paid. Selling under
-    ///         cost would hand the parts away and burn the holders' collateral.
+    /// @notice sellTransistors: price below the unit price this round paid.
     error PriceBelowCost();
-    /// @notice sellTransistors: the bid belongs to this contract. Filling it would round-trip the parts
-    ///         and fake proceeds.
+    /// @notice sellTransistors: the bid belongs to this contract; filling it would fake proceeds.
     error SelfTrade();
-    /// @notice sellTransistors: the fill moved the parts but credited no BNB, so the round would have paid
-    ///         the sale for nothing. Reverts instead of booking a zero-proceeds disposal.
+    /// @notice sellTransistors: the parts moved but no BNB arrived.
     error NoProceeds();
     error InsufficientParts();
     error PoolNotSet();
     error AlreadyPooled();
-    /// @notice returnSurplus() already booked the principal for pro-rata return; refund / abandon would
-    ///         zero the shares for 0 BNB, so both are closed.
+    /// @notice returnSurplus already booked the principal; refund / abandon would zero shares for 0 BNB.
     error SurplusAlreadyReturned();
-    /// @notice Ready: the only refund is the unspent BNB, and it must not touch the parts. Use
-    ///         returnSurplus() instead of openRefund / abandonOrder.
+    /// @notice Ready: use returnSurplus, which must not touch the parts.
     error UseReturnSurplus();
-    /// @notice Invalid fee table (bps over the cap, length mismatch, duplicate or zero recipient, or
-    ///         shares not summing to 10000). Also raised by the fee getters for an out-of-range index.
+    /// @notice Invalid fee table (cap, length, duplicate / zero recipient, shares not summing to 10000).
+    ///         Also raised by the fee getters for an out-of-range index.
     error BadFeeConfig();
-    /// @notice The service-fee table was already set. It is frozen forever once written.
+    /// @notice The fee table is already set and frozen.
     error ServiceFeeAlreadySet();
-    /// @notice The service fee can no longer be changed because somebody already subscribed.
+    /// @notice The fee is frozen because somebody already subscribed.
     error ServiceFeeLocked();
     /// @notice The round never sold out; no parts order may be placed.
     error NotSoldOutYet();
@@ -319,9 +291,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @param sharePriceBnb_ Price of one share in wei.
     /// @param totalShares_ Share cap; also the sell-out threshold.
     /// @param fundingDeadline_ Funding deadline in unix seconds (inclusive).
-    /// @param materialMarket_ Initial market; replaceable later via setMaterialMarket.
+    /// @param materialMarket_ Initial market; replaceable via setMaterialMarket.
     /// @param owner_ Campaign owner (the factory owner in practice).
-    /// @param transistors_ Parts contract locked for this round; must be whitelisted by the factory.
+    /// @param transistors_ Parts contract; must be whitelisted by the factory.
     constructor(
         uint256 sharePriceBnb_,
         uint256 totalShares_,
@@ -331,8 +303,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         address transistors_
     ) Ownable(owner_) {
         if (materialMarket_ == address(0) || transistors_ == address(0)) revert ZeroAddress();
-        // A codeless market or parts contract would make every call revert with empty returndata, which
-        // bricks cancel / refund / claim forever. Reject it at creation instead.
+        // A codeless target would make every call revert with empty returndata, bricking the round.
         if (materialMarket_.code.length == 0 || transistors_.code.length == 0) revert ZeroAddress();
         factory = msg.sender;
         if (totalShares_ == 0 || sharePriceBnb_ == 0) revert ZeroShares();
@@ -345,16 +316,60 @@ contract Campaign is Ownable, ReentrancyGuard {
         phase = Phase.None;
     }
 
-    /// @dev Accept BNB only from a market that ever served this round: bid-cancel refunds, sale proceeds
-    ///      and withdraw() all land here and are credited to `raisedBnb`. Any other sender could inflate
-    ///      the pool that refund() divides. Past markets stay accepted because settlement is asynchronous;
-    ///      rejecting them would strand the principal in a market nothing can pull from.
+    // ─────────────────────────── roles and circuit breaker ───────────────────────────
+
+    /// @notice Set the operator hot wallet. Owner only; address(0) disables the role.
+    ///         The owner always keeps every operator right, so granting cannot be a one-way door.
+    /// @param operator_ Hot wallet; the contract itself is refused (it cannot originate a call).
+    function setOperator(address operator_) external onlyOwner {
+        if (operator_ == address(this)) revert ZeroAddress();
+        emit OperatorSet(operator, operator_);
+        operator = operator_;
+    }
+
+    /// @notice Trip the circuit breaker. Owner or operator.
+    ///         Blocks money-in (`subscribe`), irreversible-out (`depositToPool`), parts-out
+    ///         (`sellTransistors`), ordering, and the secondary market. Holder exits are never blocked.
+    function halt() external {
+        _requireOperator();
+        if (halted) revert AlreadyHalted();
+        halted = true;
+        emit HaltChanged(msg.sender, true);
+    }
+
+    /// @notice Lift the circuit breaker. Owner only: a compromised operator must not undo its own brake.
+    function resume() external onlyOwner {
+        if (!halted) revert NotHalted();
+        halted = false;
+        emit HaltChanged(msg.sender, false);
+    }
+
+    /// @dev True for the owner and the current operator. Every onlyOperator entry point also accepts the
+    ///      owner, so the operator is a strict subset and can never lock the owner out.
+    /// @return Whether the caller may use operator-level entry points.
+    function _isOperator() internal view returns (bool) {
+        return msg.sender == owner || (operator != address(0) && msg.sender == operator);
+    }
+
+    /// @dev Revert unless the caller is the owner or the current operator.
+    function _requireOperator() internal view {
+        if (!_isOperator()) revert NotOperator(msg.sender);
+    }
+
+    /// @dev Circuit breaker for business entry points. Never applied to refund / surplus / fee pulls,
+    ///      to cancelling a live bid or to the admin recovery exits, so a halt can never lock assets.
+    modifier whenLive() {
+        if (halted) revert Halted();
+        _;
+    }
+
+    /// @dev Accept BNB only from a market that ever served this round (cancel refunds, proceeds,
+    ///      withdraw). Any other sender could inflate the refund pool; past markets stay accepted because
+    ///      settlement is asynchronous.
     receive() external payable {
         if (!_isKnownMarket(msg.sender)) revert DirectTransferNotAllowed();
         raisedBnb += msg.value;
-        // After pooling there is no refund path left, so a late market credit would sit in raisedBnb
-        // with nothing able to spend it (recoverBnb keeps `raisedBnb` while shares are outstanding).
-        // Book it into the holder-claimable surplus instead.
+        // After pooling there is no refund path, so a late credit would be unspendable: book it as surplus.
         if (pooled) _returnSurplus();
     }
 
@@ -373,52 +388,44 @@ contract Campaign is Ownable, ReentrancyGuard {
         return who == address(materialMarket) || _marketSeen[who];
     }
 
-    /// @notice Replace the material market. Blocked while a bid is live. Any BNB the current market still
-    ///         owes this round is pulled first (attempted best-effort, so a market that cannot pay never
-    ///         traps the round). The old market's ERC1155 approval is revoked on the way out, and it stays
-    ///         an accepted BNB sender because settlement is asynchronous.
-    /// @param materialMarket_ New market address; must be non-zero.
+    /// @notice Replace the material market. Blocked while a bid is live. BNB the old market owes is pulled
+    ///         first (best effort), its approval is revoked, and it stays an accepted BNB sender.
+    /// @param materialMarket_ New market; must have code.
     function setMaterialMarket(address materialMarket_) external onlyOwner nonReentrant {
         if (materialMarket_ == address(0)) revert ZeroAddress();
-        // No code = every placeBid / cancelBid / owed() call reverts with empty returndata, so cancels
-        // and refunds would be dead. Reject it here instead of bricking the round.
+        // A codeless market would revert every placeBid / cancelBid / owed call.
         if (materialMarket_.code.length == 0) revert ZeroAddress();
-        // Swapping markets with a live order strands the escrow on the old market. Cancel first.
+        // A live order would strand its escrow on the old market.
         if (phase == Phase.Listed) revert AlreadyListed();
-        // owed() is per market, so proceeds left behind after a swap are unreachable (withdraw() can only
-        // be called on the current market). Drain them first; a market that will not pay must not block
-        // the swap, because that is exactly when the escape hatch is needed — the round matters more than
-        // proceeds the old market cannot release.
+        // owed() is per market, so leftovers become unreachable after a swap. Drain first, but never let
+        // a market that refuses to pay block the escape hatch.
         if (_owed() > 0) {
             try materialMarket.withdraw() {} catch {}
         }
-        // Revoke the old market's operator approval, else it could still pull this round's ERC1155.
-        // A failed revoke does not block the swap (an old market may not implement it) but leaves a trace.
+        // Drop the old approval, or it could still move this round's parts.
         address previous = address(materialMarket);
         if (previous != materialMarket_) {
             _revokeApproval(previous);
         }
         emit MaterialMarketUpdated(previous, materialMarket_);
-        // Keep accepting late settlement from the market we are leaving (see _isKnownMarket).
+        // Keep accepting late settlement from the market we leave.
         _marketSeen[previous] = true;
         materialMarket = IMaterialMarket(materialMarket_);
     }
 
-    /// @dev Revoke a market's ERC1155 operator approval. Silent on failure — an old market may not
-    ///      implement it.
-    /// @param operator Former market whose approval is dropped.
-    function _revokeApproval(address operator) internal {
-        if (operator == address(0)) return;
-        try IERC1155(transistors).setApprovalForAll(operator, false) {
-            emit MaterialMarketApprovalRevoked(operator);
+    /// @dev Revoke a market's ERC1155 approval; silent on failure.
+    /// @param market Former market whose approval is dropped.
+    function _revokeApproval(address market) internal {
+        if (market == address(0)) return;
+        try IERC1155(transistors).setApprovalForAll(market, false) {
+            emit MaterialMarketApprovalRevoked(market);
         } catch {
-            // Ignore: an old / deprecated parts contract may not implement setApprovalForAll.
+            // Ignore: a deprecated parts contract may not implement it.
         }
     }
 
-    /// @notice Set the mining-pool destination. Only before pooling; depositToPool() reverts with
-    ///         PoolNotSet() while this is unset.
-    /// @param pool_ Pool address; non-zero and not this contract.
+    /// @notice Set the mining-pool destination. Only before pooling.
+    /// @param pool_ Non-zero, and not this contract.
     function setMiningPool(address pool_) external onlyOwner {
         if (pooled) revert AlreadyPooled();
         if (pool_ == address(0) || pool_ == address(this)) revert ZeroAddress();
@@ -426,10 +433,10 @@ contract Campaign is Ownable, ReentrancyGuard {
         miningPool = pool_;
     }
 
-    /// @notice Store the display-only hashpower estimate. Writable in Funding and Executing/Buying;
-    ///         refused in Listed, Ready and Mining. Moves no BNB, ERC1155 or order state.
-    /// @param estHashpower_ Estimated hashpower; read back by the UI only.
-    function setPlan(uint256 estHashpower_) external onlyOwner {
+    /// @notice Store the display-only hashpower estimate. Funding and Executing/Buying only.
+    /// @param estHashpower_ Read by the UI only.
+    function setPlan(uint256 estHashpower_) external {
+        _requireOperator();
         if (scene == Scene.Mining) revert WrongScene();
         if (scene == Scene.Executing && phase != Phase.Buying) revert WrongScene();
         estHashpower = estHashpower_;
@@ -438,11 +445,10 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── subscribe ───────────────────────────
 
-    /// @notice Buy `count` shares for exactly count × sharePriceBnb. Allowed up to and including the
-    ///         deadline; a sell-out moves the round to Executing/Buying. Subscription BNB is never
-    ///         charged a service fee (the fee applies to mining output only, README §8 rule 1).
-    /// @param count Shares to buy; must be > 0 and fit the remaining supply.
-    function subscribe(uint256 count) external payable nonReentrant {
+    /// @notice Buy `count` shares for exactly count × sharePriceBnb, up to and including the deadline.
+    ///         A sell-out moves the round to Executing/Buying. Subscription BNB pays no service fee.
+    /// @param count Shares to buy; > 0 and within the remaining supply.
+    function subscribe(uint256 count) external payable nonReentrant whenLive {
         if (scene != Scene.Funding) revert WrongScene();
         if (block.timestamp > fundingDeadline) revert FundingEnded();
         if (count == 0) revert ZeroShares();
@@ -465,20 +471,19 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── service fee (on-chain) ───────────────────────────
 
-    /// @notice Set the service fee and its split table. Owner only, and only while `sold == 0`; frozen
-    ///         afterwards so subscribers can trust the numbers they saw. 0 bps with an empty table means
-    ///         no fee. Charged on mining output at depositRevenue(), never on subscription BNB.
-    /// @param bps_ Fee rate in bps (1/10000), at most MAX_SERVICE_FEE_BPS (10%); 0 freezes "no fee".
-    /// @param recipients_ Fee recipients, at most MAX_FEE_RECIPIENTS; empty only when bps_ == 0.
-    /// @param sharesBps_ Per-recipient share in bps, aligned with recipients_; must sum to 10000.
+    /// @notice Set the service fee and its split table. Owner only, only while `sold == 0`, then frozen.
+    ///         Charged on mining output only, never on subscriptions; 0 bps + empty table = no fee.
+    /// @dev Recipients must be non-zero, unique, and not this contract (which could never pull its fee).
+    /// @param bps_ Fee rate in bps, at most MAX_SERVICE_FEE_BPS.
+    /// @param recipients_ Recipients, at most MAX_FEE_RECIPIENTS; empty only when bps_ == 0.
+    /// @param sharesBps_ Per-recipient share in bps; aligned with recipients_ and summing to 10000.
     function setServiceFee(uint16 bps_, address[] calldata recipients_, uint16[] calldata sharesBps_) external onlyOwner {
         if (serviceFeeSet) revert ServiceFeeAlreadySet();
         if (sold != 0) revert ServiceFeeLocked();
         if (bps_ > MAX_SERVICE_FEE_BPS) revert BadFeeConfig();
         if (recipients_.length != sharesBps_.length) revert BadFeeConfig();
         if (recipients_.length > MAX_FEE_RECIPIENTS) revert BadFeeConfig();
-        // Explicit "no fee": the table must be empty and there is no 10000-bps sum to satisfy, so this
-        // freezes the round at 0 without touching the split loop.
+        // Explicit "no fee": empty table, no 10000-bps sum to satisfy.
         if (bps_ == 0) {
             if (recipients_.length != 0) revert BadFeeConfig();
             serviceFeeSet = true;
@@ -489,7 +494,8 @@ contract Campaign is Ownable, ReentrancyGuard {
 
         uint256 sum = 0;
         for (uint256 i = 0; i < recipients_.length; i++) {
-            if (recipients_[i] == address(0)) revert BadFeeConfig();
+            // This contract cannot call claimFee on itself, so its own address would lock the fee forever.
+            if (recipients_[i] == address(0) || recipients_[i] == address(this)) revert BadFeeConfig();
             if (sharesBps_[i] == 0) revert BadFeeConfig();
             for (uint256 j = 0; j < i; j++) {
                 if (recipients_[j] == recipients_[i]) revert BadFeeConfig();
@@ -561,48 +567,37 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── refund (pull) ───────────────────────────
 
-    /// @notice Pull your principal. Nothing runs automatically at the deadline.
-    ///         Allowed when: Funding is past the deadline and the round never sold out; or Executing/Buying
-    ///         with `executionFailed` or with `raisedBnb` below every outstanding share.
-    ///         A full pool pays count × sharePriceBnb, a short pool pays pro-rata of `raisedBnb`.
-    ///         Only Buying is accepted in Executing: Listed has escrow still on the market (refunding
-    ///         first would pay pro-rata of a pool that is about to grow, and a market callback could
-    ///         re-enter here), and Ready holds the parts as the holders' asset. Reverts with
-    ///         PartsAreCollateral while the round holds parts the pool cannot fully repay (that refund
-    ///         would zero the shares and strand the parts), and after returnSurplus() booked the
-    ///         principal. The deadline path is the only principal exit for a round that never sold out
-    ///         (README §8 rule 6); the ordering gate reads monotonic `sold` (rule 5).
+    /// @notice Pull your principal; the only refund exit.
+    ///         Allowed when Funding is past the deadline and never sold out, or in Executing/Buying with
+    ///         `executionFailed` or a short pool. A full pool pays count × sharePriceBnb, a short one pays
+    ///         pro-rata of `raisedBnb`. Refused in Listed (escrow still on the market) and Ready (the parts
+    ///         are the holders' asset), while the pool cannot repay parts-backed shares (PartsAreCollateral),
+    ///         and after returnSurplus booked the principal.
     function refund() external nonReentrant {
         if (scene == Scene.Funding) {
-            // soldOutAt == 0 means the round never sold out (written when the scene turns Executing).
+            // soldOutAt == 0 = never sold out.
             if (soldOutAt != 0 || block.timestamp <= fundingDeadline) revert RefundNotAvailable();
         } else if (scene == Scene.Executing) {
-            // returnSurplus() already paid the principal: refunding would zero the shares for 0 BNB.
+            // returnSurplus already paid the principal; refunding would zero shares for 0 BNB.
             if (surplusBase != 0) revert SurplusAlreadyReturned();
-            // Ready holds the parts as the holders' asset; zeroing the shares there would hand them to
-            // the owner. Listed still has escrow on the market, so the pool is not the final one.
             if (phase != Phase.Buying) revert RefundNotAvailable();
-            // The parts are the collateral behind the shares. While the pool is short they cannot be
-            // handed to anybody, so a refund here would zero the shares and strand the parts.
+            // Parts in hand are the shares' collateral: zeroing the shares would strand them.
             if (_partsHeld() && !_poolCoversEveryShare()) revert PartsAreCollateral();
             if (!executionFailed && !_shortfall()) revert RefundNotAvailable();
         } else {
             revert RefundNotAvailable(); // Mining: shares are transferable, principal is gone.
         }
 
-        // A failed send must revert. Shares are cleared even when the amount rounds to 0, so a holder in
-        // a short pool is never trapped with outstandingShares above 0.
-        uint256 before = _shares[msg.sender];
-        uint256 amount = _refundHolder(msg.sender, false);
-        if (amount == 0 && _shares[msg.sender] == before) revert ZeroShares();
+        // Shares and BNB settle in one transaction; a failed send reverts everything.
+        if (_shares[msg.sender] == 0 || _escrow[msg.sender] != 0) revert ZeroShares();
+        _refundOne(msg.sender);
     }
 
-    /// @notice Owner tops the escrow up so every outstanding share can be repaid at the subscription
-    ///         price. This is the only fair way for the round's parts to leave after a partial purchase:
-    ///         holders get their principal back first, then the parts may be taken (recoverTransistors) —
-    ///         the owner effectively buys them at cost. Excess can be swept with recoverBnb() once every
-    ///         share is settled, so nothing is locked.
-    function topUpShortfall() external payable onlyOwner nonReentrant {
+    /// @notice Owner or operator tops the escrow up so every outstanding share can be repaid at the
+    ///         subscription price. This is how the parts may leave after a partial purchase: holders are
+    ///         repaid first, then the owner takes the parts at cost. Excess is sweepable with recoverBnb.
+    function topUpShortfall() external payable nonReentrant {
+        _requireOperator();
         if (scene != Scene.Executing) revert WrongScene();
         if (msg.value == 0) revert ZeroPrice();
         raisedBnb += msg.value;
@@ -617,8 +612,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         _holders.push(who);
     }
 
-    /// @dev Single writer for `phase`; emits PhaseChanged only on a real change. Every phase write goes
-    ///      through here so off-chain state derived from events never misses a transition.
+    /// @dev Single writer for `phase`; emits PhaseChanged only on a real change.
     /// @param next Phase to store.
     function _setPhase(Phase next) internal {
         uint8 previous = uint8(phase);
@@ -626,47 +620,33 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (previous != uint8(next)) emit PhaseChanged(previous, uint8(next));
     }
 
-    /// @dev Pay `who` their principal and clear their shares. The denominator is `outstandingShares`,
-    ///      not `sold`: counting exited holders would leave the pool unpayable for the last few.
-    ///      Shares are cleared even when the amount rounds to 0, so nobody is trapped with dust.
+    /// @dev Pay `who` their principal and clear their shares. Pull-only, so no path loops over holders.
+    ///      The denominator is `outstandingShares`, not `sold`, or the last holders would find it drained.
+    ///      Shares are cleared even when the amount rounds to 0, so nobody is stuck.
     /// @param who Wallet to settle.
-    /// @param soft True (openRefund): a failed send is restored and skipped. False: it reverts.
-    /// @return amount BNB sent; 0 when nothing was owed or the send was skipped.
-    function _refundHolder(address who, bool soft) internal returns (uint256 amount) {
+    /// @return amount BNB sent; 0 when it rounded to 0.
+    function _refundOne(address who) internal returns (uint256 amount) {
         uint256 s = _shares[who];
-        if (s == 0 || _escrow[who] != 0 || outstandingShares == 0) return 0;
-        // A full pool pays count × price. A short pool pays raise × shares / outstanding pro-rata.
+        if (s == 0 || outstandingShares == 0) return 0;
+        // Full pool: count × price. Short pool: pro-rata of raisedBnb.
         amount =
             raisedBnb >= outstandingShares * sharePriceBnb ? s * sharePriceBnb : (raisedBnb * s) / outstandingShares;
         _shares[who] = 0;
         outstandingShares -= s;
-        if (amount == 0) {
-            // Nothing to send, but the shares are settled: the holder is done and the pool keeps the dust
-            // for the remaining holders (their pro-rata share grows as `outstandingShares` shrinks).
-            emit Refunded(who, 0);
-            return 0;
-        }
         raisedBnb -= amount;
-        if (!_trySend(who, amount)) {
-            _shares[who] = s;
-            outstandingShares += s;
-            raisedBnb += amount;
-            if (!soft) revert TransferFailed();
-            emit RefundSendFailed(who, amount);
-            return 0;
-        }
         _refunded[who] += amount;
         totalRefunded += amount;
+        // Amount 0 (rounding): the shares are still settled; the dust stays for the rest.
+        if (amount != 0) _send(who, amount);
         emit Refunded(who, amount);
     }
 
     // ─────────────────────────── share transfer (Mining only) ───────────────────────────
 
-    /// @notice Mining only. List `count` shares at `priceBnbPerShare` each; listed shares are locked until
-    ///         sold or cancelled.
-    /// @param count Shares to list; must be > 0 and unlocked.
-    /// @param priceBnbPerShare Listing price per share in wei; must be > 0.
-    function listShares(uint256 count, uint256 priceBnbPerShare) external {
+    /// @notice Mining only. List `count` shares at `priceBnbPerShare`; they lock until sold or cancelled.
+    /// @param count Shares to list; > 0 and unlocked.
+    /// @param priceBnbPerShare Price per share in wei; > 0.
+    function listShares(uint256 count, uint256 priceBnbPerShare) external whenLive {
         if (scene != Scene.Mining) revert WrongScene();
         if (count == 0) revert ZeroShares();
         if (priceBnbPerShare == 0) revert ZeroPrice();
@@ -678,7 +658,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit Listed(_listings.length - 1, msg.sender, count, priceBnbPerShare);
     }
 
-    /// @notice Cancel a listing and unlock its shares. Seller or owner only.
+    /// @notice Cancel a listing and unlock its shares. Seller or owner only; never halted (it is an exit).
     /// @param id Listing id.
     function cancelListing(uint256 id) external {
         if (scene != Scene.Mining) revert WrongScene();
@@ -693,10 +673,11 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     /// @notice Mining only. Buy `count` shares from a listing; msg.value must equal count × price and is
-    ///         paid straight to the seller.
+    ///         paid to the seller atomically. Deliberately push (one seller, one payment): a failed send
+    ///         reverts, so shares can never move without payment. Refunds and claims stay pull.
     /// @param id Listing id.
-    /// @param count Shares to buy; must be > 0 and at most the listing's remaining shares.
-    function takeListing(uint256 id, uint256 count) external payable nonReentrant {
+    /// @param count Shares to buy; > 0 and at most the listing's remaining shares.
+    function takeListing(uint256 id, uint256 count) external payable nonReentrant whenLive {
         if (scene != Scene.Mining) revert WrongScene();
         if (id >= _listings.length || !_listings[id].open) revert NoListing();
         Listing storage l = _listings[id];
@@ -709,35 +690,42 @@ contract Campaign is Ownable, ReentrancyGuard {
         _escrow[l.seller] -= count;
         _shares[msg.sender] += count;
         _trackHolder(msg.sender);
+        // The surplus counter travels with the shares, so reselling cannot let a fresh wallet re-claim
+        // what the seller already counted in this round.
+        _moveSurplusCount(l.seller, msg.sender, count);
         l.shares -= count;
         if (l.shares == 0) l.open = false;
 
-        _send(l.seller, pay); // BNB paid to the seller immediately
+        // Atomic settlement, deliberately push: one seller, one payment, and the shares must not move
+        // without it. A failed send reverts, so "shares moved, BNB still owed" cannot happen.
+        _send(l.seller, pay);
         emit ListingTaken(id, msg.sender, l.seller, count, pay);
     }
 
     // ─────────────────────────── secondary-market bids (owner) ───────────────────────────
 
-    /// @notice Place both legs of a buy order on the material market. Owner only, and only while
-    ///         Executing/Buying. NAND is tokenId 0, LATCH is 1; the parts contract is the immutable
-    ///         `transistors`, so it is not a parameter. Escrow (qty × price per leg) leaves `raisedBnb`
-    ///         with placeBid, and a zero-qty leg is skipped (its bid id stays 0).
-    ///         If the total cost exceeds `raisedBnb` the call sets `executionFailed` and places nothing —
-    ///         it does NOT revert. One order at a time.
+    /// @notice Place both legs of a buy order. Owner or operator, Executing/Buying only. NAND is id 0,
+    ///         LATCH is id 1. Each leg sends qty × price from `raisedBnb`; a zero-qty leg is skipped
+    ///         (bid id 0). One order at a time. If the total cost exceeds `raisedBnb` it sets
+    ///         `executionFailed` and places nothing — no revert.
+    /// @dev Operator-level because ordering is the daily step that produces `Ready` (cancel / confirm /
+    ///      sell are already operator-level); the spend is reversible via `cancelTransistorOrder`.
+    ///      `depositToPool` stays owner-only — that one is irreversible.
     /// @param nandQty_ NAND quantity; 0 skips the leg.
-    /// @param nandPrice_ NAND bid price in wei per unit; ignored when nandQty_ is 0.
+    /// @param nandPrice_ NAND price per unit in wei; ignored when nandQty_ is 0.
     /// @param latchQty_ LATCH quantity; 0 skips the leg.
-    /// @param latchPrice_ LATCH bid price in wei per unit; ignored when latchQty_ is 0.
+    /// @param latchPrice_ LATCH price per unit in wei; ignored when latchQty_ is 0.
     function placeTransistorOrder(
         uint256 nandQty_,
         uint96 nandPrice_,
         uint256 latchQty_,
         uint96 latchPrice_
-    ) external onlyOwner nonReentrant {
+    ) external nonReentrant whenLive {
+        _requireOperator();
         _requireExecuting();
         if (phase != Phase.Buying) revert WrongScene();
         _requireLegParams(nandQty_, nandPrice_, latchQty_, latchPrice_);
-        // `sold` is monotonic, so refunds can never revoke this gate (README §8 rule 5).
+        // `sold` is monotonic, so refunds can never revoke this gate (README §8).
         if (sold < totalShares) revert NotSoldOutYet();
         // Retrying a previously failed order requires escrow that can still pay for it.
         if (executionFailed && raisedBnb == 0) revert RefundNotAvailable();
@@ -757,148 +745,119 @@ contract Campaign is Ownable, ReentrancyGuard {
         latchQty = latchQty_;
         nandPrice = nandPrice_;
         latchPrice = latchPrice_;
-        // Cost basis survives _clearOrder(): sellTransistors() uses it as a hard price floor.
+        // Cost basis survives _clearOrder: sellTransistors uses it as a hard price floor.
         nandCostBasis = _raiseCostBasis(nandCostBasis, nandQty_, nandPrice_);
         latchCostBasis = _raiseCostBasis(latchCostBasis, latchQty_, latchPrice_);
         priceLock = cost;
         nandBidId = _placeBidLeg(0, nandQty_, nandPrice_, nandCost);
         latchBidId = _placeBidLeg(1, latchQty_, latchPrice_, latchCost);
         _setPhase(Phase.Listed);
-        // Each order pushes the non-owner markFailed grace period forward: an owner who keeps
-        // making progress is never griefed by a bystander.
+        // Each order pushes the non-owner grace period forward, so an active owner is never griefed.
         lastOrderAt = uint64(block.timestamp);
         emit TransistorOrderPlaced(nandQty_ + latchQty_, cost);
     }
 
-    /// @notice Book the unspent subscription BNB as holder-claimable surplus without ending the round:
-    ///         parts stay here, `phase` stays Ready and depositToPool() stays available. No holder loop —
-    ///         each holder pulls a pro-rata cut with claimSurplus().
-    ///         Requires a settled market (nothing owed) so sale proceeds never mix into a principal return.
-    ///         Afterwards openRefund / abandonOrder are closed.
-    ///         The owner may call at any time; anyone else only after FAIL_GRACE from max(soldOutAt,
-    ///         lastOrderAt). That is the Ready failsafe: if the owner disappears, the leftover BNB still
-    ///         becomes claimable instead of sitting in `raisedBnb` with no exit. It moves no parts and
-    ///         cannot be used to take value — it only hands the money to its owners.
+    /// @notice Book the leftover subscription BNB as holder-claimable surplus without ending the round:
+    ///         parts stay, `phase` stays Ready, depositToPool stays available. No holder loop — each holder
+    ///         pulls with claimSurplus. Requires nothing owed by the market, and closes openRefund / abandon.
+    ///         Owner or operator any time; anyone else after FAIL_GRACE, so a vanished team cannot lock BNB.
     function returnSurplus() external nonReentrant {
         _requireReady();
         if (pooled) revert AlreadyPooled();
         if (_owed() > 0) revert ProceedsPending();
-        if (msg.sender != owner && block.timestamp < _graceBase() + FAIL_GRACE) revert RefundNotAvailable();
+        if (!_isOperator() && block.timestamp < _graceBase() + FAIL_GRACE) revert RefundNotAvailable();
         if (outstandingShares == 0) revert ZeroShares();
         if (raisedBnb == 0) revert ZeroShares();
         _returnSurplus();
         emit SurplusReturned(surplusPool, surplusBase);
     }
 
-    /// @notice Refund every holder. Only from Executing/Buying: in Ready the exit is returnSurplus()
-    ///         (reverts with UseReturnSurplus) because the parts must follow the mining path. Ready →
-    ///         Buying via setPhase is an explicit admin recovery, not a normal exit. Closed once
-    ///         returnSurplus() already paid the principal out.
-    function openRefund() external onlyOwner nonReentrant {
+    /// @notice Open refunds. Buying only — in Ready the exit is returnSurplus. Closed once returnSurplus
+    ///         booked the principal. Moves no BNB: it flags the round failed and every holder pulls with
+    ///         refund, so gas stays flat and no holder can block the call.
+    ///         Owner or operator: an abort switch, never a payout, and never halted.
+    function openRefund() external nonReentrant {
+        _requireOperator();
         _requireExecuting();
         if (surplusBase != 0) revert SurplusAlreadyReturned();
         if (phase == Phase.Ready) revert UseReturnSurplus();
-        // outstandingShares == 0 means nobody is left to refund; the dust is swept by recoverBnb.
+        // Nobody left to refund; the dust is swept by recoverBnb.
         if (outstandingShares == 0) revert ZeroShares();
-        // Rejects Listed and None too: only Buying has a refundable bid-side state.
         if (phase != Phase.Buying) revert WrongScene();
-        // Parts bought with the pool are the shares' collateral: with a short pool the remainder could
-        // never be handed over, so refunding would burn it. Top up (topUpShortfall) or pool/sell instead.
+        // Parts in hand are the shares' collateral; a short pool would burn them on refund.
         if (_partsHeld() && !_poolCoversEveryShare()) revert PartsAreCollateral();
         if (_owed() > 0) revert ProceedsPending();
         markFailed();
-        _refundAll();
+        emit RefundsOpened(outstandingShares, raisedBnb);
     }
 
-    /// @notice Give up from Buying or Listed: cancel the remaining bid, withdraw what the market owes,
-    ///         refund every holder, and only then return the remaining parts to the owner.
-    ///         Parts are skipped while a holder still holds shares AND while the holders were not repaid at
-    ///         the subscription price (a short pool means part of their money sits in the parts: handing
-    ///         those over for a pro-rata refund would be a discounted sale). Top up with topUpShortfall()
-    ///         and refund first to make the hand-over fair. Refused in Ready (there the exit is
-    ///         returnSurplus + depositToPool) and closed once returnSurplus() paid the principal out.
+    /// @notice Give up from Buying or Listed: cancel the remaining bid, pull what the market owes, open
+    ///         refunds, and hand the parts to the owner only if every share is settled and repaid. Pull-only,
+    ///         so gas stays flat. Refused in Ready (exit is returnSurplus + depositToPool).
     function abandonOrder() external onlyOwner nonReentrant {
         _requireExecuting();
         if (surplusBase != 0) revert SurplusAlreadyReturned();
         if (phase == Phase.Ready) revert UseReturnSurplus();
-        // Cancel before the refund loop: the phase must be Buying when it runs.
-        // markFailed() below would repeat this, but only when it does not early-return.
+        // Cancel first: a holder can only pull while the phase is Buying.
         _cancelLiveOrder();
         _pullOwed();
-        // After the cancels the pool is final: parts bought with it are the shares' collateral, so a
-        // short pool would zero the shares and burn the parts. Top up / pool / sell instead.
+        // The pool is final now; a short pool would burn the parts-backed shares.
         if (_partsHeld() && !_poolCoversEveryShare()) revert PartsAreCollateral();
         markFailed();
-        _refundAll();
-        // Parts move to the owner only once every share is settled AND every share was repaid in full:
-        // while shares are outstanding they are the holders' collateral (see recoverTransistors), and a
-        // short pool means the parts were bought with the holders' money. A holder that rejected BNB
-        // keeps its shares, so this is skipped and the owner can retry after that holder pulls its refund.
+        emit RefundsOpened(outstandingShares, raisedBnb);
+        // Parts leave only when no share is outstanding AND every share was repaid in full.
         if (outstandingShares == 0 && _holdersMadeWhole()) _returnHeldParts();
     }
 
-    /// @dev Soft-fail refund loop over every recorded holder.
-    function _refundAll() internal {
-        uint256 n = _holders.length;
-        for (uint256 i = 0; i < n; i++) {
-            _refundHolder(_holders[i], true);
-        }
-    }
-
-    /// @notice Cancel the open remainder of the bid and return to Buying. Owner only while nothing has
-    ///         filled; once any quantity filled, anyone may cancel the rest. Refused when the order is
-    ///         fully filled and the parts are already here. cancelBid refunds the unfilled escrow into
-    ///         receive(); filled quantity stays spent. A round dropped from the factory registry is
-    ///         cancellable by anyone, since its owner may be gone.
+    /// @notice Cancel the open remainder of the bid and return to Buying. Owner or operator while nothing
+    ///         has filled; once anything filled, anyone may cancel the rest. Refused when fully filled and
+    ///         delivered. Filled quantity stays spent; a round dropped from the registry is cancellable by
+    ///         anyone. Never halted: this is the escape hatch that returns escrow to the pool.
+    ///         This is the only right a retired round opens up: pooling and selling stay owner-only.
     function cancelTransistorOrder() external nonReentrant {
         if (phase != Phase.Listed) revert NotListed();
         bool touched = _filledSome(nandBidId, nandQty) || _filledSome(latchBidId, latchQty);
         if (orderFilled() && _partsOnHand()) revert OrderFilled();
-        if (!touched && msg.sender != owner && !_retired()) revert NotOwner(msg.sender);
+        if (!touched && !_isOperator() && !_retired()) revert NotOperator(msg.sender);
         _cancelLiveOrder();
     }
 
-    /// @notice Flag the round as failed so holders can refund. The owner may call at any time; anyone else
-    ///         only after FAIL_GRACE measured from max(soldOutAt, lastOrderAt), so every order pushes the
-    ///         grace forward and a round that never orders after selling out is not killed instantly.
-    ///         Cancels the unfilled bid legs first so their escrow returns to `raisedBnb`. Refused in Ready:
-    ///         the parts are already here, so flagging failure would let holders take a pro-rata cash refund
-    ///         and drop their claim on the parts (which the owner could then recover) — Ready exits through
-    ///         returnSurplus + depositToPool instead. No-op when already failed or not Executing; reverts
-    ///         after returnSurplus() booked the principal.
+    /// @notice Flag the round as failed so holders can refund. Owner or operator any time; anyone else after
+    ///         FAIL_GRACE. Cancels the unfilled legs first so their escrow returns to `raisedBnb`. Refused in
+    ///         Ready, where the parts are already the holders' asset. No-op when already failed or not
+    ///         Executing. Never halted: it only opens the refund gate and moves no BNB.
     function markFailed() public {
         if (scene != Scene.Executing || executionFailed) return;
-        // returnSurplus() already returned the principal; flagging a refund would burn shares for 0 BNB.
+        // returnSurplus already returned the principal; flagging a refund would burn shares for 0 BNB.
         if (surplusBase != 0) revert SurplusAlreadyReturned();
         if (phase == Phase.Ready) revert UseReturnSurplus();
-        if (msg.sender != owner && block.timestamp < _graceBase() + FAIL_GRACE) {
+        if (!_isOperator() && block.timestamp < _graceBase() + FAIL_GRACE) {
             revert RefundNotAvailable();
         }
-        executionFailed = true; // CEI: set before the market callback; a revert below rolls it back with the tx.
-        // Pull the live bid's escrow back into raisedBnb so holders refund against the real pool.
-        // A refused cancel reverts the tx, so markFailed can simply be retried.
+        executionFailed = true; // CEI: set before the market callback; a revert rolls it back.
+        // Pull the live bid's escrow back so holders refund against the real pool. A refused cancel
+        // reverts, so the call can simply be retried.
         _cancelLiveOrder();
         emit ExecutionFailed(0, raisedBnb);
     }
 
-    /// @notice Sell held transistors into a resting buy order on the market. Ready only.
-    ///         The official market has no ask book, so a seller completes a sale by filling an existing
-    ///         bid: the market pulls the parts from this contract and credits the net proceeds to
-    ///         owed(this), which this call withdraws into `raisedBnb` immediately.
-    ///         The bid must target this round's parts contract and the same token id, have enough
-    ///         remaining quantity, and pay at least the unit price this round paid (PriceBelowCost) —
-    ///         a below-cost sale would hand the parts to the buyer and burn the holders' collateral.
-    ///         A zero-price bid is refused outright (ZeroPrice) and the call reverts with NoProceeds if
-    ///         the fill credits nothing, so parts can never leave for free.
-    ///         Selling is repeatable and partial; anything left can still be pooled via depositToPool().
-    /// @param bidId Resting bid to fill.
+    /// @notice Sell held parts into a resting buy order. Owner or operator; Ready only — the market has no
+    ///         ask book, so this is the only sell path. The market pulls the parts and pays this round
+    ///         inside the fill: the official one sends BNB straight to receive(), the mock credits owed()
+    ///         for a withdraw. Both paths end with the proceeds in `raisedBnb`.
+    ///         Refused on a wrong parts contract / token id / quantity, a zero price, our own bid, or a
+    ///         price below this round's unit cost (a cheap fill would burn the collateral). Reverts with
+    ///         NoProceeds if the parts leave but no BNB arrives. Repeatable and partial. Halted stops it:
+    ///         parts leaving the contract is exactly what a breaker should stop.
+    /// @param bidId Bid to fill.
     /// @param tokenId 0 NAND, 1 LATCH.
     /// @param quantity Units to sell; at most the bid's remaining and this contract's balance.
     function sellTransistors(uint256 bidId, uint8 tokenId, uint256 quantity)
         external
-        onlyOwner
         nonReentrant
+        whenLive
     {
+        _requireOperator();
         _requireReady();
         if (pooled) revert AlreadyPooled();
         if (bidId == 0 || quantity == 0) revert NotABid();
@@ -907,32 +866,34 @@ contract Campaign is Ownable, ReentrancyGuard {
         (address buyer, address parts, uint96 price, uint8 bidTokenId,, uint256 remaining) =
             materialMarket.bids(bidId);
         if (parts != transistors || bidTokenId != tokenId || remaining < quantity) revert NotABid();
-        // A zero-price bid is not a sale, it is a giveaway: never fill it, even for a leg with no basis.
+        // A zero-price bid is a giveaway, never a sale.
         if (price == 0) revert ZeroPrice();
-        // Filling this round's own bid would round-trip the parts and book fake proceeds.
+        // Filling our own bid would round-trip the parts and book fake proceeds.
         if (buyer == address(this)) revert SelfTrade();
         if (price < _costBasis(tokenId)) revert PriceBelowCost();
         if (IERC1155(transistors).balanceOf(address(this), tokenId) < quantity) revert InsufficientParts();
 
-        // Idempotent; skips the extra isApprovedForAll SLOAD/external call.
+        // Idempotent; skips an extra isApprovedForAll call.
         IERC1155(transistors).setApprovalForAll(address(materialMarket), true);
-        materialMarket.fillBid(bidId, quantity);
-        // Proceeds land in owed(this); pull them now so the pool reflects the sale immediately.
-        uint256 before = raisedBnb;
+        // Drain anything an older settlement left credited, so the delta below is this sale only.
         _pullOwed();
-        // Parts are gone: if not one wei arrived, the round paid the sale and got nothing back. Revert.
+        uint256 before = raisedBnb;
+        materialMarket.fillBid(bidId, quantity);
+        // The official market pays the seller inside fillBid (its BNB hits receive(), which credits
+        // raisedBnb); the mock credits owed() and waits for withdraw(). Pull, then insist that BNB
+        // actually arrived — a fill that pays nothing would hand the parts away for free.
+        _pullOwed();
         if (raisedBnb == before) revert NoProceeds();
         emit TransistorsSold(bidId, tokenId, quantity, raisedBnb - before);
     }
 
-    /// @notice Pull proceeds owed by the market into `raisedBnb` (via receive). Anyone may call; no-op
-    ///         when nothing is owed.
+    /// @notice Pull market proceeds into `raisedBnb` (via receive). Anyone may call; no-op at 0.
     function withdrawMarketProceeds() external nonReentrant {
         _pullOwed();
     }
 
-    /// @notice Move Listed → Ready once both legs have remaining == 0 and this contract holds the parts.
-    ///         Does not move tokens; a zero-qty leg counts as filled.
+    /// @notice Move Listed → Ready once both legs have no remainder and the parts are here.
+    ///         Moves no tokens; a zero-qty leg counts as filled.
     function confirmTransistors() external {
         _requireExecuting();
         if (phase == Phase.Ready) revert AlreadyReady();
@@ -948,23 +909,19 @@ contract Campaign is Ownable, ReentrancyGuard {
         return _legFilled(nandBidId) && _legFilled(latchBidId);
     }
 
-    /// @notice Escape hatch: move ERC1155 tokens held here to the owner so nothing is stranded. Not for
-    ///         normal flow. Blocked while a bid is live, after pooling, and for the round's own parts while
-    ///         shares are outstanding OR while the holders were not repaid at the subscription price
-    ///         (settle them at full price first with topUpShortfall + openRefund, or send the parts to the
-    ///         pool/sell them via sellTransistors). Does not touch the order, the price lock or the scene.
-    /// @param token ERC1155 contract; not restricted to `transistors`, so foreign tokens can be moved too.
-    /// @param id Token id (0 NAND, 1 LATCH for the round's parts).
+    /// @notice Escape hatch: move ERC1155 tokens held here to the owner so nothing is stranded.
+    ///         Blocked while a bid is live, after pooling, and — for this round's own parts — while shares
+    ///         are outstanding or holders were not repaid at the subscription price.
+    /// @param token ERC1155 contract; not limited to `transistors`.
+    /// @param id Token id (0 NAND, 1 LATCH for this round's parts).
     /// @param amount Units to transfer.
     function recoverTransistors(address token, uint256 id, uint256 amount) external onlyOwner nonReentrant {
         if (phase == Phase.Listed) revert AlreadyListed();
         if (pooled) revert AlreadyPooled();
         if (token == address(0)) revert ZeroAddress();
         if (token == transistors) {
-            // The round's own parts are the collateral behind the outstanding shares. They may only leave
-            // through depositToPool() (to the pool) or sellTransistors() (into a market bid), or after
-            // every holder has been settled AND repaid in full — otherwise the owner could take the asset
-            // and leave the shares unpaid.
+            // Our parts back the outstanding shares: they leave only via depositToPool / sellTransistors,
+            // or once every holder is settled AND repaid in full.
             if (outstandingShares != 0) revert SharesOutstanding();
             if (!_holdersMadeWhole()) revert HoldersNotMadeWhole();
         }
@@ -974,28 +931,26 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── mining pool (commit) ───────────────────────────
 
-    /// @notice Commit the round's transistors to the mining pool. IRREVERSIBLE. Ready only.
-    ///         1. Book the unspent subscription BNB as holder-claimable surplus before the parts leave
-    ///            (idempotent: only newly arrived BNB is added if returnSurplus() already booked it).
+    /// @notice Commit the round's parts to the mining pool. IRREVERSIBLE. Owner only, Ready only.
+    ///         Never delegated: the factory dropping the round opens only the reversible cancel, because
+    ///         pooling would let a third party decide "mine vs sell" for the holders.
+    ///         Halted stops it: the breaker must be able to hold the irreversible step.
+    ///         1. Book the leftover BNB as holder-claimable surplus, before the parts leave.
     ///         2. Send every held part (NAND id 0, LATCH id 1) to `miningPool`.
     ///         3. Set `pooled` and enter Mining.
-    ///         Requires a settled purchase and that somebody still holds shares: pooling with no shares or
-    ///         no parts would hand the assets to the pool with nobody entitled to the output.
-    ///         The ordered quantity is not required: a round that sold some parts legitimately holds less,
-    ///         and the sale proceeds were booked for holders in step 1.
-    ///         Afterwards recoverTransistors / refund / abandonOrder / markFailed revert. The pool must
-    ///         implement onERC1155Received. Gas is O(1) in holder count (holders pull via claimSurplus).
-    function depositToPool() external onlyOwner nonReentrant {
+    ///         Requires a ready basis (settled purchase or parts on hand) and at least one outstanding
+    ///         share — with no shares or no parts nobody would own the output. The full ordered quantity is
+    ///         not required: a round that sold some parts holds less, and those proceeds were booked above.
+    function depositToPool() external onlyOwner nonReentrant whenLive {
         if (pooled) revert AlreadyPooled();
         _requireReady();
         if (miningPool == address(0)) revert PoolNotSet();
         if (!_readyBasis()) revert TransistorsNotReady();
         if (outstandingShares == 0) revert ZeroShares();
 
-        // Before the parts go: the leftover subscription BNB becomes the holders' pull-claimable surplus.
-        // Proceeds the market still holds are part of that leftover, so pull them first (best-effort: a
-        // market that cannot pay must not block the irreversible pooling step; a later settlement is then
-        // booked as a new surplus round by receive()).
+        // Leftover BNB becomes pull-claimable surplus. Proceeds are part of it, so pull them first —
+        // best effort: a market that cannot pay must not block the irreversible step (receive books a
+        // later settlement as a new surplus round).
         _pullOwedSoft();
         _returnSurplus();
 
@@ -1011,25 +966,23 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit DepositedToPool(miningPool, nandAmt, latchAmt);
     }
 
-    /// @notice PLACEHOLDER — BEM distribution is not implemented; a no-op so the Mining ABI stays stable.
-    ///         Mining revenue in BNB is already claimable by holders through claimSurplus().
+    /// @notice PLACEHOLDER — BEM distribution not implemented; no-op to keep the Mining ABI stable.
+    ///         BNB revenue is already claimable via claimSurplus.
     function harvest() external nonReentrant {
         if (scene != Scene.Mining) revert WrongScene();
     }
 
-    /// @notice PLACEHOLDER — BEM distribution is not implemented. BNB revenue is not withdrawn here:
-    ///         depositRevenue books it into the pull-claimable surplus (see claimSurplus).
+    /// @notice PLACEHOLDER — BEM distribution not implemented; BNB revenue is not withdrawn here.
     /// @return Always 0 until distribution lands.
     function claim() external nonReentrant returns (uint256) {
         if (scene != Scene.Mining) revert WrongScene();
         return 0;
     }
 
-    /// @notice Deposit mining revenue. Only `miningPool` may call. The only on-chain fee collection point:
-    ///         fee = msg.value × serviceFeeBps / 10000 split over the recipient table, and the net is added
-    ///         to the holders' pull-claimable surplus (claimSurplus) so it is never parked in a pot with no
-    ///         exit. Dust stays with the holders, so the fee is never over-charged; the fee is pulled via
-    ///         claimFee() rather than pushed, so a rejecting recipient cannot block this call.
+    /// @notice Deposit mining revenue. Only `miningPool` may call; the only on-chain fee point.
+    ///         fee = msg.value × serviceFeeBps / 10000 split over the table; the net is booked into the
+    ///         holders' pull-claimable surplus. Rounding dust stays with holders (fee never over-charged)
+    ///         and recipients pull via claimFee, so a rejecting recipient cannot block this call.
     function depositRevenue() external payable nonReentrant {
         if (scene != Scene.Mining) revert WrongScene();
         if (msg.sender != miningPool) revert NotOwner(msg.sender);
@@ -1037,12 +990,11 @@ contract Campaign is Ownable, ReentrancyGuard {
 
         uint256 fee = _accrueServiceFee(msg.value);
         uint256 net = msg.value - fee;
-        // Cumulative display total only: the money itself is booked below, so revenuePool must never be
-        // added to recoverBnb's reserve (that would double-count it).
+        // Display total only: the money is booked below, so never add this to recoverBnb's reserve.
         revenuePool += net;
         if (net != 0) {
-            // With shares outstanding the revenue is immediately claimable; with none left it stays in
-            // raisedBnb so recoverBnb can sweep it to the owner.
+            // With shares outstanding it is immediately claimable; with none left it stays in raisedBnb
+            // so recoverBnb can sweep it.
             if (outstandingShares == 0) raisedBnb += net;
             else _bookSurplus(net);
         }
@@ -1050,7 +1002,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     // ─────────────────────────── views ───────────────────────────
-    // scene and phase already have public getters. Do not wrap them again.
+    // `scene` and `phase` already have public getters.
 
     /// @param account Wallet to query.
     /// @return Unlocked shares held by `account`.
@@ -1092,11 +1044,11 @@ contract Campaign is Ownable, ReentrancyGuard {
         return _listings.length;
     }
 
-    /// @notice Listing detail by id. Callers read ids 0..listingCount()-1.
+    /// @notice Listing detail by id.
     /// @param id Listing id.
     /// @return seller Listing seller.
-    /// @return shares Shares still on the listing.
-    /// @return priceBnbPerShare Listing price per share in wei.
+    /// @return shares Shares still listed.
+    /// @return priceBnbPerShare Price per share in wei.
     /// @return open Whether the listing can still be taken.
     function getListing(uint256 id) external view returns (address seller, uint256 shares, uint256 priceBnbPerShare, bool open) {
         if (id >= _listings.length) revert NoListing();
@@ -1106,28 +1058,23 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── internal ───────────────────────────
 
-    /// @dev Book `raisedBnb` as holder-claimable surplus. No holder loop: only surplusPool / surplusBase
-    ///      are stored and holders pull in claimSurplus(). No-op when it is 0 or no shares are outstanding.
+    /// @dev Book `raisedBnb` as holder-claimable surplus. Stores only the pool / base; holders pull in
+    ///      claimSurplus. No-op when it is 0 or no shares are outstanding.
     function _returnSurplus() internal {
         uint256 pool = raisedBnb;
         if (pool == 0) return;
-        // Nobody left to pay: keep the money in raisedBnb so recoverBnb can still see it, instead of
-        // booking a pool that no share can ever claim (surplusBase would be 0).
+        // Nobody left to pay: keep it in raisedBnb so recoverBnb sees it.
         if (outstandingShares == 0) return;
         _bookSurplus(pool);
-        // The principal pool is zeroed: the money is now tracked by surplusPool and distributed by
-        // claimSurplus(). recoverBnb reserves surplusPool − surplusPaid, so the owner cannot sweep it.
+        // The principal pool is zeroed; recoverBnb reserves surplusPool − surplusPaid, so it stays safe.
         raisedBnb = 0;
     }
 
     /// @dev Add `amount` to the pull-claimable surplus. The first booking of a round fixes the denominator
-    ///      at the current outstandingShares; later top-ups (a settlement after returnSurplus, a late
-    ///      market credit after pooling, or mining revenue) share the same base, which cannot drift because
-    ///      shares are only ever transferred after pooling. Counters are never reset inside a round, or
-    ///      early claimants would be paid twice.
-    ///      Once a round has counted every base share it cannot pay another wei, so fresh money opens a new
-    ///      round. That is what keeps a second revenue deposit claimable instead of locked forever.
-    ///      Callers guarantee outstandingShares != 0.
+    ///      at the current outstandingShares; later top-ups share that base, which cannot drift because
+    ///      shares only move after pooling. Counters are never reset mid-round, or early claimants would be
+    ///      paid twice. Once every base share is counted the round cannot pay again, so fresh money opens a
+    ///      new round. Callers guarantee outstandingShares != 0.
     /// @param amount Wei to book.
     function _bookSurplus(uint256 amount) internal {
         surplusPool += amount;
@@ -1142,8 +1089,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @notice Claim your booked surplus. Covers the lazily computed entitlement plus any accrued amount
-    ///         whose earlier transfer failed. A failed send reverts, so the accrual stays claimable.
+    /// @notice Claim your booked surplus. Covers the lazily computed entitlement plus any amount whose
+    ///         earlier transfer failed. A failed send reverts, so the accrual stays claimable.
     function claimSurplus() external nonReentrant {
         uint256 amt = pendingSurplus[msg.sender];
         if (amt == 0) {
@@ -1154,23 +1101,20 @@ contract Campaign is Ownable, ReentrancyGuard {
         totalPendingSurplus -= amt;
         surplusPaid += amt;
         if (!_trySend(msg.sender, amt)) {
-            // Still undeliverable: the whole tx reverts and the money in pendingSurplus is kept as-is;
-            // the holder can retry (or switch address / use a smart-contract wallet).
+            // Reverts the whole call, keeping pendingSurplus intact so the holder can retry.
             revert TransferFailed();
         }
         _surplusClaimed[msg.sender] += amt;
         emit SurplusClaimed(msg.sender, amt);
     }
 
-    /// @dev The single source of the surplus math: which shares of `who` are uncounted and what they are
-    ///      worth, in the current round. View-only, so the writer (_accrueSurplus) and the view (surplusOf)
-    ///      cannot diverge.
-    ///      Listed shares count too: they are still the holder's until a buyer takes them, and excluding
-    ///      them would lock a seller out of the claim for as long as the listing lives (cancel-only).
+    /// @dev The single source of the surplus math: `who`'s uncounted shares this round and their value.
+    ///      View-only, so the writer and the surplusOf view cannot diverge. Listed shares count too: they
+    ///      are still the holder's, and excluding them would lock a seller out while the listing lives.
     /// @param who Wallet to evaluate.
-    /// @return newShares Uncounted shares; 0 when nothing is left or the shares exceed the base.
-    /// @return amt BNB those shares are worth (the last claimant also takes the rounding dust).
-    /// @return already Shares already counted for `who` in this round.
+    /// @return newShares Uncounted shares; 0 when nothing is left or they exceed the base.
+    /// @return amt BNB they are worth (the last claimant also takes the dust).
+    /// @return already Shares already counted for `who` this round.
     function _surplusEntitlement(address who) internal view returns (uint256 newShares, uint256 amt, uint256 already) {
         uint256 s = _shares[who] + _escrow[who];
         if (s == 0 || surplusBase == 0 || surplusRoundPool == 0) return (0, 0, 0);
@@ -1189,8 +1133,8 @@ contract Campaign is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Book a holder's entitlement into pendingSurplus. Each share is counted once per round
-    ///      (surplusCounted + surplusCountedRound), so repeated calls never pay twice.
+    /// @dev Book a holder's entitlement into pendingSurplus; each share is counted once per round, so
+    ///      repeated calls never pay twice.
     /// @param who Wallet to accrue for.
     /// @return amt Newly booked amount (0 when nothing is left to count).
     function _accrueSurplus(address who) internal returns (uint256 amt) {
@@ -1209,7 +1153,7 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Surplus claimable by `who` right now, including the not-yet-booked part. Display only.
     /// @param who Wallet to query.
-    /// @return BNB `who` could take with claimSurplus().
+    /// @return BNB `who` could take with claimSurplus.
     function surplusOf(address who) external view returns (uint256) {
         uint256 amt = pendingSurplus[who];
         if (amt != 0) return amt;
@@ -1217,9 +1161,28 @@ contract Campaign is Ownable, ReentrancyGuard {
         return amt;
     }
 
-    /// @dev Only abandonOrder() calls this, after the bid is cancelled and every share is settled, so no
-    ///      live order exists and the parts no longer back anyone's shares.
-    ///      An owner that cannot receive ERC1155 must not block the refund: the transfer is skipped.
+    /// @dev Move the current round's counted shares from `from` to `to`, so a share is counted once per
+    ///      round however often it is resold. Without this a seller could claim, resell, and let the buyer
+    ///      claim the same shares again — draining the pool from the other holders.
+    /// @param from Seller whose counter shrinks.
+    /// @param to Buyer that inherits it.
+    /// @param count Shares sold.
+    function _moveSurplusCount(address from, address to, uint256 count) internal {
+        if (surplusBase == 0 || surplusCountedRound[from] != surplusRound) return;
+        uint256 counted = surplusCounted[from];
+        if (counted == 0) return;
+        uint256 moved = count < counted ? count : counted;
+        surplusCounted[from] = counted - moved;
+        if (surplusCountedRound[to] == surplusRound) {
+            surplusCounted[to] += moved;
+        } else {
+            surplusCountedRound[to] = surplusRound;
+            surplusCounted[to] = moved;
+        }
+    }
+
+    /// @dev Hand held parts to the owner. Only abandonOrder calls this, after no share is outstanding and
+    ///      every holder was repaid. A failing transfer is skipped so the owner cannot block the call.
     function _returnHeldParts() internal {
         IERC1155 token = IERC1155(transistors);
         for (uint256 id = 0; id < 2; id++) {
@@ -1229,7 +1192,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Thin wrapper over the market getter, so every caller reads the same `owed(address(this))`.
+    /// @dev Thin wrapper so every caller reads the same `owed(address(this))`.
     /// @return BNB the market still owes this round.
     function _owed() internal view returns (uint256) {
         return materialMarket.owed(address(this));
@@ -1246,39 +1209,31 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (phase != Phase.Ready) revert TransistorsNotReady();
     }
 
-    /// @dev The purchase invariant: a real order was paid for (`priceLock`) and the market has nothing left
-    ///      to fill. The priceLock term is essential: a never-ordered (or cancelled) round has bid ids 0, so
-    ///      orderFilled() would read true and the round could otherwise reach Ready → Mining with no purchase.
-    ///      `_partsOnHand()` is deliberately NOT part of this check: after a partial sale in Ready the round
-    ///      legitimately holds fewer parts than it ordered, and requiring the full quantity would trap the
-    ///      remainder and the sale proceeds with no exit (see confirmTransistors for the delivery proof).
+    /// @dev True when a real order was paid for (`priceLock`) and the market has nothing left to fill.
+    ///      priceLock is essential: a never-ordered round has bid ids 0, so orderFilled would read true and
+    ///      Ready → Mining could be faked with no purchase. Parts on hand are checked only in _readyInvariant.
     /// @return Whether a real, fully filled purchase backs the round.
     function _purchaseSettled() internal view returns (bool) {
         return priceLock != 0 && orderFilled();
     }
 
-    /// @dev The delivery invariant, enforced when the round first becomes Ready: the purchase is settled
-    ///      AND the ordered quantity is already on hand, so a market that burns the escrow without
-    ///      delivering cannot masquerade as a finished round.
+    /// @dev Delivery invariant for the normal path into Ready: the purchase is settled AND the ordered
+    ///      quantity is on hand, so a market that burns the escrow without delivering cannot pass.
     /// @return Whether the round may be confirmed Ready.
     function _readyInvariant() internal view returns (bool) {
         return _purchaseSettled() && _partsOnHand();
     }
 
-    /// @dev True when every share ever sold has been repaid at the subscription price. The round's own
-    ///      parts are the holders' collateral: while the pool is short, part of their money sits in those
-    ///      parts, so letting them leave for a pro-rata refund would be a discounted sale. Callers are
-    ///      recoverTransistors and abandonOrder's hand-over, both of which only run at
-    ///      outstandingShares == 0 (so a full-price refund of every share is what makes totalRefunded
-    ///      reach sold × price).
+    /// @dev True when every share ever sold was repaid at the subscription price. A short pool means part
+    ///      of the money sits in the parts, so releasing them for a pro-rata refund would be a discounted
+    ///      sale. Callers only run at outstandingShares == 0.
     /// @return Whether holders were made whole.
     function _holdersMadeWhole() internal view returns (bool) {
         return totalRefunded >= sold * sharePriceBnb;
     }
 
-    /// @dev True when the round holds any of its own parts. Those parts are the outstanding shares'
-    ///      collateral, so the refund exits stay closed while the pool cannot repay every share (see
-    ///      PartsAreCollateral): zeroing the shares would leave them with nobody entitled to them.
+    /// @dev True when the round holds any of its own parts; they back the outstanding shares, so the refund
+    ///      exits stay closed while the pool cannot repay every share.
     /// @return Whether the contract holds NAND or LATCH parts of this round.
     function _partsHeld() internal view returns (bool) {
         IERC1155 token = IERC1155(transistors);
@@ -1291,24 +1246,22 @@ contract Campaign is Ownable, ReentrancyGuard {
         return raisedBnb >= outstandingShares * sharePriceBnb;
     }
 
-    /// @dev The basis for reaching Ready on a recovery path (setPhase / depositToPool): a settled
-    ///      purchase, OR parts already on hand. The second term matters because cancelling a partially
-    ///      filled order clears `priceLock` while the delivered parts stay here — without it such a round
-    ///      could never book its leftover BNB or pool the parts. The delivery proof is still enforced on
-    ///      the normal Listed → Ready path (confirmTransistors / _readyInvariant).
+    /// @dev Basis for entering Ready on a recovery path (setPhase / depositToPool): a settled purchase OR
+    ///      parts on hand. The second term matters because cancelling a partially filled order clears
+    ///      `priceLock` while the delivered parts stay. The delivery proof still applies on the normal path.
     /// @return Whether the round may enter Ready through an admin / pooling path.
     function _readyBasis() internal view returns (bool) {
         return _purchaseSettled() || _partsHeld();
     }
 
-    /// @dev Start of the non-owner grace window: the later of the sell-out and the last order, so an
-    ///      owner that keeps ordering is never griefed by a bystander.
+    /// @dev Start of the non-owner grace window: the later of sell-out and last order, so an owner that
+    ///      keeps ordering is never griefed.
     /// @return Unix timestamp the grace window is measured from.
     function _graceBase() internal view returns (uint256) {
         return uint256(lastOrderAt) > uint256(soldOutAt) ? uint256(lastOrderAt) : uint256(soldOutAt);
     }
 
-    /// @dev Reject an order with both legs empty (ZeroShares) or a funded leg priced 0 (ZeroPrice).
+    /// @dev Reject an empty order (ZeroShares) or a funded leg priced 0 (ZeroPrice).
     /// @param nandQty_ NAND quantity.
     /// @param nandPrice_ NAND price in wei; must be > 0 when nandQty_ > 0.
     /// @param latchQty_ LATCH quantity.
@@ -1318,11 +1271,11 @@ contract Campaign is Ownable, ReentrancyGuard {
         if ((nandQty_ > 0 && nandPrice_ == 0) || (latchQty_ > 0 && latchPrice_ == 0)) revert ZeroPrice();
     }
 
-    /// @dev Place one bid leg. Returns 0 for a zero quantity; reverts BadBidId when the market returns 0.
+    /// @dev Place one bid leg. Returns 0 for a zero quantity; reverts BadBidId if the market returns 0.
     /// @param tokenId 0 NAND, 1 LATCH.
     /// @param qty Units to bid for.
-    /// @param price Bid price in wei per unit.
-    /// @param cost Escrow sent with the bid (qty × price).
+    /// @param price Price per unit in wei.
+    /// @param cost Escrow sent (qty × price).
     /// @return id Market bid id, or 0 when the leg is skipped.
     function _placeBidLeg(uint8 tokenId, uint256 qty, uint96 price, uint256 cost) internal returns (uint256 id) {
         if (qty == 0) return 0;
@@ -1330,21 +1283,18 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (id == 0) revert BadBidId();
     }
 
-    /// @dev Unit price this round paid for a token id. sellTransistors() refuses to sell below it, so the
-    ///      parts can never be dumped under cost. 0 when the leg was never bought, which makes the floor
-    ///      vacuous for an id the round never paid for.
+    /// @dev Highest unit price this round paid for a token id; the sell floor. 0 when never bought.
     /// @param tokenId 0 NAND, 1 LATCH.
     /// @return Unit cost basis in wei.
     function _costBasis(uint8 tokenId) internal view returns (uint256) {
         return tokenId == 0 ? uint256(nandCostBasis) : uint256(latchCostBasis);
     }
 
-    /// @dev Raise (never lower) the unit cost basis of one leg. The basis is the highest unit price the
-    ///      round ever paid, for two reasons: a later order that skips the leg must not wipe the floor
-    ///      for parts the round still holds, and a later cheaper re-buy must not license a below-cost
-    ///      dump of the parts bought earlier — either one would let the owner strip the collateral.
+    /// @dev Raise (never lower) the cost basis: the highest unit price ever paid. Skipping the leg later
+    ///      must not wipe the floor for parts still held, and a cheaper re-buy must not license a dump of
+    ///      the earlier parts.
     /// @param current Basis stored so far.
-    /// @param qty Quantity bought on this leg; 0 leaves the basis untouched.
+    /// @param qty Quantity bought on this leg; 0 leaves it untouched.
     /// @param price Unit price paid on this leg.
     /// @return Updated basis.
     function _raiseCostBasis(uint96 current, uint256 qty, uint96 price) internal pure returns (uint96) {
@@ -1352,37 +1302,35 @@ contract Campaign is Ownable, ReentrancyGuard {
         return price;
     }
 
-    /// @dev No quantity argument is needed: a skipped leg has id 0, and _remaining(0) already reads 0,
-    ///      so the "empty leg counts as filled" rule falls out of the id check.
+    /// @dev A skipped leg has id 0 and _remaining(0) reads 0, so "empty leg counts as filled" falls out.
     /// @param id Market bid id; 0 reads as filled.
     /// @return Whether the leg has no market remainder.
     function _legFilled(uint256 id) internal view returns (bool) {
         return _remaining(id) == 0;
     }
 
-    /// @dev True when at least one unit was taken, including a leg already down to remaining 0.
-    /// @param id Market bid id; 0 reads as remaining 0.
-    /// @param qty Quantity the round ordered on that leg; a skipped leg leaves both at 0, so 0 < 0 is false.
+    /// @dev True when at least one unit was taken, including a leg already down to 0.
+    /// @param id Market bid id; 0 reads as 0.
+    /// @param qty Quantity ordered on that leg; a skipped leg leaves both at 0, so 0 < 0 is false.
     /// @return Whether remaining < qty, i.e. somebody filled part of it.
     function _filledSome(uint256 id, uint256 qty) internal view returns (bool) {
         return _remaining(id) < qty;
     }
 
-    /// @dev Cancel the unfilled remainder. A filled leg is left alone because cancelBid would revert, and
-    ///      a skipped leg has id 0, which _remaining() reports as 0 without calling the market.
+    /// @dev Cancel the unfilled remainder: a filled leg would revert, a skipped leg reads 0.
     /// @param id Market bid id.
     function _cancelOpenLeg(uint256 id) internal {
         if (_remaining(id) != 0) materialMarket.cancelBid(id);
     }
 
     /// @dev True when `raisedBnb` can no longer repay every outstanding share at the subscription price.
-    /// @return Whether refund() would pay pro-rata instead of in full.
+    /// @return Whether refund would pay pro-rata instead of in full.
     function _shortfall() internal view returns (bool) {
         return raisedBnb < outstandingShares * sharePriceBnb;
     }
 
-    /// @dev Parts for the live order are already in this contract. Token id 0 is NAND, 1 is LATCH.
-    /// @return Whether every ordered leg has been delivered.
+    /// @dev True when every ordered leg is already delivered (id 0 = NAND, 1 = LATCH).
+    /// @return Whether the ordered quantity is on hand.
     function _partsOnHand() internal view returns (bool) {
         IERC1155 token = IERC1155(transistors);
         return (nandQty <= token.balanceOf(address(this), 0)) && (latchQty <= token.balanceOf(address(this), 1));
@@ -1395,8 +1343,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         (,,,,, remaining) = materialMarket.bids(id);
     }
 
-    /// @dev Drop the live bid: ids, quantities and prices go back to 0 so no reader sees a stale order
-    ///      (readers gate on id != 0).
+    /// @dev Drop the live bid so no reader sees a stale order (readers gate on id != 0).
     function _clearOrder() internal {
         nandBidId = latchBidId = nandQty = latchQty = 0;
         nandPrice = 0;
@@ -1404,43 +1351,39 @@ contract Campaign is Ownable, ReentrancyGuard {
         priceLock = 0;
     }
 
-    /// @dev Cancel both open bid legs, pull whatever the market owes, drop the record and return to
-    ///      Buying. No-op unless Listed.
+    /// @dev Cancel both open legs, pull what the market owes, drop the record and return to Buying.
+    ///      No-op unless Listed.
     function _cancelLiveOrder() internal {
         if (phase != Phase.Listed) return;
         _cancelOpenLeg(nandBidId);
         _cancelOpenLeg(latchBidId);
-        // A market that settles cancels through owed() instead of a direct send would otherwise leave the
-        // refund pool short while the money sits claimable in the market.
+        // Without this the pool would stay short while the money sits claimable in the market.
         _pullOwedSoft();
         _clearOrder();
         _setPhase(Phase.Buying);
         emit TransistorOrderCancelled();
     }
 
-    /// @dev Withdraw whatever the market owes this round, ignoring a market that cannot pay. The cancel
-    ///      path uses it: proceeds must not be left behind, but a market whose withdraw() reverts must not
-    ///      block the cancel itself — that is exactly the escape hatch. Callers that divide a pool keep
-    ///      their own `_owed() > 0` guard (ProceedsPending) so the split is never computed on stale money.
+    /// @dev Withdraw what the market owes, ignoring one that cannot pay: the cancel path must not be blocked
+    ///      by a reverting withdraw. Pool-dividing callers keep their own `_owed() > 0` guard.
     function _pullOwedSoft() internal {
         if (_owed() == 0) return;
         try materialMarket.withdraw() {} catch {}
     }
 
-    /// @dev Withdraw whatever the market owes this round; receive() credits `raisedBnb`. No-op at 0.
+    /// @dev Withdraw what the market owes; receive credits `raisedBnb`. No-op at 0.
     function _pullOwed() internal {
         if (_owed() > 0) materialMarket.withdraw();
     }
 
-    /// @dev Official fillBid uses ERC1155 safeTransfer. The caller is not checked; the hook only returns the receiver selector.
+    /// @dev ERC1155 single-token receive hook; the market delivers parts with safeTransferFrom.
     function onERC1155Received(address, address, uint256, uint256, bytes calldata) external pure returns (bytes4) {
         return this.onERC1155Received.selector;
     }
 
     /// @notice Batch delivery hook.
-    /// @dev Required when the market delivers both legs in one safeBatchTransferFrom: without it the
-    ///      delivery reverts after `remaining` was already decremented, trapping the principal and the
-    ///      parts (confirmTransistors / depositToPool could never pass).
+    /// @dev Required when the market delivers both legs in one safeBatchTransferFrom; without it the
+    ///      delivery reverts after `remaining` was already decremented, trapping principal and parts.
     function onERC1155BatchReceived(
         address,
         address,
@@ -1462,38 +1405,34 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     /// @notice Owner escape while Executing: rewrite the sub-phase so a stuck round can reach refund or
-    ///         recovery. Moves no tokens and does not cancel a market order. Current Listed is refused —
-    ///         cancel or abandon the live bid first, or its escrow stays on the market.
-    ///         Entering Ready requires a settled purchase (`priceLock` + fully filled), so a round with no
-    ///         paid order cannot reach Ready/Mining; the delivery proof is only required on the normal
-    ///         Listed → Ready path, because a partly sold round legitimately holds fewer parts and must
-    ///         still be able to book the proceeds (returnSurplus) and pool the remainder.
-    ///         Entering Listed requires a bid with unfilled quantity on the market. Every other direction
-    ///         stays open (Ready → Buying is the recovery path).
-    /// @param next Target phase: 1 Buying, 2 Listed (needs a live unfilled bid), 3 Ready (needs a settled
-    ///        purchase or parts on hand).
-    ///        None (0) is refused: it would close ordering and every refund path except abandonOrder().
+    ///         recovery. Moves no tokens and does not cancel the market order — cancel or abandon the live
+    ///         bid first, or its escrow stays on the market.
+    ///         Listed needs a live bid with unfilled quantity; Ready needs a settled purchase or parts on
+    ///         hand. Ready → Buying is the recovery path.
+    /// @param next 1 Buying, 2 Listed, 3 Ready. None (0) is refused — it would close ordering and every
+    ///        refund path except abandonOrder.
     function setPhase(uint8 next) external onlyOwner {
         if (scene != Scene.Executing) revert WrongScene();
         if (phase == Phase.Listed) revert AlreadyListed();
-        // Listed means a bid with unfilled quantity is actually on the market. A stale id (the order was
-        // filled and confirmed Ready) must not fake it: that state has no cancel path and blocks every
-        // later setPhase through the AlreadyListed guard above.
+        // Listed must mean a bid with unfilled quantity is really on the market; a stale id (already filled
+        // and confirmed Ready) would otherwise fake it, block every later setPhase, and have no cancel path.
         if (next == uint8(Phase.Listed) && _remaining(nandBidId) + _remaining(latchBidId) == 0) revert WrongScene();
         if (next == uint8(Phase.None) || next > uint8(Phase.Ready)) revert WrongScene();
         if (next == uint8(Phase.Ready) && !_readyBasis()) revert TransistorsNotReady();
+        // Once the principal is booked as surplus, refunds are closed: leaving Ready pays nothing and only
+        // a return to Ready can move the round on. Refuse when that way back is already gone (no parts and
+        // no settled purchase), or the round would sit in Buying with every exit reverting.
+        if (surplusBase != 0 && next != uint8(Phase.Ready) && !_readyBasis()) revert WrongScene();
         _setPhase(Phase(next));
     }
 
-    /// @notice Sweep BNB no share is entitled to; the recipient is always the owner. No amount argument:
-    ///         one call moves everything safe to move. While shares are outstanding only the excess over
-    ///         `raisedBnb` leaves; once every share has left the whole balance leaves and `raisedBnb` is
-    ///         zeroed. Unclaimed fees and unclaimed surplus are never touched.
+    /// @notice Sweep BNB no share is entitled to; the recipient is always the owner. While shares are
+    ///         outstanding only the excess over escrow leaves; once all are settled the whole balance leaves
+    ///         and `raisedBnb` is zeroed. Unclaimed fees and surplus are never touched.
     function recoverBnb() external onlyOwner nonReentrant {
         uint256 amount = address(this).balance;
-        // Reserved: unclaimed fees plus unclaimed surplus (surplusPool − surplusPaid, which already
-        // contains the booked mining revenue and the not-yet-claimed totalPendingSurplus — neither may be
-        // added again). revenuePool is a cumulative display total, not a separate pot.
+        // Reserved: unclaimed fees + unclaimed surplus (which already includes booked revenue and
+        // totalPendingSurplus, so never add those again). revenuePool is display only.
         uint256 reserved = totalPendingFee;
         if (surplusPool > surplusPaid) reserved += surplusPool - surplusPaid;
         if (outstandingShares == 0) {
@@ -1512,7 +1451,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit BnbRecovered(amount, owner);
     }
 
-    /// @dev Low-level send; returns false instead of reverting on a rejecting recipient.
+    /// @dev Low-level send; false instead of reverting on a rejecting recipient.
     /// @param to Recipient.
     /// @param amount Wei to send.
     /// @return ok Whether the recipient accepted the BNB.

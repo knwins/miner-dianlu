@@ -247,10 +247,10 @@ export function explainConnectError(error) {
   if (code === "NO_WALLET" || code === "NEED_CHOICE") return error.message;
   const text = String(error?.shortMessage || error?.message || "连接失败");
   if (/usage limit|1rpc|#pricing|-32001|missing response|BAD_DATA/i.test(text)) {
-    return "钱包节点额度用尽（常见是 1rpc）。请在钱包网络设置里把 BSC 主网 RPC 改成 https://bsc-rpc.publicnode.com，保存后再点连接。";
+    return "钱包节点额度用尽（常见是 1rpc）。请把 BSC 主网 RPC 改成 https://bsc-rpc.publicnode.com 后再连接。";
   }
   if (/403|网络连接失败|data-seed-prebsc|bnbchain\.org/i.test(text)) {
-    return "钱包 RPC 连不上。请把 BSC 主网节点改成 https://bsc-rpc.publicnode.com，或断开后重新连接本页。";
+    return "钱包 RPC 连不上。请把 BSC 主网节点改成 https://bsc-rpc.publicnode.com，或断开重连。";
   }
   return text.replace(/^Error:\s*/, "");
 }

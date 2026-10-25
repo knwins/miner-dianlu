@@ -1684,6 +1684,18 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   letter-spacing: 0.08em;
   line-height: 1.4;
 }
+/*
+ * 不属于任何分组的常驻入口（晶体管市场）。
+ * 上面紧挨着「合约工作台」的卡组，靠这条分隔线+留白把两者断开，
+ * 否则它会贴着子项列表，被读成工作台的第 4 个子项。
+ */
+.nav-standalone {
+  margin-top: 16px;
+  border-top: 1px solid var(--color-border);
+  padding-top: 12px;
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+.nav-standalone.active { border-top-color: transparent; }
 
 .nav-link-main { font-size: 14px; font-weight: 600; line-height: 1.4; }
 .nav-link-hint {
@@ -1780,7 +1792,7 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 }
 .life-line.is-done { background: var(--color-success); }
 
-/* Owner 工作台子页签 */
+/* 合约工作台子页签 */
 .desk-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -2166,6 +2178,151 @@ a.rules-contract-addr:hover { text-decoration: underline; }
 /* 右栏：链上参数 + 晶体管市场流水，纵向堆叠 */
 .detail-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .detail-col > .card { margin-top: 0; }
+
+/* ── 合约工作台 · 高级配置 ────────────────────────────────────────────
+ * 设置台布局：卡片纵向单列（每张卡只办一件事），卡内是「左标签 / 右控件」
+ * 的两列行。标签列固定 1fr、控件列 0.85fr 且有 300px 下限，
+ * 于是同一种控件在不同卡片里落在同一条竖线上，也不会被长地址撑破。
+ */
+.adv-desk { display: flex; flex-direction: column; gap: 16px; }
+.adv-groups { display: flex; flex-direction: column; gap: 16px; }
+/* 卡片间距由 flex gap 统一给，抵消全局 `.card + .card` 的 margin-top */
+.adv-groups .card { margin-top: 0; }
+/* 地址用等宽字体、不做字距收紧：抄地址时不至于把 0/O、1/l 看混 */
+.adv-addr {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0;
+}
+.adv-rows { display: flex; flex-direction: column; }
+.adv-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 0.85fr);
+  align-items: start;
+  gap: 8px 24px;
+  padding: 18px 0;
+}
+.adv-row:first-child { padding-top: 0; }
+.adv-row:last-child { padding-bottom: 0; }
+.adv-row + .adv-row { border-top: 1px solid var(--color-border); }
+.adv-row-label { min-width: 0; }
+.adv-row-label strong { display: block; font-size: 14px; font-weight: 600; line-height: 1.5; }
+.adv-row-label span {
+  display: block;
+  margin-top: 4px;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.adv-control { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.adv-control > input,
+.adv-control > select,
+.adv-control-grid > input {
+  flex: 1 1 160px;
+  min-width: 0;
+  min-height: 36px;
+  padding: 4px 11px;
+  border: 1px solid var(--color-border-secondary);
+  border-radius: var(--radius);
+  background: #fff;
+  color: var(--color-text);
+  font-size: 13px;
+}
+.adv-control-grid > input { width: 100%; }
+.adv-control > input:focus,
+.adv-control > select:focus,
+.adv-control-grid > input:focus {
+  outline: 0;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px rgba(13, 158, 168, 0.12);
+}
+.adv-control > input::placeholder,
+.adv-control-grid > input::placeholder { color: var(--color-text-quaternary); }
+/* 行内按钮不吃 `.btn-primary` 的 100% 宽度，也不吃它的上外边距 */
+.adv-control .btn {
+  flex: none;
+  width: auto;
+  min-width: 84px;
+  margin-top: 0;
+  padding: 0 16px;
+  font-size: 13px;
+  font-weight: 500;
+}
+/* 控件需要多行（地址一行 + 两个数字 + 按钮）时纵向堆叠，宽度仍与单行控件对齐 */
+.adv-control-stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+.adv-control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.adv-control-stack .adv-control { flex-wrap: nowrap; }
+.adv-locked {
+  margin: 0;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px dashed var(--color-border-secondary);
+  border-radius: var(--radius);
+  background: var(--color-bg-spotlight);
+  color: var(--color-text-tertiary);
+  font-size: 13px;
+}
+/* 卡片右上角的状态徽标（熔断中 / 运行中） */
+.adv-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+.adv-chip::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.adv-chip.is-ok { color: var(--color-success); background: var(--color-success-light); }
+.adv-chip.is-warn { color: var(--color-danger); background: var(--color-danger-light); }
+/* 页头可写 / 只读徽标：与转让页的 gate 同视觉，但语义不绑在转让上 */
+.adv-gate {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.adv-gate::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.adv-gate.is-open { color: var(--color-success); background: var(--color-success-light); }
+.adv-gate.is-closed { color: var(--color-text-secondary); background: var(--color-bg-spotlight); }
+/* 窄屏：标签在上、控件在下，控件撑满整行（300px 下限在手机上放不下） */
+@media (max-width: 900px) {
+  .adv-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .adv-control > input,
+  .adv-control > select { flex: 1 1 100%; }
+}
+@media (max-width: 560px) {
+  .adv-control-grid { grid-template-columns: minmax(0, 1fr); }
+  .adv-control-stack .adv-control { flex-wrap: wrap; }
+  .adv-control .btn { min-width: 72px; }
+}
 .detail-panel .actions .btn-primary { width: auto; margin-top: 0; }
 .sheet-body .actions,
 .detail-panel .actions {
@@ -2413,6 +2570,13 @@ a.rules-contract-addr:hover { text-decoration: underline; }
   opacity: 0.45;
 }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+/*
+ * 栅格里的输入框带着浏览器给的最小内容宽度，列一窄就把卡片顶出去
+ * （高级配置右栏 340px 时最明显）。列宽交给 grid，输入框铺满自己那一格。
+ */
+.form-grid .field { min-width: 0; }
+.form-grid .field input,
+.form-grid .field select { width: 100%; min-width: 0; }
 .publish-fields { grid-template-columns: 1fr 1fr; align-items: end; }
 .publish-fields .field span {
   min-height: 44px;

@@ -1,6 +1,6 @@
 // 链上对接客户端（ethers v6）。读取 Campaign 实时状态、发送写交易。
 // 无钱包时用公共 RPC 只读；有钱包（window.ethereum）时签名发送。
-import { AbiCoder, BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress, getAddress, id, keccak256 } from "ethers";
+import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress } from "ethers";
 import { CAMPAIGN_ABI, FACTORY_ABI, MATERIAL_MARKET_ABI, MOCK_PARTS_ABI } from "./abis.js";
 import {
   CAMPAIGN_ADDRESS,
@@ -13,7 +13,6 @@ import {
   PHASE_LABEL,
 } from "./config.js";
 import { discoverWallets, explainConnectError, inAppWalletName, rememberWallet, rememberedWalletId } from "./wallets.js";
-import deployments from "./deployments.json";
 
 export { formatEther, parseEther, ZeroAddress };
 
@@ -498,35 +497,19 @@ export async function readState(account, campaignAddr = getCampaignAddress()) {
 async function readStateOn(runner, account, campaignAddr) {
   const c = campaignContract(runner, campaignAddr);
   /**
-   * 合约字节码只取一次：readyExit / surplusExit 都要靠它判断这期合约有没有某个函数，
-   * 同时挂单/成交那些路径本来就与字节码无关，取失败按空串处理（两个能力都判 false）。
+   * 逐项降级只用于「展示层可容错」的字段：单个 getter 读失败不应让整页报
+   * 「链上读取失败」。新合约的 getter 全部存在，因此这里不再按名字/字节码做能力探测。
    */
-  const campaignCode = await runner.getCode(campaignAddr).then((code) => (code || "").toLowerCase()).catch(() => "");
-  // 旧版已部署的 Campaign 没有 pooled / miningPool（这两个随矿池功能新增）。
-  // Promise.all 里任何一项 revert 都会让整次读链失败、页面报「链上读取失败」，
-  // 所以新增 getter 一律用 withDefault 降级，缺失时按「未入池」处理。
   const withDefault = (p, fallback) => p.catch(() => fallback);
-  /**
-   * `sold` 单独先取一次（不放在下面的解构数组里）。
-   *
-   * ⚠️ 旧期次合约没有 `outstandingShares` getter，需要拿 `sold` 当降级值。
-   * 但如果写成 `withDefault(c.outstandingShares ? c.outstandingShares() : Promise.resolve(sold), sold)`，
-   * 那个 `sold` 指的是**下面解构出来的 const** —— 解构赋值完成前它处于暂时性死区，
-   * 于是每次链上读取都抛 `Cannot access 'sold' before initialization`，整页读链失败。
-   * （vite build 抓不到，只有运行时才暴露。）
-   *
-   * 所以这里先建 promise，数组里与降级分支共用同一个。
-   */
-  const soldPromise = c.sold();
   const [
     scene, phase, sold, totalShares, sharePriceBnb, estHashpower,
     nandQty, latchQty, priceLock, soldOutAt, executionFailed, raisedBnb, totalRefunded,
-    fundingDeadline, transistorsAddr, marketAddr, factoryAddr, owner, pooled, miningPool,
+    fundingDeadline, transistorsAddr, marketAddr, factoryAddr, owner, operatorAddr, halted, pooled, miningPool,
     listingCount, totalPendingSurplus, orderFilled,
     outstandingShares, serviceFeeBps, serviceFeeSet, feeRecipientCount,
     revenuePool, surplusPool, lastOrderAt, surplusBase, surplusPaid,
   ] = await Promise.all([
-    c.scene(), c.phase(), soldPromise, c.totalShares(), c.sharePriceBnb(),
+    c.scene(), c.phase(), c.sold(), c.totalShares(), c.sharePriceBnb(),
     withDefault(c.estHashpower(), 0n),
     withDefault(c.nandQty(), 0n), withDefault(c.latchQty(), 0n),
     withDefault(c.priceLock(), 0n),
@@ -534,26 +517,25 @@ async function readStateOn(runner, account, campaignAddr) {
     withDefault(c.executionFailed(), false),
     c.raisedBnb(),
     withDefault(c.totalRefunded(), 0n),
-    c.fundingDeadline(), c.transistors(), readMaterialMarket(c), c.factory(),
+    c.fundingDeadline(), c.transistors(), c.materialMarket(), c.factory(),
     c.owner(),
+    withDefault(c.operator(), ZeroAddress),
+    withDefault(c.halted(), false),
     withDefault(c.pooled(), false),
     withDefault(c.miningPool(), ZeroAddress),
     withDefault(c.listingCount(), 0n),
-    withDefault(c.totalPendingSurplus ? c.totalPendingSurplus() : Promise.resolve(0n), 0n),
+    withDefault(c.totalPendingSurplus(), 0n),
     withDefault(c.orderFilled(), false),
-    // 旧期次合约没有这些 getter → 降级。
-    // 注意降级值用 soldPromise（不是解构出来的 sold —— 那是暂时性死区）。
-    withDefault(c.outstandingShares ? c.outstandingShares() : soldPromise, 0n),
-    withDefault(c.serviceFeeBps ? c.serviceFeeBps() : Promise.resolve(0), 0),
-    withDefault(c.serviceFeeSet ? c.serviceFeeSet() : Promise.resolve(false), false),
-    withDefault(c.feeRecipientCount ? c.feeRecipientCount() : Promise.resolve(0n), 0n),
-    withDefault(c.revenuePool ? c.revenuePool() : Promise.resolve(0n), 0n),
-    withDefault(c.surplusPool ? c.surplusPool() : Promise.resolve(0n), 0n),
-    // 旧期次没有这个 getter → 按 0 处理，宽限期退回只按 soldOutAt 算。
-    withDefault(c.lastOrderAt ? c.lastOrderAt() : Promise.resolve(0n), 0n),
+    withDefault(c.outstandingShares(), 0n),
+    withDefault(c.serviceFeeBps(), 0),
+    withDefault(c.serviceFeeSet(), false),
+    withDefault(c.feeRecipientCount(), 0n),
+    withDefault(c.revenuePool(), 0n),
+    withDefault(c.surplusPool(), 0n),
+    withDefault(c.lastOrderAt(), 0n),
     // 余款的分子/分母与「已实付」：surplusPool − surplusPaid 才是还没发到持有人手里的部分。
-    withDefault(c.surplusBase ? c.surplusBase() : Promise.resolve(0n), 0n),
-    withDefault(c.surplusPaid ? c.surplusPaid() : Promise.resolve(0n), 0n),
+    withDefault(c.surplusBase(), 0n),
+    withDefault(c.surplusPaid(), 0n),
   ]);
   const order = await readMarketOrder(c);
 
@@ -585,8 +567,7 @@ async function readStateOn(runner, account, campaignAddr) {
     }))
     .filter(Boolean);
 
-  // 服务费分成表：读链上（口径：服务费真正上链，不再是前端本地记录）。
-  // 旧期次合约没有这些 getter → 空表。
+  // 服务费分成表：读链上（费率与分成表都写在 Campaign 里）。
   const feeShares = [];
   {
     const fn = Number(feeRecipientCount);
@@ -606,14 +587,14 @@ async function readStateOn(runner, account, campaignAddr) {
   const refundShort = Number(scene) === 1
     && Number(phase) === 1
     && raisedBnb < outstandingShares * sharePriceBnb;
-  // 工厂已移除该期时，cancelTransistorOrder 允许任何人撤剩余单（工厂合约里的 _retired 口径）。
+  // 工厂已移除该期时，cancelTransistorOrder 允许任何人撤剩余单（合约里的 _retired 口径）。
   let retired = false;
   try {
     if (factoryAddr && factoryAddr !== ZeroAddress) {
       retired = !(await factoryContract(runner, factoryAddr).isRegistered(campaignAddr));
     }
   } catch {
-    /* 旧期次没有 factory() */
+    /* 工厂暂不可读：按「仍在册」处理 */
   }
 
   const state = {
@@ -640,7 +621,11 @@ async function readStateOn(runner, account, campaignAddr) {
      */
     transistorCount: Number(order.nandFilled ?? 0n) + Number(order.latchFilled ?? 0n), capped: false,
     owner, fundingDeadline: Number(fundingDeadline),
-    minter: marketAddr, listings,
+    /** 操作员热钱包（owner 也可执行全部操作员权限）；未设置为零地址。 */
+    operator: operatorAddr,
+    /** 熔断状态：true 时认筹/挂单/卖晶体管/入池/份额挂单与接单全部停，pulls 与撤单不受影响。 */
+    halted: Boolean(halted),
+    listings,
     ...order,
     pooled, miningPool,
     // 开期即写入的晶体管合约优先；挂单后的 market 字段若为空也不要盖掉
@@ -661,13 +646,6 @@ async function readStateOn(runner, account, campaignAddr) {
       ? Number(formatEther(raisedBnb)) / Number(outstandingShares)
       : null,
     retired,
-    readyExit: campaignCode.includes(id("sellTransistors(uint256,uint8,uint256)").slice(2, 10)),
-    /**
-     * 这期合约有没有「确认到账后立刻退回剩余募集款」的入口（returnSurplus）。
-     * 用字节码 selector 判定：老期次（含当前主网这期）没有这个函数，
-     * 它们只能在 depositToPool 时把余款记账，再由持份人 claimSurplus 领取。
-     */
-    surplusExit: campaignCode.includes(id("returnSurplus()").slice(2, 10)),
     /** 已记账、还没发到持有人手里的余款（wei 换算成 BNB 由适配层做）。 */
     surplusOutstanding: surplusPool > surplusPaid ? surplusPool - surplusPaid : 0n,
     surplusBase,
@@ -680,18 +658,11 @@ async function readStateOn(runner, account, campaignAddr) {
     const [shares, escrow, refunded, bnbBal, pendingSurplus, surplusOfRaw] = await Promise.all([
       c.sharesOf(account), c.escrowOf(account),
       c.refundedOf(account), runner.getBalance(account),
-      // 旧期次合约没有这个 getter → 按 0 处理。
-      c.pendingSurplus ? c.pendingSurplus(account).catch(() => 0n) : Promise.resolve(0n),
+      c.pendingSurplus(account).catch(() => 0n),
       // 入池后的余款改 pull 模式：surplusOf 会把「还没计提但已可领」的部分也算进来。
-      c.surplusOf ? c.surplusOf(account).catch(() => 0n) : Promise.resolve(0n),
+      c.surplusOf(account).catch(() => 0n),
     ]);
-    /**
-     * 可领余款 = max(surplusOf, pendingSurplus)。
-     *
-     * 旧期次合约没有 surplusOf（调用 revert → 0n），但有 pendingSurplus；
-     * 新期次 surplusOf ≥ pendingSurplus（它把未计提部分也算进去）。
-     * 所以取两者较大值，两种期次都能正确显示，且不会出现「旧期次显示 0」的漏账。
-     */
+    /** 可领余款 = max(surplusOf, pendingSurplus)：surplusOf 含尚未计提的部分。 */
     const claimableSurplus = surplusOfRaw > pendingSurplus ? surplusOfRaw : pendingSurplus;
     state.self = {
       shares, escrow, claimed: 0n, refunded, pending: 0n, bemBalance: 0n, bnb: bnbBal,
@@ -706,7 +677,7 @@ async function readStateOn(runner, account, campaignAddr) {
   return state;
 }
 
-/** 份额转让的成交份数留在挂单剩余字段里，不扫 ListingTaken。认筹名单走 holderCount / 存储槽，不扫 Subscribed。 */
+/** 份额转让的成交份数留在挂单剩余字段里，不扫 ListingTaken。认筹名单走 holderCount / holderAt，不扫 Subscribed。 */
 
 /** 链上只读某个视图（合约调用页用），返回人类可读字符串。 */
 export async function liveReadView(method, args = {}, account = null, campaignAddr = getCampaignAddress()) {
@@ -735,7 +706,7 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       const a = args.account || account;
       if (!a) return "请填地址";
       const c = campaignContract(getReadProvider(), campaignAddr);
-      const v = c.surplusOf ? await c.surplusOf(a) : 0n;
+      const v = await c.surplusOf(a);
       return `${Number(formatEther(v)).toFixed(4)} BNB`;
     }
     case "sharePriceBnb":
@@ -776,6 +747,14 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       return withReadProvider((runner) => readMarketOwedView(runner, campaignAddr, args.account));
     case "executionFailed":
       return state.executionFailed ? "是（已判执行失败）" : "否";
+    case "operator":
+      return state.operator && state.operator !== ZeroAddress
+        ? state.operator
+        : "未设置操作员（Owner 尚未分配；Owner 始终保留全部操作员权限）";
+    case "halted":
+      return state.halted
+        ? "已熔断：认筹、挂单、卖出、入池与份额交易已停"
+        : "运行中";
     case "soldOutAt":
       return Number(state.soldOutAt) > 0
         ? new Date(Number(state.soldOutAt) * 1000).toLocaleString("zh-CN")
@@ -797,29 +776,12 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
   }
 }
 
-// 已部署的 Campaign 还没有 holderCount。_holders 在存储槽 30（链上长度读出来是 1，首个元素即认筹地址）。
-const HOLDERS_SLOT = 30n;
-
+/** 认筹名单直接读链上 holderCount / holderAt（新合约始终提供这两个视图）。 */
 async function readHolderAddresses(runner, c) {
-  try {
-    const n = Number(await c.holderCount());
-    const out = [];
-    for (let i = 0; i < n; i++) out.push(await c.holderAt(i));
-    return out;
-  } catch (err) {
-    const text = String(err?.shortMessage || err?.message || "");
-    // 旧字节码没有这两个视图，调用会 revert。改读同一条 _holders 数组，不扫日志。
-    if (!/revert|CALL_EXCEPTION|could not decode/i.test(text)) throw err;
-  }
-  const len = BigInt(await runner.getStorage(c.target, HOLDERS_SLOT));
-  if (len === 0n || len > 10000n) return [];
-  const base = BigInt(keccak256(AbiCoder.defaultAbiCoder().encode(["uint256"], [HOLDERS_SLOT])));
+  const n = Number(await c.holderCount());
+  if (!Number.isFinite(n) || n <= 0) return [];
   const out = [];
-  for (let i = 0n; i < len; i++) {
-    const raw = await runner.getStorage(c.target, base + i);
-    if (BigInt(raw) === 0n) continue;
-    out.push(getAddress(`0x${raw.slice(-40)}`));
-  }
+  for (let i = 0; i < n; i++) out.push(await c.holderAt(i));
   return out;
 }
 
@@ -851,7 +813,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
     const id = addrs.length - i;
     try {
       const c = campaignContract(runner, address);
-      // 逐字段降级：旧期次可能缺个别 getter，缺一项不该让整行退化成「读取失败」。
+      // 单个 getter 失败时按默认值降级，不让整行退化成「读取失败」。
       const zb = (pr, d) => pr.catch(() => d);
       const base = [
         zb(c.scene(), 0n),
@@ -862,32 +824,22 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         zb(c.fundingDeadline(), 0n),
         zb(c.phase(), 1n),
         zb(c.raisedBnb(), 0n),
-        // 已售未退（当前债务）。旧期次没有这个 getter → 退回 sold。
-        zb(c.outstandingShares ? c.outstandingShares() : zb(c.sold(), 0n), 0n),
+        // 已售未退（当前债务）：退款后变小，sold 不会。
+        zb(c.outstandingShares(), 0n),
       ];
       if (account) {
         base.push(
           zb(c.sharesOf(account), 0n),
           zb(c.escrowOf(account), 0n),
           zb(c.refundedOf(account), 0n),
-          /**
-           * C-4：余款改 pull 模式 → 用 surplusOf（含未计提的可领部分）。
-           * 旧期次没有 surplusOf（revert → 0n）但有 pendingSurplus，
-           * 所以两个都读，取较大值 —— 否则旧期次明明有欠款却显示 0。
-           */
-          zb(
-            c.surplusOf ? c.surplusOf(account) : Promise.resolve(0n),
-            0n
-          ),
-          zb(
-            c.pendingSurplus ? c.pendingSurplus(account) : Promise.resolve(0n),
-            0n
-          ),
+          // 余款 pull 模式：surplusOf 含尚未计提的可领部分。
+          zb(c.surplusOf(account), 0n),
+          zb(c.pendingSurplus(account), 0n),
         );
       }
       const res = await Promise.all(base);
       const soldOutAt = await c.soldOutAt().catch(() => 0n);
-      const lastOrderAt = await (c.lastOrderAt ? c.lastOrderAt() : Promise.resolve(0n)).catch(() => 0n);
+      const lastOrderAt = await c.lastOrderAt().catch(() => 0n);
       const scene = Number(res[0]);
       const phaseN = Number(res[6]);
       rows.push({
@@ -938,32 +890,27 @@ export async function readAccountAcrossCampaigns(account, addrs) {
   return rows;
 }
 
-/**
- * 读本期接的晶体管市场地址。
- * 新代码 getter 是 materialMarket()；旧工厂造出来的期次（主网期次 #0、测试网期次、
- * legacyFactories 里的期次）只有 market()。两个都试，新的优先，都失败回 ZeroAddress。
- */
+/** 读本期接的晶体管市场地址；读不到按零地址处理（展示层显示「未配置」）。 */
 async function readMaterialMarket(c) {
   try {
     const a = await c.materialMarket();
-    if (isAddr(a) && a !== ZeroAddress) return a;
-  } catch {
-    /* 旧合约没有这个 getter，走 market() */
-  }
-  try {
-    const a = await c.market();
-    if (isAddr(a) && a !== ZeroAddress) return a;
+    return isAddr(a) && a !== ZeroAddress ? a : ZeroAddress;
   } catch {
     return ZeroAddress;
   }
-  return ZeroAddress;
 }
 
-/** 新期次才有官方买单字段。旧合约调用会 revert，按「尚未对接市场」处理。 */
+/**
+ * 本期挂单 / 卖出席位读数。
+ *
+ * 本期合约的买单与成本基准 getter 一定存在，读失败属于 RPC 异常，直接返回空值让
+ * 页面显示「未挂单」，不把它伪装成「旧合约」；市场侧读数（remaining / owed / 可吃买单）
+ * 单独降级，缺一项不影响其余字段。
+ */
 async function readMarketOrder(c) {
   const empty = {
     nandBidId: 0n, latchBidId: 0n, nandQty: 0n, latchQty: 0n,
-    nandPrice: 0n, latchPrice: 0n, transistors: ZeroAddress, orderFilled: false, marketOrders: false,
+    nandPrice: 0n, latchPrice: 0n, transistors: ZeroAddress, orderFilled: false,
     nandCostBasis: 0n, latchCostBasis: 0n,
     partsNand: 0n, partsLatch: 0n, marketOwed: 0n, sellBids: [], sellSide: false,
     nandFilled: 0n, latchFilled: 0n,
@@ -975,7 +922,6 @@ async function readMarketOrder(c) {
     ] = await Promise.all([
       c.nandBidId(), c.latchBidId(), c.nandQty(), c.latchQty(), c.nandPrice(), c.latchPrice(),
       c.transistors(), c.orderFilled(),
-      // 卖出底价用的成本基准；旧期次没有 → 0（展示层当作"未知"）。
       c.nandCostBasis().catch(() => 0n), c.latchCostBasis().catch(() => 0n),
     ]);
     const marketAddr = await readMaterialMarket(c);
@@ -986,9 +932,8 @@ async function readMarketOrder(c) {
     const sell = await readMarketSell(c, marketAddr, transistors);
     /**
      * 成交到账量 —— 与「挂单量」是两个不同的东西，不能混用。
-     * 合约在 placeTransistorOrder 时就把 nandQty/latchQty 写成**下单量**
-     * （Campaign.sol:669-670），只有撤单 _clearOrder 才清零。
-     * 所以「已经买到几颗」必须用市场剩余量反推：
+     * 合约在 placeTransistorOrder 时就把 nandQty/latchQty 写成**下单量**，
+     * 只有撤单 _clearOrder 才清零。所以「已经买到几颗」必须用市场剩余量反推：
      *   filled = 挂单量 − bids(id).remaining
      * 挂单还在等成交时 remaining == qty → filled = 0。
      * 撤单后 bid id 归零、qty 也被清，此时手里还留着的晶体管（余额）就是当初成交到的量。
@@ -1005,7 +950,7 @@ async function readMarketOrder(c) {
     return {
       nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled,
       nandCostBasis, latchCostBasis,
-      marketOrders: true, nandRemaining, latchRemaining, nandFilled, latchFilled, ...sell,
+      nandRemaining, latchRemaining, nandFilled, latchFilled, ...sell,
     };
   } catch {
     return empty;
@@ -1071,7 +1016,8 @@ async function readSellableBids(runner, marketAddr, transistors, holder) {
     .sort((a, b) => (a.price === b.price ? Number(b.id - a.id) : a.price > b.price ? -1 : 1));
 }
 
-async function readPartBalance(runner, transistors, holder, tokenId) {  if (!transistors || transistors === ZeroAddress || !holder) return 0n;
+async function readPartBalance(runner, transistors, holder, tokenId) {
+  if (!transistors || transistors === ZeroAddress || !holder) return 0n;
   try {
     const token = new Contract(transistors, ["function balanceOf(address,uint256) view returns (uint256)"], runner);
     return await token.balanceOf(holder, tokenId);
@@ -1131,13 +1077,17 @@ export async function readMarketBook(campaignAddr = getCampaignAddress()) {
     const { market, marketAddr } = await marketHandle(runner, campaignAddr);
     const nextBid = await market.nextBidId();
     const lines = [`市场 ${shortAddr(marketAddr)}`];
+    // 上限 500 张，并发读：串行 500 次 RPC 会让调试页转十几秒。
+    const top = nextBid - 1n > 500n ? 500n : nextBid - 1n;
+    const ids = [];
+    for (let i = 1n; i <= top; i++) ids.push(i);
+    const bids = await Promise.all(ids.map((id) => market.bids(id).catch(() => null)));
     let open = 0;
-    for (let i = 1n; i < nextBid && i <= 500n; i++) {
-      const b = await market.bids(i);
-      if (b.remaining === 0n) continue;
+    bids.forEach((b, idx) => {
+      if (!b || b.remaining === 0n) return;
       open += 1;
-      lines.push(`买单 #${i} · ${TOKEN_LABEL[Number(b.tokenId)] || b.tokenId} 剩余 ${b.remaining} · 单价 ${formatEther(b.price)} BNB · 买家 ${shortAddr(b.buyer)}`);
-    }
+      lines.push(`买单 #${ids[idx]} · ${TOKEN_LABEL[Number(b.tokenId)] || b.tokenId} 剩余 ${b.remaining} · 单价 ${formatEther(b.price)} BNB · 买家 ${shortAddr(b.buyer)}`);
+    });
     if (open === 0) lines.push("订单簿没有未成交买单");
     return lines.join("\n");
   });
@@ -1159,7 +1109,7 @@ async function readMarketOwedView(runner, campaignAddr, account) {
 const MARKET_LOG_WINDOWS = 6; // 最多回看 6 × 50k 块（约 10 天）；凑满条数会提前停
 const MARKET_LOG_SPAN = 50_000;
 /** 历史交易记录只保留最近这么多条（窄栏放不下更多，也不该翻旧账）。 */
-export const MARKET_TRADE_LIMIT = 3;
+export const MARKET_TRADE_LIMIT = 5;
 const blockTimeCache = new Map();
 /** 每个市场已扫到哪个块，避免每次刷新都重扫历史区间（旧版 Mock 没有任何事件）。 */
 const marketScanCursor = new Map();
@@ -1652,8 +1602,6 @@ async function readMarketTradesOnce(campaignAddr) {
 
     return {
       market: marketAddr,
-      isMock: Boolean(deployments.materialMarket || deployments.minter)
-        && String(deployments.materialMarket || deployments.minter).toLowerCase() === String(marketAddr).toLowerCase(),
       orderFilled: Boolean(ordered),
       legs,
       totals,
@@ -1664,7 +1612,7 @@ async function readMarketTradesOnce(campaignAddr) {
   });
 }
 
-// ── 原路退款记录（Campaign.Refunded / RefundSendFailed） ──
+// ── 原路退款记录（Campaign.Refunded 事件） ──
 const CAMPAIGN_LOG_SPAN = 50_000;
 /** 回溯上限：约 34 天（BSC 3s 出块）。更老的期次只显示最近的明细，汇总仍走合约读数。 */
 const CAMPAIGN_SCAN_MAX_BLOCKS = 1_000_000;
@@ -1813,7 +1761,6 @@ export async function readRefundRecords(campaignAddr = getCampaignAddress()) {
     const [raw, totalRefunded, raisedBnb, sold, executionFailed] = await Promise.all([
       readCampaignLogs(runner, campaignAddr, latest, [[
         iface.getEvent("Refunded").topicHash,
-        iface.getEvent("RefundSendFailed").topicHash,
       ]]).catch(() => null),
       c.totalRefunded().catch(() => 0n),
       c.raisedBnb().catch(() => 0n),
@@ -1830,11 +1777,10 @@ export async function readRefundRecords(campaignAddr = getCampaignAddress()) {
         continue;
       }
       if (!evt) continue;
-      if (evt.name !== "Refunded" && evt.name !== "RefundSendFailed") continue;
+      if (evt.name !== "Refunded") continue;
       rows.push({
         holder: String(evt.args.holder),
         amount: Number(formatEther(evt.args.amountBnb)),
-        failed: evt.name === "RefundSendFailed",
         blockNumber: log.blockNumber,
         txHash: log.transactionHash,
         ts: null,
@@ -1847,7 +1793,7 @@ export async function readRefundRecords(campaignAddr = getCampaignAddress()) {
     for (const row of rows) row.ts = byBlock.get(row.blockNumber) ?? null;
     rows.sort((a, b) => b.blockNumber - a.blockNumber);
 
-    const holders = new Set(rows.filter((r) => !r.failed).map((r) => r.holder.toLowerCase()));
+    const holders = new Set(rows.map((r) => r.holder.toLowerCase()));
     return {
       campaign: campaignAddr,
       events: rows,
@@ -1855,13 +1801,12 @@ export async function readRefundRecords(campaignAddr = getCampaignAddress()) {
         totalRefunded: Number(formatEther(totalRefunded)),
         pool: Number(formatEther(raisedBnb)),
         sold: Number(sold),
-        count: rows.filter((r) => !r.failed).length,
+        count: rows.length,
         holders: holders.size,
-        failed: rows.filter((r) => r.failed).length,
         executionFailed: Boolean(executionFailed),
-        listedSum: rows.reduce((acc, r) => acc + (r.failed ? 0 : r.amount), 0),
+        listedSum: rows.reduce((acc, r) => acc + r.amount, 0),
       },
-      // null 表示扫不到日志（旧节点 / 旧合约），空数组表示确实还没有退款。
+      // null 表示扫不到日志（节点不支持历史区间），空数组表示确实还没有退款。
       scanned: Array.isArray(raw),
     };
   });
@@ -1872,14 +1817,12 @@ async function campaignsOf(factoryAddr) {
   return withReadProvider(async (provider) => {
     const f = factoryContract(provider, factoryAddr);
     const n = Number(await f.campaignCount());
-    // Older factories also expose allCampaigns(); campaignCount + campaigns works on both and
-    // avoids one deliberately failing eth_call on factories that dropped it.
     const out = await Promise.all(Array.from({ length: n }, (_, i) => f.campaigns(i)));
     return out.reverse();
   });
 }
 
-/** 列出当前工厂期次（新→旧）。旧工厂地址仅保留在 deployments.legacyFactories，不再并入主列表。 */
+/** 列出当前工厂期次（新→旧）。只读当前工厂，旧工厂不再并入。 */
 export async function listCampaigns() {
   if (!isAddr(FACTORY_ADDRESS)) return [];
   return campaignsOf(FACTORY_ADDRESS);
@@ -1969,7 +1912,7 @@ async function mintPartsOrThrow(parts, buyer, tokenId, amount) {
     return await parts.mint(buyer, tokenId, amount);
   } catch (e) {
     const msg = String(e?.shortMessage || e?.message || e).slice(0, 140);
-    throw new Error(`市场已成交，但补发晶体管失败：${msg}。晶体管合约可能不是 MockERC1155，请手动 mint。`);
+    throw new Error(`已成交，但补发晶体管失败：${msg}。可能不是 MockERC1155，请手动 mint。`);
   }
 }
 
@@ -2058,48 +2001,26 @@ export const tx = {
   simulateFillBid: (signer, id, quantity) => fillBidWithParts(signer, id, quantity),
   simulateExternalBid: (signer, tokenId, price, quantity) => placeExternalBid(signer, tokenId, price, quantity),
   simulateFillCampaignBids: (signer) => fillCampaignBids(signer),
-  openRefund: async (signer) => {
-    const c = signerOrThrow(signer);
-    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
-    if (code.includes(id("openRefund()").slice(2, 10))) return c.openRefund();
-    throw new Error("这期是旧合约，链上没有 Owner 直接退款。重新部署工厂后，新开的期才能退款。");
-  },
+  openRefund: (signer) => signerOrThrow(signer).openRefund(),
   /**
    * 确认到账后立刻把没花完的募集款按份退回（不结束本期、晶体管留在合约、之后仍可 depositToPool）。
-   * 老期次合约没有这个函数：它们只能在入池时把余款记账，由持份人 claimSurplus 领。
+   * 合约在 depositToPool 里也会自动做同一件事，所以这一步是可选的「提前退」。
    */
-  returnSurplus: async (signer) => {
-    const c = signerOrThrow(signer);
-    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
-    if (code.includes(id("returnSurplus()").slice(2, 10))) return c.returnSurplus();
-    throw new Error("这期是旧合约，链上没有提前退回剩余募集款。重新部署工厂后新开的期才有；这期的余款在 depositToPool 时记账，持份人用 claimSurplus 领取。");
-  },
+  returnSurplus: (signer) => signerOrThrow(signer).returnSurplus(),
   /**
-   * Owner 自掏腰包补齐「被晶体管吃掉」的本金缺口，让池子重新能按原价退完所有份额。
+   * Owner / 操作员自掏腰包补齐「被晶体管吃掉」的本金缺口，让池子重新能按原价退完所有份额。
    * 买入之后想收摊（openRefund / abandonOrder）必须先走这一步，否则链上 PartsAreCollateral。
    */
-  topUpShortfall: async (signer, value) => signerOrThrow(signer).topUpShortfall({ value }),
-  abandonOrder: async (signer) => {
-    const c = signerOrThrow(signer);
-    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
-    if (code.includes(id("abandonOrder()").slice(2, 10))) return c.abandonOrder();
-    throw new Error("这期是旧合约，链上没有 abandonOrder。重新部署工厂后，新开的期才有这个入口。");
-  },
+  topUpShortfall: (signer, value) => signerOrThrow(signer).topUpShortfall({ value }),
+  abandonOrder: (signer) => signerOrThrow(signer).abandonOrder(),
   cancelTransistorOrder: (signer) => signerOrThrow(signer).cancelTransistorOrder(),
-  markFailed: async (signer, address) => {
-    const c = signerOrThrow(signer, address);
-    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
-    if (code.includes(id("markFailed()").slice(2, 10))) return c.markFailed();
-    throw new Error("这期是旧合约，链上没有 markFailed。请让 Owner 调 openRefund。");
-  },
+  markFailed: (signer, address) => signerOrThrow(signer, address).markFailed(),
   confirmTransistors: (signer) => signerOrThrow(signer).confirmTransistors(),
-  setPhase: async (signer, next) => {
-    const c = signerOrThrow(signer);
-    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
-    if (code.includes(id("setPhase(uint8)").slice(2, 10))) return c.setPhase(next);
-    throw new Error("这期是旧合约，链上不能改子状态。重新部署工厂后，新开的期才有这个出口。");
-  },
+  setPhase: (signer, next) => signerOrThrow(signer).setPhase(next),
   setPlan: (signer, est) => signerOrThrow(signer).setPlan(est),
+  setOperator: (signer, next) => signerOrThrow(signer).setOperator(next),
+  halt: (signer) => signerOrThrow(signer).halt(),
+  resume: (signer) => signerOrThrow(signer).resume(),
   setMiningPool: (signer, pool) => signerOrThrow(signer).setMiningPool(pool),
   depositToPool: (signer) => signerOrThrow(signer).depositToPool(),
   createCampaign: (signer, params) => createCampaignTx(signer, params),
@@ -2121,23 +2042,8 @@ export const tx = {
   },
   setFactoryOwner: (signer, newOwner) => factoryContract(signer).transferOwnership(newOwner),
   setMaterialMarket: (signer, materialMarket) => signerOrThrow(signer).setMaterialMarket(materialMarket),
-  // 无参：一次扫走所有可动 BNB（多余余额，或已无人可退时的整池）。旧期次按老签名回退。
-  recoverBnb: async (signer, address) => {
-    const c = signerOrThrow(signer, address);
-    const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
-    if (code.includes(id("recoverBnb()").slice(2, 10))) return c.recoverBnb();
-    const [bal, raised, scene, sold] = await Promise.all([
-      signer.provider.getBalance(await c.getAddress()),
-      c.raisedBnb(),
-      c.scene(),
-      c.sold(),
-    ]);
-    const amount = scene === 2n || sold === 0n ? bal : bal > raised ? bal - raised : 0n;
-    if (amount === 0n) throw new Error("本期没有可取的 BNB：池子里的钱都属于持有人。");
-    // 旧期次只有 recoverBnb(uint256)，用独立 ABI，避免和当前无参版本产生重载歧义。
-    const legacy = new Contract(await c.getAddress(), ["function recoverBnb(uint256 amount)"], signer);
-    return legacy.recoverBnb(amount);
-  },
+  // 无参：一次扫走所有可动 BNB（多余余额，或已无人可退时的整池）。
+  recoverBnb: (signer, address) => signerOrThrow(signer, address).recoverBnb(),
   recoverTransistors: (signer, token, id, amount) => signerOrThrow(signer).recoverTransistors(token, id, amount),
   transferOwnership: (signer, newOwner) => signerOrThrow(signer).transferOwnership(newOwner),
 };
@@ -2279,7 +2185,7 @@ export async function createCampaignOnChain(signer, params, onSigned) {
         return n > 0n ? factory.campaigns(n - 1n) : null;
       });
     }
-    if (!campaign) throw new Error("开期交易已确认，但未能解析新 Campaign 地址，请到顶栏切换期次或刷新");
+    if (!campaign) throw new Error("开期已确认，但没解析到新 Campaign 地址，请刷新或从顶栏切换期次");
     return { hash: t.hash, receipt, campaign };
   } catch (err) {
     if (err?.code === "ACTION_REJECTED" || /user rejected|denied/i.test(err?.message || "")) {
@@ -2347,43 +2253,83 @@ function nestedErrorText(err) {
 function explainParsed(parsed) {
   if (parsed?.name === "NotOwner") {
     const caller = parsed.args?.caller || parsed.args?.[0];
-    return `非 Factory Owner（${caller ? String(caller).slice(0, 10) + "…" : "当前钱包"}），无法开期`;
+    // 同一个错误既可能来自工厂（开期/移除），也可能来自某期合约（本期 owner-only 入口），
+    // 所以不能像旧文案那样写死「无法开期」。
+    return `当前钱包${caller ? `（${String(caller).slice(0, 10)}…）` : ""}不是 Owner：工厂级操作只允许 Factory Owner，本期操作只允许本期 owner。`;
   }
+  if (parsed?.name === "NotOperator") {
+    const caller = parsed.args?.caller || parsed.args?.[0];
+    return `当前钱包${caller ? `（${String(caller).slice(0, 10)}…）` : ""}既不是 Owner 也不是操作员。Owner 可用 setOperator 指定操作员。`;
+  }
+  if (parsed?.name === "Halted") {
+    return "本期已熔断：认筹、挂单、卖出、入池与份额交易暂停；退款、领款、撤单不受影响。等 Owner 解除后再试。";
+  }
+  if (parsed?.name === "AlreadyHalted") return "本期已熔断，无需重复操作。";
+  if (parsed?.name === "NotHalted") return "本期未熔断，无需解除。";
+  if (parsed?.name === "NotSoldOutYet") return "份数还没售完，不能挂买单（placeTransistorOrder 要求 sold == totalShares）。";
+  if (parsed?.name === "UseReturnSurplus") {
+    return "晶体管已到账：不能退款或放弃挂单。可退余款 + 入池或卖入买单；确要结束本期，先改回待挂单。";
+  }
+  if (parsed?.name === "SurplusAlreadyReturned") {
+    return "余款已按份退回，本金已在持份人手里。再退款会清零份额（合约拒绝），留着等入池即可。";
+  }
+  if (parsed?.name === "AlreadyPooled") return "本期已入池（不可逆），不能重复入池，也不能再卖晶体管或退余款。";
+  if (parsed?.name === "NotListed") return "当前没有挂着的买单，无需撤单。";
+  if (parsed?.name === "ZeroShares") return "数量为 0：份数 / 份额 / 余款分母不能为 0。";
+  if (parsed?.name === "ZeroPrice") return "金额或单价不能为 0。";
+  if (parsed?.name === "FundingEnded") return "募集已过截止时间，不能再认筹。";
+  if (parsed?.name === "ExceedsRemaining") return "认筹份数超过剩余可售份数。";
+  if (parsed?.name === "WrongPayment") return "支付金额与「份数 × 每份价格」不一致。";
+  if (parsed?.name === "ServiceFeeAlreadySet") return "挖矿产出服务费已设定并永久锁定，不能再改。";
+  if (parsed?.name === "ServiceFeeLocked") return "已有人认购，挖矿产出服务费永久锁定，不能再改。";
+  if (parsed?.name === "BadFeeConfig") {
+    return "服务费配置不合法：费率上限 10%、分成地址最多 3 个、份额合计 10000 bps。";
+  }
+  if (parsed?.name === "NoListing") return "挂单不存在（可能已成交或已撤单），刷新后再试。";
+  if (parsed?.name === "NotSeller") return "只能撤销自己发布的挂单。";
+  if (parsed?.name === "CannotTakeOwnListing") return "不能接收自己发布的挂单。";
+  if (parsed?.name === "InsufficientShares") return "可用份额不足：挂出的份额会立即锁定，不能重复使用。";
+  if (parsed?.name === "BadCount") return "数量不合法：不能为 0，也不能超过可用数量。";
+  if (parsed?.name === "PoolNotSet") return "还没设置矿池地址：先 setMiningPool，再 depositToPool。";
+  if (parsed?.name === "DirectTransferNotAllowed") {
+    return "不能直接向本期合约转 BNB，请用页面按钮操作。";
+  }
+  if (parsed?.name === "BadBidId") return "买单 ID 无效（不存在或不属于本期晶体管）。";
+  if (parsed?.name === "TransferFailed") return "BNB 转账失败（收款地址拒收或 gas 不足），整笔回滚，可重试。";
   // 注：BadFee / BadFeeShares 已从合约移除（合约没有服务费字段），不再解码——
   // 留着会让用户看到「服务费须在 1–20%」，误以为链上有服务费机制。
   if (parsed?.name === "ZeroCampaignParam") return "每份价格或总份数不能为 0";
-  if (parsed?.name === "ObservationPeriodActive") {
-    return "这期是旧版合约，时间锁尚未到期。可稍后再试，或换到已去掉时间锁的新工厂开期。";
-  }
   if (parsed?.name === "TransistorsNotReady") {
-    return "晶体管还没到账，不能确认/入池：买单需全部成交，且 NAND / LATCH 晶体管要真的在本期合约里（成交后卖家没发货也会这样）。";
+    return "晶体管还没到账，不能确认或入池：买单需全部成交，晶体管要真在本期合约里。";
   }
-  if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步。挂单中请先取消；已确认到账的期次不能再下单或退款。";
-  if (parsed?.name === "AlreadyReady") return "本期已确认到账。晶体管锁在合约里，不能单独取出。这一期只能入池或卖入买单。";
+  if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步：挂单中请先取消；已到账的期次不能再下单或退款。";
+  if (parsed?.name === "AlreadyReady") return "本期已到账，晶体管锁在合约里。只能入池或卖入买单。";
   if (parsed?.name === "ProceedsPending") return "市场还有未提取的卖出款，先提取（withdrawMarketProceeds）再继续。";
-  if (parsed?.name === "NotABid") return "这张买单不能卖：要么已成交/撤回，要么标的是别的晶体管合约或别的 NAND/LATCH，要么剩余量不够。";
-  if (parsed?.name === "PriceBelowCost") return "这张买单的单价低于本期买入成本，合约不允许亏本卖出（会烧掉持份人的抵押）。";
+  if (parsed?.name === "NotABid") return "这张买单不能卖：已成交或撤回、标的不是本期晶体管、或剩余量不够。";
+  if (parsed?.name === "PriceBelowCost") return "这张买单单价低于本期买入成本，不能亏本卖出。";
   if (parsed?.name === "SelfTrade") return "不能把本期晶体管卖给本期自己挂的买单。";
   if (parsed?.name === "OrderFilled") return "买单已全部成交，不能再取消。";
-  if (parsed?.name === "NoProceeds") return "这张买单成交后一分钱都没进本期（成交款为 0 或被市场扣光），合约拒绝白送晶体管。";
+  if (parsed?.name === "NoProceeds") return "这张买单成交后没有款项进本期，合约拒绝白送晶体管。";
   if (parsed?.name === "InsufficientParts") return "合约里的晶体管数量不够。";
   if (parsed?.name === "SharesOutstanding") {
-    return "还有持份人没结清，当期晶体管是他们的抵押，不能取出。先让持份人退款 / 领完，或改成入池。";
+    return "还有持份人没结清，晶体管是他们的抵押，不能取出。先退款 / 领完，或入池。";
   }
   if (parsed?.name === "HoldersNotMadeWhole") {
-    return "持份人还没按原价收回本金（买入花掉的那部分没补），当期晶体管不能交给 Owner。先 topUpShortfall 补齐再退款，或改成入池 / 卖出。";
+    return "持份人还没按原价收回本金，晶体管不能交给 Owner。先补齐缺口再退款，或入池 / 卖出。";
   }
   if (parsed?.name === "PartsAreCollateral") {
-    return "合约手上还有本期晶体管、而募集池已不足以按原价退完所有份额：现在退款会把晶体管烧在合约里（没人有资格领）。先 topUpShortfall 补齐本金，或直接入池 / 卖出。";
+    return "晶体管还在合约里，池子不够按原价退完。先补齐本金，或入池 / 卖出。";
   }
   if (parsed?.name === "RefundNotAvailable") {
-    return "当前状态不能退款：只有募资超时未售罄、或待挂单（buying）期次可退；挂单中 / 已到账 / 挖矿中都不行。";
-  }
-  if (parsed?.name === "CanStillAfford") return "按当前报价还能买得起晶体管，旧合约不允许退款";
-  if (parsed?.name === "WrongTransistors") {
-    return "晶体管合约地址与本期锁定的不符。旧版合约的挂单接口要显式传地址；当前界面只对新版合约（开期已锁定）下单。";
+    return "当前状态不能退款：只有募集超时或待挂单可退。";
   }
   if (parsed?.name === "ZeroAddress") return "地址不能为零地址（晶体管市场 / 晶体管合约 / 矿池 / 收款地址）";
+  if (parsed?.name === "IndexOutOfBounds") return "索引越界：列表 / 页数超出范围，刷新后再试。";
+  if (parsed?.name === "EmptyWhitelist") return "白名单不能为空：至少填一个允许的晶体管合约地址。";
+  if (parsed?.name === "PartsNotAllowed") {
+    const p = parsed.args?.parts || parsed.args?.[0];
+    return `晶体管合约不在允许名单：${p ? `${String(p).slice(0, 10)}… ` : ""}先用 setPartsAllowed 放行。`;
+  }
   if (parsed?.name) return `合约拒绝：${parsed.name}`;
   return "";
 }
@@ -2410,19 +2356,19 @@ function decodeRevert(err, iface) {
     if (text) return text;
   }
   if (/no data present/i.test(raw)) {
-    return "合约拒绝了这笔交易，钱包没有带回具体原因。若是发布或挂单/入池，请确认当前钱包权限与晶体管子态后再试。";
+    return "合约拒绝了这笔交易，钱包没带回原因。请确认钱包权限与当前子状态。";
   }
   if (/missing revert data/i.test(raw)) {
-    return "节点没有带回失败原因（missing revert data）。开期请确认钱包 BSC 节点是 https://bsc-rpc.publicnode.com，不要用已超额的 1rpc。";
+    return "节点没带回失败原因。请把钱包 BSC 节点改成 https://bsc-rpc.publicnode.com 后重试。";
   }
   if (/usage limit|1rpc\.io|#pricing|-32001/i.test(raw)) {
-    return "当前 RPC 额度用尽。请硬刷新本页，并在钱包里把 BSC 主网节点改成 https://bsc-rpc.publicnode.com 后重试。";
+    return "RPC 额度用尽。请硬刷新本页，并把钱包 BSC 节点改成 https://bsc-rpc.publicnode.com。";
   }
   if (/could not coalesce error|403|archive|personal token/i.test(raw)) {
-    return "公共节点暂时拒绝了这笔模拟。请刷新后再试；若钱包弹出更新 BSC 网络，点确认，节点用 https://bsc-rpc.publicnode.com。";
+    return "公共节点拒绝了这次模拟。刷新重试；如钱包提示更新 BSC 网络，点确认。";
   }
   if (/insufficient funds|exceeds the balance/i.test(raw)) {
-    return "钱包 BNB 不够付部署期次合约的 gas。开一期大约需要约 0.0002 BNB（按当前 gas 价）。";
+    return "钱包 BNB 不够付 gas（开一期约 0.0002 BNB）。";
   }
   return raw;
 }
@@ -2448,34 +2394,58 @@ export async function send(promiseTx, onSigned) {
     }
     const rawMsg = String(err?.shortMessage || err?.message || "");
     if (/403|网络连接失败|data-seed-prebsc|bnbchain\.org/i.test(rawMsg)) {
-      throw new Error("钱包 RPC 连不上（官方测试网节点常返回 403）。请把 BSC 测试网节点改成 https://bsc-testnet-rpc.publicnode.com 后重试。");
+      throw new Error("钱包 RPC 连不上。请把 BSC 测试网节点改成 https://bsc-testnet-rpc.publicnode.com 后重试。");
     }
     const iface = new Interface([
       ...FACTORY_ABI,
       ...CAMPAIGN_ABI,
-      CREATE_V1,
-      CREATE_V2,
       "error NotOwner(address caller)",
+      "error NotOperator(address caller)",
       "error ZeroAddress()",
-      "error ObservationPeriodActive(uint64 unlockAt)",
+      "error ZeroCampaignParam()",
+      "error IndexOutOfBounds()",
+      "error EmptyWhitelist()",
+      "error PartsNotAllowed(address parts)",
+      "error Halted()",
+      "error AlreadyHalted()",
+      "error NotHalted()",
+      "error WrongScene()",
+      "error FundingEnded()",
       "error TransistorsNotReady()",
+      "error RefundNotAvailable()",
+      "error ZeroShares()",
+      "error ZeroPrice()",
+      "error BadCount()",
+      "error InsufficientShares()",
+      "error SharesOutstanding()",
+      "error HoldersNotMadeWhole()",
+      "error PartsAreCollateral()",
+      "error ExceedsRemaining()",
+      "error WrongPayment()",
+      "error NoListing()",
+      "error NotSeller()",
+      "error CannotTakeOwnListing()",
       "error AlreadyListed()",
+      "error NotListed()",
       "error AlreadyReady()",
+      "error TransferFailed()",
+      "error OrderFilled()",
+      "error BadBidId()",
       "error ProceedsPending()",
       "error NotABid()",
       "error PriceBelowCost()",
       "error SelfTrade()",
       "error NoProceeds()",
-      "error OrderFilled()",
       "error InsufficientParts()",
-      "error CanStillAfford()",
-      "error WrongScene()",
-      "error WrongTransistors()",
-      // 旧版合约的错误签名：留着只为解码链上已部署的旧期数，解出来走「合约拒绝：<名字>」兜底。
-      "error NetlistMismatch()",
-      "error NothingToClaim()",
-      "error NoEmission()",
-      "error BadFeeShares()",
+      "error PoolNotSet()",
+      "error AlreadyPooled()",
+      "error SurplusAlreadyReturned()",
+      "error UseReturnSurplus()",
+      "error BadFeeConfig()",
+      "error ServiceFeeAlreadySet()",
+      "error ServiceFeeLocked()",
+      "error NotSoldOutYet()",
+      "error DirectTransferNotAllowed()",
     ]);
     let decoded = decodeRevert(err, iface);
     const txReq = err?.transaction;

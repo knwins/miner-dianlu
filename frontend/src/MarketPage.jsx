@@ -67,7 +67,7 @@ function partsOf(processor) {
  */
 export function MarketPage({ official, processorId = null, allowedParts = [], campaigns = [] }) {
   const whitelist = new Set((allowedParts || []).map((a) => String(a).toLowerCase()));
-  const marketAddr = deployments.materialMarket || deployments.minter || "";
+  const marketAddr = deployments.materialMarket || "";
   const rows = Array.isArray(campaigns) ? campaigns : [];
 
   /**
@@ -128,9 +128,8 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
           </div>
         </div>
         <p className="round-hero-lead">
-          两个官方处理器的晶体管在同一个晶体管市场里买卖，下面是各自的最新市价（BNB / 颗）：
-          有成交时取最近一笔成交价，暂无成交时取当前最高未成交买价。
-          每一期只锁定其中一套晶体管合约，开期时写入、不可更换。
+          两个官方处理器的晶体管在同一个市场买卖，下面是各自最新市价（BNB / 颗）。
+          有成交取最近成交价，无成交取最高买价。每期在开期时锁定其中一套晶体管合约，不可更换。
         </p>
       </header>
 
@@ -196,8 +195,7 @@ export function MarketPage({ official, processorId = null, allowedParts = [], ca
             <p className="fine">还没有期次。发布后才会在这里列出各期锁定的晶体管合约。</p>
           )}
           <p className="fine">
-            同一个晶体管市场合约可接受任意晶体管合约地址，按地址分别撮合；每一期用的是开期时锁定的那一个，
-            所以各期晶体管互不混同。
+            每期用开期时锁定的晶体管合约，各期互不混同。
           </p>
         </div>
       </article>
