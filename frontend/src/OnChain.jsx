@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   IS_CONFIGURED, CHAIN_ID, NETWORK,
   SCENE_LABEL, PHASE_LABEL, explorerAddress, explorerTx,
+  FACTORY_ADDRESS, CIRCUIT_MARKET_ADDRESS,
+  POD_MINING_ADDRESS, POD_LENS_ADDRESS, BEM_ADDRESS, CAMPAIGN_DEPLOYER_ADDRESS,
 } from "./chain/config.js";
 import {
   hasInjected, connectWallet, readState, send, tx, formatEther, parseBnb,
@@ -163,6 +165,12 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
         <div className="card-body">
           <dl className="chain-kv">
             <div><dt>Campaign</dt><dd><a href={explorerAddress(getCampaignAddress())} target="_blank" rel="noreferrer">{short(getCampaignAddress())}</a></dd></div>
+            <div><dt>Factory</dt><dd>{FACTORY_ADDRESS ? <a href={explorerAddress(FACTORY_ADDRESS)} target="_blank" rel="noreferrer">{short(FACTORY_ADDRESS)}</a> : "—"}</dd></div>
+            <div><dt>Deployer</dt><dd>{CAMPAIGN_DEPLOYER_ADDRESS ? <a href={explorerAddress(CAMPAIGN_DEPLOYER_ADDRESS)} target="_blank" rel="noreferrer">{short(CAMPAIGN_DEPLOYER_ADDRESS)}</a> : "—"}</dd></div>
+            <div><dt>Market</dt><dd>{CIRCUIT_MARKET_ADDRESS ? <a href={explorerAddress(CIRCUIT_MARKET_ADDRESS)} target="_blank" rel="noreferrer">{short(CIRCUIT_MARKET_ADDRESS)}</a> : "—"}</dd></div>
+            <div><dt>PoD</dt><dd>{POD_MINING_ADDRESS ? <a href={explorerAddress(POD_MINING_ADDRESS)} target="_blank" rel="noreferrer">{short(POD_MINING_ADDRESS)}</a> : "—"}</dd></div>
+            <div><dt>BEM</dt><dd>{BEM_ADDRESS ? <a href={explorerAddress(BEM_ADDRESS)} target="_blank" rel="noreferrer">{short(BEM_ADDRESS)}</a> : "—"}</dd></div>
+            <div><dt>Lens</dt><dd>{POD_LENS_ADDRESS ? <a href={explorerAddress(POD_LENS_ADDRESS)} target="_blank" rel="noreferrer">{short(POD_LENS_ADDRESS)}</a> : "—"}</dd></div>
             <div><dt>Owner</dt><dd>{short(s?.owner)}</dd></div>
             <div><dt>熔断</dt><dd>{halted ? "已熔断（halted）" : "运行中"}</dd></div>
             <div><dt>我的钱包</dt><dd>{account ? `${short(account)}${isOwner ? " · Owner" : ""}` : "未连接"}</dd></div>

@@ -32,6 +32,13 @@ export const POD_LENS_ADDRESS = deployments.podLens
 export const POD_MINING_ADDRESS = deployments.podMining
   || (CHAIN_ID === 56 ? "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46" : "");
 
+/** 官方 BEM ERC20；工厂 immutable 写入，每期用它支付挖矿产出。 */
+export const BEM_ADDRESS = deployments.bem
+  || (CHAIN_ID === 56 ? "0x5ce033B2bFCa3Af30b3e8C8457DeaF776A8b695a" : "");
+
+/** 无状态 Campaign 部署器；工厂 createCampaign 时调它 new 一期。 */
+export const CAMPAIGN_DEPLOYER_ADDRESS = deployments.campaignDeployer || "";
+
 // 工厂已部署即可对接。campaign 为空表示尚未开期，页面不回退到本地模拟数据。
 export const IS_CONFIGURED = isAddr(FACTORY_ADDRESS);
 

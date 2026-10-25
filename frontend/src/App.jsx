@@ -4,7 +4,18 @@ import { dealStatus } from "./dealStatus.js";
 import { ENDED, FAILED, PHASE, SCENE, outstandingOf, rowState, roundState } from "./roundState.js";
 import { OwnerAdvanced, OwnerCreate, OwnerOverview } from "./Owner.jsx";
 import PeriodNav from "./PeriodNav.jsx";
-import { IS_CONFIGURED as CHAIN_CONFIGURED, NETWORK, CHAIN_ID, explorerAddress, sourcifySource } from "./chain/config.js";
+import {
+  IS_CONFIGURED as CHAIN_CONFIGURED,
+  NETWORK,
+  CHAIN_ID,
+  explorerAddress,
+  sourcifySource,
+  POD_MINING_ADDRESS,
+  POD_LENS_ADDRESS,
+  BEM_ADDRESS,
+  CAMPAIGN_DEPLOYER_ADDRESS,
+} from "./chain/config.js";
+import { processorFromCircuitContract } from "./tapeout.js";
 import { useChain } from "./chain/useChain.js";
 import {
   send,
@@ -45,7 +56,6 @@ import {
   buildHolders,
   createScene,
   estimateHashpower,
-  executeUnlockIn,
   feePercentOf,
   formatClock,
   formatRemaining,
@@ -92,9 +102,8 @@ export default function App() {
   /**
    * 工厂电路白名单（部署时写入、之后不可增删）。
    *
-   * 这是**安全边界**不是运营开关：主网上防止 owner 把期次指向 MockERC1155
-   * （其 mint 无访问控制，任何人能无限造电路）。开期表单的可选处理器必须
-   * 从这里生成，不能用前端硬编码列表冒充链上事实。
+   * 这是**安全边界**不是运营开关：主网上防止 owner 把期次指向任意可随意 mint 的
+   * 测试 NFT。开期表单的可选处理器必须从这里生成，不能用前端硬编码列表冒充链上事实。
    *
    * ⚠️ 工厂不再有「默认电路」：开期时前端必须**显式选择一个**白名单内的处理器，
    * 不能留空、也不能用工厂默认值代替。
@@ -225,8 +234,6 @@ export default function App() {
       ? { role: "holder", label: "持份用户", shares, address: account, canOperate: false }
       : { role: "user", label: "未持份地址", shares: 0, address: account, canOperate: false };
   }, [account, book, chain.active, chain.book]);
-  const executeWait = executeUnlockIn(round, book, now);
-
   // 份额明细 / 历史：进入合约工作台即拉链上数据
   const [chainHolders, setChainHolders] = useState(null);
   const [holdersCampaign, setHoldersCampaign] = useState("");
@@ -301,7 +308,7 @@ export default function App() {
       return { ok: false, message: "harvest / claim 已移除：请用「领取挖矿奖励」再「领取 BEM」。" };
     }
     if (chain.active && WRITE_METHODS.includes(method)) return chainInvoke(method, args);
-    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "circuits", "market", "circuitMarket", "circuitHeldCount", "circuitCount", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf", "halted"].includes(method)) {
+    if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "circuits", "circuitMarket", "circuitHeldCount", "circuitCount", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf", "halted"].includes(method)) {
       return { ok: true, message: readCall(method, args, round, book, quote) };
     }
     if (/^market(OpenOrders|Listing|Sellable|Owed)$/.test(method) || method === "simulateExternalListing" || method === "simulateBuyListing") {
@@ -1432,7 +1439,6 @@ export default function App() {
             remaining={remaining}
             pay={pay}
             countdown={countdown}
-            executeWait={executeWait}
             pending={pending}
             connected={connected}
             actor={actor}
@@ -1464,6 +1470,7 @@ export default function App() {
             onRefund={(address) => act("refund", { campaign: address })}
             onMarkFailed={(address) => act("markFailed", { campaign: address })}
             onClaimSurplus={(address) => act("claimSurplus", { campaign: address })}
+            onClaimBem={(address) => act("claimBem", { campaign: address })}
             onOpenPeriod={async (address) => {
               if (usingChain && address) await chain.switchCampaign(address);
               openPage("round");
@@ -1522,12 +1529,10 @@ export default function App() {
             book={book}
             copy={copy}
             quote={quote}
-            official={official}
             pending={pending}
             pendingTarget={pendingTarget}
             actor={actor}
             account={account}
-            executeWait={executeWait}
             connected={connected}
             usingChain={usingChain}
             chain={chain}
@@ -1674,7 +1679,7 @@ function LifecycleStrip({ book }) {
 
 /** 本期：随 funding / executing / mining 切换主内容 */
 function RoundHub({
-  round, book, copy, quote, remaining, pay, countdown, executeWait,
+  round, book, copy, quote, remaining, pay, countdown,
   pending, connected, actor, onChain, onPick, onSubscribe, onRefund, onAbort, onMarkFailed, onOpenOwner, onOpenAssets, onOpenTransfer, onRecoverBnb,
   usingChain = false, periods, onSwitchPeriod,
 }) {
@@ -1695,7 +1700,7 @@ function RoundHub({
    *  - circuitHeldCount：**当前持有**张数（开出后仍持有，卖出后下降）。
    * 不要用挂单量反推 —— 官方市场买入是原子交割，成交即到账。
    */
-  const boughtParts = Number(book.circuitCount ?? book.boughtCount ?? 0) || 0;
+  const boughtParts = Number(book.circuitCount ?? 0) || 0;
   const partsOnHand = Number(book.circuitHeldCount ?? 0) || 0;
   const tradeKey = [
     book.executePhase, book.marketOwed, boughtParts, partsOnHand,
@@ -1727,7 +1732,6 @@ function RoundHub({
           remaining={remaining}
           pay={pay}
           countdown={countdown}
-          executeWait={executeWait}
           pending={pending}
           connected={connected}
             onChain={onChain}
@@ -2053,7 +2057,7 @@ function refundShortfall(row) {
 function AssetsHub({
   round, book, copy, pending, connected, usingChain,
   positions, positionsLoading,
-  onRefund, onMarkFailed, onClaimSurplus, onOpenPeriod, onConnect,
+  onRefund, onMarkFailed, onClaimSurplus, onClaimBem, onOpenPeriod, onConnect,
 }) {
   const rows = usingChain
     ? (positions || [])
@@ -2142,6 +2146,7 @@ function AssetsHub({
                   <th>我的份数</th>
                   <th>已退</th>
                   <th>待领余款</th>
+                  <th>待领 BEM</th>
                   <th></th>
                 </tr>
               </thead>
@@ -2186,6 +2191,9 @@ function AssetsHub({
                       <td>{connected && Number(row.pendingSurplusBnb || 0) > 0
                         ? `${round4(row.pendingSurplusBnb)} BNB`
                         : "—"}</td>
+                      <td>{connected && Number(row.bemClaimable || 0) > 0
+                        ? `${round4(row.bemClaimable)} BEM`
+                        : "—"}</td>
                       <td>
                         <div className="actions assets-actions">
                           <button className="btn btn-inline" type="button" onClick={() => onOpenPeriod(row.address)}>
@@ -2223,6 +2231,17 @@ function AssetsHub({
                               {pending === "claimSurplus" ? "领取中…" : `领取 ${round4(row.pendingSurplusBnb)} BNB`}
                             </button>
                           )}
+                          {connected && Number(row.bemClaimable || 0) > 0 && (
+                            <button
+                              className="btn btn-primary"
+                              type="button"
+                              disabled={Boolean(pending)}
+                              onClick={() => onClaimBem(row.address)}
+                              title="挖矿产出按份额记账后可领；需先有人调用 claimMiningRewards"
+                            >
+                              {pending === "claimBem" ? "领取中…" : `领取 ${round4(row.bemClaimable)} BEM`}
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -2239,17 +2258,13 @@ function AssetsHub({
 
 /** 合约工作台：开期 / 开矿 / 持有人 / 调用 / 调试 */
 function OwnerDesk({
-  tab, round, book, copy, quote, official, pending, pendingTarget, actor, account,
-  executeWait, connected, usingChain, chain, factoryOwner, allowedCircuits, chainHolders, holdersCampaign, now,
+  tab, round, book, copy, quote, pending, pendingTarget, actor, account,
+  connected, usingChain, chain, factoryOwner, allowedCircuits, chainHolders, holdersCampaign, now,
   onBuyCircuits, onOpenRefund, onAbandonOrder, onCancelCircuitListing, onConfirmCircuits,
   onListCircuit, onWithdrawMarketProceeds,
   onSetPlan,
-  /**
-   * 开矿前各步骤的回调。必须由 OwnerDesk 显式透传给 OwnerOverview——
-   * 之前漏了这两个，OwnerOverview 里的按钮走 `onXxx?.()` 可选调用，
-   * 于是点了**完全没有反应**（连报错都没有）：这种静默失败最难查。
-   */
-  onSetMiningPool, onDepositToPool, onReturnSurplus,
+  onReturnSurplus,
+  onStartMining, onStopMining, onClaimMiningRewards, onClaimBem,
   onRemoveCampaign, onOpenRound, onOpenAssets,
   onCreate, onConnect, onInvoke,
 }) {
@@ -2267,11 +2282,9 @@ function OwnerDesk({
           book={book}
           copy={copy}
           quote={quote}
-          official={official}
           pending={pending}
           pendingTarget={pendingTarget}
           actor={actor}
-          executeWait={executeWait}
           history={chain.active ? chain.campaigns : null}
           onSwitchCampaign={usingChain ? chain.switchCampaign : null}
           onBuyCircuits={onBuyCircuits}
@@ -2282,8 +2295,10 @@ function OwnerDesk({
           onWithdrawMarketProceeds={onWithdrawMarketProceeds}
           onConfirmCircuits={onConfirmCircuits}
           onSetPlan={onSetPlan}
-          onSetMiningPool={onSetMiningPool}
-          onDepositToPool={onDepositToPool}
+          onStartMining={onStartMining}
+          onStopMining={onStopMining}
+          onClaimMiningRewards={onClaimMiningRewards}
+          onClaimBem={onClaimBem}
           onReturnSurplus={onReturnSurplus}
           onRemoveCampaign={onRemoveCampaign}
           onOpenRound={onOpenRound}
@@ -2366,15 +2381,12 @@ function RoundFacts({ round, book, quote }) {
   const partsFromChain = onChain && hasBought;
   /**
    * 处理器与每张算力 P：
-   *  - 名称优先用合约里锁定的 circuits 地址反推出来的 processorId；
-   *  - P 只在「有已成交电路」时才敢给——P 是每张电路的算力标度，
-   *    没有电路数时它无法对应到任何真实数量，链上模式一律留空。
-   *  - 链上如果连处理器都没记录，可以从「已成交电路数 + setPlan 算力」反推标度（P ≈ H ÷ 电路数）。
+   *  - 名称只认合约锁定的 circuits → processorId；
+   *  - P 只在「有已成交电路」且已知处理器时给出，不做 H÷电路数反推。
    */
   const shownProcessor = round.processorId || (onChain ? null : est.processor) || null;
-  const inferredScale = hasBought && chainHashpower > 0 ? chainHashpower / chainParts : null;
   const shownScale = onChain
-    ? (hasBought ? (shownProcessor ? processorScale(shownProcessor) : inferredScale) : null)
+    ? (hasBought && shownProcessor ? processorScale(shownProcessor) : null)
     : (est.processorScale || null);
   /**
    * 服务费（链上口径）：serviceFeeBps 从 Campaign 读。
@@ -2535,7 +2547,7 @@ function RoundFacts({ round, book, quote }) {
   );
 }
 
-function ProductPage({ round, book, copy, quote, remaining, pay, countdown, executeWait, pending, connected, onPick, onSubscribe, onRefund, onChain = false, usingChain = false, periods, onSwitchPeriod }) {
+function ProductPage({ round, book, copy, quote, remaining, pay, countdown, pending, connected, onPick, onSubscribe, onRefund, onChain = false, usingChain = false, periods, onSwitchPeriod }) {
   const progress = Math.round((book.sold / round.totalShares) * 100);
   const fundingOpen = book.scene === "funding" && (!book.endsAt || Date.now() <= book.endsAt);
   const fundingExpired = book.scene === "funding" && book.endsAt && Date.now() > book.endsAt;
@@ -3030,22 +3042,43 @@ function RulesPage({ campaigns = [] }) {
     { title: "主动 · 挖矿份额转让", body: "仅挖矿中。在「资产转让」发布出售挂单，份额立即锁定，成交款直接付给你。" },
   ];
   const roles = [
-    ["任何人", "查看状态；挖矿中可接收他人挂单、查看进度；售罄满 3 天可判失败或退余款"],
+    ["任何人", "查看状态；挖矿中可接收他人挂单、查看进度；售罄满 3 天可判失败或退余款；可代调 claimMiningRewards"],
     ["认筹用户", "认筹；超时或失败时退款；领取自己的募集款余款"],
-    ["持份用户", "挖矿中发布 / 撤销份额挂单，领取余款与挖矿产出服务费"],
-    ["Owner（唯一管理角色）", "开期、改计划、下单 / 撤单、卖出、退余款、开退款 / 补缺口、熔断与抬闸、开矿、改子状态、取回资产、转移所有权；Owner 应当是多签"],
+    ["持份用户", "挖矿中发布 / 撤销份额挂单；领取余款、服务费与 BEM（claimBem）"],
+    ["Owner（唯一管理角色）", "开期、改计划、买入 / 挂卖电路、退余款、开退款 / 补缺口、熔断与抬闸、开矿、取回资产、转移所有权；Owner 应当是多签"],
   ];
   const sharedContracts = [
     {
-      name: "开期工厂",
+      name: "开期工厂 CampaignFactory",
       address: deployments.factory,
       verify: true,
-      use: "各期共用。开期写入每份单价、总份数、募集天数、本期电路合约（从白名单选）。",
+      use: "各期共用。开期写入每份单价、总份数、募集天数、本期电路合约（从白名单选）；immutable 绑定市场、PoD、BEM 与部署器。",
+    },
+    {
+      name: "期次部署器 CampaignDeployer",
+      address: deployments.campaignDeployer || CAMPAIGN_DEPLOYER_ADDRESS,
+      verify: true,
+      use: "无状态辅助合约：工厂 createCampaign 时由它 new 出一期 Campaign，避免工厂字节码超限。",
     },
     {
       name: "电路市场",
       address: deployments.circuitMarket,
-      use: "各期共用的官方 ERC721 电路市场。只有卖单侧：list 挂单、buy 成交、delist 撤单；卖家货款 pull 提取。",
+      use: "官方 ERC721 卖单市场（list / buy / delist）。期次合约用 safeTransferFrom 收 NFT，须实现 onERC721Received。",
+    },
+    {
+      name: "官方 PoD 挖矿",
+      address: deployments.podMining || POD_MINING_ADDRESS,
+      use: "官方挖矿代理。期次持有电路后 startMining；产出铸给期次，再 claimMiningRewards 记账。",
+    },
+    {
+      name: "官方 BEM",
+      address: deployments.bem || BEM_ADDRESS,
+      use: "挖矿产出代币。claimMiningRewards 后按份额记入 pendingBem，持份人 claimBem 自领。",
+    },
+    {
+      name: "官方 PoD Lens",
+      address: deployments.podLens || POD_LENS_ADDRESS,
+      use: "只读资格判定：refsEligible（算力倍率 + 网表无 REF）。买入面板与市价过滤会用到。",
     },
   ];
   /**
@@ -3053,12 +3086,17 @@ function RulesPage({ campaigns = [] }) {
    * 主网 = 官方两个集合（TapeOut / Behemoth）。
    */
   const partsContracts = (Array.isArray(deployments.allowedCircuits) ? deployments.allowedCircuits : [])
-    .map((address) => ({
-      name: "电路合约（ERC721）",
-      address,
-      verify: true,
-      use: "工厂白名单里的一个电路合约，开期时选中并锁定。到账后由 startMining 交给官方挖矿合约。",
-    }));
+    .map((address) => {
+      const processor = processorFromCircuitContract(address);
+      return {
+        name: processor ? `${processor} 电路（ERC721）` : "电路合约（ERC721）",
+        address,
+        verify: true,
+        use: processor
+          ? `官方 ${processor} 集合。开期锁定后，买入的电路都属于该集合，并由本期合约持有开矿。`
+          : "工厂白名单内的 ERC721。开期锁定后，买入的电路都属于该集合。",
+      };
+    });
   const periodContracts = (Array.isArray(campaigns) ? [...campaigns] : [])
     .filter((item) => item?.address)
     .sort((a, b) => Number(a.id) - Number(b.id))
@@ -3187,7 +3225,7 @@ function RulesPage({ campaigns = [] }) {
           <div className="rules-block-head">
             <h2>共用合约</h2>
             <p>
-              {NETWORK.name} 上工厂与市场各期共用；电路合约从工厂白名单里选，开期时锁定。
+              {NETWORK.name}：工厂、部署器、市场、PoD、BEM 各期共用；电路从白名单选一个开期锁定。
             </p>
           </div>
           <ul className="rules-contracts">{renderContractRows([...sharedContracts, ...partsContracts])}</ul>

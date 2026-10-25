@@ -99,7 +99,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
 
   const totals = totalsOf(data, legs, fallbackRows);
   const events = Array.isArray(data?.events) ? data.events : null;
-  const marketAddr = data?.circuitMarket || data?.market || "";
+  const marketAddr = data?.circuitMarket || "";
   const partsOnHand = Number(totals.partsHeld || 0);
 
   return (
@@ -246,7 +246,7 @@ export function MarketTradePanel({ campaignAddr, refreshKey, fallbackRows, title
   const legs = data?.legs?.length ? data.legs : fallbackTradeLegs();
   const totals = totalsOf(data, legs, fallbackRows);
   const events = Array.isArray(data?.events) ? data.events : null;
-  const marketAddr = data?.circuitMarket || data?.market || "";
+  const marketAddr = data?.circuitMarket || "";
 
   const allRecords = events && events.length
     ? [...events].reverse().map((evt, index) => ({

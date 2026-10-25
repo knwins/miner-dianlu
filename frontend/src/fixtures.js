@@ -160,12 +160,6 @@ export function identify(address, book, state = null) {
   };
 }
 
-/** 不再设观察期。保留函数是为了旧调用点，始终表示可以立即流片。 */
-export function executeUnlockIn() {
-  return 0;
-}
-
-
 /** 预览用的场景，用户可在顶栏切换观察各阶段表现。（标签取自 ./roundState.js，不另写一份） */
 export const SCENES = [
   { id: "funding", label: SCENE.funding.label },
@@ -266,12 +260,6 @@ export function round5(value) {
   return Math.round((Number(value) || 0) * 100000) / 100000;
 }
 
-/** 价格输入框的展示值：最多五位小数，去掉浮点尾巴。 */
-export function priceText(value) {
-  const n = Number(value) || 0;
-  return Number.isFinite(n) ? String(Math.round(n * 100000) / 100000) : "";
-}
-
 /** 输入过程中限制为最多五位小数（允许空串与末尾小数点）。 */
 export function clampPriceInput(raw) {
   const text = String(raw ?? "").replace(/[^\d.]/g, "");
@@ -282,12 +270,11 @@ export function clampPriceInput(raw) {
 
 /**
  * 从链上 / 本地期次字段解析「目标处理器」。
- * - 处理器：新工厂开期写入 circuits（电路合约地址）；旧期次可用 setPlan 的
- *   estHashpower / circuitHeldCount（或执行后 hashpower）反推 P≈H/电路数
+ * 链上只认开期写入的 circuits → round.processorId（adapter.roundFromState），
+ * 不做 H÷电路数反推（那是旧合约缺 circuits 时的兜底）。
  */
 export function resolveCampaignDesign(round, book = null) {
   const chain = Boolean(book?._chain);
-  // 链上只认合约字段。报价引擎的 estimate、以及 fixtures 里的默认 Behemoth，都不能当成本期处理器。
   const parts = chain
     ? Number(book?.circuitHeldCount) || 0
     : Number(book?.circuitHeldCount) || Number(book?.estimate?.usedParts) || Number(round?.circuitHeldCount) || 0;
@@ -296,27 +283,11 @@ export function resolveCampaignDesign(round, book = null) {
     : Number(book?.hashpower) || Number(book?.estHashpower) || Number(book?.estimate?.hashpower) || Number(round?.estHashpower) || 0;
 
   let processorId = null;
-  if (!chain && round?.processorId && PROCESSOR_IDS.includes(round.processorId)) {
+  if (PROCESSOR_IDS.includes(round?.processorId)) {
     processorId = round.processorId;
   } else if (!chain && round?.circuitModelId) {
     const fromCircuit = findCircuit(round.circuitModelId)?.processor;
     if (fromCircuit && PROCESSOR_IDS.includes(fromCircuit)) processorId = fromCircuit;
-  }
-  if (!processorId && hp > 0) {
-    // 旧期次没记处理器地址：用 H ÷ 电路数反推规模（P≈H/电路数），取标度最接近的处理器。
-    // 数据驱动：按标度查表匹配，不会把某个处理器误认成 Behemoth 或 TapeOut。
-    if (parts > 0) {
-      const scale = hp / parts;
-      processorId =
-        PROCESSOR_IDS.find((id) => processorScale(id) === scale) ||
-        PROCESSOR_IDS.reduce((best, id) =>
-          Math.abs(processorScale(id) - scale) < Math.abs(processorScale(best) - scale) ? id : best,
-        PROCESSOR_IDS[0]);
-    }
-  }
-  // 开期写入的 circuits → round.processorId（见 adapter.roundFromState）
-  if (!processorId && PROCESSOR_IDS.includes(round?.processorId)) {
-    processorId = round.processorId;
   }
   if (!processorId && !chain) processorId = PROCESSOR_IDS[0];
 
@@ -326,8 +297,6 @@ export function resolveCampaignDesign(round, book = null) {
     processor: processorId,
     processorScale: processorId ? processorScale(processorId) : null,
     circuitModelId: circuitId,
-    /** 链上 setPlan / execute 写入了算力，处理器由 H÷电路数反推 */
-    processorInferred: chain ? hp > 0 && Boolean(processorId) : hp > 0,
     processorKnown: Boolean(processorId),
     chainHashpower: hp,
     chainParts: parts,
@@ -1172,8 +1141,6 @@ export function applyCreate(round, draft, snapshot = QUOTE) {
  * （每份 = 募资总额 ÷ 总份数），不可单独手填——否则会破坏
  * 「募资总额 = 份数 × 每份」这一链上恒等式。
  *
- * 兼容旧调用：若不传 `hardCapBnb`，则沿用「每份 × 份数」推算募资总额。
- *
  * 电路数只由募资总额反推，校验只管发行参数本身：
  * 募资总额、总份数、服务费与分成地址。电路在电路市场自由买卖，不再校验买不买得起。
  */
@@ -1184,18 +1151,9 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
   const priceBnb = snapshot?.prices?.[model.id] ?? model.priceBnb;
   const bnbUsdt = snapshot?.bnbUsdt || MARKET.bnbUsdt;
 
-  // 募资总额：优先采用开期人手动填写的 hardCapBnb；
-  // 否则由「每份 × 份数」推算（兼容旧路径）。每份随之派生。
-  let hardCapBnb;
-  let sharePriceBnb;
-  const capRaw = draft.hardCapBnb;
-  if (capRaw !== undefined && capRaw !== null && capRaw !== "") {
-    hardCapBnb = Number(capRaw);
-    sharePriceBnb = totalShares > 0 ? hardCapBnb / totalShares : NaN;
-  } else {
-    sharePriceBnb = Number(draft.sharePriceBnb);
-    hardCapBnb = sharePriceBnb * totalShares;
-  }
+  // 募资总额由开期人手动填写；每份 = 募资总额 ÷ 总份数。
+  const hardCapBnb = Number(draft.hardCapBnb);
+  const sharePriceBnb = totalShares > 0 ? hardCapBnb / totalShares : NaN;
 
   /**
    * 本期电路数由募资总额反推，权重 H = 电路数 × P。
@@ -1294,7 +1252,6 @@ export function reviewRound(draft, snapshot = QUOTE, base = ROUND) {
     hardCap: round4(hardCapBnb),
     sharePriceBnb,
     model,
-    /** 兼容旧字段：等于该型号自身的价 */
     priceBnb,
     /** 电路数只由募资总额派生 */
     needParts: actual.totalParts,

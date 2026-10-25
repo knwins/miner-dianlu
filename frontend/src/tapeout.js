@@ -9,8 +9,8 @@
  * 每个处理器对应一个电路合约，一期在开期时锁定其中一个，之后从市场买入的
  * 每张电路都属于该集合。合约与前端都按「张」计量，只有单一电路腿。
  *
- * 价格读取（订单簿拉取、BNB 汇率、跨域代理、轮询）已全部删除：
- * 电路单价以电路市场的挂单为准（见 chain/client.js 的 readCircuitMarketSnapshot）。
+ * 电路单价以官方电路市场挂单为准（Owner 面板：`readCircuitListingsFor`；
+ * 市价条：`officialPrices.js`）。
  */
 import deployments from "./chain/deployments.json";
 
@@ -22,9 +22,6 @@ export const OFFICIAL_CIRCUIT_COLLECTIONS = {
   TapeOut: "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C",
   Behemoth: "0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c",
 };
-
-/** 兼容旧引用：旧代码把这两个地址叫 CPU，实际就是电路合约。 */
-export const OFFICIAL_CPUS = OFFICIAL_CIRCUIT_COLLECTIONS;
 
 /**
  * 处理器各自的电路合约。

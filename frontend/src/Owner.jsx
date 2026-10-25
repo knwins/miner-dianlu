@@ -190,7 +190,7 @@ function CircuitExecPanel({
     // 故意不依赖 pending：交易进行中若把 pending 放进 deps 并 early-return，
     // cleanup 会取消进行中的请求，界面会永远停在「读取中」。买入前仍会链上复核。
     let alive = true;
-    const marketAddr = String(book.circuitMarket || book.market || "");
+    const marketAddr = String(book.circuitMarket || "");
     if (!/^0x[0-9a-fA-F]{40}$/.test(marketAddr) || !/^0x[0-9a-fA-F]{40}$/.test(lockedCircuits)) {
       setMarketRows([]);
       setMarketState("error");
@@ -218,7 +218,7 @@ function CircuitExecPanel({
     return () => {
       alive = false;
     };
-  }, [chainMode, buying, book.circuitMarket, book.market, lockedCircuits, marketReload]);
+  }, [chainMode, buying, book.circuitMarket, lockedCircuits, marketReload]);
 
   /** 市场前 5 条（已按单价从低到高排序）。 */
   const topListings = marketRows.slice(0, 5);
@@ -653,7 +653,7 @@ function CircuitExecPanel({
 }
 
 export function OwnerOverview({
-  round, book, copy, pending, pendingTarget = "", actor, executeWait, history,
+  round, book, copy, pending, pendingTarget = "", actor, history,
   onSwitchCampaign, onBuyCircuits, onConfirmCircuits, onListCircuit, onCancelCircuitListing,
   onOpenRefund, onRecoverBnb, onAbandonOrder,
   onWithdrawMarketProceeds,
@@ -709,9 +709,8 @@ export function OwnerOverview({
     );
     return {
       ...item,
-      /** 处理器只作为链上事实展示；反推不出来就留空，由 UI 决定是否显示 */
+      /** 处理器只作为链上事实展示；circuits 反推不出来就留空 */
       processor: rowDesign.processorKnown ? rowDesign.processorId : "",
-      processorInferred: rowDesign.processorInferred,
     };
   });
   const [statusFilter, setStatusFilter] = useState("全部");
@@ -1021,7 +1020,7 @@ export function OwnerOverview({
                   refreshKey={marketRefreshKey}
                   fallbackRows={{
                     marketOwed: Number(book.marketOwed) || 0,
-                    circuitCount: Number(book.circuitCount ?? book.boughtCount ?? 0) || 0,
+                    circuitCount: Number(book.circuitCount ?? 0) || 0,
                     circuitHeldCount: Number(book.circuitHeldCount ?? 0) || 0,
                   }}
                 />

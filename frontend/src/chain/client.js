@@ -22,18 +22,15 @@ const STORAGE_KEY = "miner.activeCampaign";
 const isAddr = (a) => typeof a === "string" && /^0x[0-9a-fA-F]{40}$/.test(a);
 
 /** 与 Campaign.FAIL_GRACE 保持一致：非 Owner 须在售罄满 3 天后才能 markFailed。 */
-export const FAIL_GRACE_SECONDS = 3 * 86_400;
+const FAIL_GRACE_SECONDS = 3 * 86_400;
 
 /**
  * 非 Owner 能 markFailed 的时间戳（毫秒）。
  *
- * 合约口径是 `max(soldOutAt, lastOrderAt) + FAIL_GRACE`（Campaign.sol:757-758），
- * 不是「售罄满 3 天」：每次挂单都会把宽限期往前推，防止 Owner 用
- * 售罄后立刻重挂单把逃生口按回去，也让「售罄后一直没挂单」的期次不被瞬间判死。
- * 只按 soldOutAt 算会读早（本期实际 10-27 10:15，少算 25 小时），
- * 页面就会显示一个还没到的「逃生口打开」时间。
+ * 合约口径是 `max(soldOutAt, lastOrderAt) + FAIL_GRACE`，
+ * 不是「售罄满 3 天」：每次挂单都会把宽限期往前推。
  */
-export function graceEndsAtMs(soldOutAt, lastOrderAt) {
+function graceEndsAtMs(soldOutAt, lastOrderAt) {
   const base = Math.max(Number(soldOutAt) || 0, Number(lastOrderAt) || 0);
   return base > 0 ? (base + FAIL_GRACE_SECONDS) * 1000 : null;
 }
@@ -626,7 +623,6 @@ async function readStateOn(runner, account, campaignAddr) {
     bem: bemAddr,
     circuits: order.circuits && order.circuits !== ZeroAddress ? order.circuits : circuitsAddr,
     feeRecipient: "",
-    market: marketAddr,
     circuitMarket: marketAddr,
     markFailedAt,
     refundShort,
@@ -724,9 +720,8 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       return `${Number(formatEther(state.raisedBnb)).toFixed(4)} BNB`;
     case "circuits":
       return state.circuits || "—";
-    case "market":
     case "circuitMarket":
-      return state.circuitMarket || state.market || "—";
+      return state.circuitMarket || "—";
     case "circuitHeldCount":
       return `${state.circuitHeldCount ?? 0} 张`;
     case "circuitCount":
@@ -851,6 +846,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
           // 余款 pull 模式：surplusOf 含尚未计提的可领部分。
           zb(c.surplusOf(account), 0n),
           zb(c.pendingSurplus(account), 0n),
+          zb(c.bemPendingOf(account), 0n),
         );
       }
       const res = await Promise.all(base);
@@ -879,6 +875,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         pendingSurplusBnb: account
           ? Number(formatEther(res[12] > res[13] ? res[12] : res[13]))
           : 0,
+        bemClaimable: account ? Number(formatEther(res[14])) : 0,
       });
     } catch {
       rows.push({
@@ -898,6 +895,7 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         escrow: 0,
         refundedBnb: 0,
         pendingSurplusBnb: 0,
+        bemClaimable: 0,
         raisedBnb: 0,
         error: true,
       });
@@ -906,14 +904,10 @@ export async function readAccountAcrossCampaigns(account, addrs) {
   return rows;
 }
 
-/** 读本期接的电路市场地址；读不到按零地址处理（展示层显示「未配置」）。 */
+/** 读本期锁定的电路市场地址；未配置时返回零地址。 */
 async function readCircuitMarket(c) {
-  try {
-    const a = await c.circuitMarket();
-    return isAddr(a) && a !== ZeroAddress ? a : ZeroAddress;
-  } catch {
-    return ZeroAddress;
-  }
+  const a = await c.circuitMarket();
+  return isAddr(a) && a !== ZeroAddress ? a : ZeroAddress;
 }
 
 const ERC721_READ_ABI = [
@@ -1493,7 +1487,7 @@ async function readMarketTradesOnce(campaignAddr) {
     };
 
     return {
-      market: marketAddr,
+      circuitMarket: marketAddr,
       circuits,
       orderFilled: heldCount > 0n,
       legs: [...buyLegs, ...sellLegs],
@@ -1715,61 +1709,57 @@ async function campaignsOf(factoryAddr) {
   });
 }
 
-/** 列出当前工厂期次（新→旧）。只读当前工厂，旧工厂不再并入。 */
+/** 列出当前工厂期次（新→旧）。 */
 export async function listCampaigns() {
   if (!isAddr(FACTORY_ADDRESS)) return [];
   return campaignsOf(FACTORY_ADDRESS);
 }
 
-/** 读某期轻量摘要（历史列表用）。 */
+/** 读某期轻量摘要（历史列表用）。缺字段直接抛错，不做旧 ABI 降级。 */
 export async function readCampaignSummary(address) {
   return withReadProvider((runner) => readCampaignSummaryOn(runner, address));
 }
 
 async function readCampaignSummaryOn(runner, address) {
   const c = campaignContract(runner, address);
-  /**
-   * 每项单独 catch：历史期次可能由旧版合约部署，缺 getter 不能让整行变成「—」。
-   * 电路数量用 circuitHeldCount()（本期仍持有的 ERC721 张数），不再猜挂单剩余。
-   */
-  const [scene, sold, totalShares, sharePriceBnb, estHashpower, raisedBnb, circuits, circuitCount, circuitHeldCount] = await Promise.all([
-    c.scene().then(Number).catch(() => 0),
-    c.sold().then(Number).catch(() => 0),
-    c.totalShares().then(Number).catch(() => 0),
-    c.sharePriceBnb().then((v) => Number(formatEther(v))).catch(() => 0),
-    c.estHashpower().then(Number).catch(() => 0),
-    c.raisedBnb().then((v) => Number(formatEther(v))).catch(() => 0),
-    c.circuits().catch(() => ZeroAddress),
-    c.circuitCount().then(Number).catch(() => 0),
-    c.circuitHeldCount().then(Number).catch(() => 0),
-  ]);
-  // 结束状态不在 scene 里：执行失败与募集到期必须靠这几项判断。旧期次缺 getter 时按未结束处理。
-  const [phase, executionFailed, fundingDeadline, totalRefunded, outstandingShares] = await Promise.all([
-    c.phase().then(Number).catch(() => 0),
-    c.executionFailed().then(Boolean).catch(() => false),
-    c.fundingDeadline().then(Number).catch(() => 0),
-    c.totalRefunded().then((v) => Number(formatEther(v))).catch(() => 0),
-    // 已售未退（当前债务）。退款后变小，sold 不会 —— 判断「是否已全部退回」只能用它。
-    c.outstandingShares().then(Number).catch(() => null),
+  const [
+    scene, sold, totalShares, sharePriceBnb, estHashpower, raisedBnb, circuits,
+    circuitCount, circuitHeldCount, phase, executionFailed, fundingDeadline,
+    totalRefunded, outstandingShares,
+  ] = await Promise.all([
+    c.scene(),
+    c.sold(),
+    c.totalShares(),
+    c.sharePriceBnb(),
+    c.estHashpower(),
+    c.raisedBnb(),
+    c.circuits(),
+    c.circuitCount(),
+    c.circuitHeldCount(),
+    c.phase(),
+    c.executionFailed(),
+    c.fundingDeadline(),
+    c.totalRefunded(),
+    c.outstandingShares(),
   ]);
   return {
     address,
     scene: Number(scene),
-    phase,
-    executionFailed,
-    fundingDeadline,
-    totalRefunded,
-    outstandingShares,
+    phase: Number(phase),
+    executionFailed: Boolean(executionFailed),
+    fundingDeadline: Number(fundingDeadline),
+    totalRefunded: Number(formatEther(totalRefunded)),
+    outstandingShares: Number(outstandingShares),
     sold: Number(sold),
     totalShares: Number(totalShares),
-    sharePriceBnb: Number(sharePriceBnb),
+    sharePriceBnb: Number(formatEther(sharePriceBnb)),
     hashpower: Number(estHashpower),
     estHashpower: Number(estHashpower),
     distributed: 0,
     feeBem: 0,
-    raisedBnb: Number(raisedBnb),
-    circuitCount,
-    circuitHeldCount,
+    raisedBnb: Number(formatEther(raisedBnb)),
+    circuitCount: Number(circuitCount),
+    circuitHeldCount: Number(circuitHeldCount),
     circuits,
   };
 }
@@ -2110,52 +2100,6 @@ export async function readCircuitListingsFor(marketAddr, circuitsAddr) {
   });
 }
 
-/**
- * 全局读电路市场卖单（多集合）。同样走官方快照 + 链上复核。
- */
-export async function readCircuitMarketSnapshot(marketAddr, collections = []) {
-  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return null;
-  return withReadProvider(async (runner) => {
-    const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
-    const [feeBps, next] = await Promise.all([market.feeBps(), market.nextListingId()]);
-    const allow = [...new Set((collections || []).filter(isAddr).map((a) => String(a).toLowerCase()))];
-    const snap = await fetchOfficialCircuitMarketSnapshot();
-
-    const rows = [];
-    const targets = allow.length ? allow : [];
-    if (!targets.length && snap) {
-      for (const row of snap.listings) {
-        const c = String(row.circuits || "").toLowerCase();
-        if (isAddr(c) && !targets.includes(c)) targets.push(c);
-      }
-    }
-    for (const circuit of targets) {
-      let live = snap ? listingsFromSnapshot(snap, marketAddr, circuit) : null;
-      if (!live) {
-        const candidates = await scanRecentListingCandidates(runner, marketAddr, circuit);
-        live = await finalizeListings(runner, marketAddr, circuit, candidates);
-      }
-      for (const row of live) rows.push({ ...row, circuits: circuit });
-    }
-
-    rows.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
-    const floors = {};
-    for (const row of rows) {
-      const key = String(row.circuits).toLowerCase();
-      const unit = Number(formatEther(row.price));
-      if (!(key in floors) || unit < floors[key]) floors[key] = unit;
-    }
-    return {
-      market: marketAddr,
-      circuitMarket: marketAddr,
-      feeBps: Number(feeBps),
-      nextListingId: Number(next - 1n),
-      listings: rows.map((r) => ({ ...r, price: Number(formatEther(r.price)) })),
-      floors,
-    };
-  });
-}
-
 /** 自动挑单走同一套读取，保证「最便宜」与买入面板同口径。 */
 async function scanCircuitListings(campaign, market) {
   const marketAddr = await market.getAddress();
@@ -2295,8 +2239,6 @@ export const tx = {
     signerOrThrow(signer).setServiceFee(bps, recipients, sharesBps),
   claimBem: (signer, address) => signerOrThrow(signer, address).claimBem(),
   claimMiningRewards: (signer, address) => signerOrThrow(signer, address).claimMiningRewards(),
-  setServiceFee: (signer, bps, recipients, sharesBps) =>
-    signerOrThrow(signer).setServiceFee(bps, recipients, sharesBps),
   listShares: (signer, count, price) => signerOrThrow(signer).listShares(count, price),
   cancelListing: (signer, id) => signerOrThrow(signer).cancelListing(id),
   takeListing: (signer, id, count, valueWei) => signerOrThrow(signer).takeListing(id, count, { value: valueWei }),
@@ -2406,9 +2348,6 @@ export async function readAllowedCircuits() {
     return [];
   }
 }
-
-/** 兼容旧引用。 */
-export const readAllowedParts = readAllowedCircuits;
 
 /** ERC721 的 supportsInterface 标识（ERC-165）。 */
 const ERC721_INTERFACE_ID = "0x80ac58cd";
@@ -2582,7 +2521,7 @@ export async function createCampaignOnChain(signer, params, onSigned) {
 }
 
 /** 从 createCampaign 回执解析新 Campaign 地址。 */
-export function parseCreatedCampaign(receipt) {
+function parseCreatedCampaign(receipt) {
   const iface = new Interface(FACTORY_ABI);
   for (const log of receipt.logs || []) {
     try {

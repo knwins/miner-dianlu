@@ -1,28 +1,44 @@
-// 本地开发部署：MockCircuitMarket + MockCircuitNft → CampaignFactory → 开一期。
-// 电路市场只有卖单侧；本地用 MockCircuitMarket 模拟 list/buy/delist/owed/withdraw。
-// 工厂构造 2 参：(circuitMarket, allowedCircuits[])；开期时显式传一个白名单内的 ERC721 电路合约。
-// 运行：npx hardhat run scripts/deploy.js --network <net>
+// 本地开发部署：Mock 市场/NFT/PoD/BEM → CampaignDeployer → CampaignFactory → 开一期。
+// 工厂构造 5 参：(circuitMarket, allowedCircuits[], podMining, bem, campaignDeployer)。
+// 运行：node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy.js
 const { ethers } = require("hardhat");
 
 async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("部署者：", deployer.address);
 
-  // 市场费 2.5%（与官方 sell-side 市场一致的费用模型：从卖方所得里扣）。
   const market = await ethers.deployContract("MockCircuitMarket", [250]);
   await market.waitForDeployment();
   const circuits = await ethers.deployContract("MockCircuitNft");
   await circuits.waitForDeployment();
+  const bem = await ethers.deployContract("MockBem");
+  await bem.waitForDeployment();
+  const pod = await ethers.deployContract("MockPodMining", [await bem.getAddress()]);
+  await pod.waitForDeployment();
+  await (await pod.setProcessor(await circuits.getAddress(), 1)).wait();
+  const campaignDeployer = await ethers.deployContract("CampaignDeployer");
+  await campaignDeployer.waitForDeployment();
 
   const marketAddr = await market.getAddress();
   const circuitsAddr = await circuits.getAddress();
+  const bemAddr = await bem.getAddress();
+  const podAddr = await pod.getAddress();
+  const deployerAddr = await campaignDeployer.getAddress();
 
-  // 工厂构造传 [circuitMarket, allowedCircuits]（2 参，无默认电路合约）；白名单写入后不可增删。
-  const factory = await ethers.deployContract("CampaignFactory", [marketAddr, [circuitsAddr]]);
+  const factory = await ethers.deployContract("CampaignFactory", [
+    marketAddr,
+    [circuitsAddr],
+    podAddr,
+    bemAddr,
+    deployerAddr,
+  ]);
   await factory.waitForDeployment();
 
   console.log("MockCircuitMarket :", marketAddr);
   console.log("MockCircuitNft    :", circuitsAddr);
+  console.log("MockBem           :", bemAddr);
+  console.log("MockPodMining     :", podAddr);
+  console.log("CampaignDeployer  :", deployerAddr);
   console.log("电路白名单         :", Number(await factory.allowedCircuitsCount()), "项");
   console.log("CampaignFactory   :", await factory.getAddress());
 

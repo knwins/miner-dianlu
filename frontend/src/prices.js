@@ -254,11 +254,8 @@ export function planTask({ parts, circuitId, snapshot }) {
     model,
     processor,
     processorScale: P,
-    /** 兼容旧字段：全部电路同价，两个键都指向同一单价 */
     priceByPart: { CIRCUIT: priceMain },
     priceMain,
-    priceOther: priceMain,
-    priceSibling: priceMain,
     /** 造价小计：只有一类电路 */
     costBreakdown: {
       CIRCUIT: { count: totalParts, price: priceMain, cost: partsCost },

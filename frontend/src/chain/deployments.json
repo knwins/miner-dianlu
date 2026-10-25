@@ -1,28 +1,25 @@
 {
   "network": "bsc",
   "chainId": 56,
-  "deployedAt": "2026-10-25T14:32:22.523Z",
+  "deployedAt": "2026-10-25T17:48:53.070Z",
   "circuitMarket": "0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f",
+  "podMining": "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46",
+  "bem": "0x5ce033B2bFCa3Af30b3e8C8457DeaF776A8b695a",
+  "podLens": "0xdd20b9537b9f5db9d2a23e6b11ad863cf81930d8",
+  "campaignDeployer": "0x58CFe89C382e35c93D8b764Bd7cDC273abf04e14",
   "allowedCircuits": [
     "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C",
     "0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c"
   ],
-  "factory": "0x6768039789439a9da2044926293d8cc46ee4225e",
-  "legacyFactories": [
-    "0xad36f1387661e0F596781993A9E952955Da7c2Ba",
-    "0x19a47311FC280f146D1992dD99DC7Fa5735e10BA",
-    "0x638744e7308D8dCe3444d6991137f7405f5Ab2ED",
-    "0xB4315F55CD614d09092f0Fcf75ef34C5ee252c3b",
-    "0x29f4A37509ac1CB556562398240446D7168Fdc2f",
-    "0x2a27334bca2b1a04e4cd369a4e9bd945d9afce55",
-    "0x6bf44c46b60d631b2ebee490d6ea6fba032be399",
-    "0x9a6760934648C3794e51b45e3778768e99E54236"
-  ],
+  "factory": "0x81D4dD7f5c2881236bcf441a462423b034FE6F9c",
   "campaign": "",
   "campaignParams": null,
   "deployer": "0xebA1B24d36487a75C533233A07D6899a268Bb9AA",
-  "factoryDeploymentTx": "0xa4038ab2e59741a554b2722a0df62cf6b883a893bdb5b47aaed2be4303cbbf3f",
-  "factoryDeploymentBlock": 129722061,
-  "factoryRuntimeBytes": 21714,
-  "notes": "电路市场版工厂已部署（BSC 主网），尚未开期。开期需显式指定白名单内的 ERC721 电路合约；旧工厂的期次使用旧 ABI，本版前端不再展示。"
+  "factoryDeploymentTx": "",
+  "factoryDeploymentBlock": null,
+  "factoryRuntimeBytes": 2241,
+  "notes": "含 onERC721Received + 官方 PoD/BEM 的工厂。尚未开期；开期须选白名单内 ERC721。",
+  "_legacyFactoriesBackup": [
+    "0x6768039789439a9da2044926293d8cc46ee4225e"
+  ]
 }

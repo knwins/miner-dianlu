@@ -114,7 +114,7 @@ export function useChain(extra = {}) {
         if (cancelled) return;
         const saved = getCampaignAddress();
         const savedOk = addrs.some((a) => String(a).toLowerCase() === String(saved).toLowerCase());
-        // 仅当前工厂期次有效；localStorage 若仍指向旧工厂期，强制切到最新一期
+        // 仅当前工厂期次有效；localStorage 若仍指向已下架地址，强制切到最新一期
         const latest = addrs[0] || "";
         const target = savedOk ? saved : latest;
         if (!target) {

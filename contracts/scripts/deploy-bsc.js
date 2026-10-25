@@ -1,9 +1,11 @@
 // 部署到 BSC：电路市场（官方 sell-side Market 或 MockCircuitMarket）+ ERC721 电路白名单
 // （官方 TapeOut / Behemoth 电路，或 MockCircuitNft）→ CampaignFactory → 可选开一期。
 //
-// 工厂 immutable 地绑定 circuitMarket，构造 2 参：(circuitMarket, allowedCircuits[])。
+// 工厂 immutable 绑定 circuitMarket / podMining / bem / campaignDeployer，
+// 构造 5 参：(circuitMarket, allowedCircuits[], podMining, bem, campaignDeployer)。
 // 工厂没有「默认电路」：每期开期时由调用方显式选择白名单内的 ERC721 电路合约
 // （createCampaign 第 4 参必选，零地址 revert）。
+// 主网推荐直接用 scripts/deploy-factory.js（本脚本偏测试网一键）。
 //
 // 地址写回 contracts/deployments/<network>.json 与 frontend/src/chain/deployments.json。
 // 运行：npx hardhat run scripts/deploy-bsc.js --network bscTestnet
@@ -30,6 +32,8 @@ const OFFICIAL_CIRCUITS = [
   "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C", // TapeOut
   "0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c", // Behemoth
 ];
+const OFFICIAL_POD_MINING = "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46";
+const OFFICIAL_BEM = "0x5ce033B2bFCa3Af30b3e8C8457DeaF776A8b695a";
 
 function env(...names) {
   for (const name of names) {
@@ -113,38 +117,72 @@ async function main() {
   }
   console.log(`电路白名单：${allowedCircuits.length} 项${mainnet ? "（官方两件套）" : ""}`);
 
-  // 3) 工厂：构造 [circuitMarket, allowedCircuits]。
-  const factoryDeployed = await safeDeploy("CampaignFactory", [circuitMarket, allowedCircuits]);
+  // 3) PoD + BEM：主网官方；测试网可 env，否则部署 Mock。
+  let podMining = env("POD_MINING_ADDRESS") || (mainnet ? OFFICIAL_POD_MINING : "");
+  let bem = env("BEM_ADDRESS") || (mainnet ? OFFICIAL_BEM : "");
+  if (!mainnet && (!podMining || !bem)) {
+    const bemC = await safeDeploy("MockBem");
+    bem = bemC.address;
+    const podC = await safeDeploy("MockPodMining", [bem]);
+    podMining = podC.address;
+    const pod = await ethers.getContractAt("MockPodMining", podMining, deployer);
+    for (const a of allowedCircuits) await (await pod.setProcessor(a, 1)).wait();
+    console.log(`MockBem     ：${bem}`);
+    console.log(`MockPodMining：${podMining}`);
+  }
+  if ((await ethers.provider.getCode(podMining)) === "0x") throw new Error(`POD_MINING ${podMining} 无代码`);
+  if ((await ethers.provider.getCode(bem)) === "0x") throw new Error(`BEM ${bem} 无代码`);
+
+  const deployerC = await safeDeploy("CampaignDeployer");
+  const campaignDeployer = deployerC.address;
+  console.log(`CampaignDeployer：${campaignDeployer}`);
+
+  // 4) 工厂：构造 5 参。
+  const factoryDeployed = await safeDeploy("CampaignFactory", [
+    circuitMarket,
+    allowedCircuits,
+    podMining,
+    bem,
+    campaignDeployer,
+  ]);
   const factoryAddr = factoryDeployed.address;
   const factory = await ethers.getContractAt("CampaignFactory", factoryAddr, deployer);
   console.log(`Factory    ：${factoryAddr}`);
   console.log(`             交易 ${factoryDeployed.hash}（块 ${factoryDeployed.blockNumber}，gasUsed ${Number(factoryDeployed.gasUsed).toLocaleString()}）`);
 
-  // 读回构造参数，确认 immutable 配置。
   if (String(await factory.circuitMarket()).toLowerCase() !== circuitMarket.toLowerCase()) {
     throw new Error("链上 circuitMarket 与预期不一致");
+  }
+  if (String(await factory.podMining()).toLowerCase() !== podMining.toLowerCase()) {
+    throw new Error("链上 podMining 与预期不一致");
+  }
+  if (String(await factory.bem()).toLowerCase() !== bem.toLowerCase()) {
+    throw new Error("链上 bem 与预期不一致");
   }
   if (Number(await factory.allowedCircuitsCount()) !== allowedCircuits.length) {
     throw new Error("链上电路白名单数量与预期不一致");
   }
 
-  // 4) 开期。主网默认不开，避免未核对参数就收款。需要时设 OPEN_CAMPAIGN=1。
+  // 5) 开期。主网默认不开，避免未核对参数就收款。需要时设 OPEN_CAMPAIGN=1。
   const openCampaign = process.env.OPEN_CAMPAIGN === "1" || (!mainnet && process.env.OPEN_CAMPAIGN !== "0");
   if (!openCampaign) {
-    const legacyFactories = collectLegacyFactories(network.name, chainId, factoryAddr);
     const out = {
       network: network.name,
       chainId,
       deployedAt: new Date().toISOString(),
       circuitMarket,
-      /** 电路 NFT 白名单：前端开期表单的可选处理器直接由这份链上事实生成。 */
+      podMining,
+      bem,
+      campaignDeployer,
       allowedCircuits,
       factory: factoryAddr,
-      legacyFactories,
       campaign: "",
       campaignParams: null,
       deployer: deployer.address,
-      notes: "BSC 工厂已部署，尚未开期。开期需份额价 / 总份数 / 募集天数 / ERC721 电路合约（必选，从白名单选 TapeOut / Behemoth）。",
+      factoryDeploymentTx: factoryDeployed.hash,
+      factoryDeploymentBlock: factoryDeployed.blockNumber,
+      notes: "含 onERC721Received + PoD/BEM 的工厂，尚未开期。开期需份额价 / 总份数 / 募集天数 / 白名单内 ERC721。",
+      _legacyFactoriesBackup: collectLegacyFactories(network.name, chainId, factoryAddr),
     };
     writeDeploymentRecords(network.name, out);
     console.log("\n✓ 工厂已部署，未开期。地址已写入 deployments 与前端配置。");
@@ -204,33 +242,34 @@ async function main() {
     console.log(`服务费    ：${feeBps} bps（${Number(feeBps) / 100}%），${recipients.length} 个收款地址`);
   }
 
-  const legacyFactories = collectLegacyFactories(network.name, chainId, factoryAddr);
-
   const out = {
     network: network.name,
     chainId,
     deployedAt: new Date().toISOString(),
     circuitMarket,
-    /** 电路 NFT 白名单：前端开期表单的可选处理器直接由这份链上事实生成。 */
+    podMining,
+    bem,
+    campaignDeployer,
     allowedCircuits,
     factory: factoryAddr,
-    legacyFactories,
     campaign: campaignAddr,
     campaignParams: {
       sharePriceBnb: process.env.SHARE_PRICE_BNB || "0.01",
       totalShares: Number(totalShares),
       fundingDays,
       fundingSeconds: Number(fundingSeconds),
-      /** 本期锁定的 ERC721 电路合约（= 处理器）。必选，从白名单里选。 */
       campaignCircuits,
     },
     serviceFeeBps: Number(feeBps),
     serviceFeeSet: feeBps > 0n,
     feeShares,
     deployer: deployer.address,
+    factoryDeploymentTx: factoryDeployed.hash,
+    factoryDeploymentBlock: factoryDeployed.blockNumber,
     notes: mainnet
-      ? "BSC 主网已开期。电路市场为官方 sell-side 合约；ERC721 电路合约显式指定，落在官方两件套白名单内（TapeOut / Behemoth）。"
+      ? "BSC 主网已开期：官方市场 + PoD/BEM；电路为白名单内 ERC721。"
       : "测试网部署并已开期。",
+    _legacyFactoriesBackup: collectLegacyFactories(network.name, chainId, factoryAddr),
   };
 
   writeDeploymentRecords(network.name, out);

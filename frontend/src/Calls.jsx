@@ -1072,7 +1072,7 @@ export function readCall(method, args, round, book, quote = QUOTE) {
   if (method === "circuits") return book.circuits || "—";
   if (method === "circuitCount") return `${Number(book.circuitCount) || 0} 张（累计买入）`;
   if (method === "circuitHeldCount") return `${Number(book.circuitHeldCount) || 0} 张（当前持有）`;
-  if (method === "market" || method === "circuitMarket") return book.circuitMarket || "—";
+  if (method === "circuitMarket") return book.circuitMarket || "—";
   /**
    * 工厂电路白名单读项（模拟模式）。
    *

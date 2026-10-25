@@ -186,8 +186,8 @@ export function bookFromState(state, account, extra = {}) {
     halted: Boolean(state.halted),
     selfAddress: account,
     totalShares: Number(state.totalShares),
-    /** 已成交到账的电路张数（circuitCount）。买入是原子交割，成交即到账；卖出后持仓下降。 */
-    circuitCount: Number(state.boughtCount ?? state.circuitCount ?? 0),
+    /** 累计买入张数（历史）；卖出后不变。 */
+    circuitCount: Number(state.boughtCount ?? 0),
     circuitHeldCount: Number(state.circuitHeldCount ?? 0),
     estHashpower: Number(state.estHashpower),
     priceLock: bem(state.priceLock),
@@ -233,8 +233,7 @@ export function bookFromState(state, account, extra = {}) {
     /** executing+buying 且池子已不足以按原价兑付 → 持有人可按比例退款 */
     refundShort: Boolean(state.refundShort),
     refundRatio: state.refundRatio ?? null,
-    market: state.market || state.circuitMarket || "",
-    circuitMarket: state.circuitMarket || state.market || "",
+    circuitMarket: state.circuitMarket || "",
     /** 工厂已移除该期：任何人可撤剩余买单 */
     retired: Boolean(state.retired),
     picked: extra.picked ?? 1,
