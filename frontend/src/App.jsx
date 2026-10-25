@@ -278,9 +278,9 @@ export default function App() {
   function invokeCall(method, args) {
     const WRITE_METHODS = [
       "subscribe", "listShares", "cancelListing", "takeListing", "refund", "claimSurplus",
-      "placeTransistorOrder", "cancelTransistorOrder", "placeTransistorAsk", "cancelTransistorAsk", "confirmSale", "setPhase",
+      "placeTransistorOrder", "cancelTransistorOrder", "sellTransistors", "setPhase",
       "withdrawMarketProceeds", "confirmTransistors", "setPlan", "setMiningPool", "depositToPool", "returnSurplus", "topUpShortfall",
-      "simulateFillBid", "simulateFillAsk", "simulateFillCampaignBids", "simulateFillCampaignAsks",
+      "simulateFillBid", "simulateExternalBid", "simulateFillCampaignBids",
       "createCampaign", "openRefund", "abandonOrder", "markFailed", "removeCampaign", "removeCampaignAt",
       "setMaterialMarket", "recoverBnb", "recoverTransistors", "transferOwnership",
       "setFactoryOwner", "claimFee", "setServiceFee",
@@ -294,7 +294,7 @@ export default function App() {
     if (["scene", "phase", "sold", "sharePriceBnb", "totalShares", "estHashpower", "totalRefunded", "raisedBnb", "transistors", "market", "materialMarket", "executionFailed", "soldOutAt", "priceLock", "holderCount", "sharesOf"].includes(method)) {
       return { ok: true, message: readCall(method, args, round, book, quote) };
     }
-    if (/^market(OpenOrders|Bids|Asks|Owed)$/.test(method) || method.startsWith("simulateFill")) {
+    if (/^market(OpenOrders|Bids|Sellable|Owed)$/.test(method) || method.startsWith("simulateFill") || method === "simulateExternalBid") {
       return { ok: false, message: "晶体管市场调试只在链上模式可用：先连接测试网钱包。" };
     }
 
@@ -383,15 +383,12 @@ export default function App() {
     setServiceFee: "设定挖矿产出服务费",
     placeTransistorOrder: "挂买单",
     cancelTransistorOrder: "取消买单",
-    placeTransistorAsk: "挂卖单",
-    cancelTransistorAsk: "取消卖单",
-    confirmSale: "确认卖出",
+    sellTransistors: "卖入买单",
     setPhase: "改子状态",
     withdrawMarketProceeds: "提取卖出款",
     simulateFillBid: "模拟卖方成交",
-    simulateFillAsk: "模拟买方吃单",
+    simulateExternalBid: "模拟外部买单",
     simulateFillCampaignBids: "一键撮合买单",
-    simulateFillCampaignAsks: "一键吃掉卖单",
     confirmTransistors: "确认成交",
     setPlan: "写入计划",
     setMiningPool: "设置矿池",
@@ -481,19 +478,17 @@ export default function App() {
             throw new Error("托管金额超过募集余额，不会挂出。请降低数量或单价后再提交。");
           }
           await send(chainTx.placeTransistorOrder(signer, nandQty, nandPrice, latchQty, latchPrice), onSigned);
-        } else if (method === "placeTransistorAsk") {
-          if (book._chain && book.marketAsks === false) {
-            throw new Error("这期合约还没有卖单接口。重新部署并新开一期后才能 placeAsk。");
+        } else if (method === "sellTransistors") {
+          if (book._chain && book.readyExit === false) {
+            throw new Error("这期合约没有 sellTransistors。重新部署并新开一期后才能卖入买单。");
           }
-          const nandQty = BigInt(Math.floor(Number(args?.nandQty) || 0));
-          const latchQty = BigInt(Math.floor(Number(args?.latchQty) || 0));
-          if (nandQty === 0n && latchQty === 0n) throw new Error("NAND 与 LATCH 数量不能都为 0");
-          const nandPrice = nandQty > 0n ? parseEther(String(args?.nandPrice ?? "0").trim()) : 0n;
-          const latchPrice = latchQty > 0n ? parseEther(String(args?.latchPrice ?? "0").trim()) : 0n;
-          if ((nandQty > 0n && nandPrice <= 0n) || (latchQty > 0n && latchPrice <= 0n)) {
-            throw new Error("有数量的晶体管必须填写大于 0 的单价");
-          }
-          await send(chainTx.placeTransistorAsk(signer, nandQty, nandPrice, latchQty, latchPrice), onSigned);
+          const bidId = BigInt(Math.floor(Number(args?.bidId ?? 0)));
+          const tokenId = Number(args?.tokenId ?? 0);
+          const quantity = BigInt(Math.floor(Number(args?.quantity ?? 0)));
+          if (bidId <= 0n) throw new Error("请选择一个有效的买单");
+          if (tokenId !== 0 && tokenId !== 1) throw new Error("tokenId 只能是 0（NAND）或 1（LATCH）");
+          if (quantity <= 0n) throw new Error("卖出数量必须大于 0");
+          await send(chainTx.sellTransistors(signer, bidId, tokenId, quantity), onSigned);
         } else if (method === "openRefund") {
           await send(chainTx.openRefund(signer), onSigned);
         } else if (method === "abandonOrder") {
@@ -514,18 +509,16 @@ export default function App() {
             ? "已撤单并退款：未成交保证金已收回，卖出款已提取，持份人按剩余池子原路退回。"
           : method === "placeTransistorOrder"
             ? "已向晶体管市场挂买单。保证金从本期募集款托管。"
-            : method === "placeTransistorAsk"
-              ? "已向晶体管市场挂卖单。全部成交后点「确认卖出」，才能再挂买单或退款。"
-              : method === "confirmSale"
-                ? "卖出已确认，回到待挂单。可以再挂买单，或原路退款。"
+            : method === "sellTransistors"
+              ? "已吃单卖出：晶体管已交付买家，卖出款已提回本期。"
               : method === "withdrawMarketProceeds"
                 ? "卖出款已转入本期募集余额。"
                 : method === "markFailed"
                   ? "已标记执行失败：所有持有人现在可以按池子原路退款。"
                   : method === "simulateFillBid" || method === "simulateFillCampaignBids"
                     ? "已模拟卖方成交：市场剩余已扣减，晶体管已铸给买家（本期合约）。"
-                    : method === "simulateFillAsk" || method === "simulateFillCampaignAsks"
-                      ? "已模拟买方成交：晶体管已进买家钱包，卖出款记入市场 owed。"
+                    : method === "simulateExternalBid"
+                      ? "已模拟外部买家挂单：BNB 已托管到 Mock 晶体管市场，本期可以吃这张买单。"
                       : `已确认：${method} ✓`);
         await chain.refresh();
         if (
@@ -763,13 +756,18 @@ export default function App() {
       }
       case "cancelTransistorOrder": return chainTx.cancelTransistorOrder(signer);
       case "markFailed": return chainTx.markFailed(signer, args?.campaign);
-      case "cancelTransistorAsk": return chainTx.cancelTransistorAsk(signer);
-      case "confirmSale": return chainTx.confirmSale(signer);
       case "withdrawMarketProceeds": return chainTx.withdrawMarketProceeds(signer);
       case "simulateFillBid": return chainTx.simulateFillBid(signer, args.id, args.quantity);
-      case "simulateFillAsk": return chainTx.simulateFillAsk(signer, args.id, args.quantity);
+      case "simulateExternalBid": {
+        const tokenId = Number(args?.tokenId ?? 0);
+        if (tokenId !== 0 && tokenId !== 1) throw new Error("tokenId 只能是 0（NAND）或 1（LATCH）");
+        const price = parseEther(String(args?.price ?? "0").trim());
+        if (price <= 0n) throw new Error("单价必须大于 0");
+        const quantity = uintField(args?.quantity, "数量");
+        if (quantity <= 0n) throw new Error("数量必须大于 0");
+        return chainTx.simulateExternalBid(signer, tokenId, price, quantity);
+      }
       case "simulateFillCampaignBids": return chainTx.simulateFillCampaignBids(signer);
-      case "simulateFillCampaignAsks": return chainTx.simulateFillCampaignAsks(signer);
       case "confirmTransistors":
         if (book._chain && book.marketOrders === false) {
           throw new Error("这期合约不能读取官方订单簿。重新部署后，成交以 bids(id).remaining 为准。");
@@ -1352,9 +1350,7 @@ export default function App() {
             onRecoverBnb={() => act("recoverBnb")}
             onAbandonOrder={() => act("abandonOrder")}
             onCancelTransistorOrder={() => act("cancelTransistorOrder")}
-            onPlaceTransistorAsk={(args) => act("placeTransistorAsk", args)}
-            onCancelTransistorAsk={() => act("cancelTransistorAsk")}
-            onConfirmSale={() => act("confirmSale")}
+            onSellTransistors={(args) => act("sellTransistors", args)}
             onWithdrawMarketProceeds={() => act("withdrawMarketProceeds")}
             onConfirmTransistors={() => act("confirmTransistors")}
             onSetPlan={() => act("setPlan")}
@@ -1581,7 +1577,7 @@ function RoundHub({
    */
   const state = rowState(book, Date.now() / 1000, dealStatus);
 
-  // 待执行：晶体管市场成交进度（链上 Mock 与主网同一套 bids/asks 口径）。
+  // 待执行：晶体管市场成交进度（官方市场只有买单簿，卖出是吃单）。
   const buyLegs = [
     { part: "NAND", qty: Number(book.nandQty) || 0, remaining: book.nandRemaining, price: Number(book.nandPrice) || 0 },
     { part: "LATCH", qty: Number(book.latchQty) || 0, remaining: book.latchRemaining, price: Number(book.latchPrice) || 0 },
@@ -1594,12 +1590,9 @@ function RoundHub({
    */
   const filledOfLeg = (leg) => Math.max(0, leg.qty - (leg.remaining == null ? leg.qty : Number(leg.remaining)));
   const buyFilled = buyLegs.reduce((acc, leg) => acc + filledOfLeg(leg), 0);
-  const sellLegs = [
-    { qty: Number(book.nandAskQty) || 0, remaining: book.nandAskRemaining },
-    { qty: Number(book.latchAskQty) || 0, remaining: book.latchAskRemaining },
-  ].filter((leg) => leg.qty > 0);
-  const sellQty = sellLegs.reduce((acc, leg) => acc + leg.qty, 0);
-  const sellFilled = sellLegs.reduce((acc, leg) => acc + filledOfLeg(leg), 0);
+  /** 卖出没有挂单量，这里不推算：成交明细由 MarketTrades 从 TransistorsSold 事件读取。 */
+  const sellQty = 0;
+  const sellFilled = 0;
   const marketOwed = Number(book.marketOwed) || 0;
   /**
    * 晶体管数量有几个不同口径，不能混用：
@@ -1612,8 +1605,7 @@ function RoundHub({
   const partsOnHand = (Number(book.partsNand) || 0) + (Number(book.partsLatch) || 0);
   const boughtParts = Number(book.transistorCount) || 0;
   const tradeKey = [
-    book.executePhase, book.nandRemaining, book.latchRemaining,
-    book.nandAskRemaining, book.latchAskRemaining, book.marketOwed,
+    book.executePhase, book.nandRemaining, book.latchRemaining, book.marketOwed,
     book.partsNand, book.partsLatch, book.orderFilled,
   ].join("|");
 
@@ -1681,7 +1673,7 @@ function RoundHub({
                       : book.executePhase === "ready" && partsOnHand > 0
                         ? `${partsOnHand} 颗在手`
                         : buyQty > 0
-                          ? `${buyFilled} / ${buyQty} 颗${sellQty > 0 ? ` · 卖出 ${sellFilled}/${sellQty}` : ""}`
+                          ? `${buyFilled} / ${buyQty} 颗`
                           : "—"}
                   </strong>
                 </li>
@@ -1700,7 +1692,7 @@ function RoundHub({
               {state.key === "ended" ? (
                 <p className="fine">
                   {Number(book.bnbPool || 0) > 0
-                    ? `认筹份额已全部退完，合约里只剩 ${round4(book.bnbPool)} BNB 尾差（卖单溢价或除法取整）。点「取回剩余 BNB」一次性扫给 Owner；没有可退的人时，批量退款会直接回滚。`
+                    ? `认筹份额已全部退完，合约里只剩 ${round4(book.bnbPool)} BNB 尾差（卖出净额或除法取整）。点「取回剩余 BNB」一次性扫给 Owner；没有可退的人时，批量退款会直接回滚。`
                     : "合约已清空：没有可退对象，也没有可取余额。已终结的期次不能再挂单或入池，需要开新一期。"}
                 </p>
               ) : state.key === "failed" ? (
@@ -1802,16 +1794,9 @@ function RoundHub({
                 latchQty: Number(book.latchQty) || 0,
                 nandRemaining: book.nandRemaining,
                 latchRemaining: book.latchRemaining,
-                nandAskQty: Number(book.nandAskQty) || 0,
-                latchAskQty: Number(book.latchAskQty) || 0,
-                nandAskRemaining: book.nandAskRemaining,
-                latchAskRemaining: book.latchAskRemaining,
                 nandPrice: Number(book.nandPrice) || 0,
                 latchPrice: Number(book.latchPrice) || 0,
-                nandAskPrice: Number(book.nandAskPrice) || 0,
-                latchAskPrice: Number(book.latchAskPrice) || 0,
                 nandBidId: book.nandBidId, latchBidId: book.latchBidId,
-                nandAskId: book.nandAskId, latchAskId: book.latchAskId,
                 partsOnHand,
               }}
             />
@@ -1950,7 +1935,7 @@ function assetCanRefund(row, nowSec) {
   }
   if (row.scene !== "executing") return false;
   if (row.executionFailed) return true;
-  // 买单部分成交后撤单/卖单，池子可能已不够按份全退：合约允许持份人按比例自取。
+  // 买单部分成交后撤单，池子可能已不够按份全退：合约允许持份人按比例自取。
   return row.phase === "buying" && refundShortfall(row) > 0;
 }
 
@@ -2159,7 +2144,7 @@ function OwnerDesk({
   tab, onTab, tabs, round, book, copy, quote, official, pending, pendingTarget, actor, account,
   executeWait, connected, usingChain, chain, factoryOwner, allowedParts, chainHolders, holdersCampaign, now,
   onPlaceTransistorOrder, onOpenRefund, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
-  onPlaceTransistorAsk, onCancelTransistorAsk, onConfirmSale, onWithdrawMarketProceeds,
+  onSellTransistors, onWithdrawMarketProceeds,
   onSetPlan,
   /**
    * 入池前两步的回调。必须由OwnerDesk 显式透传给 OwnerOverview——
@@ -2212,9 +2197,7 @@ function OwnerDesk({
           onOpenRefund={onOpenRefund}
           onAbandonOrder={onAbandonOrder}
           onCancelTransistorOrder={onCancelTransistorOrder}
-          onPlaceTransistorAsk={onPlaceTransistorAsk}
-          onCancelTransistorAsk={onCancelTransistorAsk}
-          onConfirmSale={onConfirmSale}
+          onSellTransistors={onSellTransistors}
           onWithdrawMarketProceeds={onWithdrawMarketProceeds}
           onConfirmTransistors={onConfirmTransistors}
           onSetPlan={onSetPlan}

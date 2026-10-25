@@ -1,5 +1,5 @@
 // 只部署 CampaignFactory（不部署替身、不开期）。用于换工厂：materialMarket 是 immutable，
-// 换材料市场必须重部署一个工厂。元件合约不再有默认（每期开期时显式选），现有期次由旧工厂创建仍可调用。
+// 换晶体管市场必须重部署一个工厂。晶体管合约不再有默认（每期开期时显式选），现有期次由旧工厂创建仍可调用。
 // 运行：npx hardhat run scripts/deploy-factory.js --network bscTestnet
 //       DRY_RUN=1 只打印参数与预估费用，不发交易。
 const { ethers, network } = require("hardhat");
@@ -11,15 +11,15 @@ const { deployContract: safeDeploy } = require("./_deploy");
 const OFFICIAL_MARKET = "0xA6a80C1919a8326022d7c601a488888C13aA16E4";
 
 /**
- * 官方材料市场的两个元件合约（= 两个官方处理器的元件）。
+ * 官方晶体管市场的两个晶体管合约（= 两个官方处理器的晶体管）。
  *
  * 白名单必须包含**全部两个**：少一个的话，那个处理器的期次在主网上根本开不了。
  *
  * ⚠️ T-59：官方 Genesis CPU（processorMultiplier = 0、永远不出矿）已从项目整体移除，
- * 它的元件合约不在白名单里 —— 既不采购、也不开期。
+ * 它的晶体管合约不在白名单里 —— 既不采购、也不开期。
  *
  * ⚠️ 白名单是**安全边界**不是运营开关：不在白名单里的 ERC1155 会被工厂直接拒绝，
- * 目的是防止 owner 把期次指向 MockERC1155（其 mint 无访问控制，任何人能无限造元件）。
+ * 目的是防止 owner 把期次指向 MockERC1155（其 mint 无访问控制，任何人能无限造晶体管）。
  */
 const OFFICIAL_PARTS = [
   "0xCC42ba5De07f01B472a5b14cF45aBcCA79Eb8087", // TapeOut（CPU 0xb1024b89…）
@@ -40,26 +40,26 @@ async function main() {
 
   const minter = (process.env.MINTER_ADDRESS || "").trim() || OFFICIAL_MARKET;
   /**
-   * 元件白名单：部署时写入、之后不可增删（安全边界）。
+   * 晶体管白名单：部署时写入、之后不可增删（安全边界）。
    *
    * 来源优先级：
    *   1. ALLOWED_PARTS_ADDRESSES —— 逗号分隔的完整覆盖（测试网要用 Mock 等）
    *   2. 官方两件套（主网默认）
    *
-   * 工厂不再有「默认元件」：每个期次开期时由前端从白名单里显式选一个处理器，
+   * 工厂不再有「默认晶体管」：每个期次开期时由前端从白名单里显式选一个处理器，
    * 所以白名单必须是官方两件套（主网）或测试网替身，且不能少。
    */
   const allowedFromEnv = (process.env.ALLOWED_PARTS_ADDRESSES || "").trim();
   const allowedParts = allowedFromEnv
     ? allowedFromEnv.split(",").map((s) => s.trim()).filter(Boolean)
     : OFFICIAL_PARTS;
-  if (allowedParts.length === 0) throw new Error("元件白名单不能为空");
+  if (allowedParts.length === 0) throw new Error("晶体管白名单不能为空");
 
   if (!ethers.isAddress(minter)) throw new Error(`MINTER_ADDRESS 不是合法地址：${minter}`);
   if ((await ethers.provider.getCode(minter)) === "0x") throw new Error(`MINTER_ADDRESS ${minter} 在当前链上没有代码`);
   for (const addr of allowedParts) {
-    if (!ethers.isAddress(addr)) throw new Error(`元件白名单含非法地址：${addr}`);
-    if ((await ethers.provider.getCode(addr)) === "0x") throw new Error(`元件白名单 ${addr} 在当前链上没有代码`);
+    if (!ethers.isAddress(addr)) throw new Error(`晶体管白名单含非法地址：${addr}`);
+    if ((await ethers.provider.getCode(addr)) === "0x") throw new Error(`晶体管白名单 ${addr} 在当前链上没有代码`);
   }
 
   const balance = await ethers.provider.getBalance(deployer.address);
@@ -75,7 +75,7 @@ async function main() {
   const runtimeBytes = (factoryArt.deployedBytecode.length - 2) / 2;
   console.log(`Factory 创建码：${size} 字节，运行时 ${runtimeBytes} 字节（上限 24,576）`);
   console.log(`materialMarket ：${minter}`);
-  console.log(`元件白名单  ：${allowedParts.length} 项`);
+  console.log(`晶体管白名单  ：${allowedParts.length} 项`);
   allowedParts.forEach((a, i) => console.log(`   [${i}] ${a}`));
   if (runtimeBytes > 24_576) throw new Error("Factory 运行时代码已超限，先 npm run size 处理体积");
 
@@ -109,15 +109,15 @@ async function main() {
   ]);
   if (mmOnChain.toLowerCase() !== minter.toLowerCase()) throw new Error("链上 materialMarket 与预期不一致");
   if (Number(nAllowed) !== allowedParts.length) {
-    throw new Error(`链上元件白名单数量不一致：期望 ${allowedParts.length}，实际 ${nAllowed}`);
+    throw new Error(`链上晶体管白名单数量不一致：期望 ${allowedParts.length}，实际 ${nAllowed}`);
   }
   for (let i = 0; i < allowedParts.length; i++) {
     const onChain = await factory.allowedPartsAt(i);
     if (onChain.toLowerCase() !== allowedParts[i].toLowerCase()) {
-      throw new Error(`链上元件白名单 [${i}] 与预期不一致：${onChain} ≠ ${allowedParts[i]}`);
+      throw new Error(`链上晶体管白名单 [${i}] 与预期不一致：${onChain} ≠ ${allowedParts[i]}`);
     }
   }
-  console.log(`✓ 元件白名单读回一致（${nAllowed} 项）`);
+  console.log(`✓ 晶体管白名单读回一致（${nAllowed} 项）`);
 
   const legacy = collectLegacyFactories(network.name, chainId, factoryAddr);
   const out = {
@@ -126,9 +126,9 @@ async function main() {
     deployedAt: new Date().toISOString(),
     materialMarket: minter,
     /**
-     * 元件白名单（= 这个工厂能创建的期次可选的处理器）。
+     * 晶体管白名单（= 这个工厂能创建的期次可选的处理器）。
      * 前端开期表单直接从这份链上事实生成可选项，不硬编码处理器列表。
-     * 工厂不再有默认元件——每期开期时由前端显式选一个白名单内的地址。
+     * 工厂不再有默认晶体管——每期开期时由前端显式选一个白名单内的地址。
      */
     allowedParts,
     factory: factoryAddr,

@@ -56,12 +56,12 @@ async function main() {
     const bad = list.filter((a) => !OFFICIAL_PARTS.some((o) => o.toLowerCase() === a.toLowerCase()));
     const missing = OFFICIAL_PARTS.filter((o) => !list.some((a) => a.toLowerCase() === o.toLowerCase()));
     if (bad.length) console.log(`✗ 白名单含非官方地址：${bad.join(",")}`);
-    else if (missing.length) console.log(`✗ 白名单缺少官方元件：${missing.join(",")}`);
+    else if (missing.length) console.log(`✗ 白名单缺少官方晶体管：${missing.join(",")}`);
     else console.log("✓ ALLOWED_PARTS_ADDRESSES 恰好是官方两件套");
   } else console.log("✓ 白名单将用官方两件套（默认）");
 
-  // 检查官方地址在主网是否有代码（材料市场 / 两个元件）
-  for (const [name, addr] of [["材料市场", OFFICIAL_MARKET], ...OFFICIAL_PARTS.map((a, i) => [`元件${i}`, a])]) {
+  // 检查官方地址在主网是否有代码（晶体管市场 / 两个晶体管）
+  for (const [name, addr] of [["晶体管市场", OFFICIAL_MARKET], ...OFFICIAL_PARTS.map((a, i) => [`晶体管${i}`, a])]) {
     const code = await ethers.provider.getCode(addr);
     console.log(`  ${name} ${addr} → 代码 ${code === "0x" ? "缺失✗" : "存在✓"}`);
   }

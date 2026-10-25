@@ -661,7 +661,7 @@ async function readStateOn(runner, account, campaignAddr) {
       ? Number(formatEther(raisedBnb)) / Number(outstandingShares)
       : null,
     retired,
-    readyExit: campaignCode.includes(id("confirmSale()").slice(2, 10)),
+    readyExit: campaignCode.includes(id("sellTransistors(uint256,uint8,uint256)").slice(2, 10)),
     /**
      * 这期合约有没有「确认到账后立刻退回剩余募集款」的入口（returnSurplus）。
      * 用字节码 selector 判定：老期次（含当前主网这期）没有这个函数，
@@ -761,8 +761,17 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       return readMarketBook(campaignAddr);
     case "marketBids":
       return withReadProvider((runner) => readMarketBidView(runner, campaignAddr, args.id || 1));
-    case "marketAsks":
-      return withReadProvider((runner) => readMarketAskView(runner, campaignAddr, args.id || 1));
+    case "marketSellable":
+      return withReadProvider(async (runner) => {
+        const c = campaignContract(runner, campaignAddr);
+        const marketAddr = await readMaterialMarket(c);
+        const transistors = await c.transistors().catch(() => ZeroAddress);
+        const bids = await readSellableBids(runner, marketAddr, transistors, campaignAddr);
+        if (!bids.length) return "没有可吃的买单（标的是本期晶体管且有剩余量）";
+        return bids
+          .map((b) => `买单 #${b.id} · ${TOKEN_LABEL[b.tokenId]} 剩余 ${b.remaining} · 单价 ${formatEther(b.price)} BNB · 买家 ${shortAddr(b.buyer)}`)
+          .join("\n");
+      });
     case "marketOwed":
       return withReadProvider((runner) => readMarketOwedView(runner, campaignAddr, args.account));
     case "executionFailed":
@@ -955,23 +964,26 @@ async function readMarketOrder(c) {
   const empty = {
     nandBidId: 0n, latchBidId: 0n, nandQty: 0n, latchQty: 0n,
     nandPrice: 0n, latchPrice: 0n, transistors: ZeroAddress, orderFilled: false, marketOrders: false,
-    nandAskId: 0n, latchAskId: 0n, nandAskQty: 0n, latchAskQty: 0n,
-    nandAskPrice: 0n, latchAskPrice: 0n, askOpen: false,
-    nandAskRemaining: null, latchAskRemaining: null,
-    partsNand: 0n, partsLatch: 0n, marketAsks: false,
+    nandCostBasis: 0n, latchCostBasis: 0n,
+    partsNand: 0n, partsLatch: 0n, marketOwed: 0n, sellBids: [], sellSide: false,
     nandFilled: 0n, latchFilled: 0n,
   };
   try {
-    const [nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled] = await Promise.all([
+    const [
+      nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled,
+      nandCostBasis, latchCostBasis,
+    ] = await Promise.all([
       c.nandBidId(), c.latchBidId(), c.nandQty(), c.latchQty(), c.nandPrice(), c.latchPrice(),
       c.transistors(), c.orderFilled(),
+      // 卖出底价用的成本基准；旧期次没有 → 0（展示层当作"未知"）。
+      c.nandCostBasis().catch(() => 0n), c.latchCostBasis().catch(() => 0n),
     ]);
     const marketAddr = await readMaterialMarket(c);
     const [nandRemaining, latchRemaining] = await Promise.all([
       readLegRemaining(c.runner, marketAddr, nandBidId, nandQty),
       readLegRemaining(c.runner, marketAddr, latchBidId, latchQty),
     ]);
-    const asks = await readMarketAsk(c, marketAddr, transistors);
+    const sell = await readMarketSell(c, marketAddr, transistors);
     /**
      * 成交到账量 —— 与「挂单量」是两个不同的东西，不能混用。
      * 合约在 placeTransistorOrder 时就把 nandQty/latchQty 写成**下单量**
@@ -988,95 +1000,75 @@ async function readMarketOrder(c) {
       }
       return held || 0n;
     };
-    const nandFilled = filledOf(nandQty, nandRemaining, nandBidId, asks.partsNand);
-    const latchFilled = filledOf(latchQty, latchRemaining, latchBidId, asks.partsLatch);
+    const nandFilled = filledOf(nandQty, nandRemaining, nandBidId, sell.partsNand);
+    const latchFilled = filledOf(latchQty, latchRemaining, latchBidId, sell.partsLatch);
     return {
       nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice, transistors, orderFilled,
-      marketOrders: true, nandRemaining, latchRemaining, nandFilled, latchFilled, ...asks,
+      nandCostBasis, latchCostBasis,
+      marketOrders: true, nandRemaining, latchRemaining, nandFilled, latchFilled, ...sell,
     };
   } catch {
     return empty;
   }
 }
 
-async function readMarketAsk(c, marketAddr, transistors) {
-  const blank = {
-    nandAskId: 0n, latchAskId: 0n, nandAskQty: 0n, latchAskQty: 0n,
-    nandAskPrice: 0n, latchAskPrice: 0n, askOpen: false,
-    nandAskRemaining: null, latchAskRemaining: null,
-    partsNand: 0n, partsLatch: 0n, marketAsks: false, marketOwed: 0n,
-    marketAskSide: false,
-  };
+/**
+ * 卖出侧读数。官方晶体管市场**没有卖单簿**，所以这里不存在"本期挂着的卖单"，
+ * 只有三样东西：合约手里的晶体管余额、市场欠本期的款、以及**可以吃的外部买单**。
+ */
+async function readMarketSell(c, marketAddr, transistors) {
+  const blank = { partsNand: 0n, partsLatch: 0n, marketOwed: 0n, sellBids: [], sellSide: false };
+  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return blank;
+  const holder = c.target;
   try {
-    const [nandAskId, latchAskId, nandAskQty, latchAskQty, nandAskPrice, latchAskPrice] = await Promise.all([
-      c.nandAskId(), c.latchAskId(), c.nandAskQty(), c.latchAskQty(),
-      c.nandAskPrice(), c.latchAskPrice(),
-    ]);
-    const holder = c.target;
-    const [nandAskRemaining, latchAskRemaining, partsNand, partsLatch, marketOwed, hasAskSide] = await Promise.all([
-      readAskRemaining(c.runner, marketAddr, nandAskId, nandAskQty),
-      readAskRemaining(c.runner, marketAddr, latchAskId, latchAskQty),
+    const [partsNand, partsLatch, marketOwed, sellBids] = await Promise.all([
       readPartBalance(c.runner, transistors, holder, 0),
       readPartBalance(c.runner, transistors, holder, 1),
       readMarketOwed(c.runner, marketAddr, holder),
-      marketHasAskSide(c.runner, marketAddr),
+      readSellableBids(c.runner, marketAddr, transistors, holder),
     ]);
-    const askOpen = (nandAskRemaining != null && nandAskRemaining > 0n)
-      || (latchAskRemaining != null && latchAskRemaining > 0n)
-      || ((nandAskQty > 0n || latchAskQty > 0n) && nandAskRemaining == null && latchAskRemaining == null);
-    return {
-      nandAskId, latchAskId, nandAskQty, latchAskQty, nandAskPrice, latchAskPrice, askOpen,
-      nandAskRemaining, latchAskRemaining, partsNand, partsLatch, marketAsks: true, marketOwed,
-      // 市场没有卖单侧 → 本期不能挂卖单（链上必然 revert），前端要挡住入口。
-      marketAskSide: hasAskSide,
-    };
+    return { partsNand, partsLatch, marketOwed, sellBids, sellSide: true };
   } catch {
     return blank;
   }
 }
 
 /**
- * 探测晶体管市场**到底有没有卖单侧**。
- *
- * 晶体管市场（主网 0xA6a8…16E4）经 eth_call 核实：只有买单侧
- * （placeBid / cancelBid / bids / fillBid(uint256,uint256) / owed / withdraw / nextBidId / feeBps），
- * placeAsk / asks / nextAskId / cancelAsk / fillAsk 全部不存在。
- * 合约的 placeTransistorAsk / cancelTransistorAsk / confirmSale 在主网上必然 revert。
- *
- * 判定方式：读字节码里有没有 placeAsk / asks 的 4 字节 selector ——
- * 代理合约的 fallback 会把未知 selector 都吃掉（missing revert data），
- * try/call 分不清「不存在」和「存在但报错」，所以不看调用结果。
- *
- * 注意：晶体管市场是 **EIP-1967 代理**，代理自身的 runtime 只有一百多字节，
- * selector 全在实现合约里。只扫代理地址会对任何市场都判 false（连 placeBid 都找不到），
- * 所以要先读实现槽再扫实现合约的字节码 —— 否则以后市场真的加上卖单侧，前端也永远不会放开挂卖。
+ * 挑出本期能吃的外部买单：标的是本期晶体管合约、还有剩余量、买家不是本期自己。
+ * 全部读 `bids(id)`，不扫日志；只回看最近 500 张，按单价从高到低（同价新单在前）。
  */
-const EIP1967_IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
-
-async function marketHasAskSide(runner, marketAddr) {
-  if (!marketAddr || marketAddr === ZeroAddress) return false;
-  // placeAsk(address,uint8,uint96,uint256) 是本仓库 IMaterialMarket 的签名；
-  // placeAsk(address,uint96,address,uint8,uint256) 是官方接口注释里记的旧签名，两个都认。
-  const askSelectors = [
-    id("placeAsk(address,uint8,uint96,uint256)").slice(2, 10),
-    id("placeAsk(address,uint96,address,uint8,uint256)").slice(2, 10),
-    id("asks(uint256)").slice(2, 10),
-  ];
-  const hasAskSelector = async (addr) => {
-    const code = (await runner.getCode(addr)).toLowerCase();
-    if (!code || code === "0x") return false;
-    return askSelectors.some((sel) => code.includes(sel));
-  };
+async function readSellableBids(runner, marketAddr, transistors, holder) {
+  const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
+  let next = 1n;
   try {
-    if (await hasAskSelector(marketAddr)) return true;
-    // 代理：继续扫实现合约（marketAddr 本身是直接部署的市场时，实现槽为 0，直接返回 false）
-    const raw = await runner.getStorage(marketAddr, EIP1967_IMPL_SLOT);
-    const impl = "0x" + String(raw || "").slice(-40);
-    if (!isAddr(impl) || /^0x0{40}$/.test(impl)) return false;
-    return await hasAskSelector(impl);
+    next = await market.nextBidId();
   } catch {
-    return false;
+    return [];
   }
+  const first = next > 500n ? next - 500n : 1n;
+  const ids = [];
+  for (let i = next - 1n; i >= first && ids.length < 20; i--) ids.push(i);
+  const rows = await Promise.all(ids.map(async (bidId) => {
+    try {
+      const b = await market.bids(bidId);
+      if (b.remaining === 0n) return null;
+      if (!isAddr(b.transistors) || b.transistors.toLowerCase() !== String(transistors).toLowerCase()) return null;
+      if (String(b.buyer).toLowerCase() === String(holder).toLowerCase()) return null;
+      return {
+        id: bidId,
+        tokenId: Number(b.tokenId),
+        price: BigInt(b.price),
+        remaining: BigInt(b.remaining),
+        feeBps: Number(b.feeBps),
+        buyer: b.buyer,
+      };
+    } catch {
+      return null;
+    }
+  }));
+  return rows
+    .filter(Boolean)
+    .sort((a, b) => (a.price === b.price ? Number(b.id - a.id) : a.price > b.price ? -1 : 1));
 }
 
 async function readPartBalance(runner, transistors, holder, tokenId) {  if (!transistors || transistors === ZeroAddress || !holder) return 0n;
@@ -1102,7 +1094,7 @@ async function readLegRemaining(runner, marketAddr, id, qty) {
   }
 }
 
-/** 卖单成交款先落在市场 owed，不提取的话 openRefund 会被合约拒绝。 */
+/** 卖出成交款先落在市场 owed，不提取的话 openRefund / depositToPool 会被合约拒绝。 */
 async function readMarketOwed(runner, marketAddr, account) {
   if (!marketAddr || marketAddr === ZeroAddress || !account) return 0n;
   try {
@@ -1110,20 +1102,6 @@ async function readMarketOwed(runner, marketAddr, account) {
     return await market.owed(account);
   } catch {
     return 0n;
-  }
-}
-
-async function readAskRemaining(runner, marketAddr, id, qty) {
-  if (marketAddr == null) return null;
-  if (marketAddr === ZeroAddress || id === 0n || qty === 0n) return 0n;
-  try {
-    const market = new Contract(marketAddr, [
-      "function asks(uint256) view returns (address seller, uint96 price, address transistors, uint8 tokenId, uint256 remaining)",
-    ], runner);
-    const ask = await market.asks(id);
-    return ask.remaining;
-  } catch {
-    return null;
   }
 }
 
@@ -1147,11 +1125,11 @@ async function marketHandle(runner, campaignAddr = getCampaignAddress()) {
   return { campaign, market, marketAddr };
 }
 
-/** 列出市场里所有未成交的买单/卖单，供调试页直接看。 */
+/** 列出市场里所有未成交的买单，供调试页直接看。市场没有卖单侧，所以只有买单。 */
 export async function readMarketBook(campaignAddr = getCampaignAddress()) {
   return withReadProvider(async (runner) => {
     const { market, marketAddr } = await marketHandle(runner, campaignAddr);
-    const [nextBid, nextAsk] = await Promise.all([market.nextBidId(), market.nextAskId()]);
+    const nextBid = await market.nextBidId();
     const lines = [`市场 ${shortAddr(marketAddr)}`];
     let open = 0;
     for (let i = 1n; i < nextBid && i <= 500n; i++) {
@@ -1160,13 +1138,7 @@ export async function readMarketBook(campaignAddr = getCampaignAddress()) {
       open += 1;
       lines.push(`买单 #${i} · ${TOKEN_LABEL[Number(b.tokenId)] || b.tokenId} 剩余 ${b.remaining} · 单价 ${formatEther(b.price)} BNB · 买家 ${shortAddr(b.buyer)}`);
     }
-    for (let i = 1n; i < nextAsk && i <= 500n; i++) {
-      const a = await market.asks(i);
-      if (a.remaining === 0n) continue;
-      open += 1;
-      lines.push(`卖单 #${i} · ${TOKEN_LABEL[Number(a.tokenId)] || a.tokenId} 剩余 ${a.remaining} · 单价 ${formatEther(a.price)} BNB · 卖家 ${shortAddr(a.seller)}`);
-    }
-    if (open === 0) lines.push("订单簿没有未成交挂单");
+    if (open === 0) lines.push("订单簿没有未成交买单");
     return lines.join("\n");
   });
 }
@@ -1176,13 +1148,6 @@ async function readMarketBidView(runner, campaignAddr, id) {
   const bidId = parseUintField(id, "买单 ID");
   const b = await market.bids(bidId);
   return `买单 #${bidId} · ${TOKEN_LABEL[Number(b.tokenId)] || b.tokenId} · 买家 ${shortAddr(b.buyer)} · 单价 ${formatEther(b.price)} BNB · 剩余 ${b.remaining} · 手续费 ${b.feeBps} bps`;
-}
-
-async function readMarketAskView(runner, campaignAddr, id) {
-  const { market } = await marketHandle(runner, campaignAddr);
-  const askId = parseUintField(id, "卖单 ID");
-  const a = await market.asks(askId);
-  return `卖单 #${askId} · ${TOKEN_LABEL[Number(a.tokenId)] || a.tokenId} · 卖家 ${shortAddr(a.seller)} · 单价 ${formatEther(a.price)} BNB · 剩余 ${a.remaining}`;
 }
 
 async function readMarketOwedView(runner, campaignAddr, account) {
@@ -1212,97 +1177,6 @@ async function blockTime(runner, blockNumber) {
   }
 }
 
-/**
- * 卖单结束时间：旧版晶体管市场没有事件，用历史区块读 asks(id).remaining，
- * 二分出 remaining 从 >0 变成 0 的区块，再取该区块时间戳。
- * 节点不支持历史状态时返回 null（前端不显示时间）。结果按「市场|订单号」缓存。
- */
-const askSettleCache = new Map();
-const ASK_TIME_KEY = "tapeout.askSettleTimes.v1";
-
-function readAskTimeStore() {
-  if (typeof localStorage === "undefined") return {};
-  try { return JSON.parse(localStorage.getItem(ASK_TIME_KEY) || "{}") || {}; } catch { return {}; }
-}
-function writeAskTime(cacheKey, ts) {
-  try {
-    const all = readAskTimeStore();
-    all[cacheKey] = ts;
-    localStorage.setItem(ASK_TIME_KEY, JSON.stringify(all));
-  } catch {
-    /* 隐私模式或配额满：只保留内存缓存 */
-  }
-}
-
-async function askSettledAt(runner, market, askId, fromBlock, latest) {
-  if (fromBlock == null || latest == null || latest <= fromBlock) return null;
-  const key = `${String(market.target).toLowerCase()}|${askId}`;
-  if (askSettleCache.has(key)) return askSettleCache.get(key);
-  const stored = readAskTimeStore()[key];
-  if (stored) {
-    askSettleCache.set(key, { ts: stored });
-    return { ts: stored };
-  }
-  try {
-    const remainingAt = async (bn) => Number((await market.asks(askId, { blockTag: bn })).remaining);
-    if ((await remainingAt(latest)) !== 0 || (await remainingAt(fromBlock)) === 0) {
-      askSettleCache.set(key, null);
-      return null;
-    }
-    // 先按指数步长试探结束区间，成交通常就在挂单后不久，能把二分范围缩小。
-    let lo = fromBlock;
-    let hi = latest;
-    for (let step = 64; step <= 8192; step *= 2) {
-      const probe = fromBlock + step;
-      if (probe >= latest) break;
-      if ((await remainingAt(probe)) === 0) { hi = probe; break; }
-      lo = probe;
-    }
-    let guard = 0;
-    while (lo + 1 < hi && guard < 24) {
-      const mid = Math.floor((lo + hi) / 2);
-      if ((await remainingAt(mid)) === 0) hi = mid;
-      else lo = mid;
-      guard += 1;
-    }
-    const ts = await blockTime(runner, hi);
-    if (ts == null) return null;
-    writeAskTime(key, ts);
-    askSettleCache.set(key, { ts });
-    return { ts };
-  } catch {
-    return null;
-  }
-}
-
-/** 卖单成交 / 撤回时间（渲染后补）。legs 需带 placedBlock；返回 { [orderId]: ts }。 */
-export async function readAskSettleTimes(campaignAddr, legs) {
-  if (!isAddr(campaignAddr) || !Array.isArray(legs) || !legs.length) return {};
-  const asks = legs.filter((l) => l.side === "sell" && l.placedBlock && l.remaining === 0);
-  if (!asks.length) return {};
-  return withReadProvider(async (runner) => {
-    const c = campaignContract(runner, campaignAddr);
-    const marketAddr = await readMaterialMarket(c);
-    if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return {};
-    const market = new Contract(marketAddr, MATERIAL_MARKET_ABI, runner);
-    const latest = await runner.getBlockNumber().catch(() => null);
-    if (!latest) return {};
-    const out = {};
-    await Promise.all(asks.map(async (leg) => {
-      const hit = await askSettledAt(runner, market, leg.orderId, leg.placedBlock, latest);
-      if (hit) out[String(leg.orderId)] = hit.ts;
-    }));
-    return out;
-  });
-}
-
-/**
- * 挂单 / 撤单 / 到账时间：旧版晶体管市场合约没有事件，用本期合约自己的事件补时间。
- * 返回按区块升序的标记，调用方取各类别最近一条。节点失败返回 null（前端不显示时间）。
- * 结果按「本期 + 水位区块」存 localStorage：刷新页面只补新区块，不再重扫历史。
- */
-const TRADE_MARKS_KEY = "tapeout.tradeMarks.v1";
-
 function loadTradeMarksCache(campaignAddr) {
   if (typeof localStorage === "undefined") return null;
   try {
@@ -1331,8 +1205,7 @@ async function readTradeMarks(runner, campaignAddr, latest) {
   const names = [
     "TransistorOrderPlaced",
     "TransistorOrderCancelled",
-    "TransistorAskPlaced",
-    "TransistorAskCancelled",
+    "TransistorsSold",
     "TransistorsConfirmed",
   ];
   // topics 是「每个位置可选的取值集合」：五个事件都是 topic0，必须塞进同一个位置数组才是 OR。
@@ -1378,7 +1251,7 @@ async function readTradeMarks(runner, campaignAddr, latest) {
     const key = `${log.transactionHash}:${log.blockNumber}:${evt.name}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    // 带上参数：确认卖出 / 取消订单会清空 bid/ask 字段，历史只能靠事件里的订单号回放。
+    // 带上参数：撤单 / 确认到账会清空 bid 字段，历史只能靠事件里的订单号回放。
     const args = {};
     evt.fragment.inputs.forEach((input, i) => {
       const value = evt.args[i];
@@ -1447,22 +1320,17 @@ function clearMarketNoEvents(addr) {
 }
 
 /**
- * 市场事件 → 历史交易记录行。只认「先出现 BidPlaced/AskPlaced 且买方/卖方是本期」
- * 的订单号，再按订单号收该单的成交与撤回 —— 否则把别人的成交也画进来。
+ * 市场事件 → 历史交易记录行。只认「先出现 BidPlaced 且买方是本期」的订单号，
+ * 再按订单号收该单的成交与撤回 —— 否则把别人的成交也画进来。
+ * 卖出是原子吃单（没有 AskPlaced），记录由 readMarketTradesOnce 用 TransistorsSold 补齐。
  */
 function buildMarketRows(parsed, me) {
   const bidIds = new Set();
-  const askIds = new Set();
   const bidMeta = new Map();
-  const askMeta = new Map();
   for (const e of parsed) {
     if (e.name === "BidPlaced" && String(e.args.buyer).toLowerCase() === me) {
       bidIds.add(String(e.args.id));
       bidMeta.set(String(e.args.id), { price: e.args.price, part: TOKEN_LABEL[Number(e.args.tokenId)] || String(e.args.tokenId) });
-    }
-    if (e.name === "AskPlaced" && String(e.args.seller).toLowerCase() === me) {
-      askIds.add(String(e.args.id));
-      askMeta.set(String(e.args.id), { price: e.args.price, part: TOKEN_LABEL[Number(e.args.tokenId)] || String(e.args.tokenId) });
     }
   }
 
@@ -1470,9 +1338,7 @@ function buildMarketRows(parsed, me) {
   for (const e of parsed) {
     const id = e.args?.id != null ? String(e.args.id) : "";
     const isBid = e.name.startsWith("Bid");
-    const isAsk = e.name.startsWith("Ask");
     if (isBid && !bidIds.has(id)) continue;
-    if (isAsk && !askIds.has(id)) continue;
     if (e.name === "ProceedsWithdrawn" && String(e.args.account).toLowerCase() !== me) continue;
     let row;
     if (e.name === "BidPlaced") {
@@ -1491,13 +1357,6 @@ function buildMarketRows(parsed, me) {
       row = { kind: "fill", side: "buy", id, qty: e.args.quantity, remaining: e.args.remaining, price: meta.price ?? null, part: meta.part || "—", amount };
     } else if (e.name === "BidCancelled") {
       row = { kind: "cancel", side: "buy", id, amount: e.args.refund };
-    } else if (e.name === "AskPlaced") {
-      row = { kind: "place", side: "sell", id, qty: e.args.quantity, price: e.args.price, amount: null, part: TOKEN_LABEL[Number(e.args.tokenId)] || String(e.args.tokenId) };
-    } else if (e.name === "AskFilled") {
-      const meta = askMeta.get(id) || {};
-      row = { kind: "fill", side: "sell", id, qty: e.args.quantity, amount: e.args.paid, price: meta.price ?? null, part: meta.part || "—" };
-    } else if (e.name === "AskCancelled") {
-      row = { kind: "cancel", side: "sell", id, qty: e.args.quantity, amount: null };
     } else if (e.name === "ProceedsWithdrawn") {
       row = { kind: "withdraw", side: "sell", id: "", amount: e.args.amount };
     } else {
@@ -1596,18 +1455,9 @@ function legStatus(side, qty, remaining) {
   return "filled";
 }
 
-/** 卖单 remaining 归零后，靠「晶体管是否已回到本期」区分成交与撤回。 */
-function settleAskStatus(leg, owed, partsHeld) {
-  if (leg.remaining == null || leg.remaining > 0) return leg.status;
-  if (owed > 0) return "filled";
-  if (leg.orderQty == null) return "settled";
-  if (partsHeld >= leg.orderQty) return "cancelled";
-  return "settled";
-}
-
 /**
- * 待执行状态的晶体管市场成交记录：本期买单/卖单 + 成交进度 + 市场欠款。
- * 新版 Mock 有事件时同时返回链上流水；旧版无事件时退回按 bids/asks/owed 推导。
+ * 待执行状态的晶体管市场成交记录：本期买单 + 卖出记录 + 市场欠款。
+ * 官方市场没有卖单簿，卖出是原子吃单，所以卖出的每一笔都来自本期的 TransistorsSold 事件。
  */
 export async function readMarketTrades(campaignAddr = getCampaignAddress()) {
   if (!isAddr(campaignAddr)) return null;
@@ -1632,15 +1482,11 @@ async function readMarketTradesOnce(campaignAddr) {
 
     const [
       nandBidId, latchBidId, nandQty, latchQty, nandPrice, latchPrice,
-      nandAskId, latchAskId, nandAskQty, latchAskQty, nandAskPrice, latchAskPrice,
       transistors, ordered,
     ] = await Promise.all([
       c.nandBidId().catch(() => 0n), c.latchBidId().catch(() => 0n),
       c.nandQty().catch(() => 0n), c.latchQty().catch(() => 0n),
       c.nandPrice().catch(() => 0n), c.latchPrice().catch(() => 0n),
-      c.nandAskId().catch(() => 0n), c.latchAskId().catch(() => 0n),
-      c.nandAskQty().catch(() => 0n), c.latchAskQty().catch(() => 0n),
-      c.nandAskPrice().catch(() => 0n), c.latchAskPrice().catch(() => 0n),
       c.transistors().catch(() => ZeroAddress),
       c.orderFilled().catch(() => false),
     ]);
@@ -1691,153 +1537,81 @@ async function readMarketTradesOnce(campaignAddr) {
       }
     }
 
+    // 市场事件只覆盖买单侧（挂单 / 成交 / 撤回 / 提取）；卖出记录来自本期的 TransistorsSold。
     const events = await readMarketLogs(runner, marketAddr, campaignAddr).catch(() => null);
 
-    // 市场合约没有事件时，挂单/撤单/到账时间从本期合约自己的事件补。
     let marks = null;
-    if (!Array.isArray(events) || events.length === 0) {
-      try {
-        const latest = await runner.getBlockNumber();
-        marks = await readTradeMarks(runner, campaignAddr, latest);
-      } catch {
-        marks = null;
-      }
+    try {
+      const latest = await runner.getBlockNumber();
+      marks = await readTradeMarks(runner, campaignAddr, latest);
+    } catch {
+      marks = null;
     }
     const bidPlaced = lastMark(marks, "TransistorOrderPlaced");
     const bidCancel = lastMark(marks, "TransistorOrderCancelled");
-    const askPlaced = lastMark(marks, "TransistorAskPlaced");
-    const askCancel = lastMark(marks, "TransistorAskCancelled");
     const confirmed = lastMark(marks, "TransistorsConfirmed");
 
-    // 卖单历史：confirmSale / cancelTransistorAsk 会把 nandAskId / nandAskQty 清零，
-    // Mock 晶体管市场又没有事件，所以用本期合约的「挂卖」事件回放订单号与数量，
-    // 价格 / 剩余量仍以晶体管市场 asks(id) 为准。
-    const askHistory = new Map();
-    const askPlacedEvents = [];
-    const askCancelBlocks = [];
+    /**
+     * 卖出腿：官方市场没有卖单簿，卖出是"吃一张已挂买单"的原子动作，不存在挂着的卖单。
+     * 每笔卖出都来自本期的 TransistorsSold(bidId, tokenId, quantity, proceeds)；
+     * proceeds 已扣 1% 市场费，所以这里的单价是**净得款单价**，不假装是挂价。
+     */
+    const sellEvents = [];
     if (Array.isArray(marks)) {
       for (const m of marks) {
-        if (m.name === "TransistorAskPlaced") askPlacedEvents.push(m);
-        else if (m.name === "TransistorAskCancelled") askCancelBlocks.push(m.blockNumber);
-      }
-    }
-    askPlacedEvents.sort((a, b) => a.blockNumber - b.blockNumber);
-    for (let i = 0; i < askPlacedEvents.length; i++) {
-      const m = askPlacedEvents[i];
-      const boundary = i + 1 < askPlacedEvents.length ? askPlacedEvents[i + 1].blockNumber : Infinity;
-      const cancelled = askCancelBlocks.some((bn) => bn > m.blockNumber && bn < boundary);
-      const placedLegs = [
-        { id: Number(m.args?.nandAskId || 0), qty: Number(m.args?.nandQty || 0), part: "NAND" },
-        { id: Number(m.args?.latchAskId || 0), qty: Number(m.args?.latchQty || 0), part: "LATCH" },
-      ];
-      for (const p of placedLegs) {
-        if (!(p.id > 0)) continue;
-        askHistory.set(String(p.id), {
-          part: p.part,
-          qty: p.qty > 0 ? p.qty : null,
-          placedAt: m.ts ?? null,
-          placedBlock: m.blockNumber,
-          cancelled,
-        });
-      }
-    }
-    // 事件读不到时，至少按订单簿把「本期挂过、已结束」的卖单捞回来（数量未知）。
-    // 顺手把读到的 asks(id) 存下来，后面拼卖单腿时不再重复请求。
-    const askStructs = new Map();
-    let nextAskId = null;
-    try { nextAskId = Number(await market.nextAskId()); } catch { nextAskId = null; }
-    if (nextAskId != null && nextAskId > 1) {
-      const ids = [];
-      for (let i = 1; i < nextAskId; i++) ids.push(i);
-      const rows = await Promise.all(ids.map((i) => market.asks(i).catch(() => null)));
-      rows.forEach((a, index) => {
-        if (!a) return;
-        const id = String(index + 1);
-        askStructs.set(id, a);
-        if (askHistory.has(id)) return;
-        if (String(a.seller).toLowerCase() !== String(campaignAddr).toLowerCase()) return;
-        askHistory.set(id, {
-          part: TOKEN_LABEL[Number(a.tokenId)] || String(a.tokenId),
-          qty: null,
+        if (m.name !== "TransistorsSold") continue;
+        const qty = Number(m.args?.quantity || 0);
+        let proceeds = 0n;
+        try { proceeds = BigInt(m.args?.proceeds || "0"); } catch { proceeds = 0n; }
+        const tokenId = Number(m.args?.tokenId || 0);
+        const part = TOKEN_LABEL[tokenId] || String(tokenId);
+        const netPrice = qty > 0 ? formatEther(proceeds / BigInt(qty)) : null;
+        legs.push({
+          side: "sell",
+          part,
+          orderId: String(m.args?.bidId || ""),
+          orderQty: qty || null,
+          price: netPrice,
+          filled: qty || null,
+          remaining: 0,
+          amount: formatEther(proceeds),
+          status: "settled",
+          live: false,
           placedAt: null,
-          placedBlock: null,
-          cancelled: false,
+          filledAt: m.ts ?? null,
+          cancelAt: null,
+          confirmedAt: null,
         });
-      });
-    }
-
-    const liveSell = new Map();
-    for (const leg of [
-      { part: "NAND", id: nandAskId, qty: nandAskQty, price: nandAskPrice },
-      { part: "LATCH", id: latchAskId, qty: latchAskQty, price: latchAskPrice },
-    ]) {
-      if (leg.id === 0n || leg.qty === 0n) continue;
-      liveSell.set(String(leg.id), { part: leg.part, qty: Number(leg.qty), priceWei: leg.price });
-    }
-
-    for (const id of new Set([...liveSell.keys(), ...askHistory.keys()])) {
-      const live = liveSell.get(id);
-      const hist = askHistory.get(id);
-      const ask = askStructs.get(id) || await market.asks(id).catch(() => null);
-      askStructs.set(id, ask);
-      if (!ask && !live) continue;
-      const priceWei = ask && ask.price != null ? ask.price : live?.priceWei ?? null;
-      const qty = live?.qty ?? hist?.qty ?? null;
-      const remaining = ask ? Number(ask.remaining) : null;
-      const part = ask
-        ? (TOKEN_LABEL[Number(ask.tokenId)] || live?.part || hist?.part || "—")
-        : (live?.part || hist?.part || "—");
-      const filled = remaining == null || qty == null ? null : Math.max(0, qty - remaining);
-      let status;
-      if (remaining == null) status = "open";
-      else if (remaining > 0) status = qty != null && remaining < qty ? "partial" : "open";
-      else if (hist?.cancelled) status = "cancelled";
-      else status = live && owed > 0 ? "filled" : "settled";
-      legs.push({
-        side: "sell",
-        part,
-        orderId: id,
-        orderQty: qty,
-        price: priceWei == null ? null : formatEther(priceWei),
-        filled,
-        remaining,
-        amount: filled == null || priceWei == null ? null : formatEther(BigInt(filled) * priceWei),
-        status,
-        live: Boolean(live),
-        placedAt: live ? null : hist?.placedAt ?? null,
-        cancelAt: null,
-        confirmedAt: null,
-      });
-    }
-
-    for (const leg of legs) {
-      if (leg.side === "buy") {
-        leg.placedAt = bidPlaced?.ts ?? null;
-        leg.cancelAt = bidCancel && bidPlaced && bidCancel.blockNumber >= bidPlaced.blockNumber
-          ? bidCancel.ts ?? null
-          : null;
-        // 只有确认发生在本次挂单之后，才算这一单到账，避免把上一轮的时间贴到新单上。
-        leg.confirmedAt = confirmed && bidPlaced && confirmed.blockNumber >= bidPlaced.blockNumber
-          ? confirmed.ts ?? null
-          : null;
-      } else if (leg.live) {
-        leg.placedAt = askPlaced?.ts ?? null;
-        leg.cancelAt = askCancel && askPlaced && askCancel.blockNumber >= askPlaced.blockNumber
-          ? askCancel.ts ?? null
-          : null;
-        leg.confirmedAt = null;
+        sellEvents.push({
+          kind: "fill",
+          side: "sell",
+          id: String(m.args?.bidId || ""),
+          qty: qty || null,
+          price: null,
+          amount: String(proceeds),
+          part,
+          txHash: m.txHash,
+          blockNumber: m.blockNumber,
+          ts: m.ts ?? null,
+        });
       }
     }
 
     for (const leg of legs) {
-      if (leg.side !== "sell" || !leg.live) continue;
-      leg.status = settleAskStatus(leg, owed, leg.part === "NAND" ? partsNand : partsLatch);
+      if (leg.side !== "buy") continue;
+      leg.placedAt = bidPlaced?.ts ?? null;
+      leg.cancelAt = bidCancel && bidPlaced && bidCancel.blockNumber >= bidPlaced.blockNumber
+        ? bidCancel.ts ?? null
+        : null;
+      // 只有确认发生在本次挂单之后，才算这一单到账，避免把上一轮的时间贴到新单上。
+      leg.confirmedAt = confirmed && bidPlaced && confirmed.blockNumber >= bidPlaced.blockNumber
+        ? confirmed.ts ?? null
+        : null;
     }
 
     /**
      * 时间优先取市场事件本身：给的是**这一单**（按订单号）的挂出 / 成交 / 撤回时刻，
-     * 比本期合约的「最近一次挂单」更准。手上有市场事件时不再去扫本期合约日志，
-     * 也就不会出现「事件有了、时间列反而是 —」。
+     * 比本期合约的「最近一次挂单」更准。
      */
     if (Array.isArray(events) && events.length) {
       const byId = new Map();
@@ -1858,14 +1632,6 @@ async function readMarketTradesOnce(campaignAddr) {
       }
     }
 
-    // 卖单成交 / 撤回时间要二分历史区块，比较慢：这里只挂 placedBlock，
-    // 由 readAskSettleTimes 在渲染后补，避免整块记录等十几秒。
-    for (const leg of legs) {
-      if (leg.side !== "sell") continue;
-      const hist = askHistory.get(String(leg.orderId));
-      leg.placedBlock = hist?.placedBlock ?? null;
-    }
-
     const buyLegs = legs.filter((l) => l.side === "buy");
     const sellLegs = legs.filter((l) => l.side === "sell");
     const sum = (rows, key) => rows.reduce((acc, r) => acc + (Number(r[key]) || 0), 0);
@@ -1881,6 +1647,9 @@ async function readMarketTradesOnce(campaignAddr) {
       partsLatch,
     };
 
+    const feed = Array.isArray(events) ? [...events, ...sellEvents] : sellEvents;
+    feed.sort((a, b) => (a.blockNumber || 0) - (b.blockNumber || 0));
+
     return {
       market: marketAddr,
       isMock: Boolean(deployments.materialMarket || deployments.minter)
@@ -1888,9 +1657,9 @@ async function readMarketTradesOnce(campaignAddr) {
       orderFilled: Boolean(ordered),
       legs,
       totals,
-      events,
+      events: feed,
       marks,
-      supportsEvents: Array.isArray(events) && events.length > 0,
+      supportsEvents: feed.length > 0,
     };
   });
 }
@@ -2250,35 +2019,17 @@ async function fillCampaignBids(signer) {
   return last;
 }
 
-/** 买方吃掉一张卖单：按卖单价付 BNB，晶体管进入当前钱包。 */
-async function fillAskAsBuyer(signer, askId, quantity) {
-  const { market } = await marketHandle(signer);
-  const id = parseUintField(askId, "卖单 ID");
-  const ask = await market.asks(id);
-  const qty = parseUintField(quantity, "吃单数量", ask.remaining);
-  if (qty <= 0n) throw new Error("吃单数量必须大于 0");
-  if (qty > ask.remaining) throw new Error(`卖单 #${id} 剩余 ${ask.remaining}，不能成交 ${qty}`);
-  return market.fillAsk(id, qty, { value: ask.price * qty });
-}
-
-/** 一键吃掉本期全部卖单：卖出款记入市场 owed，再 withdrawMarketProceeds / confirmSale。 */
-async function fillCampaignAsks(signer) {
+/** 模拟一个外部买家：用当前钱包挂一张买单，供本期 Owner 吃单卖出（仅测试网 Mock）。 */
+async function placeExternalBid(signer, tokenId, price, quantity) {
   const c = signerOrThrow(signer);
   const { market } = await marketHandle(signer);
-  const legs = [
-    [await c.nandAskId(), await c.nandAskQty()],
-    [await c.latchAskId(), await c.latchAskQty()],
-  ];
-  let last = null;
-  for (const [id, qty] of legs) {
-    if (id === 0n || qty === 0n) continue;
-    const ask = await market.asks(id);
-    if (ask.remaining === 0n) continue;
-    last = await market.fillAsk(id, ask.remaining, { value: ask.price * ask.remaining });
-    await last.wait();
-  }
-  if (!last) throw new Error("本期没有未成交的卖单，先 placeTransistorAsk");
-  return last;
+  const part = parseUintField(tokenId, "晶体管编号", 0n);
+  if (part > 1n) throw new Error("晶体管编号只能是 0（NAND）或 1（LATCH）");
+  const unit = parseEther(String(price));
+  if (!(unit > 0n)) throw new Error("单价必须大于 0");
+  const qty = parseUintField(quantity, "数量", 1n);
+  if (qty <= 0n) throw new Error("数量必须大于 0");
+  return market.placeBid(await c.transistors(), part, unit, qty, { value: unit * qty });
 }
 
 // ── 写操作：均返回 tx（调用方 await tx.wait()） ──
@@ -2301,14 +2052,12 @@ export const tx = {
   takeListing: (signer, id, count, valueWei) => signerOrThrow(signer).takeListing(id, count, { value: valueWei }),
   placeTransistorOrder: (signer, nandQty, nandPrice, latchQty, latchPrice) =>
     signerOrThrow(signer).placeTransistorOrder(nandQty, nandPrice, latchQty, latchPrice),
-  placeTransistorAsk: (signer, nandQty, nandPrice, latchQty, latchPrice) =>
-    signerOrThrow(signer).placeTransistorAsk(nandQty, nandPrice, latchQty, latchPrice),
-  cancelTransistorAsk: (signer) => signerOrThrow(signer).cancelTransistorAsk(),
+  sellTransistors: (signer, bidId, tokenId, quantity) =>
+    signerOrThrow(signer).sellTransistors(bidId, tokenId, quantity),
   withdrawMarketProceeds: (signer) => signerOrThrow(signer).withdrawMarketProceeds(),
   simulateFillBid: (signer, id, quantity) => fillBidWithParts(signer, id, quantity),
-  simulateFillAsk: (signer, id, quantity) => fillAskAsBuyer(signer, id, quantity),
+  simulateExternalBid: (signer, tokenId, price, quantity) => placeExternalBid(signer, tokenId, price, quantity),
   simulateFillCampaignBids: (signer) => fillCampaignBids(signer),
-  simulateFillCampaignAsks: (signer) => fillCampaignAsks(signer),
   openRefund: async (signer) => {
     const c = signerOrThrow(signer);
     const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
@@ -2344,7 +2093,6 @@ export const tx = {
     throw new Error("这期是旧合约，链上没有 markFailed。请让 Owner 调 openRefund。");
   },
   confirmTransistors: (signer) => signerOrThrow(signer).confirmTransistors(),
-  confirmSale: (signer) => signerOrThrow(signer).confirmSale(),
   setPhase: async (signer, next) => {
     const c = signerOrThrow(signer);
     const code = (await signer.provider.getCode(await c.getAddress())).toLowerCase();
@@ -2610,11 +2358,14 @@ function explainParsed(parsed) {
   if (parsed?.name === "TransistorsNotReady") {
     return "晶体管还没到账，不能确认/入池：买单需全部成交，且 NAND / LATCH 晶体管要真的在本期合约里（成交后卖家没发货也会这样）。";
   }
-  if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步。挂单中请先取消；已确认到账的旧期不能再挂卖或退款。";
-  if (parsed?.name === "AlreadyReady") return "本期已确认到账。晶体管锁在合约里，不能单独取出。这一期只能入池。";
-  if (parsed?.name === "AlreadyAsked") return "还有未结算的卖单，先取消剩余或确认卖出。";
-  if (parsed?.name === "NotAsked") return "当前没有可确认的卖单。";
+  if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步。挂单中请先取消；已确认到账的期次不能再下单或退款。";
+  if (parsed?.name === "AlreadyReady") return "本期已确认到账。晶体管锁在合约里，不能单独取出。这一期只能入池或卖入买单。";
+  if (parsed?.name === "ProceedsPending") return "市场还有未提取的卖出款，先提取（withdrawMarketProceeds）再继续。";
+  if (parsed?.name === "NotABid") return "这张买单不能卖：要么已成交/撤回，要么标的是别的晶体管合约或别的 NAND/LATCH，要么剩余量不够。";
+  if (parsed?.name === "PriceBelowCost") return "这张买单的单价低于本期买入成本，合约不允许亏本卖出（会烧掉持份人的抵押）。";
+  if (parsed?.name === "SelfTrade") return "不能把本期晶体管卖给本期自己挂的买单。";
   if (parsed?.name === "OrderFilled") return "买单已全部成交，不能再取消。";
+  if (parsed?.name === "NoProceeds") return "这张买单成交后一分钱都没进本期（成交款为 0 或被市场扣光），合约拒绝白送晶体管。";
   if (parsed?.name === "InsufficientParts") return "合约里的晶体管数量不够。";
   if (parsed?.name === "SharesOutstanding") {
     return "还有持份人没结清，当期晶体管是他们的抵押，不能取出。先让持份人退款 / 领完，或改成入池。";
@@ -2710,8 +2461,11 @@ export async function send(promiseTx, onSigned) {
       "error TransistorsNotReady()",
       "error AlreadyListed()",
       "error AlreadyReady()",
-      "error AlreadyAsked()",
-      "error NotAsked()",
+      "error ProceedsPending()",
+      "error NotABid()",
+      "error PriceBelowCost()",
+      "error SelfTrade()",
+      "error NoProceeds()",
       "error OrderFilled()",
       "error InsufficientParts()",
       "error CanStillAfford()",

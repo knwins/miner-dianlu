@@ -63,7 +63,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     uint256 public immutable sharePriceBnb; // price per share (wei)
     uint256 public immutable totalShares; // share cap
     uint64 public immutable fundingDeadline; // funding deadline (unix seconds)
-    /// @notice Parts contract (ERC1155) locked at create; every bid / ask of this round targets it.
+    /// @notice Parts contract (ERC1155) locked at create; every bid of this round targets it.
     address public immutable transistors;
     /// @notice Market used for placeBid / cancelBid / bids. Replaceable via setMaterialMarket; every
     ///         market that ever served this round stays an accepted BNB sender (async settlement).
@@ -131,18 +131,12 @@ contract Campaign is Ownable, ReentrancyGuard {
     uint96 public nandPrice;
     /// @notice Locked LATCH bid price. Display only: never read by on-chain logic.
     uint96 public latchPrice;
-    /// @notice NAND ask id on the market; 0 when no ask was placed or the leg was skipped.
-    uint256 public nandAskId;
-    /// @notice LATCH ask id on the market; 0 when the leg was skipped.
-    uint256 public latchAskId;
-    /// @notice NAND quantity listed; 0 when the leg was skipped.
-    uint256 public nandAskQty;
-    /// @notice LATCH quantity listed; 0 when the leg was skipped.
-    uint256 public latchAskQty;
-    /// @notice Live NAND ask price. Display only: never read by on-chain logic.
-    uint96 public nandAskPrice;
-    /// @notice Live LATCH ask price. Display only: never read by on-chain logic.
-    uint96 public latchAskPrice;
+    /// @notice Unit cost the round paid for NAND (wei). Written when an order is placed and never
+    ///         cleared, so sellTransistors() can refuse to sell below cost — an owner self-dealing
+    ///         into a 1-wei bid would otherwise strip the holders' collateral.
+    uint96 public nandCostBasis;
+    /// @notice Unit cost the round paid for LATCH (wei). See nandCostBasis.
+    uint96 public latchCostBasis;
     /// @notice Design hashpower estimate. Display only: never read by on-chain logic.
     uint256 public estHashpower;
 
@@ -193,10 +187,13 @@ contract Campaign is Ownable, ReentrancyGuard {
     mapping(address => bool) private _holderSeen;
 
     Listing[] private _listings;
-    /// @dev Addresses that ever served as this round's market. receive() accepts BNB from any of
-    ///      them: market settlement / bid cancellation is asynchronous, and recognizing only the
+    /// @dev Markets that ever served this round, other than the current one. receive() accepts BNB from
+    ///      all of them: market settlement / bid cancellation is asynchronous, and recognizing only the
     ///      current market would permanently reject late-arriving funds.
-    address[] private _marketHistory;
+    ///      A mapping (not an array) keeps _isKnownMarket O(1): it runs on the receive() path of every
+    ///      cancel refund and withdraw, so an owner-grown list would eventually make those run out of gas
+    ///      and strand the round's escrow.
+    mapping(address => bool) private _marketSeen;
 
     // ─────────────────────── events ───────────────────────
     event Subscribed(address indexed subscriber, uint256 count, uint256 paidBnb);
@@ -211,12 +208,13 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @param escrowBnb Total escrow debited from raisedBnb.
     event TransistorOrderPlaced(uint256 count, uint256 escrowBnb);
     event TransistorOrderCancelled();
-    /// @param nandQty NAND quantity listed (0 when the leg was skipped).
-    /// @param latchQty LATCH quantity listed (0 when the leg was skipped).
-    /// @param nandAskId NAND ask id, 0 when the leg was skipped.
-    /// @param latchAskId LATCH ask id, 0 when the leg was skipped.
-    event TransistorAskPlaced(uint256 nandQty, uint256 latchQty, uint256 nandAskId, uint256 latchAskId);
-    event TransistorAskCancelled();
+    /// @notice Held transistors were sold into a resting market bid (the only sell path: the official
+    ///         market has no ask book). `proceeds` is the BNB credited to the round after the market fee.
+    /// @param bidId Resting bid that was filled.
+    /// @param tokenId 0 NAND, 1 LATCH.
+    /// @param quantity Units sold.
+    /// @param proceeds BNB received into `raisedBnb`.
+    event TransistorsSold(uint256 indexed bidId, uint8 indexed tokenId, uint256 quantity, uint256 proceeds);
     event TransistorsConfirmed();
     /// @notice needBnb is the bid cost that could not be afforded (0 when markFailed flags the round).
     ///         raisedBnb is the escrow available at that point. Neither path reverts.
@@ -236,8 +234,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     event DepositedToPool(address indexed pool, uint256 nandAmount, uint256 latchAmount);
     /// @notice The Executing sub-phase changed. Emitted by _setPhase(), the only writer of `phase`.
     event PhaseChanged(uint8 indexed previous, uint8 indexed next);
-    /// @notice The round's sale order was settled and the proceeds pulled. The phase returns to Buying.
-    event AskSettled(uint256 proceeds);
     /// @notice Surplus was accrued to a holder. Amount is now claimable via claimSurplus().
     event SurplusAccrued(address indexed holder, uint256 amountBnb);
     /// @notice The unspent subscription BNB was booked for pro-rata return right after the parts were
@@ -286,9 +282,21 @@ contract Campaign is Ownable, ReentrancyGuard {
     error TransferFailed();
     error OrderFilled();
     error BadBidId();
-    error BadAskId();
-    error AlreadyAsked();
-    error NotAsked();
+    /// @notice Market proceeds are still sitting in owed(). Pull them (withdrawMarketProceeds) first, so
+    ///         the pool a refund or surplus booking divides is final.
+    error ProceedsPending();
+    /// @notice sellTransistors: the id is not a fillable bid for this round (closed, wrong parts
+    ///         contract, wrong token id, or not enough remaining quantity).
+    error NotABid();
+    /// @notice sellTransistors: the bid price is below the unit price this round paid. Selling under
+    ///         cost would hand the parts away and burn the holders' collateral.
+    error PriceBelowCost();
+    /// @notice sellTransistors: the bid belongs to this contract. Filling it would round-trip the parts
+    ///         and fake proceeds.
+    error SelfTrade();
+    /// @notice sellTransistors: the fill moved the parts but credited no BNB, so the round would have paid
+    ///         the sale for nothing. Reverts instead of booking a zero-proceeds disposal.
+    error NoProceeds();
     error InsufficientParts();
     error PoolNotSet();
     error AlreadyPooled();
@@ -337,7 +345,7 @@ contract Campaign is Ownable, ReentrancyGuard {
         phase = Phase.None;
     }
 
-    /// @dev Accept BNB only from a market that ever served this round: bid-cancel refunds, ask settlement
+    /// @dev Accept BNB only from a market that ever served this round: bid-cancel refunds, sale proceeds
     ///      and withdraw() all land here and are credited to `raisedBnb`. Any other sender could inflate
     ///      the pool that refund() divides. Past markets stay accepted because settlement is asynchronous;
     ///      rejecting them would strand the principal in a market nothing can pull from.
@@ -362,26 +370,21 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @param who Address to test.
     /// @return True when `who` is the current market or ever served as one.
     function _isKnownMarket(address who) internal view returns (bool) {
-        if (who == address(materialMarket)) return true;
-        for (uint256 i = 0; i < _marketHistory.length; i++) {
-            if (_marketHistory[i] == who) return true;
-        }
-        return false;
+        return who == address(materialMarket) || _marketSeen[who];
     }
 
-    /// @notice Replace the material market. Blocked while a bid or an ask is live. Any BNB the current
-    ///         market still owes this round is pulled first (attempted best-effort, so a market that cannot
-    ///         pay never traps the round). The old market's ERC1155 approval is revoked on the way out, and
-    ///         it stays an accepted BNB sender because settlement is asynchronous.
+    /// @notice Replace the material market. Blocked while a bid is live. Any BNB the current market still
+    ///         owes this round is pulled first (attempted best-effort, so a market that cannot pay never
+    ///         traps the round). The old market's ERC1155 approval is revoked on the way out, and it stays
+    ///         an accepted BNB sender because settlement is asynchronous.
     /// @param materialMarket_ New market address; must be non-zero.
     function setMaterialMarket(address materialMarket_) external onlyOwner nonReentrant {
         if (materialMarket_ == address(0)) revert ZeroAddress();
         // No code = every placeBid / cancelBid / owed() call reverts with empty returndata, so cancels
         // and refunds would be dead. Reject it here instead of bricking the round.
         if (materialMarket_.code.length == 0) revert ZeroAddress();
-        // Swapping markets with a live order/ask strands the escrow on the old market. Cancel first.
+        // Swapping markets with a live order strands the escrow on the old market. Cancel first.
         if (phase == Phase.Listed) revert AlreadyListed();
-        if (_askOpen()) revert AlreadyAsked();
         // owed() is per market, so proceeds left behind after a swap are unreachable (withdraw() can only
         // be called on the current market). Drain them first; a market that will not pay must not block
         // the swap, because that is exactly when the escape hatch is needed — the round matters more than
@@ -396,10 +399,9 @@ contract Campaign is Ownable, ReentrancyGuard {
             _revokeApproval(previous);
         }
         emit MaterialMarketUpdated(previous, materialMarket_);
+        // Keep accepting late settlement from the market we are leaving (see _isKnownMarket).
+        _marketSeen[previous] = true;
         materialMarket = IMaterialMarket(materialMarket_);
-        if (previous != materialMarket_) {
-            _marketHistory.push(previous);
-        }
     }
 
     /// @dev Revoke a market's ERC1155 operator approval. Silent on failure — an old market may not
@@ -663,7 +665,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice Mining only. List `count` shares at `priceBnbPerShare` each; listed shares are locked until
     ///         sold or cancelled.
     /// @param count Shares to list; must be > 0 and unlocked.
-    /// @param priceBnbPerShare Ask price per share in wei; must be > 0.
+    /// @param priceBnbPerShare Listing price per share in wei; must be > 0.
     function listShares(uint256 count, uint256 priceBnbPerShare) external {
         if (scene != Scene.Mining) revert WrongScene();
         if (count == 0) revert ZeroShares();
@@ -721,8 +723,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         `transistors`, so it is not a parameter. Escrow (qty × price per leg) leaves `raisedBnb`
     ///         with placeBid, and a zero-qty leg is skipped (its bid id stays 0).
     ///         If the total cost exceeds `raisedBnb` the call sets `executionFailed` and places nothing —
-    ///         it does NOT revert. One order at a time: a live ask must be cancelled first (a fully
-    ///         filled ask is cleared here).
+    ///         it does NOT revert. One order at a time.
     /// @param nandQty_ NAND quantity; 0 skips the leg.
     /// @param nandPrice_ NAND bid price in wei per unit; ignored when nandQty_ is 0.
     /// @param latchQty_ LATCH quantity; 0 skips the leg.
@@ -735,7 +736,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     ) external onlyOwner nonReentrant {
         _requireExecuting();
         if (phase != Phase.Buying) revert WrongScene();
-        _requireNoLiveAsk();
         _requireLegParams(nandQty_, nandPrice_, latchQty_, latchPrice_);
         // `sold` is monotonic, so refunds can never revoke this gate (README §8 rule 5).
         if (sold < totalShares) revert NotSoldOutYet();
@@ -757,6 +757,9 @@ contract Campaign is Ownable, ReentrancyGuard {
         latchQty = latchQty_;
         nandPrice = nandPrice_;
         latchPrice = latchPrice_;
+        // Cost basis survives _clearOrder(): sellTransistors() uses it as a hard price floor.
+        nandCostBasis = _raiseCostBasis(nandCostBasis, nandQty_, nandPrice_);
+        latchCostBasis = _raiseCostBasis(latchCostBasis, latchQty_, latchPrice_);
         priceLock = cost;
         nandBidId = _placeBidLeg(0, nandQty_, nandPrice_, nandCost);
         latchBidId = _placeBidLeg(1, latchQty_, latchPrice_, latchCost);
@@ -770,8 +773,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @notice Book the unspent subscription BNB as holder-claimable surplus without ending the round:
     ///         parts stay here, `phase` stays Ready and depositToPool() stays available. No holder loop —
     ///         each holder pulls a pro-rata cut with claimSurplus().
-    ///         Requires a settled market (no open ask, no ask awaiting confirmation, nothing owed) so sale
-    ///         proceeds never mix into a principal return. Afterwards openRefund / abandonOrder are closed.
+    ///         Requires a settled market (nothing owed) so sale proceeds never mix into a principal return.
+    ///         Afterwards openRefund / abandonOrder are closed.
     ///         The owner may call at any time; anyone else only after FAIL_GRACE from max(soldOutAt,
     ///         lastOrderAt). That is the Ready failsafe: if the owner disappears, the leftover BNB still
     ///         becomes claimable instead of sitting in `raisedBnb` with no exit. It moves no parts and
@@ -779,8 +782,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     function returnSurplus() external nonReentrant {
         _requireReady();
         if (pooled) revert AlreadyPooled();
-        // _askRecorded() also covers a still-open ask, so _askOpen() would be redundant here.
-        if (_askRecorded() || _owed() > 0) revert AlreadyAsked();
+        if (_owed() > 0) revert ProceedsPending();
         if (msg.sender != owner && block.timestamp < _graceBase() + FAIL_GRACE) revert RefundNotAvailable();
         if (outstandingShares == 0) revert ZeroShares();
         if (raisedBnb == 0) revert ZeroShares();
@@ -803,14 +805,13 @@ contract Campaign is Ownable, ReentrancyGuard {
         // Parts bought with the pool are the shares' collateral: with a short pool the remainder could
         // never be handed over, so refunding would burn it. Top up (topUpShortfall) or pool/sell instead.
         if (_partsHeld() && !_poolCoversEveryShare()) revert PartsAreCollateral();
-        _requireNoLiveAsk();
-        if (_owed() > 0) revert AlreadyAsked();
+        if (_owed() > 0) revert ProceedsPending();
         markFailed();
         _refundAll();
     }
 
-    /// @notice Give up from Buying or Listed: cancel the remaining bid and open asks, withdraw what the
-    ///         market owes, refund every holder, and only then return the remaining parts to the owner.
+    /// @notice Give up from Buying or Listed: cancel the remaining bid, withdraw what the market owes,
+    ///         refund every holder, and only then return the remaining parts to the owner.
     ///         Parts are skipped while a holder still holds shares AND while the holders were not repaid at
     ///         the subscription price (a short pool means part of their money sits in the parts: handing
     ///         those over for a pro-rata refund would be a discounted sale). Top up with topUpShortfall()
@@ -820,10 +821,9 @@ contract Campaign is Ownable, ReentrancyGuard {
         _requireExecuting();
         if (surplusBase != 0) revert SurplusAlreadyReturned();
         if (phase == Phase.Ready) revert UseReturnSurplus();
-        // Cancel before the ask/parts move: the phase must be Buying when the refund loop runs.
+        // Cancel before the refund loop: the phase must be Buying when it runs.
         // markFailed() below would repeat this, but only when it does not early-return.
         _cancelLiveOrder();
-        _cancelOpenAsk();
         _pullOwed();
         // After the cancels the pool is final: parts bought with it are the shares' collateral, so a
         // short pool would zero the shares and burn the parts. Top up / pool / sell instead.
@@ -881,57 +881,48 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit ExecutionFailed(0, raisedBnb);
     }
 
-    /// @notice List parts held after the buy was confirmed. Ready only — in Buying a partial fill must be
-    ///         cancelled or filled and confirmed first. Reverts while any ask leg is live. Approves the
-    ///         market once, then places one ask per non-zero leg.
-    /// @param nandQty_ NAND quantity to sell; 0 skips the leg.
-    /// @param nandPrice_ NAND ask price in wei per unit; ignored when nandQty_ is 0.
-    /// @param latchQty_ LATCH quantity to sell; 0 skips the leg.
-    /// @param latchPrice_ LATCH ask price in wei per unit; ignored when latchQty_ is 0.
-    function placeTransistorAsk(
-        uint256 nandQty_,
-        uint96 nandPrice_,
-        uint256 latchQty_,
-        uint96 latchPrice_
-    ) external onlyOwner nonReentrant {
+    /// @notice Sell held transistors into a resting buy order on the market. Ready only.
+    ///         The official market has no ask book, so a seller completes a sale by filling an existing
+    ///         bid: the market pulls the parts from this contract and credits the net proceeds to
+    ///         owed(this), which this call withdraws into `raisedBnb` immediately.
+    ///         The bid must target this round's parts contract and the same token id, have enough
+    ///         remaining quantity, and pay at least the unit price this round paid (PriceBelowCost) —
+    ///         a below-cost sale would hand the parts to the buyer and burn the holders' collateral.
+    ///         A zero-price bid is refused outright (ZeroPrice) and the call reverts with NoProceeds if
+    ///         the fill credits nothing, so parts can never leave for free.
+    ///         Selling is repeatable and partial; anything left can still be pooled via depositToPool().
+    /// @param bidId Resting bid to fill.
+    /// @param tokenId 0 NAND, 1 LATCH.
+    /// @param quantity Units to sell; at most the bid's remaining and this contract's balance.
+    function sellTransistors(uint256 bidId, uint8 tokenId, uint256 quantity)
+        external
+        onlyOwner
+        nonReentrant
+    {
         _requireReady();
-        _requireLegParams(nandQty_, nandPrice_, latchQty_, latchPrice_);
-        _requireNoLiveAsk();
+        if (pooled) revert AlreadyPooled();
+        if (bidId == 0 || quantity == 0) revert NotABid();
+        if (tokenId > 1) revert NotABid();
 
-        IERC1155 token = IERC1155(transistors);
-        if (nandQty_ > 0 && token.balanceOf(address(this), 0) < nandQty_) revert InsufficientParts();
-        if (latchQty_ > 0 && token.balanceOf(address(this), 1) < latchQty_) revert InsufficientParts();
+        (address buyer, address parts, uint96 price, uint8 bidTokenId,, uint256 remaining) =
+            materialMarket.bids(bidId);
+        if (parts != transistors || bidTokenId != tokenId || remaining < quantity) revert NotABid();
+        // A zero-price bid is not a sale, it is a giveaway: never fill it, even for a leg with no basis.
+        if (price == 0) revert ZeroPrice();
+        // Filling this round's own bid would round-trip the parts and book fake proceeds.
+        if (buyer == address(this)) revert SelfTrade();
+        if (price < _costBasis(tokenId)) revert PriceBelowCost();
+        if (IERC1155(transistors).balanceOf(address(this), tokenId) < quantity) revert InsufficientParts();
+
         // Idempotent; skips the extra isApprovedForAll SLOAD/external call.
-        token.setApprovalForAll(address(materialMarket), true);
-
-        nandAskQty = nandQty_;
-        latchAskQty = latchQty_;
-        nandAskPrice = nandPrice_;
-        latchAskPrice = latchPrice_;
-        nandAskId = _placeAskLeg(0, nandQty_, nandPrice_);
-        latchAskId = _placeAskLeg(1, latchQty_, latchPrice_);
-        emit TransistorAskPlaced(nandQty_, latchQty_, nandAskId, latchAskId);
-    }
-
-    /// @notice Cancel the unsold ask remainder so the parts return here; fully filled legs are skipped.
-    ///         Pull proceeds with withdrawMarketProceeds() after fills.
-    function cancelTransistorAsk() external onlyOwner nonReentrant {
-        if (!_askRecorded()) revert NotAsked();
-        _cancelOpenAsk();
-        emit TransistorAskCancelled();
-    }
-
-    /// @notice Close a settled ask: pull owed BNB, clear the ask record and return to Buying (the only phase
-    ///         that can place another bid or settle a refund after a sale). Ready only.
-    function confirmSale() external onlyOwner nonReentrant {
-        _requireReady();
-        if (_askOpen()) revert AlreadyAsked();
-        uint256 owed = _owed();
-        if (!_askRecorded() && owed == 0) revert NotAsked();
+        IERC1155(transistors).setApprovalForAll(address(materialMarket), true);
+        materialMarket.fillBid(bidId, quantity);
+        // Proceeds land in owed(this); pull them now so the pool reflects the sale immediately.
+        uint256 before = raisedBnb;
         _pullOwed();
-        _clearAsk();
-        _setPhase(Phase.Buying);
-        emit AskSettled(owed);
+        // Parts are gone: if not one wei arrived, the round paid the sale and got nothing back. Revert.
+        if (raisedBnb == before) revert NoProceeds();
+        emit TransistorsSold(bidId, tokenId, quantity, raisedBnb - before);
     }
 
     /// @notice Pull proceeds owed by the market into `raisedBnb` (via receive). Anyone may call; no-op
@@ -961,7 +952,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         normal flow. Blocked while a bid is live, after pooling, and for the round's own parts while
     ///         shares are outstanding OR while the holders were not repaid at the subscription price
     ///         (settle them at full price first with topUpShortfall + openRefund, or send the parts to the
-    ///         pool/market instead). Does not touch the order, the price lock or the scene.
+    ///         pool/sell them via sellTransistors). Does not touch the order, the price lock or the scene.
     /// @param token ERC1155 contract; not restricted to `transistors`, so foreign tokens can be moved too.
     /// @param id Token id (0 NAND, 1 LATCH for the round's parts).
     /// @param amount Units to transfer.
@@ -971,9 +962,9 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (token == address(0)) revert ZeroAddress();
         if (token == transistors) {
             // The round's own parts are the collateral behind the outstanding shares. They may only leave
-            // through depositToPool() (to the pool) or the market (placeTransistorAsk), or after every
-            // holder has been settled AND repaid in full — otherwise the owner could take the asset and
-            // leave the shares unpaid.
+            // through depositToPool() (to the pool) or sellTransistors() (into a market bid), or after
+            // every holder has been settled AND repaid in full — otherwise the owner could take the asset
+            // and leave the shares unpaid.
             if (outstandingShares != 0) revert SharesOutstanding();
             if (!_holdersMadeWhole()) revert HoldersNotMadeWhole();
         }
@@ -1002,6 +993,10 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (outstandingShares == 0) revert ZeroShares();
 
         // Before the parts go: the leftover subscription BNB becomes the holders' pull-claimable surplus.
+        // Proceeds the market still holds are part of that leftover, so pull them first (best-effort: a
+        // market that cannot pay must not block the irreversible pooling step; a later settlement is then
+        // booked as a new surplus round by receive()).
+        _pullOwedSoft();
         _returnSurplus();
 
         IERC1155 token = IERC1155(transistors);
@@ -1101,7 +1096,7 @@ contract Campaign is Ownable, ReentrancyGuard {
     /// @param id Listing id.
     /// @return seller Listing seller.
     /// @return shares Shares still on the listing.
-    /// @return priceBnbPerShare Ask price per share in wei.
+    /// @return priceBnbPerShare Listing price per share in wei.
     /// @return open Whether the listing can still be taken.
     function getListing(uint256 id) external view returns (address seller, uint256 shares, uint256 priceBnbPerShare, bool open) {
         if (id >= _listings.length) revert NoListing();
@@ -1335,16 +1330,26 @@ contract Campaign is Ownable, ReentrancyGuard {
         if (id == 0) revert BadBidId();
     }
 
-    /// @dev Place one ask leg. Returns 0 for a zero quantity. An id of 0 would make _askOpen() read
-    ///      remaining 0 and silently unlock a second order, so it reverts with BadAskId.
+    /// @dev Unit price this round paid for a token id. sellTransistors() refuses to sell below it, so the
+    ///      parts can never be dumped under cost. 0 when the leg was never bought, which makes the floor
+    ///      vacuous for an id the round never paid for.
     /// @param tokenId 0 NAND, 1 LATCH.
-    /// @param qty Units to list.
-    /// @param price Ask price in wei per unit.
-    /// @return id Market ask id, or 0 when the leg is skipped.
-    function _placeAskLeg(uint8 tokenId, uint256 qty, uint96 price) internal returns (uint256 id) {
-        if (qty == 0) return 0;
-        id = materialMarket.placeAsk(transistors, tokenId, price, qty);
-        if (id == 0) revert BadAskId();
+    /// @return Unit cost basis in wei.
+    function _costBasis(uint8 tokenId) internal view returns (uint256) {
+        return tokenId == 0 ? uint256(nandCostBasis) : uint256(latchCostBasis);
+    }
+
+    /// @dev Raise (never lower) the unit cost basis of one leg. The basis is the highest unit price the
+    ///      round ever paid, for two reasons: a later order that skips the leg must not wipe the floor
+    ///      for parts the round still holds, and a later cheaper re-buy must not license a below-cost
+    ///      dump of the parts bought earlier — either one would let the owner strip the collateral.
+    /// @param current Basis stored so far.
+    /// @param qty Quantity bought on this leg; 0 leaves the basis untouched.
+    /// @param price Unit price paid on this leg.
+    /// @return Updated basis.
+    function _raiseCostBasis(uint96 current, uint256 qty, uint96 price) internal pure returns (uint96) {
+        if (qty == 0 || price <= current) return current;
+        return price;
     }
 
     /// @dev No quantity argument is needed: a skipped leg has id 0, and _remaining(0) already reads 0,
@@ -1399,60 +1404,32 @@ contract Campaign is Ownable, ReentrancyGuard {
         priceLock = 0;
     }
 
-    /// @dev Cancel both open bid legs, drop the record and return to Buying. No-op unless Listed.
+    /// @dev Cancel both open bid legs, pull whatever the market owes, drop the record and return to
+    ///      Buying. No-op unless Listed.
     function _cancelLiveOrder() internal {
         if (phase != Phase.Listed) return;
         _cancelOpenLeg(nandBidId);
         _cancelOpenLeg(latchBidId);
+        // A market that settles cancels through owed() instead of a direct send would otherwise leave the
+        // refund pool short while the money sits claimable in the market.
+        _pullOwedSoft();
         _clearOrder();
         _setPhase(Phase.Buying);
         emit TransistorOrderCancelled();
     }
 
+    /// @dev Withdraw whatever the market owes this round, ignoring a market that cannot pay. The cancel
+    ///      path uses it: proceeds must not be left behind, but a market whose withdraw() reverts must not
+    ///      block the cancel itself — that is exactly the escape hatch. Callers that divide a pool keep
+    ///      their own `_owed() > 0` guard (ProceedsPending) so the split is never computed on stale money.
+    function _pullOwedSoft() internal {
+        if (_owed() == 0) return;
+        try materialMarket.withdraw() {} catch {}
+    }
+
     /// @dev Withdraw whatever the market owes this round; receive() credits `raisedBnb`. No-op at 0.
     function _pullOwed() internal {
         if (_owed() > 0) materialMarket.withdraw();
-    }
-
-    /// @dev True when an ask is recorded, whether still open or already filled.
-    function _askRecorded() internal view returns (bool) {
-        return (nandAskQty | latchAskQty) != 0;
-    }
-
-    /// @dev Revert while any ask leg still has a market remainder; otherwise drop a fully filled record so
-    ///      no ghost order shows up in the UI. One _askOpen() call instead of purge-then-check.
-    function _requireNoLiveAsk() internal {
-        if (_askOpen()) revert AlreadyAsked();
-        if (_askRecorded()) _clearAsk();
-    }
-
-    /// @dev True while any ask leg still has a market remainder. The `qty > 0` guards are unnecessary:
-    ///      a skipped leg has id 0 and _askRemaining(0) returns 0 without a market call.
-    function _askOpen() internal view returns (bool) {
-        return _askRemaining(nandAskId) > 0 || _askRemaining(latchAskId) > 0;
-    }
-
-    /// @param id Ask id; 0 reads as fully filled.
-    /// @return remaining Unfilled quantity on the ask.
-    function _askRemaining(uint256 id) internal view returns (uint256 remaining) {
-        if (id == 0) return 0;
-        (,,,, remaining) = materialMarket.asks(id);
-    }
-
-    /// @dev Cancel both open ask legs and drop the record. Fully filled legs are skipped.
-    function _cancelOpenAsk() internal {
-        uint256 a = nandAskId;
-        uint256 b = latchAskId;
-        _clearAsk();
-        if (_askRemaining(a) != 0) materialMarket.cancelAsk(a);
-        if (_askRemaining(b) != 0) materialMarket.cancelAsk(b);
-    }
-
-    /// @dev Drop the ask record: ids, quantities and prices.
-    function _clearAsk() internal {
-        nandAskId = latchAskId = nandAskQty = latchAskQty = 0;
-        nandAskPrice = 0;
-        latchAskPrice = 0;
     }
 
     /// @dev Official fillBid uses ERC1155 safeTransfer. The caller is not checked; the hook only returns the receiver selector.
@@ -1491,16 +1468,18 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         paid order cannot reach Ready/Mining; the delivery proof is only required on the normal
     ///         Listed → Ready path, because a partly sold round legitimately holds fewer parts and must
     ///         still be able to book the proceeds (returnSurplus) and pool the remainder.
-    ///         Entering Listed requires a live bid id. Every other direction stays open (Ready → Buying is
-    ///         the recovery path).
-    /// @param next Target phase: 1 Buying, 2 Listed (needs a live bid), 3 Ready (needs a settled purchase).
+    ///         Entering Listed requires a bid with unfilled quantity on the market. Every other direction
+    ///         stays open (Ready → Buying is the recovery path).
+    /// @param next Target phase: 1 Buying, 2 Listed (needs a live unfilled bid), 3 Ready (needs a settled
+    ///        purchase or parts on hand).
     ///        None (0) is refused: it would close ordering and every refund path except abandonOrder().
     function setPhase(uint8 next) external onlyOwner {
         if (scene != Scene.Executing) revert WrongScene();
         if (phase == Phase.Listed) revert AlreadyListed();
-        // Listed means a live bid exists. Faking it would leave no cancel path and block every later
-        // setPhase through the AlreadyListed guard above.
-        if (next == uint8(Phase.Listed) && nandBidId == 0 && latchBidId == 0) revert WrongScene();
+        // Listed means a bid with unfilled quantity is actually on the market. A stale id (the order was
+        // filled and confirmed Ready) must not fake it: that state has no cancel path and blocks every
+        // later setPhase through the AlreadyListed guard above.
+        if (next == uint8(Phase.Listed) && _remaining(nandBidId) + _remaining(latchBidId) == 0) revert WrongScene();
         if (next == uint8(Phase.None) || next > uint8(Phase.Ready)) revert WrongScene();
         if (next == uint8(Phase.Ready) && !_readyBasis()) revert TransistorsNotReady();
         _setPhase(Phase(next));

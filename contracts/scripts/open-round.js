@@ -29,15 +29,15 @@ async function main() {
   console.log(`\n开期参数：份额价 ${ethers.formatEther(sharePrice)} BNB · 总份数 ${totalShares} · 募集 ${fundingDays} 天（${fundingSeconds} 秒）`);
 
   /**
-   * 本期元件合约（= 处理器），createCampaign 第 4 参。**必选**。
+   * 本期晶体管合约（= 处理器），createCampaign 第 4 参。**必选**。
    *
-   * 工厂不再有「默认元件」：零地址一律 revert（ZeroAddress），
+   * 工厂不再有「默认晶体管」：零地址一律 revert（ZeroAddress），
    * 非零也必须在工厂白名单内，否则 revert PartsNotAllowed。
    * 白名单若只有一项，留空则自动用它；多项则必须显式指定。
    */
   const campaignParts = (process.env.CAMPAIGN_PARTS_ADDRESS || "").trim();
   const allowedCount = Number(await factory.allowedPartsCount());
-  if (allowedCount === 0) throw new Error("工厂元件白名单为空，无法指定元件合约");
+  if (allowedCount === 0) throw new Error("工厂晶体管白名单为空，无法指定晶体管合约");
   if (campaignParts) {
     const ok = await factory.isAllowedParts(campaignParts);
     if (!ok) {
@@ -50,9 +50,9 @@ async function main() {
   } else if (allowedCount === 1) {
     campaignParts = await factory.allowedPartsAt(0);
   } else {
-    throw new Error("白名单有多项，必须用 CAMPAIGN_PARTS_ADDRESS 显式指定本期元件合约");
+    throw new Error("白名单有多项，必须用 CAMPAIGN_PARTS_ADDRESS 显式指定本期晶体管合约");
   }
-  console.log(`元件合约  ：${campaignParts}`);
+  console.log(`晶体管合约  ：${campaignParts}`);
 
   const before = await factory.campaignCount();
   const tx = await factory.createCampaign(
@@ -70,7 +70,7 @@ async function main() {
   console.log(`\n✓ 已开新期 #${idx}：${campaignAddr}`);
   console.log(`  工厂期次数：${before} → ${after}`);
   console.log(`  已注册    ：${await factory.isRegistered(campaignAddr)}`);
-  console.log(`  锁定元件  ：${await campaign.transistors()}`);
+  console.log(`  锁定晶体管  ：${await campaign.transistors()}`);
 
   /**
    * 服务费与分成表：**第二笔交易**（setServiceFee）。
@@ -104,7 +104,7 @@ async function main() {
     totalShares: Number(totalShares),
     fundingDays,
     fundingSeconds: Number(fundingSeconds),
-      /** 本期锁定的元件合约（= 处理器）；从白名单里显式选，必填。 */
+      /** 本期锁定的晶体管合约（= 处理器）；从白名单里显式选，必填。 */
       campaignParts,
   };
   dep.serviceFeeBps = Number(feeBps);

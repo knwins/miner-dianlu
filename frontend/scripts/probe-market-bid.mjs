@@ -11,8 +11,9 @@
  *   1. placeBid 的 msg.value 到底是 price×quantity，还是 price×quantity×(1+feeBps/10000)？
  *      若需含手续费，Campaign 现在的 `raisedBnb -= qty*price` 就会少付 → placeBid revert。
  *   2. 官方市场是否暴露 placeAsk / cancelAsk / fillAsk？
- *      Campaign 的「晶体管到账后回市场挂卖单」路径（placeTransistorAsk）依赖它们。
- *   3. 官方市场是否有 fillBid（由卖家主动成交）？Campaign 依赖它把晶体管买回来。
+ *      已确认：没有（只探一次，作为「卖出只能吃已挂买单」的证据）。
+ *   3. 官方市场是否有 fillBid（由卖家主动成交）？Campaign 依赖它把晶体管买回来，
+ *      卖出时也用它吃已挂买单（sellTransistors → fillBid → withdraw）。
  *
  * 全部用 eth_call（只读模拟，不落链、不花真钱）。
  *
@@ -55,7 +56,7 @@ for (const [label, v] of [
   console.log(`  ${label} → ${r.ok ? "OK (可接受) id=" + BigInt(r.data) : "revert: " + r.err}`);
 }
 
-console.log("\n=== 2. 卖单侧可用性（Campaign.placeTransistorAsk 依赖）===");
+console.log("\n=== 2. 卖单侧可用性（结论：不存在，卖出只能吃已挂买单）===");
 for (const sig of ["placeAsk(address,uint8,uint96,uint256)", "cancelAsk(uint256)", "fillAsk(uint256)", "fillBid(uint256)", "cancelBid(uint256)"]) {
   const args = sig.includes("address") ? [PARTS, 0n, PRICE, QTY] : [1n];
   const r = await call(MARKET, sig, args);

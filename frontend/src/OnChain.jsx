@@ -209,7 +209,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                 <div>
                   <p className="fine">待执行 · {PHASE_LABEL[s.phase]} · 售罄于 {fmtTime(s.soldOutAt)} · 锁价 {s.priceLock > 0 ? `${fmt(s.priceLock)} BNB/颗 × ${s.transistorCount}` : "未锁"}</p>
                   {s.phase === 1 && Number(s.raisedBnb) < Number(s.sold) * Number(s.sharePriceBnb) && (
-                    <p className="fine chain-warn">池子已低于按份全退所需，持份人现在可按比例退款；卖单成交款提取进池可补回一部分。</p>
+                    <p className="fine chain-warn">池子已低于按份全退所需，持份人现在可按比例退款；卖出晶体管回的款可以补回一部分。</p>
                   )}
                   {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降价重挂，或原路退款；勿在锁价/晶体管数为 0 时 depositToPool。</p>}
                   {isOwner && (

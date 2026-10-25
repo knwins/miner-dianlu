@@ -1,4 +1,4 @@
-// 测试网准备：部署 MockERC1155（元件合约，供工厂默认写入与卖方交割）。
+// 测试网准备：部署 MockERC1155（晶体管合约，供工厂默认写入与卖方交割）。
 // 电路 NFT / BEM / PoD 已随流片逻辑移除，不再部署。
 // 运行：npx hardhat run scripts/testnet-setup.js --network bscTestnet
 const { ethers } = require("hardhat");

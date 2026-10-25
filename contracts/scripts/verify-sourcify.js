@@ -75,7 +75,7 @@ async function campaignConstructorArgs(campaignAddr, dep) {
     try {
       marketAddr = await c.materialMarket();
     } catch {
-      marketAddr = await c.market();
+      marketAddr = await c.materialMarket();
     }
     return [
       parsed.args.sharePriceBnb,

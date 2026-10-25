@@ -8,9 +8,8 @@
  * 前端不再直接读取价格：实时取价、跨域代理、轮询、涨跌高亮这一整套
  * 已经全部删除。页面上的晶体管单价只有两个来源：
  *
- *   1. 链上实读：Campaign 记录了 Owner 实际挂单/成交的单价
- *      （nandPrice / latchPrice / nandAskPrice / latchAskPrice），
- *      这是权威值，由 chain/adapter 写进 book。
+ *   1. 链上实读：Campaign 记录了 Owner 实际买单的单价
+ *      （nandPrice / latchPrice），这是权威值，由 chain/adapter 写进 book。
  *   2. 本文件的 NOMINAL_QUOTE：开期测算用的**静态基准价**，
  *      仅当链上还没有任何单价时兜底，用来把「募资总额能买多少晶体管」
  *      这类预估算出来。它不是行情，不会自己变动。

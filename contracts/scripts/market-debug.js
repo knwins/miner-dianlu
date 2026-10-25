@@ -1,15 +1,20 @@
-// 材料市场（MockMaterialMarket）调试：模拟卖方成交买单 / 模拟买方吃掉卖单。
+// 晶体管市场（MockMaterialMarket）调试：模拟卖方成交买单 / 让本期吃买单卖出。
 // 只依赖已部署的合约，不会再部署任何东西。
 //
-// 列出本期挂单：
+// 官方晶体管市场只有**买单侧**（没有 placeAsk / asks / fillAsk），
+// 所以「卖出」在本脚本里是两种不同的动作，别混：
+//   - FILL_BIDS=1：模拟**卖方**成交本期的买单（fillBid + 把晶体管 mint 给本期合约），
+//     用于把期次从 Listed 推到 Ready。
+//   - SELL_BID=<id>：**本期合约**调用 sellTransistors 吃一张已挂买单（真实的链上卖出）。
+//
+// 列出本期挂单与可吃的买单：
 //   npx hardhat run scripts/market-debug.js --network bscTestnet
-// 一键撮合本期全部买单（fillBid + 把元件 mint 给本期合约，随后可 confirmTransistors）：
+// 一键撮合本期全部买单（随后可 confirmTransistors / CONFIRM=1）：
 //   FILL_BIDS=1 npx hardhat run scripts/market-debug.js --network bscTestnet
-// 一键吃掉本期全部卖单（用当前钱包付 BNB 买下元件，卖出款记入市场 owed）：
-//   FILL_ASKS=1 npx hardhat run scripts/market-debug.js --network bscTestnet
-// 指定单张挂单成交：
+// 指定单张买单成交（模拟卖方）：
 //   BID_ID=1 BID_QTY=1 npx hardhat run scripts/market-debug.js --network bscTestnet
-//   ASK_ID=1 ASK_QTY=1 npx hardhat run scripts/market-debug.js --network bscTestnet
+// 本期合约吃买单卖出（source: deployer 私钥持有的 Owner 钱包）：
+//   SELL_BID=1 SELL_TOKEN=0 SELL_QTY=1 npx hardhat run scripts/market-debug.js --network bscTestnet
 // 期次地址默认读 deployments/<network>.json，也可用 CAMPAIGN=0x... 覆盖。
 const { ethers, network } = require("hardhat");
 const { readFileSync, existsSync } = require("node:fs");
@@ -19,29 +24,25 @@ const TOKEN_NAME = ["NAND", "LATCH"];
 
 const MARKET_ABI = [
   "function nextBidId() view returns (uint256)",
-  "function nextAskId() view returns (uint256)",
   "function bids(uint256) view returns (address buyer, address transistors, uint96 price, uint8 tokenId, uint16 feeBps, uint256 remaining)",
-  "function asks(uint256) view returns (address seller, uint96 price, address transistors, uint8 tokenId, uint256 remaining)",
   "function owed(address) view returns (uint256)",
   "function fillBid(uint256 id, uint256 quantity)",
-  "function fillAsk(uint256 id, uint256 quantity) payable",
 ];
 
 const CAMPAIGN_ABI = [
   "function phase() view returns (uint8)",
   "function scene() view returns (uint8)",
-  "function market() view returns (address)",
+  "function materialMarket() view returns (address)",
   "function transistors() view returns (address)",
   "function orderFilled() view returns (bool)",
   "function nandBidId() view returns (uint256)",
   "function latchBidId() view returns (uint256)",
   "function nandQty() view returns (uint256)",
   "function latchQty() view returns (uint256)",
-  "function nandAskId() view returns (uint256)",
-  "function latchAskId() view returns (uint256)",
-  "function nandAskQty() view returns (uint256)",
-  "function latchAskQty() view returns (uint256)",
+  "function nandCostBasis() view returns (uint256)",
+  "function latchCostBasis() view returns (uint256)",
   "function confirmTransistors()",
+  "function sellTransistors(uint256 bidId, uint8 tokenId, uint256 quantity)",
   "function withdrawMarketProceeds()",
 ];
 
@@ -69,7 +70,7 @@ async function main() {
 
   const [signer] = await ethers.getSigners();
   const campaign = new ethers.Contract(campaignAddr, CAMPAIGN_ABI, signer);
-  const marketAddr = await campaign.market();
+  const marketAddr = await campaign.materialMarket();
   const market = new ethers.Contract(marketAddr, MARKET_ABI, signer);
   const transistors = await campaign.transistors();
 
@@ -77,32 +78,25 @@ async function main() {
   console.log(`操作钱包  ：${signer.address}（${ethers.formatEther(await ethers.provider.getBalance(signer.address))} BNB）`);
   console.log(`Campaign  ：${campaignAddr}  场景 ${SCENE[Number(await campaign.scene())] || "?"} / 阶段 ${PHASE[Number(await campaign.phase())] || "?"}`);
   console.log(`市场      ：${marketAddr}`);
-  console.log(`元件      ：${transistors}`);
+  console.log(`晶体管    ：${transistors}`);
   console.log("");
 
+  /** 打印所有未成交买单；标的是本期晶体管的额外标注「可吃」。 */
   async function printBids() {
     const next = Number(await market.nextBidId());
     const rows = [];
     for (let id = 1; id < next; id++) {
       const b = await market.bids(id);
       if (b.remaining === 0n) continue;
-      rows.push(`  bid #${id} ${TOKEN_NAME[Number(b.tokenId)] || b.tokenId} 剩余 ${b.remaining} 颗 单价 ${ethers.formatEther(b.price)} BNB 买家 ${b.buyer}`);
+      const mine = String(b.transistors).toLowerCase() === String(transistors).toLowerCase();
+      rows.push(
+        `  bid #${id} ${TOKEN_NAME[Number(b.tokenId)] || b.tokenId} 剩余 ${b.remaining} 颗 单价 ${ethers.formatEther(b.price)} BNB 买家 ${b.buyer}${mine ? "  ← 本期可吃" : ""}`
+      );
     }
     console.log(rows.length ? `买单（${rows.length}）：\n${rows.join("\n")}` : "买单：无未成交挂单");
   }
 
-  async function printAsks() {
-    const next = Number(await market.nextAskId());
-    const rows = [];
-    for (let id = 1; id < next; id++) {
-      const a = await market.asks(id);
-      if (a.remaining === 0n) continue;
-      rows.push(`  ask #${id} ${TOKEN_NAME[Number(a.tokenId)] || a.tokenId} 剩余 ${a.remaining} 单价 ${ethers.formatEther(a.price)} BNB 卖家 ${a.seller}`);
-    }
-    console.log(rows.length ? `卖单（${rows.length}）：\n${rows.join("\n")}` : "卖单：无未成交挂单");
-  }
-
-  /** 模拟卖方成交：fillBid 后把元件 mint 给买家（本期合约）。 */
+  /** 模拟卖方成交：fillBid 后把晶体管 mint 给买家（本期合约）。 */
   async function fillBid(id, quantity, label) {
     const b = await market.bids(id);
     if (b.remaining === 0n) return console.log(`${label}：已全部成交，跳过`);
@@ -113,20 +107,11 @@ async function main() {
     await (await parts.mint(b.buyer, b.tokenId, qty)).wait();
   }
 
-  /** 模拟买方成交：付 BNB 吃掉卖单，元件进当前钱包。 */
-  async function fillAsk(id, quantity, label) {
-    const a = await market.asks(id);
-    if (a.remaining === 0n) return console.log(`${label}：已全部成交，跳过`);
-    const qty = quantity == null || quantity > a.remaining ? a.remaining : quantity;
-    const value = a.price * qty;
-    console.log(`${label}：fillAsk(${id}, ${qty}) 支付 ${ethers.formatEther(value)} BNB 给 ${a.seller}`);
-    await (await market.fillAsk(id, qty, { value })).wait();
-  }
-
   const bidId = envBig("BID_ID");
   const bidQty = envBig("BID_QTY");
-  const askId = envBig("ASK_ID");
-  const askQty = envBig("ASK_QTY");
+  const sellBid = envBig("SELL_BID");
+  const sellToken = envBig("SELL_TOKEN");
+  const sellQty = envBig("SELL_QTY");
 
   if (process.env.FILL_BIDS === "1") {
     const legs = [
@@ -140,19 +125,18 @@ async function main() {
     console.log(`orderFilled() = ${await campaign.orderFilled()}`);
   }
 
-  if (process.env.FILL_ASKS === "1") {
-    const legs = [
-      [await campaign.nandAskId(), await campaign.nandAskQty(), "NAND 卖单"],
-      [await campaign.latchAskId(), await campaign.latchAskQty(), "LATCH 卖单"],
-    ];
-    for (const [id, qty, label] of legs) {
-      if (id === 0n || qty === 0n) continue;
-      await fillAsk(id, null, label);
-    }
-  }
-
   if (bidId != null) await fillBid(bidId, bidQty, `指定买单 #${bidId}`);
-  if (askId != null) await fillAsk(askId, askQty, `指定卖单 #${askId}`);
+
+  if (sellBid != null) {
+    const b = await market.bids(sellBid);
+    const tokenId = sellToken == null ? Number(b.tokenId) : Number(sellToken);
+    const qty = sellQty == null ? b.remaining : sellQty;
+    console.log(
+      `sellTransistors(${sellBid}, ${tokenId}, ${qty}) · 单价 ${ethers.formatEther(b.price)} BNB` +
+      ` · 本期成本 ${ethers.formatEther(tokenId === 0 ? await campaign.nandCostBasis() : await campaign.latchCostBasis())} BNB`
+    );
+    await (await campaign.sellTransistors(sellBid, tokenId, qty)).wait();
+  }
 
   if (process.env.CONFIRM === "1") {
     console.log("confirmTransistors() …");
@@ -166,10 +150,9 @@ async function main() {
 
   console.log("");
   await printBids();
-  await printAsks();
   const partsReader = new ethers.Contract(transistors, ["function balanceOf(address,uint256) view returns (uint256)"], signer);
   console.log(`市场欠本期合约：${ethers.formatEther(await market.owed(campaignAddr))} BNB`);
-  console.log(`本期持有元件：NAND ${await partsReader.balanceOf(campaignAddr, 0)} / LATCH ${await partsReader.balanceOf(campaignAddr, 1)}`);
+  console.log(`本期持有晶体管：NAND ${await partsReader.balanceOf(campaignAddr, 0)} / LATCH ${await partsReader.balanceOf(campaignAddr, 1)}`);
 }
 
 main().catch((e) => {

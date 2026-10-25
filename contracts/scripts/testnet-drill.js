@@ -1,18 +1,18 @@
 // 测试网端到端演练：在 BSC 测试网跑通一期完整生命周期。
 //
-// 目的：主网部署前，先在真链上验证 T-79 形态（工厂 2 参 / 开期必选元件）能走通全程：
-//   工厂部署 → 开期（显式指定元件） → 认购售罄 → Owner 下单 → 市场成交交割 →
+// 目的：主网部署前，先在真链上验证 T-79 形态（工厂 2 参 / 开期必选晶体管）能走通全程：
+//   工厂部署 → 开期（显式指定晶体管） → 认购售罄 → Owner 下单 → 市场成交交割 →
 //   确认到账 → 设矿池入池（不可逆） → 挖矿份额挂单与转让 → 余款领取 →
 //   挖矿产出服务费计提与领取
 //
-// 测试网没有官方材料市场与官方元件合约（那些地址在 chainId 97 上没有代码），
+// 测试网没有官方晶体管市场与官方晶体管合约（那些地址在 chainId 97 上没有代码），
 // 所以用 MockMaterialMarket + MockERC1155 替身；它们都有 chainId 56 部署即 revert 的护栏。
 //
 // 运行：node scripts/testnet-drill.js
 const { ethers, network } = require("hardhat");
 
 // 金额规模压到最小：测试网余额有限，演练只需要证明流程通，不需要真实金额。
-// 100 份 × 0.00001 BNB = 0.001 BNB 募资总额；元件总成本 0.0005 BNB，剩 0.0005 作余款。
+// 100 份 × 0.00001 BNB = 0.001 BNB 募资总额；晶体管总成本 0.0005 BNB，剩 0.0005 作余款。
 const SHARE_PRICE = ethers.parseEther("0.00001");
 const TOTAL_SHARES = 100n;
 const FUNDING_SECONDS = 7n * 86400n;
@@ -97,7 +97,7 @@ async function main() {
   }
   console.log(`  参与钱包已注资：alice ${alice.address.slice(0, 10)}… / bob ${bob.address.slice(0, 10)}… / 矿池 ${poolWallet.address.slice(0, 10)}…`);
 
-  section("基础设施：mock 材料市场 + mock 元件 + 工厂");
+  section("基础设施：mock 晶体管市场 + mock 晶体管 + 工厂");
   const market = await ethers.deployContract("MockMaterialMarket");
   await market.waitForDeployment();
   const parts = await ethers.deployContract("MockERC1155");
@@ -117,14 +117,14 @@ async function main() {
     String(await factory.materialMarket()).toLowerCase() === marketAddr.toLowerCase(),
     "工厂 materialMarket 与预期不一致",
   );
-  assert(Number(await factory.allowedPartsCount()) === 1, "工厂元件白名单应为 1 项");
+  assert(Number(await factory.allowedPartsCount()) === 1, "工厂晶体管白名单应为 1 项");
   assert(
     String(await factory.allowedPartsAt(0)).toLowerCase() === partsAddr.toLowerCase(),
-    "工厂元件白名单内容与预期不一致",
+    "工厂晶体管白名单内容与预期不一致",
   );
   ok("工厂读回一致", "materialMarket + 白名单 1 项");
 
-  section("开期：元件合约必选");
+  section("开期：晶体管合约必选");
   // 零地址必须被拒（ZeroAddress）。
   await expectRevert(
     factory.createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, ethers.ZeroAddress),
@@ -149,10 +149,10 @@ async function main() {
   console.log(`  Campaign ${campaignAddr}`);
   assert(
     String(await campaign.transistors()).toLowerCase() === partsAddr.toLowerCase(),
-    "期次锁定的元件合约与开期指定的不一致",
+    "期次锁定的晶体管合约与开期指定的不一致",
   );
   assert(await factory.isRegistered(campaignAddr), "期次应已登记");
-  ok("开期成功", `锁定元件 ${partsAddr}`);
+  ok("开期成功", `锁定晶体管 ${partsAddr}`);
 
   section("服务费：开期后第二笔交易设置（sold == 0 时才可设）");
   const feeBps = 100; // 1%
@@ -188,13 +188,13 @@ async function main() {
   assert(Number(nandBidId) > 0 && Number(latchBidId) > 0, "两条腿都应产生挂单 id");
   ok("买单已挂", `nand#${nandBidId} / latch#${latchBidId}`);
 
-  // 模拟市场成交：fillBid 把 remaining 清零，并 mint 元件到期次合约。
+  // 模拟市场成交：fillBid 把 remaining 清零，并 mint 晶体管到期次合约。
   await (await market.fillBid(nandBidId, NAND_QTY)).wait();
   await (await market.fillBid(latchBidId, LATCH_QTY)).wait();
   await (await parts.mint(campaignAddr, 0, NAND_QTY)).wait();
   await (await parts.mint(campaignAddr, 1, LATCH_QTY)).wait();
   assert(await campaign.orderFilled(), "两条腿都应已成交");
-  ok("市场成交并交割元件", "NAND 60 / LATCH 40 已到账");
+  ok("市场成交并交割晶体管", "NAND 60 / LATCH 40 已到账");
 
   section("确认到账 → 设矿池 → 入池（不可逆）");
   await (await campaign.confirmTransistors()).wait();
@@ -202,7 +202,7 @@ async function main() {
   ok("确认到账", "Ready");
 
   // 矿池地址必须能接收 ERC1155，且必须是能发交易的钱包（后面它要打挖矿收益）。
-  // MockERC1155 的 safeTransferFrom 不检查 receiver 钩子，用普通钱包地址即可收元件。
+  // MockERC1155 的 safeTransferFrom 不检查 receiver 钩子，用普通钱包地址即可收晶体管。
   const poolAddr = poolWallet.address;
   await (await campaign.connect(owner).setMiningPool(poolAddr)).wait();
   await (await campaign.connect(owner).depositToPool()).wait();
@@ -211,7 +211,7 @@ async function main() {
   assert(
     Number(await parts.balanceOf(poolAddr, 0)) === Number(NAND_QTY) &&
       Number(await parts.balanceOf(poolAddr, 1)) === Number(LATCH_QTY),
-    "元件未全部转入矿池",
+    "晶体管未全部转入矿池",
   );
   ok("入池完成", "Mining（不可逆）");
 
@@ -293,7 +293,7 @@ async function main() {
   console.log(`  期次      ${campaignAddr}`);
   console.log(`  场景/子态 Mining / Ready，pooled=${await campaign.pooled()}`);
   console.log(`  售出      ${await campaign.sold()} 份，托管 ${ethers.formatEther(await campaign.raisedBnb())} BNB`);
-  console.log(`  元件      矿池持有 NAND ${await parts.balanceOf(poolAddr, 0)} / LATCH ${await parts.balanceOf(poolAddr, 1)}`);
+  console.log(`  晶体管      矿池持有 NAND ${await parts.balanceOf(poolAddr, 0)} / LATCH ${await parts.balanceOf(poolAddr, 1)}`);
   console.log(`  份额      Alice ${await campaign.sharesOf(alice.address)} / Bob ${await campaign.sharesOf(bob.address)}`);
   console.log(`  收益池    ${ethers.formatEther(await campaign.revenuePool())} BNB`);
   console.log(`\n✓ 测试网完整生命周期演练通过（${step} 项检查）`);

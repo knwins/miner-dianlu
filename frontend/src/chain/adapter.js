@@ -190,8 +190,19 @@ export function bookFromState(state, account, extra = {}) {
     estHashpower: Number(state.estHashpower),
     priceLock: bem(state.priceLock),
     marketOrders: Boolean(state.marketOrders),
-    // 晶体管市场是否真有卖单侧。主网只有买单侧 → 挂卖单入口必须挡住。
-    marketAskSide: Boolean(state.marketAskSide),
+    /** 卖出侧读数：合约手里的晶体管、市场欠款、以及能吃的外部买单。 */
+    sellSide: Boolean(state.sellSide),
+    sellBids: Array.isArray(state.sellBids) ? state.sellBids.map((b) => ({
+      id: String(b.id),
+      tokenId: Number(b.tokenId),
+      price: bem(b.price),
+      remaining: Number(b.remaining),
+      feeBps: Number(b.feeBps),
+      buyer: b.buyer,
+    })) : [],
+    // 本期买入成本（每颗，wei→BNB）：sellTransistors 的底价，低于它的买单卖不了。
+    nandCostBasis: bem(state.nandCostBasis || 0),
+    latchCostBasis: bem(state.latchCostBasis || 0),
     orderFilled: Boolean(state.orderFilled),
     nandBidId: state.nandBidId != null ? String(state.nandBidId) : "0",
     latchBidId: state.latchBidId != null ? String(state.latchBidId) : "0",
@@ -201,17 +212,8 @@ export function bookFromState(state, account, extra = {}) {
     latchPrice: bem(state.latchPrice || 0),
     nandRemaining: state.nandRemaining == null ? null : Number(state.nandRemaining),
     latchRemaining: state.latchRemaining == null ? null : Number(state.latchRemaining),
-    nandAskId: state.nandAskId != null ? String(state.nandAskId) : "0",
-    latchAskId: state.latchAskId != null ? String(state.latchAskId) : "0",
-    nandAskQty: Number(state.nandAskQty || 0),
-    latchAskQty: Number(state.latchAskQty || 0),
-    nandAskPrice: bem(state.nandAskPrice || 0),
-    latchAskPrice: bem(state.latchAskPrice || 0),
-    nandAskRemaining: state.nandAskRemaining == null ? null : Number(state.nandAskRemaining),
-    latchAskRemaining: state.latchAskRemaining == null ? null : Number(state.latchAskRemaining),
-    askOpen: Boolean(state.askOpen),
-    marketAsks: Boolean(state.marketAsks),
     marketOwed: bem(state.marketOwed || 0),
+    /** 这期合约有 sellTransistors()：ready 阶段可以吃外部买单把晶体管卖掉。 */
     readyExit: state.readyExit !== false,
     /** 这期合约有 returnSurplus()：确认到账后可提前把剩余募集款按份退回，且不影响入池。 */
     surplusExit: Boolean(state.surplusExit),

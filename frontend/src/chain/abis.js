@@ -32,12 +32,8 @@ export const CAMPAIGN_ABI = [
   "function latchQty() view returns (uint256)",
   "function nandPrice() view returns (uint96)",
   "function latchPrice() view returns (uint96)",
-  "function nandAskId() view returns (uint256)",
-  "function latchAskId() view returns (uint256)",
-  "function nandAskQty() view returns (uint256)",
-  "function latchAskQty() view returns (uint256)",
-  "function nandAskPrice() view returns (uint96)",
-  "function latchAskPrice() view returns (uint96)",
+  "function nandCostBasis() view returns (uint96)",
+  "function latchCostBasis() view returns (uint96)",
   "function estHashpower() view returns (uint256)",
   "function sharePriceBnb() view returns (uint256)",
   "function totalShares() view returns (uint256)",
@@ -70,8 +66,7 @@ export const CAMPAIGN_ABI = [
   "function cancelListing(uint256 id)",
   "function takeListing(uint256 id, uint256 count) payable",
   "function placeTransistorOrder(uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
-  "function placeTransistorAsk(uint256 nandQty, uint96 nandPrice, uint256 latchQty, uint96 latchPrice)",
-  "function cancelTransistorAsk()",
+  "function sellTransistors(uint256 bidId, uint8 tokenId, uint256 quantity)",
   "function withdrawMarketProceeds()",
   "function returnSurplus()",
   "function topUpShortfall() payable",
@@ -80,7 +75,6 @@ export const CAMPAIGN_ABI = [
   "function cancelTransistorOrder()",
   "function markFailed()",
   "function confirmTransistors()",
-  "function confirmSale()",
   "function setPhase(uint8 next)",
   "function setMaterialMarket(address materialMarket_)",
   "function setMiningPool(address pool_)",
@@ -102,8 +96,7 @@ export const CAMPAIGN_ABI = [
   "event ExecutionFailed(uint256 needBnb, uint256 raisedBnb)",
   "event TransistorOrderPlaced(uint256 count, uint256 escrowBnb)",
   "event TransistorOrderCancelled()",
-  "event TransistorAskPlaced(uint256 nandQty, uint256 latchQty, uint256 nandAskId, uint256 latchAskId)",
-  "event TransistorAskCancelled()",
+  "event TransistorsSold(uint256 indexed bidId, uint8 indexed tokenId, uint256 quantity, uint256 proceeds)",
   "event TransistorsConfirmed()",
   "event MiningPoolSet(address indexed previous, address indexed next)",
   "event DepositedToPool(address indexed pool, uint256 nandAmount, uint256 latchAmount)",
@@ -127,19 +120,15 @@ export const CAMPAIGN_ABI = [
  *     —— 5 个参数；Mock 是 (id, quantity, remaining) 3 个。
  *        proceeds + fee = 买家为这批晶体管付出的托管额（fee 恒为 1%）。
  *   官方 BidCancelled(uint256,uint256) 与 Mock **同签名**（0x434f4081…），只写一份。
- *   晶体管市场没有卖单侧（placeAsk 不存在），所以 AskPlaced / AskFilled /
- *   AskCancelled / ProceedsWithdrawn 只有 Mock 会发。
+ *   晶体管市场没有卖单侧（placeAsk / asks / fillAsk / cancelAsk 都不存在），只有买单簿；
+ *   卖出 = 卖方调用 fillBid 吃一张已挂买单。所以这里也不需要 Ask* 事件。
  */
 export const MATERIAL_MARKET_ABI = [
   "function nextBidId() view returns (uint256)",
-  "function nextAskId() view returns (uint256)",
   "function bids(uint256) view returns (address buyer, address transistors, uint96 price, uint8 tokenId, uint16 feeBps, uint256 remaining)",
-  "function asks(uint256) view returns (address seller, uint96 price, address transistors, uint8 tokenId, uint256 remaining)",
   "function owed(address) view returns (uint256)",
   "function fillBid(uint256 id, uint256 quantity)",
-  "function fillAsk(uint256 id, uint256 quantity) payable",
   "function cancelBid(uint256 id)",
-  "function cancelAsk(uint256 id)",
   "function withdraw()",
   // —— 晶体管市场（主网 0xA6a80C19…，EIP-1967 代理）——
   "event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint256 price, uint256 quantity)",
@@ -148,9 +137,6 @@ export const MATERIAL_MARKET_ABI = [
   // —— Mock 市场（测试网）——
   "event BidPlaced(uint256 indexed id, address indexed buyer, address indexed transistors, uint8 tokenId, uint96 price, uint256 quantity)",
   "event BidFilled(uint256 indexed id, uint256 quantity, uint256 remaining)",
-  "event AskPlaced(uint256 indexed id, address indexed seller, address indexed transistors, uint8 tokenId, uint96 price, uint256 quantity)",
-  "event AskFilled(uint256 indexed id, address indexed buyer, uint256 quantity, uint256 paid)",
-  "event AskCancelled(uint256 indexed id, uint256 quantity)",
   "event ProceedsWithdrawn(address indexed account, uint256 amount)",
 ];
 

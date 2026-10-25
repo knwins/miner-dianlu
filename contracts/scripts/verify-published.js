@@ -48,7 +48,7 @@ async function campaignConstructorArgs(campaignAddr, dep) {
       const parsed = iface.parseLog(log);
       if (String(parsed.args.campaign).toLowerCase() !== String(campaignAddr).toLowerCase()) continue;
       const c = await ethers.getContractAt("Campaign", campaignAddr);
-      const materialMarket = await c.market();
+      const materialMarket = await c.materialMarket();
       const transistors = await c.transistors();
       return [
         parsed.args.sharePriceBnb,
@@ -78,16 +78,16 @@ async function main() {
     );
   }
 
-  // 主网额外核对：材料市场必须是官方地址；元件白名单必须是官方两件套。
+  // 主网额外核对：晶体管市场必须是官方地址；晶体管白名单必须是官方两件套。
   if (chainId === 56) {
     const market = String(dep.materialMarket || "").toLowerCase();
     if (market !== OFFICIAL_MARKET.toLowerCase()) {
-      throw new Error(`主网材料市场应为 ${OFFICIAL_MARKET}，部署记录是 ${dep.materialMarket}`);
+      throw new Error(`主网晶体管市场应为 ${OFFICIAL_MARKET}，部署记录是 ${dep.materialMarket}`);
     }
     const wl = Array.isArray(dep.allowedParts) ? dep.allowedParts.map((a) => a.toLowerCase()) : [];
     for (const o of OFFICIAL_PARTS) {
       if (!wl.includes(o.toLowerCase())) {
-        throw new Error(`主网元件白名单必须包含官方元件 ${o}（否则它的期次开不了）`);
+        throw new Error(`主网晶体管白名单必须包含官方晶体管 ${o}（否则它的期次开不了）`);
       }
     }
   }

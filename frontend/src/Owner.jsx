@@ -97,7 +97,7 @@ function formatRemain(ms) {
 export function OwnerOverview({
   round, book, copy, pending, pendingTarget = "", actor, executeWait, history,
   onSwitchCampaign, onPlaceTransistorOrder, onOpenRefund, onRecoverBnb, onAbandonOrder, onCancelTransistorOrder, onConfirmTransistors,
-  onPlaceTransistorAsk, onCancelTransistorAsk, onConfirmSale, onWithdrawMarketProceeds,
+  onSellTransistors, onWithdrawMarketProceeds,
   onDepositToPool, onSetMiningPool, onSetPlan, onReturnSurplus,   onRemoveCampaign, onOpenRound, onOpenAssets,
   account = "", connected = false, signer = null, chainHolders = null, holdersCampaign = "", quote, onInvoke,
   transistorUnitPrice = null,
@@ -176,20 +176,15 @@ export function OwnerOverview({
   const [latchQty, setLatchQty] = useState("1");
   const [nandPrice, setNandPrice] = useState("0");
   const [latchPrice, setLatchPrice] = useState("0");
-  const [sellNandQty, setSellNandQty] = useState("0");
-  const [sellLatchQty, setSellLatchQty] = useState("0");
-  const [sellNandPrice, setSellNandPrice] = useState("0");
-  const [sellLatchPrice, setSellLatchPrice] = useState("0");
-  /** 空闲时选挂买单还是卖单；有活单时由链上状态决定，不并存。 */
-  const [orderSide, setOrderSide] = useState("buy");
+  /** 卖出：按买单 ID 记每张单要卖多少颗（默认填满剩余量）。 */
+  const [sellQty, setSellQty] = useState({});
   const priceTouched = useRef(false);
-  const sellPriceTouched = useRef(false);
   useEffect(() => {
     priceTouched.current = false;
-    sellPriceTouched.current = false;
     // 切期次时把挂买单数量也复位成默认各 1 颗，避免沿用上一期填过的数量
     setNandQty("1");
     setLatchQty("1");
+    setSellQty({});
   }, [book.address]);
   /**
    * 挂买单：数量默认各 1 颗（NAND / LATCH），单价预填成当前市场参考价
@@ -205,15 +200,6 @@ export function OwnerOverview({
     if (refPrice.NAND > 0) setNandPrice(priceText(round5(refPrice.NAND)));
     if (refPrice.LATCH > 0) setLatchPrice(priceText(round5(refPrice.LATCH)));
   }, [book.address, book.executePhase, refPrice.NAND, refPrice.LATCH]);
-  useEffect(() => {
-    const heldNand = Number(book.partsNand) || 0;
-    const heldLatch = Number(book.partsLatch) || 0;
-    setSellNandQty(String(heldNand));
-    setSellLatchQty(String(heldLatch));
-    if (sellPriceTouched.current) return;
-    if (heldNand > 0 && refPrice.NAND > 0) setSellNandPrice(priceText(round5(refPrice.NAND)));
-    if (heldLatch > 0 && refPrice.LATCH > 0) setSellLatchPrice(priceText(round5(refPrice.LATCH)));
-  }, [book.address, book.partsNand, book.partsLatch, refPrice.NAND, refPrice.LATCH]);
   const historyRows = (history != null ? history : PAST_ROUNDS).map((item) => {
     const onChainRow = history != null;
     const rowDesign = resolveCampaignDesign(
@@ -365,9 +351,9 @@ export function OwnerOverview({
     // 订单/结算状态一变就重读市场流水（挂单、成交、确认到账、提取卖出款）。
     const marketRefreshKey = [
       book.executePhase, book.nandBidId, book.latchBidId,
-      book.nandRemaining, book.latchRemaining,
-      book.nandAskRemaining, book.latchAskRemaining, book.marketOwed,
+      book.nandRemaining, book.latchRemaining, book.marketOwed,
       book.partsNand, book.partsLatch, book.orderFilled,
+      (book.sellBids || []).map((b) => `${b.id}:${b.remaining}:${b.price}`).join(","),
     ].join("|");
     return (
       <div className="detail-split">
@@ -418,19 +404,12 @@ export function OwnerOverview({
                   const orderCost = round5(orderCostRaw);
                   const heldNand = Number(book.partsNand) || 0;
                   const heldLatch = Number(book.partsLatch) || 0;
-                  const sellNandN = Math.min(heldNand, Math.max(0, Math.floor(Number(sellNandQty) || 0)));
-                  const sellLatchN = Math.min(heldLatch, Math.max(0, Math.floor(Number(sellLatchQty) || 0)));
-                  const sellNandP = Number(sellNandPrice) || 0;
-                  const sellLatchP = Number(sellLatchPrice) || 0;
-                  const sellProceeds = round5(sellNandN * sellNandP + sellLatchN * sellLatchP);
                   const buyOpen = book.executePhase === "listed";
-                  const askOpen = Boolean(book.askOpen);
-                  const idle = !buyOpen && !askOpen;
-                  // Ready：买单已确认。这里才能卖、入池或退款。卖单成交后必须再确认，才回到可卖、可退。
+                  const idle = !buyOpen;
+                  // Ready：买单已确认。这里才能把晶体管卖入市场买单、入池或退余款。
                   const ready = book.executePhase === "ready";
-                  const askRecorded = (Number(book.nandAskQty) || 0) > 0 || (Number(book.latchAskQty) || 0) > 0;
                   const marketOwedEarly = Number(book.marketOwed) || 0;
-                  // 测试网 MockMaterialMarket：可直接在当前买、卖单卡片上模拟对手方成交。
+                  // 测试网 MockMaterialMarket：可直接在当前买单卡片上模拟卖方成交。
                   const mockMarket = Boolean(
                     book._chain
                     && Number(deployments.chainId) === 97
@@ -438,23 +417,21 @@ export function OwnerOverview({
                     && book.market
                     && String(book.market).toLowerCase() === String(deployments.materialMarket || deployments.minter).toLowerCase()
                   );
-                  const saleSettled = ready && !askOpen && (askRecorded || marketOwedEarly > 0);
                   const canBuy = raised > 0 && idle && book.executePhase === "buying";
                   const legacyReady = ready && book.readyExit === false;
-                  // 挂卖单要求**市场真的有卖单侧**。官方晶体管市场只有买单侧
-                  // （placeAsk / asks / nextAskId / cancelAsk / fillAsk 都不存在），
-                  // 这时 placeTransistorAsk 在链上必然 revert，前端不能给入口。
-                  const canSell = Boolean(book.marketAskSide) && (heldNand > 0 || heldLatch > 0) && ready && !legacyReady && !askOpen && !saleSettled;
                   /**
-                   * 空闲时表单方向只看阶段：Buying 挂买单，Ready 之后一律是卖单侧。
-                   *
-                   * 旧写法 `askOpen || canSell || saleSettled ? "sell" : "buy"` 把「不能卖」
-                   * 退回买侧：主网 Ready（晶体管市场没有卖单侧 → canSell=false）时会渲染成
-                   * 「挂买中 · 当前不能挂买单」，既解释不了为什么不能卖，也和上方的
-                   * 「下一步：可以挂卖」互相打脸。现在 Ready 走卖侧，卖不了时由下面的
-                   * 空态说明原因（市场没有卖单侧）。
+                   * 官方晶体管市场只有买单侧，卖出 = 吃一张已挂买单。
+                   * 这里列出「标的是本期晶体管、买家不是本期、还有剩余量」的外部买单。
                    */
-                  const side = buyOpen || !ready ? "buy" : "sell";
+                  const sellBids = Array.isArray(book.sellBids) ? book.sellBids : [];
+                  const bidHeld = (bid) => (Number(bid.tokenId) === 0 ? heldNand : heldLatch);
+                  const bidQtyOf = (bid) => {
+                    const raw = sellQty[bid.id];
+                    const want = raw == null ? Number(bid.remaining) : Math.floor(Number(raw) || 0);
+                    return Math.max(0, Math.min(Number(bid.remaining), bidHeld(bid), want));
+                  };
+                  const bidFloor = (bid) => Number(Number(bid.tokenId) === 0 ? book.nandCostBasis : book.latchCostBasis) || 0;
+                  const bidSellable = (bid) => bidQtyOf(bid) > 0 && Number(bid.price) >= bidFloor(bid);
                   /** 入池只要求手里有晶体管，不再比对推算出来的配比 */
                   const partsEnough = heldNand + heldLatch > 0;
                   // 合约 confirmTransistors() 要求两条腿 remaining 全为 0 **并且** 本期真的持有对应数量的晶体管。
@@ -470,12 +447,10 @@ export function OwnerOverview({
                   ].filter(Boolean).join(" + ");
                   // 托管额超过 raisedBnb 时不允许点提交（链上也不会真正挂出）。
                   const overBudget = orderCostRaw > raised;
-                  const canPlaceBuy = isOwner && canBuy && side === "buy" && !overBudget
+                  const canPlaceBuy = isOwner && canBuy && !overBudget
                     && (nandN > 0 || latchN > 0)
                     && (nandN === 0 || nandP > 0)
                     && (latchN === 0 || latchP > 0);
-                  const canPlaceSell = isOwner && canSell && side === "sell" && (sellNandN > 0 || sellLatchN > 0)
-                    && (sellNandN === 0 || sellNandP > 0) && (sellLatchN === 0 || sellLatchP > 0);
                   const bidRows = [
                     Number(book.nandQty) > 0
                       ? { side: "buy", part: "NAND", id: book.nandBidId || "—", qty: book.nandQty, price: book.nandPrice, remaining: book.nandRemaining }
@@ -484,24 +459,12 @@ export function OwnerOverview({
                       ? { side: "buy", part: "LATCH", id: book.latchBidId || "—", qty: book.latchQty, price: book.latchPrice, remaining: book.latchRemaining }
                       : null,
                   ].filter(Boolean);
-                  const askRows = book.marketAsks ? [
-                    Number(book.nandAskQty) > 0
-                      ? { side: "sell", part: "NAND", id: book.nandAskId || "—", qty: book.nandAskQty, price: book.nandAskPrice, remaining: book.nandAskRemaining }
-                      : null,
-                    Number(book.latchAskQty) > 0
-                      ? { side: "sell", part: "LATCH", id: book.latchAskId || "—", qty: book.latchAskQty, price: book.latchAskPrice, remaining: book.latchAskRemaining }
-                      : null,
-                  ].filter(Boolean) : [];
                   const legOpen = (row) => {
-                    if (row.side === "buy") {
-                      if (book.executePhase !== "listed") return false;
-                      if (row.remaining == null) return !book.orderFilled;
-                      return Number(row.remaining) > 0;
-                    }
-                    if (row.remaining == null) return askOpen;
+                    if (book.executePhase !== "listed") return false;
+                    if (row.remaining == null) return !book.orderFilled;
                     return Number(row.remaining) > 0;
                   };
-                  const liveRows = buyOpen ? bidRows : askOpen ? askRows : [];
+                  const liveRows = buyOpen ? bidRows : [];
                   {/*
                    * 步骤条要落在真实阶段上：
                    * 旧版 buyOpen 一律算第 2 步「确认到账」，但挂单还在等成交时
@@ -509,11 +472,10 @@ export function OwnerOverview({
                    * 只有买单全部成交（orderFilled）才进「确认到账」。
                    */}
                   const flowStep = book.executePhase === "ready" ? 3 : book.orderFilled ? 2 : 1;
-                  // 卖单成交款留在市场 owed 里，未提取时 openRefund 会被合约拒绝。
+                  // 卖出款由 sellTransistors 立即提回；市场还欠款时可手工提取（入池/退余款前必须清零）。
                   const marketOwed = marketOwedEarly;
-                  const canWithdraw = isOwner && book.marketAsks && askOpen && marketOwed > 0;
-                  const canConfirmSale = isOwner && saleSettled;
-                  const canRefund = isOwner && !askOpen && !saleSettled && marketOwed <= 0
+                  const canWithdraw = isOwner && marketOwed > 0;
+                  const canRefund = isOwner && marketOwed <= 0
                     && outstanding > 0
                     && book.executePhase === "buying";
                   const dustOnly = isOwner && outstanding === 0 && Number(book.bnbPool || 0) > 0;
@@ -524,7 +486,7 @@ export function OwnerOverview({
                    */
                   const hasReturnSurplus = Boolean(book.surplusExit) || !book._chain;
                   const canReturnSurplus = isOwner && ready && !legacyReady && hasReturnSurplus
-                    && raised > 0 && !askOpen && !saleSettled && marketOwed <= 0 && outstanding > 0;
+                    && raised > 0 && marketOwed <= 0 && outstanding > 0;
                   const surplusBooked = Number(book.surplusOutstanding || 0) > 0;
                   /**
                    * 入池前必须先把余款按份退回（余额=0 时无需退）。
@@ -535,56 +497,44 @@ export function OwnerOverview({
                     || Number(book.surplusBase || 0) > 0;
                   const surplusReturnHint = !hasReturnSurplus
                     ? "这期合约没有 returnSurplus。余款在 depositToPool 时按份记账，持份人用 claimSurplus 领；不会因为入池而消失。"
-                    : askOpen
-                      ? "卖单还挂着，先确认或取消，再退剩余募集款"
-                      : saleSettled
-                        ? "先确认卖出，再退剩余募集款"
-                        : raised <= 0
-                          ? "募集款已全部用于买晶体管，没有可退的余款"
-                          : undefined;
+                    : marketOwed > 0
+                      ? "晶体管市场还有卖出款没提回本期，先提取再退剩余募集款"
+                      : raised <= 0
+                        ? "募集款已全部用于买晶体管，没有可退的余款"
+                        : undefined;
                   const refundHint = ready || legacyReady
                     ? "晶体管确认到账后不再走「原路退款」：退款只会把没花完的募集款按份退给持份人，晶体管留在合约里等入池（用「退回剩余募集款」）。要结束本期必须先把子状态改回待挂单（setPhase）。"
-                    : askOpen
-                      ? "卖单还挂着，不能退款"
-                      : saleSettled
-                        ? "先确认卖出，再退款"
-                        : outstanding === 0
-                          ? "份额已全部退完，没有可退对象；池子里的尾差用「取回剩余 BNB」扫出"
-                          : undefined;
-                  // 放弃挂单：一次撤销买单剩余 + 撤卖单 + 提取卖出款 + 按池子退款，不需要逐项操作。
+                    : outstanding === 0
+                      ? "份额已全部退完，没有可退对象；池子里的尾差用「取回剩余 BNB」扫出"
+                      : undefined;
+                  // 放弃挂单：一次撤销买单剩余 + 提取卖出款 + 按池子退款，不需要逐项操作。
                   // 成交的部分已上链不可撤；只有还剩未成交时才允许放弃。
-                  const hasOpenLeg = [book.nandRemaining, book.latchRemaining, book.nandAskRemaining, book.latchAskRemaining]
+                  const hasOpenLeg = [book.nandRemaining, book.latchRemaining]
                     .some((remaining) => remaining == null || Number(remaining) > 0);
                   // 晶体管事先确认到账（Ready）后 abandonOrder 会以 UseReturnSurplus 回滚：
-                  // 那个状态只允许「退余款 + 入池」，晶体管不能被退回 Owner。
-                  const canAbandon = isOwner && !ready && ((buyOpen && hasOpenLeg) || askOpen);
-                  const nextHint = saleSettled
-                    ? "卖单已成交。点「确认卖出」收到 BNB 并回到待挂单，之后才能再挂买单或退款。"
-                    : askOpen
-                      ? "卖单挂着。全部成交后确认；还没卖完可以取消剩余。"
-                    : legacyReady
-                      ? "这期是已上线的旧合约：没有提前退余款的入口，也不能再走「原路退款」——余款会在 depositToPool 入池那一刻按份记账，持份人用 claimSurplus 领，晶体管只会进矿池。"
+                  // 那个状态只允许「退余款 + 入池 / 卖入买单」，晶体管不能被退回 Owner。
+                  const canAbandon = isOwner && !ready && buyOpen && hasOpenLeg;
+                  const nextHint = legacyReady
+                    ? "这期是已上线的旧合约：没有提前退余款的入口，也不能再走「原路退款」——余款会在 depositToPool 入池那一刻按份记账，持份人用 claimSurplus 领，晶体管只会进矿池。"
                     : ready
                       ? (partsEnough
                         ? (book.surplusExit
-                          ? (book.marketAskSide === false
-                            ? "买单已确认，晶体管在合约里，当前晶体管市场没有卖单侧（挂卖会 revert）。入池前先点「退回剩余募集款」把没花完的 BNB 按份退给持份人（本金立刻变成可领，本期继续、晶体管不动），然后设矿池地址 → depositToPool 入池（不可逆）。"
-                            : "买单已确认，晶体管在合约里。入池前先点「退回剩余募集款」把没花完的 BNB 按份退给持份人（本期继续、晶体管不动）；也可以先挂卖。之后设矿池地址 → depositToPool 入池（不可逆）。")
-                          : "买单已确认，晶体管在合约里。这期合约没有提前退余款的入口，余款会在 depositToPool 入池那一刻按份记账（持份人用 claimSurplus 领），晶体管只会进矿池。设好矿池地址后 depositToPool 入池（不可逆）。")
+                          ? "买单已确认，晶体管在合约里。可以吃市场里标的本期晶体管的买单卖出（成交款立即提回），或先点「退回剩余募集款」把没花完的 BNB 按份退给持份人（本期继续、晶体管不动）；之后设矿池地址 → depositToPool 入池（不可逆）。"
+                          : "买单已确认，晶体管在合约里。可以吃市场买单卖出，或直接入池。这期合约没有提前退余款的入口，余款会在 depositToPool 入池那一刻按份记账（持份人用 claimSurplus 领），晶体管只会进矿池。")
                         : "手里还没有晶体管，不能入池。先挂买单买入并确认到账。")
                       : outstanding === 0
-                        ? "已全部退款（份数归零），池子里若还有卖单溢价，Owner 可用「取回 BNB」扫出。"
+                        ? "已全部退款（份数归零），池子里若还有多余 BNB，Owner 可用「取回 BNB」扫出。"
                         : buyOpen
                           ? (book.orderFilled
                             ? (partsForOrderEnough
-                              ? "买单已成交齐，点「确认到账」。确认后才能卖、入池或退款。"
+                              ? "买单已成交齐，点「确认到账」。确认后才能卖入市场买单、入池或退余款。"
                               : `买单已成交，但晶体管还没进本期合约（还缺 ${partsShortLabel || "晶体管"}）。` +
                                 (mockMarket
                                   ? "点「补发晶体管」按缺额 mint 后再确认；链上 confirmTransistors 要求晶体管余额到位。"
                                   : "等卖家把晶体管转到本期合约后，再点「确认到账」。"))
                             : "等待市场成交。未成交部分可以取消；成交的不能撤销。")
                           : canBuy
-                            ? "挂买单买入晶体管，买多少自己定。成交并确认后，才能卖、入池或退款。"
+                            ? "挂买单买入晶体管，买多少自己定。成交并确认后，才能卖入市场买单、入池或退余款。"
                             : book.executionFailed
                               ? "上次挂单超余额未挂出，改低单价重试或退款。"
                               : "当前不能挂单。";
@@ -597,26 +547,17 @@ export function OwnerOverview({
                         ? `晶体管还没到账：还缺 ${partsShortLabel || "晶体管"}` + (mockMarket ? "。点「补发晶体管」补齐后再确认。" : "。等卖家把晶体管转到本期合约后再确认。")
                         : undefined;
 
-                  const renderLegForm = (kind) => {
-                    const isBuy = kind === "buy";
+                  const renderBuyForm = () => {
                     /**
                      * 市价列来源：链上单价优先（mock / 测试网），官方市价其次（主网）。
                      * 列头直接写来源，单元格只留数字 —— 数字本身就是可点填的按钮
                      * （主色 + 下划线 + title 提示），不再挂「官方市价 · 点填」小字。
                      */
                     const quoteLabel = minterUnit > 0 ? "链上市场单价" : "官方市价";
-                    const legs = isBuy
-                      ? [
-                          { key: "nand", label: "NAND", qty: nandQty, setQty: setNandQty, price: nandPrice, setPrice: setNandPrice, touch: priceTouched, quote: refPrice.NAND, source: quoteLabel },
-                          { key: "latch", label: "LATCH", qty: latchQty, setQty: setLatchQty, price: latchPrice, setPrice: setLatchPrice, touch: priceTouched, quote: refPrice.LATCH, source: quoteLabel },
-                        ].filter(Boolean)
-                      : [
-                          heldNand > 0 && { key: "nand", label: "NAND", qty: sellNandQty, setQty: setSellNandQty, price: sellNandPrice, setPrice: setSellNandPrice, touch: sellPriceTouched, quote: refPrice.NAND, source: quoteLabel, max: heldNand },
-                          heldLatch > 0 && { key: "latch", label: "LATCH", qty: sellLatchQty, setQty: setSellLatchQty, price: sellLatchPrice, setPrice: setSellLatchPrice, touch: sellPriceTouched, quote: refPrice.LATCH, source: quoteLabel, max: heldLatch },
-                        ].filter(Boolean);
-                    if (legs.length === 0) {
-                      return <p className="flow-empty">{isBuy ? "填写要买的 NAND / LATCH 数量与单价。" : "暂无库存可卖。"}</p>;
-                    }
+                    const legs = [
+                      { key: "nand", label: "NAND", qty: nandQty, setQty: setNandQty, price: nandPrice, setPrice: setNandPrice, touch: priceTouched, quote: refPrice.NAND, source: quoteLabel },
+                      { key: "latch", label: "LATCH", qty: latchQty, setQty: setLatchQty, price: latchPrice, setPrice: setLatchPrice, touch: priceTouched, quote: refPrice.LATCH, source: quoteLabel },
+                    ];
                     return (
                       <div className="flow-form">
                         {/*
@@ -636,7 +577,7 @@ export function OwnerOverview({
                             <tr>
                               <th>晶体管</th>
                               <th>数量</th>
-                              <th>{isBuy ? "买价 BNB" : "卖价 BNB"}</th>
+                              <th>买价 BNB</th>
                               <th>{quoteLabel}</th>
                             </tr>
                           </thead>
@@ -645,7 +586,6 @@ export function OwnerOverview({
                               <tr key={leg.key}>
                                 <td>
                                   <strong>{leg.label}</strong>
-                                  {leg.max != null && <span className="flow-max">持有 {leg.max}</span>}
                                 </td>
                                 <td>
                                   <input inputMode="numeric" value={leg.qty} disabled={!isOwner || Boolean(pending)} onChange={(e) => leg.setQty(e.target.value)} />
@@ -678,41 +618,112 @@ export function OwnerOverview({
                           </tbody>
                         </table>
                         <div className="flow-form-bar">
-                          <span className={overBudget && isBuy ? "is-warn" : undefined}>
-                            {isBuy
-                              ? `托管 ${orderCost} BNB · 可用 ${round4(raised)}${overBudget ? " · 超余额不会挂出" : ""}`
-                              : `预估收入 ${sellProceeds} BNB`}
+                          <span className={overBudget ? "is-warn" : undefined}>
+                            {`托管 ${orderCost} BNB · 可用 ${round4(raised)}${overBudget ? " · 超余额不会挂出" : ""}`}
                           </span>
-                          {isBuy ? (
-                            <button
-                              className="btn btn-primary"
-                              type="button"
-                              disabled={!canPlaceBuy || Boolean(pending)}
-                              onClick={() => onPlaceTransistorOrder?.({
-                                nandQty: nandN,
-                                latchQty: latchN,
-                                nandPrice: nandN > 0 ? String(nandP) : "0",
-                                latchPrice: latchN > 0 ? String(latchP) : "0",
-                              })}
-                            >
-                              {pending === "placeTransistorOrder" ? "提交中…" : "提交买单"}
-                            </button>
-                          ) : (
-                            <button
-                              className="btn btn-primary"
-                              type="button"
-                              disabled={!canPlaceSell || Boolean(pending)}
-                              onClick={() => onPlaceTransistorAsk?.({
-                                nandQty: sellNandN,
-                                latchQty: sellLatchN,
-                                nandPrice: sellNandN > 0 ? String(sellNandP) : "0",
-                                latchPrice: sellLatchN > 0 ? String(sellLatchP) : "0",
-                              })}
-                            >
-                              {pending === "placeTransistorAsk" ? "提交中…" : "提交卖单"}
-                            </button>
-                          )}
+                          <button
+                            className="btn btn-primary"
+                            type="button"
+                            disabled={!canPlaceBuy || Boolean(pending)}
+                            onClick={() => onPlaceTransistorOrder?.({
+                              nandQty: nandN,
+                              latchQty: latchN,
+                              nandPrice: nandN > 0 ? String(nandP) : "0",
+                              latchPrice: latchN > 0 ? String(latchP) : "0",
+                            })}
+                          >
+                            {pending === "placeTransistorOrder" ? "提交中…" : "提交买单"}
+                          </button>
                         </div>
+                      </div>
+                    );
+                  };
+
+                  /**
+                   * Ready 的卖出：官方晶体管市场没有卖单簿，卖出 = 吃一张已挂买单。
+                   * 每张买单一个数量输入（默认填满剩余量），单价由买单决定，本期不能自己喊价。
+                   * 合约侧还会校验：标的必须是本期晶体管、买家不能是本期自己、单价不得低于本期买入成本。
+                   */
+                  const renderSellPanel = () => {
+                    if (book._chain && !book.sellSide) {
+                      return <p className="flow-empty">这期合约没有卖出接口（旧合约），晶体管确认到账后只能入池。</p>;
+                    }
+                    if (!book._chain) {
+                      return <p className="flow-empty">模拟模式不撮合外部买单：确认到账后可直接入池。链上模式会列出可吃的外部买单。</p>;
+                    }
+                    if (heldNand + heldLatch === 0) {
+                      return <p className="flow-empty">手里没有可卖的晶体管，先挂买单买入并确认到账。</p>;
+                    }
+                    if (sellBids.length === 0) {
+                      return <p className="flow-empty">市场里还没有标的本期晶体管的买单。等外部买家挂买单，或直接把晶体管投进矿池。</p>;
+                    }
+                    return (
+                      <div className="flow-form">
+                        <table className="flow-table">
+                          <thead>
+                            <tr>
+                              <th>晶体管</th>
+                              <th>单价 BNB</th>
+                              <th>剩余</th>
+                              <th>卖出</th>
+                              <th>买家</th>
+                              <th />
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {sellBids.map((bid) => {
+                              const part = Number(bid.tokenId) === 0 ? "NAND" : "LATCH";
+                              const floor = bidFloor(bid);
+                              const belowCost = Number(bid.price) < floor;
+                              const qty = bidQtyOf(bid);
+                              const ok = isOwner && !pending && bidSellable(bid);
+                              return (
+                                <tr key={bid.id}>
+                                  <td>
+                                    <strong>{part}</strong>
+                                    <span className="flow-max">持有 {bidHeld(bid)}</span>
+                                  </td>
+                                  <td
+                                    className={belowCost ? "is-warn" : undefined}
+                                    title={belowCost ? `低于本期买入成本 ${formatUnitPrice(floor)} BNB/颗，链上会以 PriceBelowCost 回滚` : undefined}
+                                  >
+                                    {formatUnitPrice(round5(Number(bid.price)))}
+                                  </td>
+                                  <td>{Number(bid.remaining)}</td>
+                                  <td>
+                                    <input
+                                      inputMode="numeric"
+                                      value={sellQty[bid.id] ?? String(bid.remaining)}
+                                      disabled={!isOwner || Boolean(pending)}
+                                      onChange={(e) => setSellQty((prev) => ({ ...prev, [bid.id]: e.target.value }))}
+                                    />
+                                  </td>
+                                  <td className="mono">{shortAddress(bid.buyer)}</td>
+                                  <td>
+                                    <button
+                                      className="btn btn-inline"
+                                      type="button"
+                                      disabled={!ok}
+                                      title={belowCost
+                                        ? `买单单价低于本期买入成本（${formatUnitPrice(floor)} BNB/颗），合约会拒绝`
+                                        : undefined}
+                                      onClick={() => onSellTransistors?.({
+                                        bidId: String(bid.id),
+                                        tokenId: Number(bid.tokenId),
+                                        quantity: qty,
+                                      })}
+                                    >
+                                      {pending === "sellTransistors" ? "卖出中…" : "卖出"}
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                        <p className="fine">
+                          单价由买单决定，成交款扣 1% 市场费后立即提回本期。低于本期买入成本的买单不能卖（会烧掉持份人的抵押）。
+                        </p>
                       </div>
                     );
                   };
@@ -749,28 +760,21 @@ export function OwnerOverview({
                       <p className="flow-next"><strong>下一步</strong>{nextHint}</p>
 
                       {/* 上：当前挂单；下：操作表单 / 主按钮 */}
-                      {!legacyReady && (book.executePhase === "buying" || book.executePhase === "listed" || ready || askOpen || marketOwed > 0) && (
+                      {!legacyReady && (book.executePhase === "buying" || book.executePhase === "listed" || ready || marketOwed > 0) && (
                         <div className="flow-panel">
                           <div className="flow-panel-head">
                             <div>
                               {/*
                                * 只留标题：这段原本每个分支都有一句说明，但和正上方
-                               * 「下一步」的 nextHint 逐字重复（例如买单两处都写
-                               * 「买多少自己定，确认后才能卖、入池或退款」）。
+                               * 「下一步」的 nextHint 逐字重复。
                                * 说明归 nextHint 一处，这里只交代这是哪张单。
                                */}
-                              <h3>
-                                {buyOpen ? "当前买单"
-                                  : askOpen ? "当前卖单"
-                                    : saleSettled ? "卖单待确认"
-                                      // 卖不了时不要写「挂卖中」——下面空态会说明为什么卖不了
-                                      : side === "sell" ? (canSell ? "挂卖中" : "卖出") : "挂买中"}
-                              </h3>
+                              <h3>{buyOpen ? "当前买单" : ready ? "卖入市场买单" : "挂买中"}</h3>
                             </div>
                           </div>
 
                           <div className="flow-panel-body">
-                            {(buyOpen || askOpen) ? (
+                            {buyOpen ? (
                               <>
                                 <table className="flow-table">
                                   <thead>
@@ -849,7 +853,7 @@ export function OwnerOverview({
                                   )}
                                   {canWithdraw && (
                                     <button
-                                      className="btn btn-primary"
+                                      className="btn btn-inline"
                                       type="button"
                                       disabled={!isOwner || Boolean(pending)}
                                       onClick={onWithdrawMarketProceeds}
@@ -857,79 +861,36 @@ export function OwnerOverview({
                                       {pending === "withdrawMarketProceeds" ? "提取中…" : "提取卖出款"}
                                     </button>
                                   )}
-                                  {askOpen && (
-                                    <button
-                                      className="btn btn-inline"
-                                      type="button"
-                                      disabled={!isOwner || Boolean(pending)}
-                                      onClick={onCancelTransistorAsk}
-                                      title="只撤还没卖掉的部分"
-                                    >
-                                      {pending === "cancelTransistorAsk" ? "取消中…" : "取消卖单"}
-                                    </button>
-                                  )}
-                                  {askOpen && mockMarket && (
-                                    <button
-                                      className="btn btn-inline"
-                                      type="button"
-                                      disabled={!connected || Boolean(pending)}
-                                      onClick={() => onInvoke("simulateFillCampaignAsks", {})}
-                                      title="测试网 Mock 晶体管市场：代替买方按挂单价吃掉这两张卖单，卖出款记入市场 owed"
-                                    >
-                                      {pending === "simulateFillCampaignAsks" ? "吃单中…" : "模拟吃单"}
-                                    </button>
-                                  )}
                                 </div>
                               </>
-                            ) : saleSettled ? (
-                              <div className="flow-panel-actions">
-                                <button
-                                  className="btn btn-primary"
-                                  type="button"
-                                  disabled={!canConfirmSale || Boolean(pending)}
-                                  onClick={onConfirmSale}
-                                >
-                                  {pending === "confirmSale" ? "确认中…" : "确认卖出"}
-                                </button>
-                                <span className="flow-note">确认后才能再挂买单或退款。</span>
-                              </div>
-                            ) : marketOwed > 0 && !canBuy ? (
-                              <div className="flow-panel-actions">
-                                <button
-                                  className="btn btn-primary"
-                                  type="button"
-                                  disabled={!isOwner || Boolean(pending)}
-                                  onClick={onWithdrawMarketProceeds}
-                                >
-                                  {pending === "withdrawMarketProceeds" ? "提取中…" : "提取卖出款"}
-                                </button>
-                                <span className="flow-note">从晶体管市场取回 BNB，之后可退款或重挂买单。</span>
-                              </div>
                             ) : (
                               <>
-                                {side === "buy" && (canBuy ? renderLegForm("buy") : (
+                                {!ready && (canBuy ? renderBuyForm() : (
                                   <p className="flow-empty">
                                     {raised <= 0 ? "募集余额为 0，无法挂买单。" : "当前不能挂买单。"}
                                   </p>
                                 ))}
-                                {side === "sell" && (canSell ? renderLegForm("sell") : (
-                                  <p className="flow-empty">
-                                    {book._chain && book.marketAskSide === false
-                                      ? "当前晶体管市场没有卖单侧（只有买单），挂卖单链上会直接 revert。晶体管到账后直接入池即可。"
-                                      : !book.marketAsks
-                                        ? "这期合约无卖单接口，需重新部署后开新期。"
-                                        : heldNand + heldLatch === 0
-                                          ? "手里没有可卖的晶体管，先挂买单买入并确认到账。"
-                                          : "确认买单到账后才能挂卖单。"}
-                                  </p>
-                                ))}
+                                {marketOwed > 0 && (
+                                  <div className="flow-panel-actions">
+                                    <button
+                                      className="btn btn-inline"
+                                      type="button"
+                                      disabled={!isOwner || Boolean(pending)}
+                                      onClick={onWithdrawMarketProceeds}
+                                    >
+                                      {pending === "withdrawMarketProceeds" ? "提取中…" : "提取卖出款"}
+                                    </button>
+                                    <span className="flow-note">市场还欠本期 {round4(marketOwed)} BNB，入池或退余款前先提回。</span>
+                                  </div>
+                                )}
+                                {ready && renderSellPanel()}
                               </>
                             )}
                           </div>
                         </div>
                       )}
 
-                      {(book.executePhase === "buying" || book.executePhase === "listed" || ready || askOpen) && (
+                      {(book.executePhase === "buying" || book.executePhase === "listed" || ready) && (
                         <div className="flow-tools">
                           {/*
                            * 退余款不是退款：钱按份退回持份人（pull，各自 claimSurplus 领），
@@ -968,7 +929,7 @@ export function OwnerOverview({
                               type="button"
                               disabled={Boolean(pending)}
                               onClick={onRecoverBnb}
-                              title="份额已全部退完，池子里的尾差/卖单溢价没有归属。recoverBnb() 无参，一次扫给 Owner。"
+                              title="份额已全部退完，池子里的尾差/多余 BNB 没有归属。recoverBnb() 无参，一次扫给 Owner。"
                             >
                               {pending === "recoverBnb" ? "取回中…" : "取回剩余 BNB"}
                             </button>
@@ -981,7 +942,7 @@ export function OwnerOverview({
                               onClick={onAbandonOrder}
                               title={buyOpen && !hasOpenLeg
                                 ? "买单已全部成交，晶体管已上链，无法撤销"
-                                : "撤销未成交买单、撤卖单、提取卖出款，然后按当前池子给持份人退款。"}
+                                : "撤销未成交买单、提取卖出款，然后按当前池子给持份人退款。"}
                             >
                               {pending === "abandonOrder" ? "撤回中…" : "放弃挂单并退款"}
                             </button>
@@ -989,7 +950,7 @@ export function OwnerOverview({
                         </div>
                       )}
 
-                      {ready && !book.executionFailed && !askOpen && !saleSettled && (
+                      {ready && !book.executionFailed && (
                         <div className="flow-panel">
                           <div className="flow-panel-head">
                             <div>
@@ -1047,13 +1008,15 @@ export function OwnerOverview({
                               <button
                                 className="btn btn-primary"
                                 type="button"
-                                disabled={!isOwner || Boolean(pending) || !hasPoolOnChain || !surplusBeforePool}
+                                disabled={!isOwner || Boolean(pending) || !hasPoolOnChain || !surplusBeforePool || marketOwed > 0}
                                 title={
                                   !hasPoolOnChain
                                     ? "请先设置矿池地址（链上 depositToPool 要求 miningPool 非零）"
-                                    : !surplusBeforePool
-                                      ? "入池前必须先把剩余募集款按份退回给持份人：先点上面的「退回剩余募集款」"
-                                      : undefined
+                                    : marketOwed > 0
+                                      ? "市场还欠本期卖出款，先点上面的「提取卖出款」再入池"
+                                      : !surplusBeforePool
+                                        ? "入池前必须先把剩余募集款按份退回给持份人：先点上面的「退回剩余募集款」"
+                                        : undefined
                                 }
                                 onClick={() => submitDepositToPool()}
                               >
@@ -1169,10 +1132,6 @@ export function OwnerOverview({
                     nandQty: Number(book.nandQty) || 0, latchQty: Number(book.latchQty) || 0,
                     nandRemaining: book.nandRemaining, latchRemaining: book.latchRemaining,
                     nandPrice: Number(book.nandPrice) || 0, latchPrice: Number(book.latchPrice) || 0,
-                    nandAskId: book.nandAskId, latchAskId: book.latchAskId,
-                    nandAskQty: Number(book.nandAskQty) || 0, latchAskQty: Number(book.latchAskQty) || 0,
-                    nandAskRemaining: book.nandAskRemaining, latchAskRemaining: book.latchAskRemaining,
-                    nandAskPrice: Number(book.nandAskPrice) || 0, latchAskPrice: Number(book.latchAskPrice) || 0,
                     marketOwed: Number(book.marketOwed) || 0,
                     partsNand: Number(book.partsNand) || 0, partsLatch: Number(book.partsLatch) || 0,
                   }}

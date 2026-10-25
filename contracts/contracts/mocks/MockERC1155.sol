@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @notice Minimal ERC1155 used to test Campaign recover / placeAsk flows.
+/// @notice Minimal ERC1155 used to test Campaign recover / sellTransistors flows.
 contract MockERC1155 {
     mapping(uint256 => mapping(address => uint256)) private _balances;
     mapping(address => mapping(address => bool)) private _operatorApproval;

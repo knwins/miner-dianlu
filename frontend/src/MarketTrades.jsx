@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { readAskSettleTimes, readMarketTrades, MARKET_TRADE_LIMIT } from "./chain/client.js";
+import { useEffect, useState } from "react";
+import { readMarketTrades, MARKET_TRADE_LIMIT } from "./chain/client.js";
 import { explorerAddress, explorerTx } from "./chain/config.js";
 import { round4, shortAddress } from "./fixtures.js";
 
@@ -53,7 +53,7 @@ function formatStampFull(ts) {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
-/** 链上读不到市场时，用 book 里已有的 bids/asks 余额拼出同样的表。 */
+/** 链上读不到市场时，用 book 里已有的买单余额拼出同样的表（卖出只有事件，没有挂单可拼）。 */
 export function fallbackTradeLegs(f) {
   const rows = [];
   const push = (side, part, qty, remaining, price, id) => {
@@ -78,8 +78,6 @@ export function fallbackTradeLegs(f) {
   };
   push("buy", "NAND", f.nandQty, f.nandRemaining, f.nandPrice, f.nandBidId);
   push("buy", "LATCH", f.latchQty, f.latchRemaining, f.latchPrice, f.latchBidId);
-  push("sell", "NAND", f.nandAskQty, f.nandAskRemaining, f.nandAskPrice, f.nandAskId);
-  push("sell", "LATCH", f.latchAskQty, f.latchAskRemaining, f.latchAskPrice, f.latchAskId);
   return rows;
 }
 
@@ -87,48 +85,15 @@ export function fallbackTradeLegs(f) {
 export function useMarketTrades(campaignAddr, refreshKey) {
   const [data, setData] = useState(null);
   const [failed, setFailed] = useState(false);
-  const askedRef = useRef(new Set());
   useEffect(() => {
     let alive = true;
     if (!campaignAddr) return () => { alive = false; };
-    askedRef.current = new Set();
     setFailed(false);
     readMarketTrades(campaignAddr)
       .then((next) => { if (alive) setData(next); })
       .catch(() => { if (alive) setFailed(true); });
     return () => { alive = false; };
   }, [campaignAddr, refreshKey]);
-
-  // 卖单没有链上事件：成交/撤回时间要二分历史区块，放在渲染后补，避免整块记录等十几秒。
-  useEffect(() => {
-    if (!data?.legs?.length) return undefined;
-    const pending = data.legs.filter((leg) => leg.side === "sell"
-      && leg.placedBlock
-      && leg.remaining === 0
-      && leg.filledAt == null
-      && leg.cancelAt == null
-      && !askedRef.current.has(String(leg.orderId)));
-    if (!pending.length) return undefined;
-    pending.forEach((leg) => askedRef.current.add(String(leg.orderId)));
-    let alive = true;
-    readAskSettleTimes(campaignAddr, pending)
-      .then((times) => {
-        if (!alive || !times || !Object.keys(times).length) return;
-        setData((prev) => {
-          if (!prev?.legs) return prev;
-          return {
-            ...prev,
-            legs: prev.legs.map((leg) => {
-              const ts = times[String(leg.orderId)];
-              if (ts == null || leg.side !== "sell") return leg;
-              return leg.status === "cancelled" ? { ...leg, cancelAt: ts } : { ...leg, filledAt: ts };
-            }),
-          };
-        });
-      })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, [data, campaignAddr]);
 
   return { data, failed };
 }
@@ -182,8 +147,8 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
             <small>支出 {round4(totals.buySpent)} BNB</small>
           </li>
           <li>
-            <span>卖单成交</span>
-            <strong>{totals.sellFilled} / {totals.sellQty} 颗</strong>
+            <span>卖出成交</span>
+            <strong>{totals.sellFilled} 颗</strong>
             <small>回款 {round4(totals.sellProceeds)} BNB</small>
           </li>
           <li>
@@ -278,7 +243,7 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
         <p className="fine">
           {failed
             ? "读取市场失败：节点暂不可用，先按本地状态展示。"
-            : "成交进度读晶体管市场的 bids / asks / owed；挂单、成交与撤单时间取市场合约的链上事件。"}
+            : "成交进度读晶体管市场的 bids / owed；买单挂出、成交与撤回时间取市场合约的链上事件，卖出记录取本期的 TransistorsSold。"}
         </p>
       </div>
     </article>
@@ -288,9 +253,9 @@ export function MarketTrades({ campaignAddr, refreshKey, fallbackRows }) {
 function eventText(evt) {
   const bnb = (wei) => `${round4(Number(wei) / 1e18)} BNB`;
   const at = evt.price ? ` @ ${bnb(evt.price)}` : "";
-  if (evt.kind === "place") return `${evt.side === "buy" ? "挂买单" : "挂卖单"} #${evt.id} · ${evt.part || ""} ${evt.qty} 颗${at}`.replace("  ", " ");
-  if (evt.kind === "fill") return `${evt.side === "buy" ? "买单" : "卖单"} #${evt.id} 成交 ${evt.qty} 颗${at}${evt.amount ? ` · ${bnb(evt.amount)}` : ""}`;
-  if (evt.kind === "cancel") return `${evt.side === "buy" ? "买单" : "卖单"} #${evt.id} 撤回${evt.amount ? ` · 退回 ${bnb(evt.amount)}` : ""}`;
+  if (evt.kind === "place") return `挂买单 #${evt.id} · ${evt.part || ""} ${evt.qty} 颗${at}`.replace("  ", " ");
+  if (evt.kind === "fill") return `${evt.side === "buy" ? "买单" : "卖出"} #${evt.id} 成交 ${evt.qty} 颗${at}${evt.amount ? ` · ${bnb(evt.amount)}` : ""}`;
+  if (evt.kind === "cancel") return `买单 #${evt.id} 撤回${evt.amount ? ` · 退回 ${bnb(evt.amount)}` : ""}`;
   if (evt.kind === "withdraw") return `提取市场款 ${bnb(evt.amount)}`;
   return "";
 }
