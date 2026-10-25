@@ -159,11 +159,15 @@ export function bookFromState(state, account, extra = {}) {
     refundedTotal: bem(state.totalRefunded),
     refundedSelf: bem(self.refunded),
     /**
-     * 待领余款（wei）。C-4 之后余款改 pull 模式：入池时不再推给持有人，
+     * 待领余款（wei）。余款改 pull 模式：不再推给持有人，
      * 持份人自己调 claimSurplus() 领。claimableSurplus 含尚未计提的可领部分。
      */
     pendingSurplusSelf: bem(self.claimableSurplus ?? self.pendingSurplus),
     pendingSurplusTotal: bem(state.totalPendingSurplus),
+    /** 持有人可领的 BEM（官方挖矿产出按份额记账，claimBem 领取）。 */
+    bemClaimable: bem(self.bemClaimable ?? 0n),
+    /** 本期未领取的挖矿产出（BEM，按官方合约 pending 汇总）。 */
+    miningPendingBem: bem(state.miningPendingBem ?? 0n),
     /**
      * 服务费是否已设定（链上）。
      * false = 还能改（只要还没人认购）；true = 已永久锁定。
@@ -178,14 +182,11 @@ export function bookFromState(state, account, extra = {}) {
     bnb,
     capped: false,
     owner: state.owner,
-    /** 熔断中：入口（认筹/挂单/卖出/入池/份额市场）全停，pull 与撤单仍可用。 */
+    /** 熔断中：入口（认筹/挂单/卖出/开矿/份额市场）全停，pull 与撤单仍可用。 */
     halted: Boolean(state.halted),
     selfAddress: account,
     totalShares: Number(state.totalShares),
-    /**
-     * 已成交到账的电路张数（circuitHeldCount）。
-     * 买入是原子交割，成交即到账；卖出 / 入池后持仓下降。
-     */
+    /** 已成交到账的电路张数（circuitCount）。买入是原子交割，成交即到账；卖出后持仓下降。 */
     circuitCount: Number(state.boughtCount ?? state.circuitCount ?? 0),
     circuitHeldCount: Number(state.circuitHeldCount ?? 0),
     estHashpower: Number(state.estHashpower),
@@ -197,6 +198,8 @@ export function bookFromState(state, account, extra = {}) {
       listingId: String(c.listingId),
       price: bem(c.price),
       cost: bem(c.cost || 0),
+      miningStatus: Number(c.miningStatus) || 0,
+      miningPending: c.miningPending || 0n,
     })) : [],
     sellBids: Array.isArray(state.sellBids) ? state.sellBids.map((b) => ({
       id: String(b.id),
@@ -206,7 +209,11 @@ export function bookFromState(state, account, extra = {}) {
       remaining: Number(b.remaining),
       feeBps: Number(b.feeBps),
       buyer: b.buyer,
+      miningStatus: Number(b.miningStatus) || 0,
+      miningPending: b.miningPending || 0n,
     })) : [],
+    /** 官方挖矿读数：挖矿中的张数。 */
+    miningActiveCount: Number(state.miningActiveCount ?? 0),
     /** 订单已成交（本期至少持有过一张电路）。 */
     orderFilled: Boolean(state.orderFilled),
     /** 市场欠本期的 BNB（可 withdrawMarketProceeds）。 */
@@ -214,10 +221,7 @@ export function bookFromState(state, account, extra = {}) {
     /** 已记账、尚未发到持有人手里的余款（BNB）。 */
     surplusOutstanding: bem(state.surplusOutstanding || 0),
     surplusBase: Number(state.surplusBase || 0),
-    /** 电路是否已投入矿池（不可逆）。入池后合约余额归 0，展示要用 circuitHeldCount。 */
-    pooled: Boolean(state.pooled),
-    /** 矿池地址（链上事实）：零地址 = 未设置。Owner 面板用它判断能否 depositToPool。 */
-    miningPool: state.miningPool || "",
+    /** 电路是否已在官方挖矿（由 miningStatus 汇总，不再有「入池」这个不可逆状态）。 */
     /** 本期锁定的 ERC721 电路集合。 */
     circuits: state.circuits || "",
     _sharePriceWei: state.sharePriceBnb,

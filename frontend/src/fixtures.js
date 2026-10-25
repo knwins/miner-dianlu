@@ -186,17 +186,17 @@ export const SCENE_COPY = {
   funding: {
     badge: SCENE.funding.label,
     tone: SCENE.funding.tone,
-    lead: "本期开放认筹，份额售罄后由 Owner 买入电路并投入矿池。",
+    lead: "本期开放认筹，份额售罄后由 Owner 买入电路并开矿。",
   },
   executing: {
     badge: SCENE.executing.label,
     tone: SCENE.executing.tone,
-    lead: "份数已售完。Owner 挂单买入电路、确认到账后投入矿池；入池前本金不动，可原路退款或改价重挂。",
+    lead: "份数已售完。Owner 挂单买入电路、确认到账后开矿；开矿前本金不动，可原路退款或改价重挂。",
   },
   mining: {
     badge: SCENE.mining.label,
     tone: SCENE.mining.tone,
-    lead: "电路已入池，本期进入挖矿（不可逆）。分配合约接入前不产出发放；退出只能转让份额。",
+    lead: "电路已在官方 PoD 合约挖矿，产出按份额分给持份人；退出只能转让份额。",
   },
 };
 
@@ -374,7 +374,7 @@ export const PAST_ROUNDS = [
  *   募资总额 BNB → ÷ 电路实时单价 → 能买多少电路；H = 电路数 × P
  *
  * 电路数由本期募资总额派生（round.partCount），开期后不可改，所以权重是确定的。
- * 实际入池数量以 Owner 在电路市场买入并确认到账的电路为准（买多少算多少），
+ * 实际开矿数量以 Owner 在电路市场买入并确认到账的电路为准（买多少算多少），
  * 不再推算「需要几个」「募资总额够买几个」。
  *
  * 报价来自实时价格源（`prices.js`），同一期在不同时刻结果不同。
@@ -730,7 +730,7 @@ export function seedCalls(round = ROUND) {
     { time: now - 26 * 3600_000, method: "harvest", ok: true, message: `入账 ${formatBem(h.userPart)} BEM，挖矿产出服务费 ${formatBem(h.fee)} BEM` },
     { time: now - 3 * 86400_000, method: "claim", ok: true, message: `${shortAddress(WALLET)} 领取 ${formatBem(book.claimable)} BEM` },
     { time: now - 5 * 86400_000, method: "claim", ok: true, message: "0x8b21…B21A 领取 18.60 BEM" },
-    { time: now - 12 * 86400_000, method: "execute", ok: true, message: `已买入电路并转入矿池，算力 ${book.hashpower}` },
+    { time: now - 12 * 86400_000, method: "startMining", ok: true, message: `已买入电路并用官方挖矿合约开矿，算力 ${book.hashpower}` },
     { time: now - 13 * 86400_000, method: "subscribe", ok: true, message: `0x8b21…B21A 认筹 6 份，支付 ${(6 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000, method: "subscribe", ok: true, message: `${shortAddress(WALLET)} 认筹 4 份，支付 ${(4 * round.sharePriceBnb).toFixed(4)} BNB` },
     { time: now - 14 * 86400_000 - 3600_000, method: "createCampaign", ok: true, message: `第 ${round.id} 期创建，${round.totalShares} 份 × ${round.sharePriceBnb} BNB，挖矿产出服务费 ${feePercentOf(round)}%` },
@@ -989,7 +989,7 @@ export function applyBuyCircuits(round, book, actor = null, args = {}) {
     return { ok: false, message: "只有待执行状态可以买入电路。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "电路已确认到账，直接入池或挂回市场卖出。" };
+    return { ok: false, message: "电路已确认到账，直接开矿或挂回市场卖出。" };
   }
   if (book.executionFailed && (book.bnbPool || 0) <= 0) {
     return { ok: false, message: "本金已退光，不能再买入。" };
@@ -1080,7 +1080,7 @@ export function applyConfirmCircuits(round, book, actor = null) {
     return { ok: false, message: "只有待执行状态可以确认到账。" };
   }
   if (book.executePhase === "ready") {
-    return { ok: false, message: "电路已确认到账，可直接入池。" };
+    return { ok: false, message: "电路已确认到账，可直接开矿。" };
   }
   const held = Number(book.circuitHeldCount ?? 0) || 0;
   if (held <= 0) {
@@ -1088,136 +1088,12 @@ export function applyConfirmCircuits(round, book, actor = null) {
   }
   return {
     ok: true,
-    message: `已确认 ${held} 张电路到账，可以入池。`,
+    message: `已确认 ${held} 张电路到账，可以开矿。`,
     book: {
       ...book,
       executePhase: "ready",
       circuitHeldCount: held,
     },
-  };
-}
-
-/**
- * 把电路投入矿池：预估变成实际的唯一地方。
- *
- * 权限：仅 Owner。电路到账后即可执行，不再等待观察期。
- * 执行逻辑：直接按 Owner 在电路市场实际买入并确认到账的电路数量入池开矿。
- *          电路数不再由图纸推算、也不与募资总额做「买不买得起」的比较——
- *          买多少算多少，H = 实买电路数 × P。采购款之外的余量按份退回。
- */
-export function applyExecute(round, book, quote = MARKET, actor = null) {
-  if (book.scene !== "executing") return { ok: false, message: "只有售罄后的待执行状态可以 execute。" };
-  if (book.sold < round.totalShares) return { ok: false, message: "份数尚未售罄，不能执行。" };
-  /**
-   * 电路须已通过调用 tapeout.net 挂单逻辑并确认到账（executePhase === "ready"）才能流片。
-   * executePhase 缺失（旧数据/非 executing）按 ready 处理，避免误拦截；
-   * 自然售罄进入 executing 时已补 executePhase="buying"（见 applySubscribe），故此处会正确拦住。
-   */
-  if (book.executePhase && book.executePhase !== "ready") {
-    return { ok: false, message: "电路还没到账。先挂买单并确认到账，再入池。" };
-  }
-
-  const who = actor || identify(WALLET, book);
-  const label = who.label || (who.role === ROLE.OWNER ? "Owner" : who.shares > 0 ? "持份用户" : "未持份地址");
-  // F3：execute 不可逆（把全期募集款烧掉），权限收紧为仅 Owner
-  if (who.role !== ROLE.OWNER) {
-    return { ok: false, message: "只有 Owner 能把电路投入矿池（不可逆）。" };
-  }
-
-  // 价格快照锁价——以本次执行的报价（或挂单时锁定的报价）结算，
-  // 避免「按调用瞬间实时价」被抢跑/抬价导致机会损失。
-  const lockUsed = book.priceLock || quote;
-  const est = estimateHashpower(round, lockUsed, book.sold);
-  /**
-   * 入池电路数 = Owner 从电路市场实际买入并确认到账的张数（circuitHeldCount）。
-   * 不再拿它跟任何推算出来的需求配比或「募资总额能买几个」比较——买多少算多少。
-   */
-  const bought = Math.max(0, Math.floor(Number(book.circuitHeldCount ?? 0) || 0));
-  const parts = bought > 0 ? bought : est.usedParts;
-  const unit = Number(book.priceLock) > 0 ? Number(book.priceLock) : Number(est.priceBnb) || 0;
-  const actual = planTask({ parts, circuitId: est.circuitModelId, snapshot: est.quote });
-  const hashpower = actual.hashpower;
-  const dailyBem = bemRate(hashpower);
-
-  // 流片：支出实际采购款，余量按份退回各钱包（对齐 _returnSurplus）
-  const cost = round4(parts * unit);
-  const poolBefore = Number(book.bnbPool || 0);
-  const surplus = round4(Math.max(0, poolBefore - cost));
-  let wallets = { ...book.wallets };
-  let refundedExtra = 0;
-  if (surplus > 0 && book.sold > 0) {
-    for (const [addr, wallet] of Object.entries(wallets)) {
-      const free = Number(wallet.mine || 0);
-      if (free <= 0) continue;
-      const part = round4((surplus * free) / book.sold);
-      if (part <= 0) continue;
-      refundedExtra = round4(refundedExtra + part);
-      wallets[addr] = {
-        ...wallet,
-        refunded: round4((wallet.refunded || 0) + part),
-        bnb: round4((wallet.bnb || 0) + part),
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    scene: "mining",
-    message: `${label}触发 execute：募集 ${est.hardCapBnb} BNB，购入 ${parts} 张${est.circuitName}，` +
-      `入池算力 ${hashpower}` +
-      (surplus > 0 ? `；余量 ${surplus} BNB 已按份退回` : "") +
-      `。`,
-    book: recomputeSelf({
-      ...book,
-      wallets,
-      scene: "mining",
-      hashpower,
-      dailyBem,
-      harvestCount: 0,
-      feeBem: 0,
-      distributed: 0,
-      actualBnb: est.bnb,
-      actualQuote: est.quote,
-      executedBy: who.role,
-      executionFailed: false,
-      executePhase: undefined,
-      priceLock: unit > 0 ? round5(unit) : undefined,
-      circuitCount: parts,
-      circuitHeldCount: 0,
-      bnbPool: 0,
-      refundedBnb: round4((book.refundedBnb || 0) + refundedExtra),
-      endsAt: undefined,
-    }),
-  };
-}
-
-export function applyHarvest(round, book) {
-  if (book.scene !== "mining") {
-    return { ok: false, message: "只有挖矿中才能 harvest。" };
-  }
-  const dailyBem = bemRate(book.hashpower, {
-    pool: book.capped ? "unverified" : "verified",
-  });
-  // 领取次数不设上限：须有可分发日产，且扣费后净额 > 0
-  if (dailyBem <= 0) return { ok: false, message: "当前没有可分发数量（日产为 0），无法 harvest。" };
-  const rate = feeRate(round);
-  if (dailyBem * (1 - rate) <= 0) return { ok: false, message: "扣除挖矿产出服务费后没有可分发净额，无法 harvest。" };
-  const addr = String(book.selfAddress || WALLET).toLowerCase();
-  const wallet = book.wallets[addr] || { mine: 0, listingShares: 0, claimed: 0 };
-  const hBefore = computeHarvest(round, book, addr);
-  const nextCount = (book.harvestCount || 0) + 1;
-  // harvest 是**全网分发**：把第 nextCount 轮日产出计入每位持有人的 pending，
-  // 所有地址按各自份额自动 accrual（pending = accruedNet − claimed 在 recomputeSelf 里按地址重算）。
-  return {
-    ok: true,
-    message: `全网分发第 ${nextCount} 轮，本次你分得 ${formatBem(hBefore.userPart)} BEM（挖矿产出服务费 ${formatBem(hBefore.fee)} BEM，次数不限）`,
-    book: recomputeSelf({
-      ...book,
-      harvestCount: nextCount,
-      // 全局统计（全部持有人累计）
-      feeBem: round4(dailyBem * rate * nextCount),
-      distributed: round4(dailyBem * (1 - rate) * nextCount),
-    }),
   };
 }
 

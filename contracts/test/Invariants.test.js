@@ -49,28 +49,34 @@ async function deployFixture() {
   const [owner, alice, bob, carol, feeRecipient, pool, seller] = await ethers.getSigners();
   const market = await ethers.deployContract("MockCircuitMarket", [FEE_BPS]);
   const nft = await ethers.deployContract("MockCircuitNft");
+  const bem = await ethers.deployContract("MockBem");
+  const pod = await ethers.deployContract("MockPodMining", [await bem.getAddress()]);
+  const deployer = await ethers.deployContract("CampaignDeployer");
   const factory = await ethers.deployContract("CampaignFactory", [
     await market.getAddress(),
     [await nft.getAddress()],
+    await pod.getAddress(),
+    await bem.getAddress(),
+    await deployer.getAddress(),
   ]);
+  await pod.setProcessor(await nft.getAddress(), 1);
   await factory
     .connect(owner)
     .createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await nft.getAddress());
   const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
-  return { market, nft, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller };
+  return { market, nft, bem, pod, deployer, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller };
 }
 
 async function pooledFixture() {
   const ctx = await loadFixture(deployFixture);
-  const { campaign, owner, alice, bob, pool } = ctx;
+  const { campaign, owner, alice, bob } = ctx;
   await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
   await campaign.connect(bob).subscribe(40n, { value: 40n * SHARE_PRICE });
   await campaign.connect(owner).setPlan(408n);
-  await buy(ctx, UNIT);
+  const tokens = await buy(ctx, UNIT);
   await campaign.confirmCircuits();
-  await campaign.connect(owner).setMiningPool(pool.address);
-  await campaign.connect(owner).depositToPool();
-  return ctx;
+  await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+  return { ...ctx, tokenId: tokens[0] };
 }
 
 async function ledger(campaign) {
@@ -125,7 +131,7 @@ async function expectCollateralInvariant(campaign) {
 describe("ledger identity", () => {
   it("holds at every stage of a full lifecycle and ends with nothing unowned", async () => {
     const ctx = await loadFixture(deployFixture);
-    const { campaign, owner, alice, bob, feeRecipient, pool } = ctx;
+    const { campaign, owner, alice, bob, feeRecipient } = ctx;
     await campaign.connect(owner).setServiceFee(500, [feeRecipient.address], [10000]);
 
     await expectLedgerClosed(campaign);
@@ -134,23 +140,22 @@ describe("ledger identity", () => {
     await expectLedgerClosed(campaign);
 
     await campaign.connect(owner).setPlan(408n);
-    await buy(ctx, UNIT);
+    const tokens = await buy(ctx, UNIT);
     await expectLedgerClosed(campaign);
 
     await campaign.confirmCircuits();
     await expectLedgerClosed(campaign);
-    await campaign.connect(owner).setMiningPool(pool.address);
-    await campaign.connect(owner).depositToPool();
+    await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
     await expectLedgerClosed(campaign);
-    expect(await campaign.circuitHeldCount()).to.equal(0n);
+    expect(await campaign.circuitHeldCount()).to.equal(1n);
 
-    await campaign.connect(pool).depositRevenue({ value: ethers.parseEther("0.05") });
+    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.05") });
     await expectLedgerClosed(campaign);
     await campaign.connect(alice).claimSurplus();
     await expectLedgerClosed(campaign);
 
     // 7 wei dust must have an owner too.
-    await campaign.connect(pool).depositRevenue({ value: 7n });
+    await campaign.connect(owner).depositRevenue({ value: 7n });
     await expectLedgerClosed(campaign);
     await campaign.connect(bob).claimSurplus();
     await campaign.connect(feeRecipient).claimFee();
@@ -160,8 +165,8 @@ describe("ledger identity", () => {
   it("pays the surplus pool out to the last wei in either claim order", async () => {
     for (const order of [["alice", "bob"], ["bob", "alice"]]) {
       const ctx = await loadFixture(pooledFixture);
-      const { campaign, pool } = ctx;
-      await campaign.connect(pool).depositRevenue({ value: 7n });
+      const { campaign, owner } = ctx;
+      await campaign.connect(owner).depositRevenue({ value: 7n });
       const total = await campaign.surplusPool();
       for (const who of order) {
         await campaign.connect(ctx[who]).claimSurplus();
@@ -174,13 +179,13 @@ describe("ledger identity", () => {
   });
 
   it("keeps later revenue claimable after an earlier round was fully claimed", async () => {
-    const { campaign, alice, bob, pool } = await loadFixture(pooledFixture);
+    const { campaign, alice, bob, owner } = await loadFixture(pooledFixture);
     await campaign.connect(alice).claimSurplus();
-    await campaign.connect(pool).depositRevenue({ value: ethers.parseEther("0.07") });
+    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.07") });
     await campaign.connect(bob).claimSurplus();
     expect(await campaign.surplusPaid()).to.equal(await campaign.surplusPool());
 
-    await campaign.connect(pool).depositRevenue({ value: ethers.parseEther("0.11") });
+    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.11") });
     expect(await campaign.surplusOf(alice.address)).to.be.greaterThan(0n);
     expect(await campaign.surplusOf(bob.address)).to.be.greaterThan(0n);
     await campaign.connect(alice).claimSurplus();
@@ -190,15 +195,14 @@ describe("ledger identity", () => {
 
   it("holds when a holder rejects the payout: the accrual stays retryable and reserved", async () => {
     const ctx = await loadFixture(deployFixture);
-    const { campaign, owner, alice, pool } = ctx;
+    const { campaign, owner, alice } = ctx;
     const rejector = await ethers.deployContract("Rejector");
     await rejector.subscribe(await campaign.getAddress(), 10n, { value: 10n * SHARE_PRICE });
     await campaign.connect(alice).subscribe(90n, { value: 90n * SHARE_PRICE });
     await campaign.connect(owner).setPlan(408n);
-    await buy(ctx, UNIT);
+    const tokens = await buy(ctx, UNIT);
     await campaign.confirmCircuits();
-    await campaign.connect(owner).setMiningPool(pool.address);
-    await campaign.connect(owner).depositToPool();
+    await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
     await expectLedgerClosed(campaign);
 
     const before = await campaign.surplusOf(await rejector.getAddress());
@@ -341,12 +345,11 @@ describe("shares and circuit conservation", () => {
       campaign.connect(owner).recoverCircuits(await nft.getAddress(), tokenId),
     ).to.be.revertedWithCustomError(campaign, "SharesOutstanding");
 
-    // Pooling is still open: the shares keep their claim on the circuit's output.
+    // Mining is still open: the shares keep their claim on the circuit's output.
     await campaign.connect(owner).setPhase(PHASE.Ready);
-    await campaign.connect(owner).setMiningPool(pool.address);
-    await campaign.connect(owner).depositToPool();
+    await campaign.connect(owner).startMining(tokenId, 0, 0, [], [], []);
     expect(await campaign.outstandingShares()).to.equal(100n);
-    expect(await nft.ownerOf(tokenId)).to.equal(pool.address);
+    expect(await nft.ownerOf(tokenId)).to.equal(await campaign.getAddress());
     await expectCollateralInvariant(campaign);
   });
 });
@@ -377,7 +380,7 @@ describe("randomized lifecycles", () => {
     it(`seed ${seed}: ledger, shares and collateral stay conserved`, async () => {
       const rand = rng(seed);
       const ctx = await loadFixture(deployFixture);
-      const { campaign, owner, alice, bob, carol, pool, nft } = ctx;
+      const { campaign, owner, alice, bob, carol, nft } = ctx;
       const signers = [alice, bob, carol];
       const count = 2 + Math.floor(rand() * 2);
       const cuts = split(TOTAL_SHARES, count, rand);
@@ -419,14 +422,13 @@ describe("randomized lifecycles", () => {
         await campaign.connect(owner).returnSurplus();
         await expectLedgerClosed(campaign);
       }
-      await campaign.connect(owner).setMiningPool(pool.address);
-      await campaign.connect(owner).depositToPool();
+      await campaign.connect(owner).startMining(tokenId, 0, 0, [], [], []);
       await expectLedgerClosed(campaign);
 
       const rounds = 1 + Math.floor(rand() * 2);
       for (let i = 0; i < rounds; i++) {
         const amount = BigInt(Math.floor(rand() * 1e15)) + 7n;
-        await campaign.connect(pool).depositRevenue({ value: amount });
+        await campaign.connect(owner).depositRevenue({ value: amount });
         await expectLedgerClosed(campaign);
       }
 
@@ -444,7 +446,7 @@ describe("randomized lifecycles", () => {
         expect(await campaign.surplusOf(signers[i].address)).to.equal(0n);
       }
       await expectSharesConserved(campaign);
-      expect(await nft.ownerOf(tokenId)).to.equal(pool.address);
+      expect(await nft.ownerOf(tokenId)).to.equal(await campaign.getAddress());
       await expectNoDustLeft(campaign);
     });
   }

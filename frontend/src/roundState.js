@@ -2,7 +2,7 @@
  * 流程状态 / 子状态的**唯一词表**。
  *
  * 为什么单独成模块：状态词原来散在 8 个地方各写一套，同一个子状态最多有四种写法
- * （补不补买入动作、加不加「· 待入池」后缀、要不要空格，各写各的），
+ * （补不补买入动作、加不加「· 待开矿」后缀、要不要空格，各写各的），
  * 同一个页面上下两处描述同一件事、措辞还不一样。改一次要翻 8 个文件，
  * 漏一个就出现「自相矛盾的两句话」。
  *
@@ -44,7 +44,7 @@ export const FAILED = { key: "failed", label: "执行失败", tone: "back" };
 export const PHASE = {
   buying: { key: "buying", label: "待挂单", sub: "待挂单", full: "待挂单" },
   listed: { key: "listed", label: "挂单中", sub: "挂单中", full: "挂单中" },
-  ready: { key: "ready", label: "已到账", sub: "待入池", full: "已到账 · 待入池" },
+  ready: { key: "ready", label: "已到账", sub: "待开矿", full: "已到账 · 待开矿" },
 };
 
 /** 链上 phase 是数字 1/2/3，前端 book.executePhase 是字符串。两种都要吃得下。 */
@@ -142,7 +142,7 @@ export function roundState(row, now = Date.now()) {
  *
  *   stage     阶段词（已结束 / 执行失败 / 募集中 / 待执行 / 挖矿中）
  *   deal      认购徽标（认购中 / 已售罄 / 空）
- *   substate  当前卡点或原因（待挂单 / 挂单中 / 已到账 · 待入池 / 原因）
+ *   substate  当前卡点或原因（待挂单 / 挂单中 / 已到账 · 待开矿 / 原因）
  */
 export function rowState(row, nowSec = Math.floor(Date.now() / 1000), dealOf) {
   const state = roundState(row, nowSec * 1000);
@@ -164,7 +164,7 @@ export function rowState(row, nowSec = Math.floor(Date.now() / 1000), dealOf) {
   } else if (state.sceneKey === "executing") {
     substate = short ? "池子不足 · 按比例退" : state.phase.full;
   } else if (state.sceneKey === "mining") {
-    substate = "电路已入池 · 不可逆";
+    substate = "官方挖矿中";
   }
 
   return {
@@ -187,9 +187,9 @@ export function nextActionOf(row) {
   if (state.key === "failed") return "原路退款 / 降价重挂";
   if (state.sceneKey === "funding") return "等待售罄";
   if (state.sceneKey === "executing") {
-    if (state.phaseKey === "listed") return "等成交 → 确认到账 → 入池";
-    if (state.phaseKey === "ready") return "退余款 → 入池";
-    return "挂单 → 确认到账 → 入池";
+    if (state.phaseKey === "listed") return "等成交 → 确认到账 → 开矿";
+    if (state.phaseKey === "ready") return "退余款 → 开矿";
+    return "挂单 → 确认到账 → 开矿";
   }
   if (state.sceneKey === "mining") return "份额转让";
   return "查看详情";

@@ -14,6 +14,13 @@ export const FACTORY_ADDRESS = deployments.factory || "";
  * 电路市场地址。合约侧字段名就是 circuitMarket，部署记录随之统一。
  */
 export const CIRCUIT_MARKET_ADDRESS = deployments.circuitMarket || "";
+/**
+ * 官方 PoD Lens（只读辅助合约）：`refsEligible(circuits, circuitId)` 在链上判断
+ * 一张电路是否真有挖矿资格（processorMultiplier > 0 且网表没有 REF 引用）。
+ * 主网地址固定；测试网没有官方 Lens，留空表示跳过资格过滤。
+ */
+export const POD_LENS_ADDRESS = deployments.podLens
+  || (CHAIN_ID === 56 ? "0xdd20b9537b9f5db9d2a23e6b11ad863cf81930d8" : "");
 
 // 工厂已部署即可对接。campaign 为空表示尚未开期，页面不回退到本地模拟数据。
 export const IS_CONFIGURED = isAddr(FACTORY_ADDRESS);

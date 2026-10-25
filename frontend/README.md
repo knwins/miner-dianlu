@@ -32,7 +32,7 @@ npm run build             # 生产构建
 | 路径 | 作用 |
 |---|---|
 | `src/App.jsx` | 主壳、导航、认购/详情页、唯一动作入口 `invokeCall` |
-| `src/Owner.jsx` | Owner 工作台：开期、买电路、挂卖、确认、入池、退款 |
+| `src/Owner.jsx` | Owner 工作台：开期、买电路、挂卖、确认、开矿、退款 |
 | `src/OnChain.jsx` | 链上明细调试面板（读合约状态、逐张买电路） |
 | `src/MarketPage.jsx` | 电路市场页：官方处理器市价 + 各期锁定集合 |
 | `src/MarketTrades.jsx` | 成交记录 / 市场欠款 / 在售电路 |
@@ -107,9 +107,13 @@ chain/config.js ──► chain/client.js ──► chain/adapter.js ──► A
 | 字段 | 含义 |
 |---|---|
 | `circuitCount` | 累计买入张数（历史，不随卖出下降） |
-| `circuitHeldCount` | 当前持有张数（卖出/入池后下降） |
+| `circuitHeldCount` | 当前持有张数（卖出后下降） |
 | `circuits` | 本期锁定的 ERC721 集合地址 |
-| `listedCircuits` | 当前挂卖的电路（tokenId / listingId / price / cost） |
+| `listedCircuits` | 当前挂卖的电路（tokenId / listingId / price / cost / miningStatus） |
+| `sellBids` | 当前持有未挂卖的电路（含官方 `miningStatus` / `miningPending`） |
+| `miningActiveCount` | 官方 PoD 里处于「挖矿中」的张数 |
+| `miningPendingBem` | 本期未领取的挖矿产出（BEM） |
+| `bemClaimable` | 当前钱包按份额可领的 BEM |
 | `circuitCostBasis(tokenId)` | 该 token 的买入价，挂卖底价 |
 | `marketOwed` | 市场欠本期的 BNB（可 `withdrawMarketProceeds`） |
 | `priceLock` | 累计买入成本（BNB） |
@@ -117,15 +121,32 @@ chain/config.js ──► chain/client.js ──► chain/adapter.js ──► A
 ## 7. Owner 工作流
 
 ```text
-售罄 → buyCircuits（按挂单价批量买入，成本从 raisedBnb 扣）
+售罄 → buyCircuits（勾选官方市场的前 5 笔最低价卖单，成本从 raisedBnb 扣）
      → confirmCircuits（确认持有，进入 Ready）
      → setPlan（算力估算）
      → returnSurplus（可选：先把剩余 BNB 记成余款）
-     → setMiningPool
-     → depositToPool（不可逆，电路转给矿池）
+     → startMining（逐张调用官方 PoD 挖矿合约，taskId = 0 是未验证池）
+     → claimMiningRewards（把官方产出领回本期，按份额记账）
+     → claimBem（持份人各自领取）
+     → stopMining（可选：停止某张电路，产出当场结算）
 ```
 
-需要变现时（Ready、未入池）：
+官方 PoD 地址在 `src/chain/config.js`：`POD_MINING_ADDRESS` / `POD_LENS_ADDRESS`。
+电路**始终留在 Campaign 名下**，不再有矿池转账，也没有「入池不可逆」这一步。
+官方市场挂单默认按单价**从低到高**排序，并且只显示 Lens `refsEligible` 判定可挖矿的电路。
+
+买入面板（`Owner.jsx` → `CircuitExecPanel`）：
+
+- 只列**本期开期锁定的 ERC721 集合**在官方市场里的在售挂单，按单价从低到高排序，
+  并且**只显示 Lens `refsEligible` 判定可挖矿的电路**；
+  集合与市场地址都来自链上期次状态（`circuits` / `circuitMarket`），不用前端缓存。
+- 勾选后按 `listingId` 精确吃单（`chainTx.buyCircuitsListings`），提交前在链上重读
+  `listings(id)` 与 `listingFor(circuits, tokenId)`：被撤单、被成交、换集合、改价一律拒发交易。
+- 合计超过募集余额时按钮直接禁用（合约会置 `ExecutionFailed`，前端先挡）。
+- 卖单扫描回看最近 200 笔挂单（市场是全集合共用的一本账）；每批 10 个读，避免限流
+  静默丢单 —— 丢单会让底价看起来比实际更高。
+
+需要变现时（Ready 或 Mining、无在售挂单）：
 
 ```text
 listCircuit(tokenId, price)  → 等待成交 → withdrawMarketProceeds()

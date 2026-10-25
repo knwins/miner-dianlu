@@ -11,6 +11,7 @@ import {
   IS_CONFIGURED,
   SCENE_LABEL,
   PHASE_LABEL,
+  POD_LENS_ADDRESS,
 } from "./config.js";
 import { discoverWallets, explainConnectError, inAppWalletName, rememberWallet, rememberedWalletId } from "./wallets.js";
 
@@ -504,7 +505,7 @@ async function readStateOn(runner, account, campaignAddr) {
   const [
     scene, phase, sold, totalShares, sharePriceBnb, estHashpower,
     priceLock, soldOutAt, executionFailed, raisedBnb, totalRefunded,
-    fundingDeadline, circuitsAddr, marketAddr, factoryAddr, owner, halted, pooled, miningPool,
+    fundingDeadline, circuitsAddr, marketAddr, factoryAddr, owner, halted, podMiningAddr, bemAddr,
     listingCount, totalPendingSurplus,
     outstandingShares, serviceFeeBps, serviceFeeSet, feeRecipientCount,
     revenuePool, surplusPool, lastOrderAt, surplusBase, surplusPaid,
@@ -519,8 +520,8 @@ async function readStateOn(runner, account, campaignAddr) {
     c.fundingDeadline(), c.circuits(), c.circuitMarket(), c.factory(),
     c.owner(),
     withDefault(c.halted(), false),
-    withDefault(c.pooled(), false),
-    withDefault(c.miningPool(), ZeroAddress),
+    withDefault(c.podMining(), ZeroAddress),
+    withDefault(c.bem(), ZeroAddress),
     withDefault(c.listingCount(), 0n),
     withDefault(c.totalPendingSurplus(), 0n),
     withDefault(c.outstandingShares(), 0n),
@@ -612,15 +613,16 @@ async function readStateOn(runner, account, campaignAddr) {
     soldOutAt: Number(soldOutAt), executionFailed, priceLock,
     /**
      * 电路数 = **本期仍持有的 ERC721 电路张数**（circuitHeldCount）。
-     * 买入是原子交割，成交后立刻到账；卖出 / 入池后持仓下降。
+     * 买入是原子交割，成交后立刻到账；卖出后持仓下降。
      */
     circuitHeldCount: Number(order.heldCount ?? 0n), capped: false,
     owner, fundingDeadline: Number(fundingDeadline),
-    /** 熔断状态：true 时认筹/挂单/卖电路/入池/份额挂单与接单全部停，pulls 与撤单不受影响。 */
+    /** 熔断状态：true 时认筹/挂单/卖电路/开矿/份额挂单与接单全部停，pulls 与撤单不受影响。 */
     halted: Boolean(halted),
     listings,
     ...order,
-    pooled, miningPool,
+    podMining: podMiningAddr,
+    bem: bemAddr,
     circuits: order.circuits && order.circuits !== ZeroAddress ? order.circuits : circuitsAddr,
     feeRecipient: "",
     market: marketAddr,
@@ -632,7 +634,7 @@ async function readStateOn(runner, account, campaignAddr) {
      * outstandingShares 是当前债务（已售未退）——「已售 X/Y」和退款分母都用它。
      */
     outstandingShares,
-    /** 入池后未发出去的余款池：surplusPool 是累计已记账，surplusBase 是本轮的分母。 */
+    /** 开矿后未发出去的余款池：surplusPool 是累计已记账，surplusBase 是本轮的分母。 */
     surplusPool,
     revenuePool,
     refundRatio: refundShort && outstandingShares > 0n
@@ -648,23 +650,26 @@ async function readStateOn(runner, account, campaignAddr) {
   };
 
   if (account) {
-    const [shares, escrow, refunded, bnbBal, pendingSurplus, surplusOfRaw] = await Promise.all([
+    const [shares, escrow, refunded, bnbBal, pendingSurplus, surplusOfRaw, bemClaimable] = await Promise.all([
       c.sharesOf(account), c.escrowOf(account),
       c.refundedOf(account), runner.getBalance(account),
       c.pendingSurplus(account).catch(() => 0n),
-      // 入池后的余款改 pull 模式：surplusOf 会把「还没计提但已可领」的部分也算进来。
+      // 挖矿后的余款改 pull 模式：surplusOf 会把「还没计提但已可领」的部分也算进来。
       c.surplusOf(account).catch(() => 0n),
+      // 官方 PoD 奖励按份额记账，持有人用 claimBem() 领取。
+      c.bemPendingOf(account).catch(() => 0n),
     ]);
     /** 可领余款 = max(surplusOf, pendingSurplus)：surplusOf 含尚未计提的部分。 */
     const claimableSurplus = surplusOfRaw > pendingSurplus ? surplusOfRaw : pendingSurplus;
     state.self = {
-      shares, escrow, claimed: 0n, refunded, pending: 0n, bemBalance: 0n, bnb: bnbBal,
+      shares, escrow, claimed: 0n, refunded, pending: 0n, bemBalance: bemClaimable, bnb: bnbBal,
       /**
-       * 待领余款（wei）。C-4 之后余款改 pull 模式：不再在入池时推给持有人，
+       * 待领余款（wei）。挖矿后余款改 pull 模式：不再在开矿时推给持有人，
        * 而是持份人自己调 claimSurplus() 领。claimableSurplus 含尚未计提的可领部分。
        */
       pendingSurplus,
       claimableSurplus,
+      bemClaimable,
     };
   }
   return state;
@@ -747,7 +752,7 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       return state.executionFailed ? "是（已判执行失败）" : "否";
     case "halted":
       return state.halted
-        ? "已熔断：认筹、挂单、卖出、入池与份额交易已停"
+        ? "已熔断：认筹、挂单、卖出、开矿与份额交易已停"
         : "运行中";
     case "soldOutAt":
       return Number(state.soldOutAt) > 0
@@ -759,6 +764,22 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
         : "未锁价";
     case "holderCount":
       return `${await campaignContract(getReadProvider(), campaignAddr).holderCount()} 个地址`;
+    case "miningStatus": {
+      const tokenId = args.tokenId ?? args.id ?? "0";
+      return withReadProvider(async (runner) => {
+        const c = campaignContract(runner, campaignAddr);
+        const status = Number(await c.miningStatus(tokenId));
+        const labels = ["未开矿", "挖矿中", "已撤销", "冷却中"];
+        return labels[status] || String(status);
+      });
+    }
+    case "bemPendingOf": {
+      const a = args.account || account;
+      if (!a) return "请填地址";
+      const c = campaignContract(getReadProvider(), campaignAddr);
+      const v = await c.bemPendingOf(a);
+      return `${Number(formatEther(v)).toFixed(4)} BEM`;
+    }
     case "sharesOf": {
       const a = args.account || account;
       if (!a) return "请填地址";
@@ -910,13 +931,14 @@ const ERC721_READ_ABI = [
  * 字段说明：
  *   heldCount = 本期持有的电路张数（circuitHeldCount）；
  *   sellBids = 尚未挂单的持仓，每张一行（id = tokenId），点击卖出 = 以成本价挂回市场；
- *   listedCircuits = 已挂单的持仓，供 Owner 撤单（撤单后才能入池）。
+ *   listedCircuits = 已挂单的持仓，供 Owner 撤单（开矿前必须全部撤单）。
  */
 async function readCircuitOrder(c) {
   const empty = {
     circuits: ZeroAddress, orderFilled: false,
     marketOwed: 0n, sellBids: [], listedCircuits: [], sellSide: false,
     heldCount: 0n, boughtCount: 0n, circuitHeldCount: 0n,
+    miningActiveCount: 0, miningPendingBem: 0n,
   };
   try {
     const holder = c.target;
@@ -938,9 +960,11 @@ async function readCircuitOrder(c) {
       ? await Promise.all(Array.from({ length: n }, (_, i) => c.circuitIds(i).catch(() => null)))
       : [];
     const rows = await Promise.all(ids.filter((v) => v != null).map(async (tokenId) => {
-      const [cost, listingId] = await Promise.all([
+      const [cost, listingId, status, pending] = await Promise.all([
         c.circuitCostBasis(tokenId).catch(() => 0n),
         c.circuitListingId(tokenId).catch(() => 0n),
+        c.miningStatus(tokenId).then(Number).catch(() => 0),
+        c.miningPending(tokenId).catch(() => 0n),
       ]);
       let owned = false;
       if (token) {
@@ -961,7 +985,7 @@ async function readCircuitOrder(c) {
           listed = false;
         }
       }
-      return { tokenId, cost, listingId, owned, listed, listingPrice };
+      return { tokenId, cost, listingId, owned, listed, listingPrice, miningStatus: status, miningPending: pending };
     }));
 
     const held = rows.filter((r) => r.owned);
@@ -978,6 +1002,8 @@ async function readCircuitOrder(c) {
       heldCount,
       boughtCount,
       circuitHeldCount: heldCount,
+      miningActiveCount: held.filter((r) => r.miningStatus === 1).length,
+      miningPendingBem: held.reduce((acc, r) => acc + (r.miningPending || 0n), 0n),
       marketOwed,
       sellSide: Boolean(market),
       // 每张未挂单的持仓一行；价格预填成本价（>= 成本才允许挂）。
@@ -989,12 +1015,16 @@ async function readCircuitOrder(c) {
         feeBps,
         buyer: marketAddr,
         circuitTokenId: r.tokenId,
+        miningStatus: r.miningStatus,
+        miningPending: r.miningPending,
       })),
       listedCircuits: listed.map((r) => ({
         tokenId: r.tokenId,
         listingId: r.listingId,
         price: r.listingPrice || r.cost,
         cost: r.cost,
+        miningStatus: r.miningStatus,
+        miningPending: r.miningPending,
       })),
     };
   } catch {
@@ -1758,7 +1788,12 @@ function parseUintField(raw, label, fallback = null) {
   return BigInt(text);
 }
 
-/** 扫最近的市场卖单，筛出属于本期电路合约、仍有效的挂单。 */
+/**
+ * 扫最近的市场卖单，筛出属于本期电路合约、仍有效**且当前能挖矿**的挂单。
+ *
+ * 能挖矿用官方 Lens 的 `refsEligible` 判定（processorMultiplier > 0 且网表无 REF）。
+ * 自动挑单必须走同一套过滤：买到一张不能出矿的电路，等于把募集款换成砖头。
+ */
 async function scanCircuitListings(campaign, market, lookback = 200) {
   const circuits = String(await campaign.circuits()).toLowerCase();
   const next = await market.nextListingId();
@@ -1773,6 +1808,8 @@ async function scanCircuitListings(campaign, market, lookback = 200) {
       if (String(l.circuits).toLowerCase() !== circuits) return null;
       const live = await market.listingFor(l.circuits, l.tokenId);
       if (!live.valid || live.id !== id) return null;
+      const mineable = await readMineable(market.runner, circuits, Number(l.tokenId));
+      if (mineable === false) return null;
       return { id, tokenId: l.tokenId, price: l.price, seller: l.seller };
     } catch {
       return null;
@@ -1806,6 +1843,9 @@ export async function readCircuitMarketSnapshot(marketAddr, collections = [], lo
         try {
           const live = await market.listingFor(l.circuits, l.tokenId);
           if (!live.valid || live.id !== ids[i]) continue;
+          // 市场页同样只展示「当前能挖矿」的电路，与 Owner 买入面板同口径。
+          const mineable = await readMineable(runner, l.circuits, Number(l.tokenId));
+          if (mineable === false) continue;
           rows.push({ id: ids[i], circuits: l.circuits, tokenId: Number(l.tokenId), price: l.price, seller: l.seller });
         } catch {
           /* 单条挂单读失败不影响整页 */
@@ -1830,15 +1870,101 @@ export async function readCircuitMarketSnapshot(marketAddr, collections = [], lo
   });
 }
 
-/** 读某一期可买的市场卖单（UI 表单用）。 */
-export async function readCampaignCircuitListings(campaignAddr = getCampaignAddress()) {
+/**
+ * 官方 PoD Lens 的只读入口。
+ * `refsEligible` 会把 processorMultiplier 与「网表不得含 REF」两条资格规则
+ * 一起判掉 —— 这正是官方 start() 的前置条件，所以它比前端白名单更权威。
+ */
+const POD_LENS_ABI = [
+  "function refsEligible(address circuits, uint256 circuitId) view returns (bool)",
+];
+
+/** 读一张电路是否真的有挖矿资格；Lens 未配置 / 读取失败时返回 null（未知）。 */
+async function readMineable(runner, circuitsAddr, tokenId) {
+  if (!isAddr(POD_LENS_ADDRESS)) return null;
+  try {
+    const lens = new Contract(POD_LENS_ADDRESS, POD_LENS_ABI, runner);
+    return Boolean(await lens.refsEligible(circuitsAddr, tokenId));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 读官方市场里某个 ERC721 集合的在售卖单（Owner「从电路市场买入」面板用）。
+ *
+ * 为什么不用期次合约去读：期次状态里已经有 `circuits`（开期锁定的集合）和
+ * `circuitMarket`（市场地址），直接按这两个值扫市场即可 —— 少两次 RPC，
+ * 而且列表严格 = 「本期能买的那一个集合」。
+ *
+ * 返回按单价从低到高排序，`price` 保留 wei（BigInt），`priceBnb` 是展示用数字。
+ * lookback = 回扫多少笔挂单 ID（市场是全集合共用的一本账，太短会漏掉本集合的挂单）。
+ */
+export async function readCircuitListingsFor(marketAddr, circuitsAddr, lookback = 200) {
+  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return [];
+  if (!isAddr(circuitsAddr) || circuitsAddr === ZeroAddress) return [];
+  const want = String(circuitsAddr).toLowerCase();
   return withReadProvider(async (runner) => {
-    const campaign = campaignContract(runner, campaignAddr);
-    const marketAddr = await readCircuitMarket(campaign);
-    if (!isAddr(marketAddr) || marketAddr === ZeroAddress) return [];
     const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
-    const rows = await scanCircuitListings(campaign, market);
-    return rows.map((r) => ({ ...r, priceBnb: Number(formatEther(r.price)) }));
+    const next = await market.nextListingId();
+    const latest = next - 1n;
+    if (latest <= 0n) return [];
+    const first = latest > BigInt(lookback) ? latest - BigInt(lookback) + 1n : 1n;
+    const ids = [];
+    for (let i = latest; i >= first; i--) ids.push(i);
+
+    /**
+     * 分批读挂单记录：每批 10 个。
+     *
+     * 为什么不是几百个 Promise 一起打出去：公共 RPC 对突发并发会限流，
+     * 读失败的请求被 catch 成 null 后，**最便宜的那笔挂单会被静默漏掉** ——
+     * 列表看着正常，底价却不是真的底价（实测漏过 0.0399 BNB 的卖单）。
+     * 每批 10 个实测 0 失败；批内失败项再重试一次，仍失败的才跳过。
+     */
+    const records = [];
+    for (let i = 0; i < ids.length; i += 10) {
+      const slice = ids.slice(i, i + 10);
+      const rows = await Promise.all(slice.map((id) => market.listings(id).catch(() => null)));
+      const retry = [];
+      rows.forEach((row, k) => { if (!row) retry.push(k); });
+      if (retry.length) {
+        await Promise.all(retry.map(async (k) => {
+          rows[k] = await market.listings(slice[k]).catch(() => null);
+        }));
+      }
+      records.push(...rows.map((row, k) => ({ id: slice[k], row })));
+    }
+
+    const matches = [];
+    for (const { id, row: l } of records) {
+      if (!l || String(l.circuits).toLowerCase() !== want) continue;
+      try {
+        const live = await market.listingFor(l.circuits, l.tokenId);
+        if (!live.valid || BigInt(live.id) !== id) continue;
+        matches.push({ id, tokenId: Number(l.tokenId), price: l.price, seller: l.seller });
+      } catch {
+        /* 单条有效性命中失败不影响整页 */
+      }
+    }
+    /**
+     * 只留下**当前可以挖矿**的电路：官方 Lens 的 refsEligible 会同时检查
+     * processorMultiplier > 0 与「网表没有 REF」——挂单在售 ≠ 能出矿。
+     * Lens 未配置（测试网）或单次读取失败时无法判定，不静默隐藏挂单；
+     * 但链上明确返回 false 的，一律不显示。
+     */
+    const lensConfigured = isAddr(POD_LENS_ADDRESS);
+    const mineable = [];
+    for (const row of matches) {
+      if (!lensConfigured) {
+        mineable.push(row);
+        continue;
+      }
+      const ok = await readMineable(runner, want, row.tokenId);
+      if (ok !== false) mineable.push(row);
+    }
+    return mineable
+      .sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0))
+      .map((r) => ({ ...r, priceBnb: Number(formatEther(r.price)) }));
   });
 }
 
@@ -1865,6 +1991,59 @@ async function buyCircuitsFromMarket(signer, maxQty, maxPriceWei) {
     picks.map((l) => l.tokenId),
     picks.map((l) => l.price),
   );
+}
+
+/**
+ * 买入**指定的**市场挂单（Owner 面板勾选模式）。
+ *
+ * 与按数量自动挑单的区别：这里按 listingId 精确吃单，UI 勾哪几张就买哪几张。
+ * 价格与归属**不采信前端缓存**：每笔都在链上重读 `listings(id)` 和
+ * `listingFor(circuits, tokenId)`，挂单被撤、被成交、换了集合、改了价，
+ * 都在签名前就拒掉 —— 否则整批买会在链上 revert，白付 gas。
+ *
+ * @param {object} signer ethers Signer
+ * @param {Array<{id:number|string, tokenId:number|string}>} picks
+ */
+async function buyCircuitsListings(signer, picks) {
+  const campaign = signerOrThrow(signer);
+  const marketAddr = await campaign.circuitMarket();
+  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) throw new Error("本期没有配置电路市场");
+  const circuitsAddr = String(await campaign.circuits());
+  if (!isAddr(circuitsAddr) || circuitsAddr === ZeroAddress) throw new Error("本期没有锁定电路合约（ERC721）");
+  const list = Array.isArray(picks) ? picks : [];
+  if (list.length === 0) throw new Error("请先勾选要买入的电路挂单");
+
+  const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, signer);
+  const ids = [];
+  const tokenIds = [];
+  const prices = [];
+  const seen = new Set();
+  for (const pick of list) {
+    const id = BigInt(Math.floor(Number(pick?.id ?? -1)));
+    const tokenId = BigInt(Math.floor(Number(pick?.tokenId ?? -1)));
+    if (id <= 0n || tokenId < 0n) throw new Error("勾选的挂单无效，请刷新市场卖单后重选");
+    if (seen.has(String(id))) continue; // 同一挂单只吃一次
+    seen.add(String(id));
+    const l = await market.listings(id);
+    if (String(l.circuits).toLowerCase() !== circuitsAddr.toLowerCase()) {
+      throw new Error(`挂单 #${id} 不属于本期锁定的电路合约，请刷新市场卖单`);
+    }
+    if (BigInt(l.tokenId) !== tokenId) {
+      throw new Error(`挂单 #${id} 的 tokenId 已变化，请刷新市场卖单`);
+    }
+    const live = await market.listingFor(l.circuits, l.tokenId);
+    if (!live.valid || BigInt(live.id) !== id) {
+      throw new Error(`挂单 #${id} 已被撤单或成交，请刷新市场卖单`);
+    }
+    if (BigInt(live.price) !== BigInt(l.price)) {
+      throw new Error(`挂单 #${id} 的单价已变化，请刷新市场卖单`);
+    }
+    ids.push(id);
+    tokenIds.push(tokenId);
+    prices.push(l.price);
+  }
+  if (ids.length === 0) throw new Error("没有可买入的挂单");
+  return campaign.buyCircuits(ids, tokenIds, prices);
 }
 
 /** 把本期持有的一张电路挂回市场；价格缺省 = 该 token 的买入成本（合约下限）。 */
@@ -1919,8 +2098,10 @@ export const tx = {
   claimFee: (signer, address) => signerOrThrow(signer, address).claimFee(),
   setServiceFee: (signer, bps, recipients, sharesBps) =>
     signerOrThrow(signer).setServiceFee(bps, recipients, sharesBps),
-  claim: (signer, address) => signerOrThrow(signer, address).claim(),
-  harvest: (signer) => signerOrThrow(signer).harvest(),
+  claimBem: (signer, address) => signerOrThrow(signer, address).claimBem(),
+  claimMiningRewards: (signer, address) => signerOrThrow(signer, address).claimMiningRewards(),
+  setServiceFee: (signer, bps, recipients, sharesBps) =>
+    signerOrThrow(signer).setServiceFee(bps, recipients, sharesBps),
   listShares: (signer, count, price) => signerOrThrow(signer).listShares(count, price),
   cancelListing: (signer, id) => signerOrThrow(signer).cancelListing(id),
   takeListing: (signer, id, count, valueWei) => signerOrThrow(signer).takeListing(id, count, { value: valueWei }),
@@ -1935,14 +2116,16 @@ export const tx = {
   buyCircuits: (signer, listingIds, tokenIds, prices) =>
     signerOrThrow(signer).buyCircuits(listingIds, tokenIds, prices),
   buyCircuitsFromMarket: (signer, qty, maxPriceWei) => buyCircuitsFromMarket(signer, qty, maxPriceWei),
+  /** 精确买入勾选的挂单（UI 用）。id/tokenId 来自市场实时读数，价格在链上重读。 */
+  buyCircuitsListings: (signer, picks) => buyCircuitsListings(signer, picks),
 
   simulateBuyListing: (signer, id) => simulateBuyListing(signer, id),
   simulateExternalListing: (signer, tokenId, price) => simulateExternalListing(signer, tokenId, price),
 
   openRefund: (signer) => signerOrThrow(signer).openRefund(),
   /**
-   * 确认到账后立刻把没花完的募集款按份退回（不结束本期、电路留在合约、之后仍可 depositToPool）。
-   * 合约在 depositToPool 里也会自动做同一件事，所以这一步是可选的「提前退」。
+   * 确认到账后立刻把没花完的募集款按份退回（不结束本期、电路留在合约、之后仍可 startMining）。
+   * 合约在 startMining 里也会自动做同一件事，所以这一步是可选的「提前退」。
    */
   returnSurplus: (signer) => signerOrThrow(signer).returnSurplus(),
   /**
@@ -1956,8 +2139,11 @@ export const tx = {
   setPlan: (signer, est) => signerOrThrow(signer).setPlan(est),
   halt: (signer) => signerOrThrow(signer).halt(),
   resume: (signer) => signerOrThrow(signer).resume(),
-  setMiningPool: (signer, pool) => signerOrThrow(signer).setMiningPool(pool),
-  depositToPool: (signer) => signerOrThrow(signer).depositToPool(),
+  // 官方 PoD 挖矿：taskId 0 = 未验证池（UI 默认），已验证池需先 armMining 再下一块 startMining。
+  armMining: (signer, tokenId) => signerOrThrow(signer).armMining(tokenId),
+  startMining: (signer, tokenId, taskId = 0, anchorBlock = 0, inputs = [], expectedOuts = [], proofs = []) =>
+    signerOrThrow(signer).startMining(tokenId, taskId, anchorBlock, inputs, expectedOuts, proofs),
+  stopMining: (signer, tokenId) => signerOrThrow(signer).stopMining(tokenId),
   createCampaign: (signer, params) => createCampaignTx(signer, params),
   removeCampaignAt: (signer, index) => factoryContract(signer).removeCampaign(index),
   // 链上只有按索引移除；工厂合约不再提供 indexOf，这里遍历 campaigns(0..count) 自己查。
@@ -2263,18 +2449,18 @@ function explainParsed(parsed) {
     return `当前钱包${caller ? `（${String(caller).slice(0, 10)}…）` : ""}不是 Owner：工厂级操作只允许 Owner，本期操作只允许本期 owner。`;
   }
   if (parsed?.name === "Halted") {
-    return "本期已熔断：认筹、挂单、卖出、入池与份额交易暂停；退款、领款、撤单不受影响。等 Owner 解除后再试。";
+    return "本期已熔断：认筹、挂单、卖出、开矿与份额交易暂停；退款、领款、撤单不受影响。等 Owner 解除后再试。";
   }
   if (parsed?.name === "AlreadyHalted") return "本期已熔断，无需重复操作。";
   if (parsed?.name === "NotHalted") return "本期未熔断，无需解除。";
   if (parsed?.name === "NotSoldOutYet") return "份数还没售完，不能开始执行（需 sold == totalShares）。";
   if (parsed?.name === "UseReturnSurplus") {
-    return "电路已到账：不能退款或放弃采购。可退余款 + 入池或挂回市场；确要结束本期，先改回待挂单。";
+    return "电路已到账：不能退款或放弃采购。可退余款 + 开矿或挂回市场；确要结束本期，先改回待挂单。";
   }
   if (parsed?.name === "SurplusAlreadyReturned") {
-    return "余款已按份退回，本金已在持份人手里。再退款会清零份额（合约拒绝），留着等入池即可。";
+    return "余款已按份退回，本金已在持份人手里。再退款会清零份额（合约拒绝），留着等开矿即可。";
   }
-  if (parsed?.name === "AlreadyPooled") return "本期已入池（不可逆），不能重复入池，也不能再卖电路或退余款。";
+  if (parsed?.name === "AlreadyMining") return "这张电路已经在挖矿，无需重复开始。";
   if (parsed?.name === "NotListed") return "这张电路当前没有挂单，无需撤单。";
   if (parsed?.name === "ZeroShares") return "数量为 0：份数 / 份额 / 余款分母不能为 0。";
   if (parsed?.name === "ZeroPrice") return "金额或单价不能为 0。";
@@ -2291,7 +2477,7 @@ function explainParsed(parsed) {
   if (parsed?.name === "CannotTakeOwnListing") return "不能接收自己发布的挂单。";
   if (parsed?.name === "InsufficientShares") return "可用份额不足：挂出的份额会立即锁定，不能重复使用。";
   if (parsed?.name === "BadCount") return "数量不合法：不能为 0，也不能超过可用数量。";
-  if (parsed?.name === "PoolNotSet") return "还没设置矿池地址：先 setMiningPool，再 depositToPool。";
+  if (parsed?.name === "NoRewards") return "当前没有正在挖矿的电路，暂无可领取奖励。";
   if (parsed?.name === "DirectTransferNotAllowed") {
     return "不能直接向本期合约转 BNB，请用页面按钮操作。";
   }
@@ -2302,32 +2488,32 @@ function explainParsed(parsed) {
   if (parsed?.name === "TransferFailed") return "BNB 转账失败（收款地址拒收或 gas 不足），整笔回滚，可重试。";
   if (parsed?.name === "ZeroCampaignParam") return "每份价格或总份数不能为 0";
   if (parsed?.name === "CircuitsNotReady") {
-    return "电路还没到账，不能确认或入池：先买入电路并确认本期合约真的持有 NFT。";
+    return "电路还没到账，不能确认或开矿：先买入电路并确认本期合约真的持有 NFT。";
   }
   if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步：有电路正在市场挂单，请先撤单。";
-  if (parsed?.name === "AlreadyReady") return "本期已到账，电路锁在合约里。只能入池或挂回市场。";
+  if (parsed?.name === "AlreadyReady") return "本期已到账，电路锁在合约里。只能开矿或挂回市场。";
   if (parsed?.name === "ProceedsPending") return "市场还有未提取的卖出款，先提取（withdrawMarketProceeds）再继续。";
   if (parsed?.name === "NotACircuit") return "这张挂单的标的不是本期白名单电路合约。";
   if (parsed?.name === "NotACircuitOwner") return "本期合约不持有这张电路 NFT。";
   if (parsed?.name === "CircuitNotDelivered") return "市场成交了，但电路 NFT 没有转到本期合约（CircuitNotDelivered）。";
   if (parsed?.name === "TooManyCircuits") return "一次买入的电路张数超过合约上限（TooManyCircuits）。";
-  if (parsed?.name === "CircuitStillListed") return "还有电路挂在市场：先全部撤单再入池。";
+  if (parsed?.name === "CircuitStillListed") return "还有电路挂在市场：先全部撤单再开矿。";
   if (parsed?.name === "PriceBelowCost") return "挂单价低于本期买入成本，合约拒绝亏本挂出。";
   if (parsed?.name === "SelfTrade") return "不能买回本期自己挂出的电路。";
   if (parsed?.name === "InsufficientCircuits") return "合约里的电路数量不够。";
   if (parsed?.name === "SharesOutstanding") {
-    return "还有持份人没结清，电路是他们的抵押，不能取出。先退款 / 领完，或入池。";
+    return "还有持份人没结清，电路是他们的抵押，不能取出。先退款 / 领完，或开矿。";
   }
   if (parsed?.name === "HoldersNotMadeWhole") {
-    return "持份人还没按原价收回本金，电路不能交给 Owner。先补齐缺口再退款，或入池 / 卖出。";
+    return "持份人还没按原价收回本金，电路不能交给 Owner。先补齐缺口再退款，或开矿 / 卖出。";
   }
   if (parsed?.name === "CircuitsAreCollateral") {
-    return "电路还在合约里，池子不够按原价退完。先补齐本金，或入池 / 卖出。";
+    return "电路还在合约里，池子不够按原价退完。先补齐本金，或开矿 / 卖出。";
   }
   if (parsed?.name === "RefundNotAvailable") {
     return "当前状态不能退款：只有募集超时或待采购可退。";
   }
-  if (parsed?.name === "ZeroAddress") return "地址不能为零地址（电路市场 / 电路合约 / 矿池 / 收款地址）";
+  if (parsed?.name === "ZeroAddress") return "地址不能为零地址（电路市场 / 电路合约 / 挖矿合约 / 收款地址）";
   if (parsed?.name === "IndexOutOfBounds") return "索引越界：列表 / 页数超出范围，刷新后再试。";
   if (parsed?.name === "EmptyWhitelist") return "白名单不能为空：至少填一个允许的电路合约地址。";
   if (parsed?.name === "CircuitsNotAllowed") {

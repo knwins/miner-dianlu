@@ -114,15 +114,18 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
   const s = state;
   const heldNum = Number(s?.circuitHeldCount ?? 0) || 0;
   const listedNum = Number(s?.listedCircuits?.length || 0) || 0;
-  // openRefund / depositToPool 的链上门槛，逐条对应合约里的 revert（挡在签名之前，省 gas）。
+  /** 本期持有的电路 tokenId（官方 start/stop 都是逐张调用）。 */
+  const heldIds = [
+    ...(s?.sellBids || []).map((b) => String(b.circuitTokenId ?? b.id)),
+    ...(s?.listedCircuits || []).map((c) => String(c.tokenId)),
+  ];
+  // openRefund / startMining 的链上门槛，逐条对应合约里的 revert（挡在签名之前，省 gas）。
   const marketOwedNum = s ? Number(formatEther(s.marketOwed || 0n)) : 0;
   const surplusBooked = Number(s?.surplusBase || 0) > 0;
   const outstandingNum = s ? Number(s.outstandingShares || 0n) : 0;
   const partsHeld = heldNum;
   const raisedBnbNum = s ? Number(formatEther(s.raisedBnb)) : 0;
-  const poolSet = s
-    ? /^0x[0-9a-fA-F]{40}$/.test(String(s.miningPool || "")) && !/^0x0{40}$/i.test(String(s.miningPool || ""))
-    : false;
+  const miningActiveNum = Number(s?.miningActiveCount ?? 0) || 0;
   const poolCoversShares = s
     ? raisedBnbNum + 1e-12 >= outstandingNum * Number(formatEther(s.sharePriceBnb))
     : false;
@@ -133,14 +136,11 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
     : marketOwedNum > 0 ? "电路市场还欠本期卖出款（ProceedsPending）：先提取"
     : partsHeld > 0 && !poolCoversShares ? "电路还在合约里、池子不够按原价退完（CircuitsAreCollateral）：先 topUpShortfall"
     : "";
-  const poolGate = !s ? ""
-    : s.pooled ? "本期已入池（AlreadyPooled）"
-    : s.phase !== 3 ? "先确认电路到账（Ready）再入池"
-    : !poolSet ? "还没写矿池地址（PoolNotSet）：在「合约工作台」里先 setMiningPool"
-    : outstandingNum <= 0 ? "份额已全部退完（ZeroShares），没有持有人可分产出"
+  const miningGate = !s ? ""
+    : halted ? "本期已熔断，开矿已暂停"
+    : s.phase !== 3 ? "先确认电路到账（Ready）再开矿"
+    : partsHeld <= 0 ? "合约手上没有电路（NotACircuitOwner）"
     : listedNum > 0 ? "还有电路挂在市场（CircuitStillListed）：先撤单"
-    : partsHeld <= 0 ? "合约手上没有电路（InsufficientCircuits）"
-    : halted ? "本期已熔断，入池已暂停"
     : "";
   // 买入参数与成本预览。buyCircuits 是 non-payable，采购款直接从募集余额扣；
   // 前端先把超余额挡在签名之外，避免用一次失败把整期标记为执行失败。
@@ -233,7 +233,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                   {s.phase === 1 && Number(s.raisedBnb) < Number(s.sold) * Number(s.sharePriceBnb) && (
                     <p className="fine chain-warn">池子已低于按份全退所需，持份人可按比例退款；把电路挂回市场卖出可以补回一部分。</p>
                   )}
-                  {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降低单价重试或退款；没有电路时不要入池。</p>}
+                  {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降低单价重试或退款；没有电路时不要开矿。</p>}
                   {canOperate && (
                     <div className="chain-actions">
                       {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est || "0")))}>写入预估算力</button>}
@@ -308,15 +308,26 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                         <p className="fine">本期合约还没有电路：先在「买入电路」里从市场买入，再确认到账。</p>
                       )}
                       {s.phase === 3 && !s.executionFailed && isOwner && (
-                        <button
-                          className="btn btn-primary"
-                          type="button"
-                          disabled={busy || Boolean(poolGate)}
-                          title={poolGate || undefined}
-                          onClick={() => run("depositToPool", (sg) => tx.depositToPool(sg))}
-                        >
-                          depositToPool 进入挖矿
-                        </button>
+                        <>
+                          <button
+                            className="btn btn-primary"
+                            type="button"
+                            disabled={busy || Boolean(miningGate)}
+                            title={miningGate || "调用官方 PoD 挖矿合约开矿（taskId = 0 未验证池）"}
+                            onClick={() => run("开启挖矿", (sg) => tx.startMining(sg, BigInt(heldIds[0] ?? 0)))}
+                          >
+                            开启挖矿（第 1 张）
+                          </button>
+                          <button
+                            className="btn btn-inline"
+                            type="button"
+                            disabled={busy || miningActiveNum === 0}
+                            title={miningActiveNum === 0 ? "当前没有挖矿中的电路" : undefined}
+                            onClick={() => run("领取挖矿奖励", (sg) => tx.claimMiningRewards(sg))}
+                          >
+                            领取挖矿奖励
+                          </button>
+                        </>
                       )}
                     </div>
                   )}
@@ -331,8 +342,8 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
               {s.scene === 2 && (
                 <div>
                   <p className="fine">
-                    电路已入池，本期进入挖矿（不可逆）。harvest / claim 为占位空实现，不产出发放；
-                    持份用户退出只能通过「发布转让挂单」走份额转让。
+                    电路由本期合约持有并通过官方 PoD 挖矿合约产出 BEM：先「领取挖矿奖励」把产出收到本期，
+                    持份人再各自 claimBem；退出只能通过「发布转让挂单」走份额转让。
                   </p>
                 </div>
               )}

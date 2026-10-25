@@ -121,10 +121,12 @@ function contractCatalog(round, book = {}) {
         { name: "raisedBnb", kind: "read", caller: "任何人", signature: "raisedBnb() view", summary: "合约托管中的 BNB（募集款 + 卖出款 − 已支出）。", fields: [] },
         { name: "circuits", kind: "read", caller: "任何人", signature: "circuits() view", summary: "开期锁定的 ERC721 电路集合。每张电路是该集合里的一个 tokenId。", fields: [] },
         { name: "circuitMarket", kind: "read", caller: "任何人", signature: "circuitMarket() view", summary: "本期使用的官方电路市场地址（只有卖单侧）。", fields: [] },
-        { name: "circuitCount", kind: "read", caller: "任何人", signature: "circuitCount() view", summary: "累计买入的电路张数（历史事实，卖出/入池后不变）。", fields: [] },
-        { name: "circuitHeldCount", kind: "read", caller: "任何人", signature: "circuitHeldCount() view", summary: "本期合约当前持有的电路张数。卖出或入池后下降。", fields: [] },
+        { name: "circuitCount", kind: "read", caller: "任何人", signature: "circuitCount() view", summary: "累计买入的电路张数（历史事实，卖出后不变）。", fields: [] },
+        { name: "circuitHeldCount", kind: "read", caller: "任何人", signature: "circuitHeldCount() view", summary: "本期合约当前持有的电路张数。卖出后下降。", fields: [] },
         { name: "executionFailed", kind: "read", caller: "任何人", signature: "executionFailed() view", summary: "是否已判执行失败；为真时持份人可退款。", fields: [] },
-        { name: "halted", kind: "read", caller: "任何人", signature: "halted() view", summary: "熔断中：认筹、挂单、卖出、入池、份额交易全停；退款、领款、撤单不受影响。", fields: [] },
+        { name: "halted", kind: "read", caller: "任何人", signature: "halted() view", summary: "熔断中：认筹、挂单、卖出、开矿、份额交易全停；退款、领款、撤单不受影响。", fields: [] },
+        { name: "miningStatus", kind: "read", caller: "任何人", signature: "miningStatus(uint256) view", summary: "某张电路的官方 PoD 状态：0 未开矿 / 1 挖矿中 / 2 已撤销 / 3 冷却中。", fields: [["tokenId", "电路 tokenId", "0"]] },
+        { name: "bemPendingOf", kind: "read", caller: "任何人", signature: "bemPendingOf(address) view", summary: "该地址现在可领的 BEM（含还没结算进 pendingBem 的部分）。", fields: [["account", "地址", "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"]] },
         { name: "soldOutAt", kind: "read", caller: "任何人", signature: "soldOutAt() view", summary: "售罄时间。非 Owner 判失败须等售罄满 3 天。", fields: [] },
         { name: "priceLock", kind: "read", caller: "任何人", signature: "priceLock() view", summary: "累计采购成本（BNB，所有已买入电路的成本之和）。", fields: [] },
         { name: "holderCount", kind: "read", caller: "任何人", signature: "holderCount() view", summary: "持份地址数量。", fields: [] },
@@ -163,14 +165,34 @@ function contractCatalog(round, book = {}) {
           ],
         },
         { name: "markFailed", kind: "write", caller: "Owner 随时；其他人须售罄满 3 天", signature: "markFailed()", summary: "把本期判为执行失败，为所有持份人打开退款。Owner 随时可调，其他人须售罄满 3 天；电路已到账则不可用。", fields: [] },
-        { name: "claim", kind: "write", caller: "用户", signature: "claim()", summary: "占位实现，当前不产出发放。", fields: [] },
+        { name: "claimBem", kind: "write", caller: "持份用户", signature: "claimBem()", summary: "领取你按份额应得的 BEM（官方挖矿产出）。同一笔只能领一次。", fields: [] },
+        { name: "claimMiningRewards", kind: "write", caller: "任何人", signature: "claimMiningRewards()", summary: "把官方挖矿合约里的奖励领回本期合约，再按份额记账给持份人（BEM 不会进调用者口袋）。", fields: [] },
         {
-          name: "depositToPool",
+          name: "startMining",
           kind: "write",
           caller: "仅 Owner",
-          signature: "depositToPool()",
-          summary: "把电路投入矿池，本期进入挖矿（不可逆）。没花完的募集款会先按份记账给持份人。",
-          fields: [],
+          signature: "startMining(uint256 tokenId,uint32 taskId,uint256 anchorBlock,bytes[] inputs,bytes[] expectedOuts,bytes32[][] proofs)",
+          summary: "用官方 PoD 挖矿合约开启某张电路的挖矿。taskId = 0 是未验证池（一次调用即可）；已验证池要先 armMining 再在后面的块传 anchor 与抽样向量。",
+          fields: [
+            ["tokenId", "电路 tokenId", "0"],
+            ["taskId", "官方任务 ID（0 = 未验证池）", "0"],
+          ],
+        },
+        {
+          name: "armMining",
+          kind: "write",
+          caller: "仅 Owner",
+          signature: "armMining(uint256 tokenId)",
+          summary: "为已验证池预约：记录当前块作为抽样锚点。必须在 startMining 之前的块调用。",
+          fields: [["tokenId", "电路 tokenId", "0"]],
+        },
+        {
+          name: "stopMining",
+          kind: "write",
+          caller: "仅 Owner",
+          signature: "stopMining(uint256 tokenId)",
+          summary: "停止某张电路的挖矿，产出当场结算并按份额记账。NFT 仍留在本期，冷静期后可重新开矿。",
+          fields: [["tokenId", "电路 tokenId", "0"]],
         },
         {
           name: "confirmCircuits",
@@ -232,7 +254,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "Owner（其他人须满 3 天）",
           signature: "returnSurplus()",
-          summary: "把没花完的募集款按份退回持份人（各自领取）。不结束本期，之后仍可入池。要求市场不欠款。",
+          summary: "把没花完的募集款按份退回持份人（各自领取）。不结束本期，之后仍可开矿。要求市场不欠款。",
           fields: [],
         },
         {
@@ -270,22 +292,6 @@ function contractCatalog(round, book = {}) {
           ],
         },
         {
-          name: "setMiningPool",
-          kind: "write",
-          caller: "仅 Owner",
-          signature: "setMiningPool(address)",
-          summary: "设定矿池地址，入池时电路转到这里。",
-          fields: [["pool", "矿池地址", ""]],
-        },
-        {
-          name: "harvest",
-          kind: "write",
-          caller: "任何人",
-          signature: "harvest()",
-          summary: "占位实现，当前不产出发放。",
-          fields: [],
-        },
-        {
           name: "setCircuitMarket",
           kind: "write",
           caller: "仅 Owner",
@@ -298,7 +304,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Owner",
           signature: "recoverBnb()",
-          summary: "把本期多余的 BNB 转给 Owner：认筹本金留在池里，只转多余部分；入池后或全部退完后整池剩余转出。",
+          summary: "把本期多余的 BNB 转给 Owner：认筹本金留在池里，只转多余部分；全部退完后整池剩余转出。",
           fields: [],
         },
         {
@@ -306,7 +312,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "仅 Owner",
           signature: "recoverCircuits(address,uint256)",
-          summary: "把当期持有的某一张 ERC721 电路转给 Owner。已入池、挂单中或份额未结清时拒绝。",
+          summary: "把当期持有的某一张 ERC721 电路转给 Owner。挂单中或份额未结清时拒绝。",
           fields: [
             ["token", "电路合约", book.circuits || ""],
             ["id", "tokenId", "0"],
@@ -325,7 +331,7 @@ function contractCatalog(round, book = {}) {
           kind: "write",
           caller: "Owner",
           signature: "halt()",
-          summary: "熔断：暂停认筹、挂单、卖出、入池与份额交易。退款、领款、撤单不受影响，不会锁住任何人的资产。",
+          summary: "熔断：暂停认筹、挂单、卖出、开矿与份额交易。退款、领款、撤单不受影响，不会锁住任何人的资产。",
           fields: [],
         },
         {
@@ -601,15 +607,15 @@ function sameAddr(a, b) {
 
 /**
  * 被熔断（halted）挡住的写入口 —— 与合约 `whenLive` 完全对应：
- * subscribe / buyCircuits / listCircuit / depositToPool / listShares / takeListing。
- * refund / claimSurplus / claimFee / cancelListing / cancelCircuitListing / withdrawMarketProceeds
- * 以及各类管理取回都不在表内：熔断永远不能锁住退出与撤单。
+ * subscribe / buyCircuits / listCircuit / startMining / listShares / takeListing。
+ * refund / claimSurplus / claimBem / claimMiningRewards / cancelListing / cancelCircuitListing
+ * / withdrawMarketProceeds 以及各类管理取回都不在表内：熔断永远不能锁住退出与撤单。
  */
 const HALTED_BLOCKED = new Set([
   "subscribe",
   "buyCircuits",
   "listCircuit",
-  "depositToPool",
+  "startMining",
   "listShares",
   "takeListing",
 ]);
@@ -632,7 +638,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (book.halted && HALTED_BLOCKED.has(method.name)) {
     return {
       ok: false,
-      reason: "本期已熔断：认筹、挂单、卖出、入池与份额交易暂停；退款与撤单不受影响。等 Owner 抬闸后再试。",
+      reason: "本期已熔断：认筹、挂单、卖出、开矿与份额交易暂停；退款与撤单不受影响。等 Owner 抬闸后再试。",
     };
   }
   if (method.name === "createCampaign") {
@@ -656,11 +662,8 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (method.name === "recoverCircuits") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "仅 Owner 可以把电路转给自己。" };
-    // 合约四道闸：已入池（AlreadyPooled）、挂单中（AlreadyListed）、
+    // 合约三道闸：挂单中（AlreadyListed）、
     // 本期电路还有份额未结清（SharesOutstanding）/ 持份人没按原价收回本金（HoldersNotMadeWhole）。
-    if (book.pooled) {
-      return { ok: false, reason: "本期已入池（AlreadyPooled）：电路已转给矿池，合约里没有可转出的余额。" };
-    }
     if (Number(book.listedCircuits?.length || 0) > 0) {
       return { ok: false, reason: "还有电路挂在市场（AlreadyListed）：先撤单才能转出。" };
     }
@@ -669,7 +672,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
       if (outstandingOf(book) > 0) {
         return {
           ok: false,
-          reason: "还有持份人没结清（SharesOutstanding）：本期电路是他们的抵押，不能取回。先退款或入池。",
+          reason: "还有持份人没结清（SharesOutstanding）：本期电路是他们的抵押，不能取回。先退款或卖出。",
         };
       }
       if (Number(book.refundedTotal || 0) < Number(book.sold || 0) * Number(round.sharePriceBnb || 0)) {
@@ -680,7 +683,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
       }
     }
     if (book.executePhase === "ready") {
-      return { ok: true, reason: "取出后子状态仍是已到账。重新放回本期并确认后，才能 depositToPool 入池。" };
+      return { ok: true, reason: "取出后子状态仍是已到账。重新放回本期并确认后，才能 startMining 开矿。" };
     }
     return { ok: true, reason: "把本期持有的电路转给当前 Owner。" };
   }
@@ -709,7 +712,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "解除熔断只有 Owner 能做。" };
     if (!book.halted) return { ok: false, reason: "本期未熔断，无需解除。" };
-    return { ok: true, reason: "恢复认筹、挂买单、卖出、入池与份额市场；这是唯一能解除熔断的入口。" };
+    return { ok: true, reason: "恢复认筹、挂买单、卖出、开矿与份额市场；这是唯一能解除熔断的入口。" };
   }
   if (method.name === "subscribe") {
     if (!connected) return { ok: false, reason: "subscribe 需要已连接的用户钱包。" };
@@ -805,13 +808,10 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     }
     return { ok: true, reason: "已过 3 天宽限期：先撤未成交买单，再判失败并开放退款。" };
   }
-  if (method.name === "claim") {
-    return { ok: false, reason: "claim 是占位实现（no-op）：不产出发放，前端不提供调用入口。" };
-  }
   if (method.name === "claimSurplus") {
     const pending = Number(book.pendingSurplusSelf || 0);
     if (!book._chain) return { ok: false, reason: "仅链上模式可用。" };
-    if (pending <= 0) return { ok: false, reason: "当前钱包没有待领余款：还没退余款，也还没入池。" };
+    if (pending <= 0) return { ok: false, reason: "当前钱包没有待领余款：还没退余款，也还没开始挖矿。" };
     return { ok: true, reason: `领取 ${pending.toFixed(4)} BNB：按份应得、还没转到你地址的募集款余款。` };
   }
   if (method.name === "claimFee") {
@@ -849,7 +849,7 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态需要买入电路。" };
     // 合约只允许 Buying：Ready / None 都会 revert WrongScene。
     if (book.executePhase !== "buying") {
-      return { ok: false, reason: "只有待挂单（Buying）可买入；已到账请直接入池或先 setPhase 回 1。" };
+      return { ok: false, reason: "只有待挂单（Buying）可买入；已到账请直接开矿或先 setPhase 回 1。" };
     }
     // 合约要求 sold == totalShares（NotSoldOutYet）：已退款清零份额不会撤销这道闸。
     if (Number(book.sold || 0) < Number(round.totalShares || 0)) {
@@ -862,28 +862,28 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   }
   if (method.name === "cancelCircuitListing") {
     if (!connected) return { ok: false, reason: "需要连接钱包。" };
-    if (book.scene === "mining") return { ok: false, reason: "已入池，合约里没有可撤的挂单。" };
+    if (book.scene === "mining") return { ok: false, reason: "挖矿中，合约里没有可撤的挂单。" };
     if (!(Number(book.listedCircuits?.length || 0) > 0)) {
       return { ok: false, reason: "当前没有电路挂在市场（activeListingCount = 0），调用会回滚。" };
     }
     if (!canOperate(actor) && !book.retired) {
       return { ok: false, reason: "在册期次只有 Owner 能撤单；工厂移除该期后任何人才可撤。" };
     }
-    return { ok: true, reason: "撤单后 NFT 仍在本期合约，随后可重新挂单或入池。" };
+    return { ok: true, reason: "撤单后 NFT 仍在本期合约，随后可重新挂单或开矿。" };
   }
   if (method.name === "withdrawMarketProceeds") {
     if (!connected) return { ok: false, reason: "需要连接钱包（虽然任何人可调）。" };
     if (!(Number(book.marketOwed) > 0)) {
       return { ok: false, reason: "电路市场当前没有欠本期合约的款，调用是 no-op。" };
     }
-    return { ok: true, reason: "把电路市场 owed 里的钱转进本期 raisedBnb，供退款或入池余量计算。" };
+    return { ok: true, reason: "把电路市场 owed 里的钱转进本期 raisedBnb，供退款或退余款计算。" };
   }
   if (method.name === "setPhase") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "仅 Owner 可改子状态。" };
     if (book.scene === "mining" || book.scene === "funding") return { ok: false, reason: "只有待执行可以改子状态。" };
     if (Number(book.listedCircuits?.length || 0) > 0) {
-      return { ok: false, reason: "还有电路挂在市场（AlreadyListed）：先撤单，否则挂单会和入池/退款交错。" };
+      return { ok: false, reason: "还有电路挂在市场（AlreadyListed）：先撤单，否则挂单会和开矿/退款交错。" };
     }
     const nextPhase = Number(values?.next ?? 1);
     if (![1, 2, 3].includes(nextPhase)) return { ok: false, reason: "子状态只能是 1 待挂单 / 2 Ready / 3 已到账（0 与非法值链上回滚）。" };
@@ -898,49 +898,54 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (method.name === "confirmCircuits") {
     // 合约里 confirmCircuits() 是 external，任何人可调；前端只做状态校验。
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态需要确认到账。" };
-    if (book.executePhase === "ready") return { ok: false, reason: "电路已确认到账，直接 depositToPool 入池，或 listCircuit 挂回市场。" };
+    if (book.executePhase === "ready") return { ok: false, reason: "电路已确认到账，直接 startMining 开矿，或 listCircuit 挂回市场。" };
     if (!(Number(book.circuitHeldCount) > 0)) {
       return { ok: false, reason: "本期合约还没持有电路（CircuitsNotReady）：先用 buyCircuits 买入。" };
     }
-    return { ok: true, reason: "确认后即可挂回市场卖出或入池。任何人可调，不需要 Owner 签名。" };
+    return { ok: true, reason: "确认后即可开矿或挂回市场卖出。任何人可调，不需要 Owner 签名。" };
   }
-  if (method.name === "depositToPool") {
-    if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以 depositToPool。" };
-    if (book.executePhase !== "ready") return { ok: false, reason: "电路尚未到账，请先由 Owner 买入电路并确认成交到账。" };
-    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 可以 depositToPool 入池（不可逆操作）。" };
-    // 合约硬门槛：未入池、矿池地址已设置、有到位依据、仍有未退份额、手里真的有电路。
-    if (book.pooled) return { ok: false, reason: "本期已入池（AlreadyPooled），不能重复入池。" };
-    if (book._chain && (!book.miningPool || /^0x0{40}$/i.test(String(book.miningPool)))) {
-      return { ok: false, reason: "还没设置矿池地址（PoolNotSet）：先 setMiningPool，再 depositToPool。" };
-    }
-    if (book._chain && String(book.miningPool).toLowerCase() === String(book.campaign || "").toLowerCase()) {
-      return { ok: false, reason: "矿池地址是本期合约自己（ZeroAddress）：先在 setMiningPool 里改成真实的矿池地址。" };
-    }
-    if (!(outstandingOf(book) > 0)) {
-      return { ok: false, reason: "份额已全部退完（outstandingShares = 0），没有持有人可分产出，链上会以 ZeroShares 拒绝入池。" };
-    }
+  if (method.name === "startMining") {
+    if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
+    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能用官方挖矿合约开矿。" };
+    const minable = book.scene === "mining" || (book.scene === "executing" && book.executePhase === "ready");
+    if (!minable) return { ok: false, reason: "电路还没确认到账（WrongScene）：先买入并确认到账。" };
     if (!(Number(book.circuitHeldCount) > 0)) {
-      return { ok: false, reason: "本期合约手上没有电路（InsufficientCircuits）：先买入并确认到账再入池。" };
+      return { ok: false, reason: "本期合约手上没有电路（NotACircuitOwner）：开矿会被官方合约拒绝。" };
     }
     if (Number(book.listedCircuits?.length || 0) > 0) {
-      return { ok: false, reason: "还有电路挂在市场（CircuitStillListed）：先撤单才能入池。" };
-    }
-    /**
-     * 合约在 depositToPool 内部就把没花完的募集款按份记账（_returnSurplus），
-     * 并先尽力提取市场欠款（_pullOwedSoft）——两步都不需要前端先单独做一遍。
-     * 这里只提示，不再挡路（多一步 returnSurplus 只会多花一笔 gas）。
-     */
-    const notes = [];
-    if (Number(book.marketOwed) > 0) {
-      notes.push("市场还欠本期卖出款：入池时会先尽力提取，提不动的部分之后进账仍会按份记账给持份人");
-    }
-    if (Number(book.bnbPool) > 0 && !(Number(book.surplusBase) > 0)) {
-      notes.push("没花完的募集款会在同一笔交易里按份记账给持份人");
+      return { ok: false, reason: "还有电路挂在市场（CircuitStillListed）：先撤单才能开矿。" };
     }
     return {
       ok: true,
-      reason: `电路转入矿池，本期进入挖矿（不可逆）。${notes.length ? `注意：${notes.join("；")}。` : ""}`,
+      reason: "调用官方 PoD 挖矿合约开矿：电路留在本期合约名下，产出由官方铸给本期再按份额分配。taskId=0 是未验证池。",
     };
+  }
+  if (method.name === "armMining") {
+    if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
+    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能 armMining。" };
+    if (!(Number(book.circuitHeldCount) > 0)) return { ok: false, reason: "本期合约手上没有电路。" };
+    return { ok: true, reason: "记录抽样锚点块。已验证池必须在 arm 之后的块（anchor 必须小于当前块）再调 startMining。" };
+  }
+  if (method.name === "stopMining") {
+    if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
+    if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能停止挖矿。" };
+    if (!(Number(book.miningActiveCount || 0) > 0)) {
+      return { ok: false, reason: "当前没有挖矿中的电路（NothingToStop），调用会回滚。" };
+    }
+    return { ok: true, reason: "停止后产出当场结算并按份额记账，NFT 仍在本期；官方冷静期后才能重新开矿。" };
+  }
+  if (method.name === "claimMiningRewards") {
+    if (!connected) return { ok: false, reason: "需要连接钱包。" };
+    if (!(Number(book.miningActiveCount || 0) > 0) && !(Number(book.miningPendingBem || 0) > 0)) {
+      return { ok: false, reason: "没有挖矿中的电路，也没有未领产出（NoRewards）。" };
+    }
+    return { ok: true, reason: "把官方挖矿合约里已产出的 BEM 领回本期合约，再按份额记账；BEM 不会进调用者口袋。" };
+  }
+  if (method.name === "claimBem") {
+    if (!book._chain) return { ok: false, reason: "仅链上模式可用。" };
+    if (!connected) return { ok: false, reason: "需要连接持份人钱包。" };
+    if (!(Number(book.bemClaimable || 0) > 0)) return { ok: false, reason: "当前钱包没有可领 BEM（NoRewards）：先等 Owner 领取挖矿奖励。" };
+    return { ok: true, reason: `领取 ${Number(book.bemClaimable).toFixed(4)} BEM：按份额应得的挖矿产出。` };
   }
   if (method.name === "returnSurplus") {
     if (book.scene !== "executing") return { ok: false, reason: "只有待执行状态可以退余款。" };
@@ -1014,18 +1019,6 @@ export function callGate(method, book, round, connected, actor = { role: "user",
       reason: "撤未成交买单、提取卖出款、打开退款；份额全清并退完后，剩余电路才退回 Owner。池子不够时先补齐。",
     };
   }
-  if (method.name === "setMiningPool") {
-    if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
-    if (!canOperate(actor)) return { ok: false, reason: "仅本期 Owner 可设定矿池地址。" };
-    if (book.pooled) return { ok: false, reason: "本期已入池（不可逆），矿池地址不能再改。" };
-    const pool = String(values?.pool || "").trim();
-    if (pool && !/^0x[0-9a-fA-F]{40}$/.test(pool)) return { ok: false, reason: "矿池地址必须是 20 字节地址。" };
-    if (pool && /^0x0{40}$/i.test(pool)) return { ok: false, reason: "矿池地址不能是零地址（ZeroAddress）。" };
-    if (pool && String(book.campaign || "").toLowerCase() === pool.toLowerCase()) {
-      return { ok: false, reason: "矿池地址不能是本期合约自己（ZeroAddress）。" };
-    }
-    return { ok: true, reason: "写入本期矿池地址；入池前可反复改，depositToPool 之后锁死。" };
-  }
   if (method.name === "setPlan") {
     if (!connected) return { ok: false, reason: "需要连接 Owner 钱包。" };
     if (!canOperate(actor)) return { ok: false, reason: "只有 Owner 能 setPlan。" };
@@ -1034,9 +1027,6 @@ export function callGate(method, book, round, connected, actor = { role: "user",
       return { ok: false, reason: "挂单中或已到账时不可改 setPlan。" };
     }
     return { ok: true, reason: "写入预估算力，上链后不改。" };
-  }
-  if (method.name === "harvest") {
-    return { ok: false, reason: "harvest 是占位实现（no-op）：不产出发放，前端不提供调用入口。" };
   }
   return { ok: false, reason: "未知函数。" };
 }
@@ -1095,7 +1085,7 @@ export function readCall(method, args, round, book, quote = QUOTE) {
   if (method === "executionFailed") return book.executionFailed ? "是（已判执行失败）" : "否";
   if (method === "halted") {
     return book.halted
-      ? "已熔断：认筹、挂单、卖出、入池与份额交易已停"
+      ? "已熔断：认筹、挂单、卖出、开矿与份额交易已停"
       : "运行中";
   }
   if (method === "soldOutAt") {
@@ -1105,6 +1095,14 @@ export function readCall(method, args, round, book, quote = QUOTE) {
     return Number(book.priceLock) > 0
       ? `${Number(book.priceLock).toFixed(4)} BNB（${book.circuitHeldCount || 0} 张）`
       : "未锁价";
+  }
+  if (method === "miningStatus") {
+    const labels = ["未开矿", "挖矿中", "已撤销", "冷却中"];
+    const row = (book.sellBids || []).find((b) => String(b.circuitTokenId ?? b.id) === String(args?.tokenId ?? ""));
+    return row ? (labels[Number(row.miningStatus) || 0] || "未开矿") : "仅链上模式可读（官方 miningStatus）";
+  }
+  if (method === "bemPendingOf") {
+    return `${Number(book.bemClaimable || 0).toFixed(4)} BEM（当前钱包）`;
   }
   if (method === "holderCount") return `${book.wallets ? Object.keys(book.wallets).length : 0} 个地址（模拟）`;
   const account = String(args.account || "").toLowerCase();

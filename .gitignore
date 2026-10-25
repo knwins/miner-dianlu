@@ -37,3 +37,9 @@ frontend/.shots/
 
 # ── 探针运行产物（截图等）──
 frontend/scripts/_*.png
+
+# ── 官方合约抓取产物（随时可重新抓，不入库）──
+# 手写接口在 contracts/contracts/interfaces/IPodMining.sol，这些只是链上抓回来的原始副本。
+contracts/_podmining.clean.sol
+contracts/probe-*.json
+contracts/probe-*.txt

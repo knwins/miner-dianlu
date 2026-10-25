@@ -10,7 +10,7 @@
 | 路径 | 作用 |
 |---|---|
 | `contracts/CampaignFactory.sol` | 期次工厂：电路白名单、创建/移除期次 |
-| `contracts/Campaign.sol` | 单期主合约：认筹、买电路、份额转让、入池、退款、收益 |
+| `contracts/Campaign.sol` | 单期主合约：认筹、买电路、份额转让、官方 PoD 挖矿、退款、产出分配 |
 | `contracts/interfaces/ICircuitMarket.sol` | 官方电路市场（卖单侧）接口 |
 | `contracts/interfaces/IERC721.sol` | 电路 NFT 接口 |
 | `contracts/mocks/` | 测试替身（MockCircuitMarket / MockCircuitNft），**禁止上主网** |
@@ -76,7 +76,7 @@ Funding ──售罄──► Executing/None ──(setPhase 1)──► Executi
                                                    │ confirmCircuits()
                                                    ▼
                                               Executing/Ready
-                                                   │ depositToPool()
+                                                   │ startMining() 逐张
                                                    ▼
                                                 Mining
 ```
@@ -91,14 +91,16 @@ Funding ──售罄──► Executing/None ──(setPhase 1)──► Executi
 **单钥匙**：没有 operator/admin 等二级角色。所有管理入口 `onlyOwner`，
 owner 应当是**多签 / 硬件钱包**。
 
-Owner 可调用（非完整列表）：`setCircuitMarket` / `setMiningPool` / `setPlan` /
-`setServiceFee` / `setPhase` / `buyCircuits` / `listCircuit` / `depositToPool` /
+Owner 可调用（非完整列表）：`setCircuitMarket` / `setPlan` /
+`setServiceFee` / `setPhase` / `buyCircuits` / `listCircuit` / `startMining` /
+`armMining` / `stopMining` /
 `openRefund` / `abandonOrder` / `topUpShortfall` / `halt` / `resume` /
 `recoverBnb` / `recoverCircuits` / `transferOwnership`。
 
 任何人可调用：`subscribe`（付 BNB）、`confirmCircuits`（只校验持有）、
 `withdrawMarketProceeds`、`cancelCircuitListing`（工厂移除后）、`markFailed`
-（宽限期后）、`refund` / `claimSurplus` / `claimFee`、`depositRevenue`（仅矿池）。
+（宽限期后）、`refund` / `claimSurplus` / `claimFee` / `claimBem` /
+`claimMiningRewards`。
 
 ## 5. 资金与电路路径
 
@@ -135,39 +137,50 @@ function listCircuit(uint256 tokenId, uint96 price) external onlyOwner
 function cancelCircuitListing(uint256 tokenId) external
 ```
 
-- 仅 `Ready`、未入池、未熔断。
+- 仅 `Ready`、未熔断。
 - `price >= circuitCostBasis[tokenId]`，否则 `PriceBelowCost`。
 - 只做**单 token approve**，不用 `setApprovalForAll`。
 - NFT 不离开 Campaign；成交后市场把净额记到 `owed(address(this))`，
   由 `withdrawMarketProceeds()` 提回 `raisedBnb`。
 - 撤单：期次在册时仅 owner；工厂移除后任何人可撤（可逆逃生）。
 
-### 5.4 入池（不可逆）
+### 5.4 官方 PoD 挖矿（不再有「入池」）
 
 ```solidity
-function depositToPool() external onlyOwner
+function armMining(uint256 tokenId) external onlyOwner
+function startMining(uint256 tokenId, uint32 taskId, uint256 anchorBlock, bytes[] inputs, bytes[] expectedOuts, bytes32[][] proofs) external onlyOwner
+function stopMining(uint256 tokenId) external onlyOwner
+function claimMiningRewards() external
+function claimBem() external
 ```
 
-- 仅 `Ready`、未入池、未熔断；要求矿池地址已设置、无在售电路、至少一张电路、至少一份未清份额。
-- 先把剩余 BNB 记为持份人可领余款（`surplusPool`），再把**全部持有的电路 NFT**
-  转给 `miningPool`，最后置 `pooled = true`，进入 `Mining`。
-- 入池后 `refund` / `recoverCircuits` / 再次入池全部关闭。
+- **电路始终留在 Campaign 名下**，不再转给任何矿池合约：合约就是官方 PoD 挖矿合约里的
+  NFT holder，产出由官方合约直接铸给 Campaign。
+- `startMining`：仅 `Ready`（或已进入 `Mining`）、未熔断、无在售电路、至少一张电路。
+  `taskId == 0` 是未验证池（不需要抽样向量）；已验证池需先 `armMining` 记录锚点块，
+  再在**后面的块**带 `anchorBlock` / `inputs` / `expectedOuts` / `proofs` 调 `start`。
+- `stopMining`：停止某张电路的挖矿，官方合约当场结算产出（COOLING 状态）。
+- `claimMiningRewards`：把官方合约里已产出的 BEM 领回本期，按 `bemAccPerShare` 记账。
+- `claimBem`：持份人按份额领取 `pendingBem`。
+- 已删除：`setMiningPool` / `depositToPool` / `miningPool` / `pooled` / `depositRevenue` /
+  `harvest` / `claim`。挖矿产出只来自官方合约，不存在外部矿池打款。
 
 ### 5.5 退款与余款
 
 - `refund()`：唯一本金出口。售罄前超时、或 `executionFailed` 后，持份人自领。
   退款不减少 `sold`，只减少 `outstandingShares`。
-- `returnSurplus()`：`Ready` 时把剩余 BNB 记成余款，不结束期次，之后仍可入池。
+- `returnSurplus()`：`Ready` 时把剩余 BNB 记成余款，不结束期次，之后仍可开矿。
 - `claimSurplus()`：持份人按份额领余款。
 - 电路在手且池子不足以按原价覆盖全部份额时，退款出口返回 `CircuitsAreCollateral`；
   owner 可先 `topUpShortfall()` 补齐，再退款 / 取回电路。
 - `openRefund()` / `abandonOrder()` 只置失败标志与开闸，**不遍历持份人转账**。
 
-### 5.6 挖矿收益
+### 5.6 挖矿产出分配
 
-- `depositRevenue()`：只有 `miningPool` 可调；扣服务费后净额进入余款池。
-- `claimFee()`：服务费收款方自领。
-- `harvest()` / `claim()` 目前是占位实现，不发放 BEM。
+- 官方 PoD 合约按 `minerKey(circuits, tokenId)` 把 BEM 铸给 Campaign（NFT holder）。
+- `claimMiningRewards()` 把 BEM 领回后按份额累加 `bemAccPerShare`。
+- `claimFee()`：服务费收款方自领挖矿产出服务费。
+- `claimBem()`：持份人自领产出，pull 模式，永不主动遍历。
 
 ## 6. 份额转让
 
@@ -181,19 +194,19 @@ function depositToPool() external onlyOwner
 `halt()` / `resume()` 均 `onlyOwner`。
 
 - `whenLive` 只挡**入口**：`subscribe` / `buyCircuits` / `listCircuit` /
-  `depositToPool` / `listShares` / `takeListing`。
-- `refund` / `claimSurplus` / `claimFee` / `cancelListing` /
-  `cancelCircuitListing` / `markFailed` / `openRefund` / `returnSurplus` /
-  `abandonOrder` / `depositRevenue` **永远不被熔断挡住**。
+  `startMining` / `listShares` / `takeListing`。
+- `refund` / `claimSurplus` / `claimFee` / `claimBem` / `claimMiningRewards` /
+  `cancelListing` / `cancelCircuitListing` / `markFailed` / `openRefund` /
+  `returnSurplus` / `abandonOrder` / `stopMining` **永远不被熔断挡住**。
 
 ## 8. 关键不变量
 
 1. **电路是份额的抵押**：份额未结清且未按原价退完时，当期电路不能离开合约
-   （只能入池或按不低于成本的价卖回市场）。
+   （只能按不低于成本的价卖回市场，或交给官方 PoD 合约挖矿）。
 2. **卖出底价 = 该 token 的买入价**：`circuitCostBasis[tokenId]`，低于它 `PriceBelowCost`。
 3. **退款不减少 `sold`**：售罄闸门只看 `sold`，退款只减 `outstandingShares`。
 4. **退款/开闸只 PULL 不 PUSH**：不遍历持份人，gas 恒定，拒收 BNB 的地址不能卡死整批。
-5. **入池不可逆**：`depositToPool` 永远 `onlyOwner`，工厂移除后也不对公众开放。
+5. **电路永不离场**：开矿只是调用官方 PoD 合约（`startMining`），ERC721 始终在 Campaign 名下。
 6. **熔断只关入口，不关出口**。
 7. **换市场先提旧账**：`setCircuitMarket` 对旧市场 `withdraw()`，并撤销旧授权。
 8. **`price` 不允许为 0**：买入价格、挂卖价格都拒绝 0。
@@ -232,6 +245,8 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-bscscan
 | 电路市场 | `0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f` |
 | 电路合约 TapeOut（ERC721） | `0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C` |
 | 电路合约 Behemoth（ERC721） | `0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c` |
+| 官方 PoD 挖矿代理 | `0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46` |
+| 官方 PoD Lens（资格判定） | `0xdd20b9537b9f5db9d2a23e6b11ad863cf81930d8` |
 
 工厂已部署但**尚未开期**（`campaignCount == 0`）。开期时必须显式指定白名单内的 ERC721 电路合约。
 
@@ -248,7 +263,7 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-bscscan
 - 单张与批量买电路、价格/挂单失效回滚、买不起置失败
 - `confirmCircuits` 持有校验
 - 挂卖 / 撤单 / 成本底价 / 换市场提款
-- 入池不可逆、余款、份额转让、服务费、熔断
+- 开矿（start/stop/claim）、余款、份额转让、服务费、熔断
 - 账本不变量与随机生命周期
 
 ## 11. 已知边界

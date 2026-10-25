@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Ownable} from "./access/Ownable.sol";
-import {Campaign} from "./Campaign.sol";
+import {ICampaignDeployer} from "./interfaces/ICampaignDeployer.sol";
 
 /// @title CampaignFactory — opens each crowdfunding round
 /// @notice Owner-only creation and registry removal. Economic params are fixed at creation; the shared
@@ -15,6 +15,12 @@ import {Campaign} from "./Campaign.sol";
 contract CampaignFactory is Ownable {
     /// @notice Shared Circuit Market (the list / buy target). Immutable.
     address public immutable circuitMarket;
+    /// @notice Official PoD mining contract handed to every round.
+    address public immutable podMining;
+    /// @notice Official BEM token handed to every round.
+    address public immutable bem;
+    /// @notice Stateless deployer that holds Campaign's creation code (keeps this factory under 24KB).
+    address public immutable campaignDeployer;
 
     /// @notice Circuit NFT collections a round may lock; written once at construction and never editable.
     address[] private _allowedCircuits;
@@ -43,12 +49,33 @@ contract CampaignFactory is Ownable {
 
     /// @param circuitMarket_ Shared market; immutable. Rounds may replace it individually.
     /// @param allowedCircuits_ Whitelisted circuit NFT contracts; at least one, all with code.
-    constructor(address circuitMarket_, address[] memory allowedCircuits_) Ownable(msg.sender) {
-        if (circuitMarket_ == address(0)) revert ZeroAddress();
-        // A codeless target would revert every market call with empty returndata, bricking every round.
-        if (circuitMarket_.code.length == 0) revert ZeroAddress();
+    /// @param podMining_ Official PoD mining contract; every round mines through it.
+    /// @param bem_ Official BEM token paid out by official mining.
+    /// @param campaignDeployer_ Stateless Campaign deployer; must have code.
+    constructor(
+        address circuitMarket_,
+        address[] memory allowedCircuits_,
+        address podMining_,
+        address bem_,
+        address campaignDeployer_
+    ) Ownable(msg.sender) {
+        if (
+            circuitMarket_ == address(0) || podMining_ == address(0) || bem_ == address(0)
+                || campaignDeployer_ == address(0)
+        ) revert ZeroAddress();
+        // A codeless target would revert every market / mining / deploy call with empty returndata,
+        // bricking every round.
+        if (
+            circuitMarket_.code.length == 0 || podMining_.code.length == 0 || bem_.code.length == 0
+                || campaignDeployer_.code.length == 0
+        ) {
+            revert ZeroAddress();
+        }
         if (allowedCircuits_.length == 0) revert EmptyWhitelist();
         circuitMarket = circuitMarket_;
+        podMining = podMining_;
+        bem = bem_;
+        campaignDeployer = campaignDeployer_;
         for (uint256 i = 0; i < allowedCircuits_.length; i++) {
             if (allowedCircuits_[i] == address(0) || allowedCircuits_[i].code.length == 0) revert ZeroAddress();
             _allowedCircuits.push(allowedCircuits_[i]);
@@ -109,15 +136,17 @@ contract CampaignFactory is Ownable {
         // Both operands fit in uint64, and the checked sum is validated before the narrowing cast.
         uint64 deadline = uint64(block.timestamp) + fundingSeconds;
 
-        Campaign c = new Campaign(
+        campaign = ICampaignDeployer(campaignDeployer).deploy(
             sharePriceBnb,
             totalShares,
             deadline,
             mi,
             ow, // Campaign owner = factory owner
-            circuits_
+            circuits_,
+            podMining,
+            bem,
+            address(this)
         );
-        campaign = address(c);
         _registered[campaign] = true;
         uint256 index = campaigns.length;
         campaigns.push(campaign);
