@@ -1,278 +1,112 @@
-# contracts · 电路众筹挖矿合约
+# contracts · 合约说明
 
-> 仓库：<https://github.com/knwins/miner-dianlu>
->
-> 本文档只描述**当前代码**。链上会随部署变化，地址以 `deployments/<network>.json` 与
-> `frontend/src/chain/deployments.json` 为准。
+只描述**当前代码**。地址以 `deployments/<network>.json` 与 `frontend/src/chain/deployments.json` 为准。
 
-## 0. 目录
+## 文件
 
 | 路径 | 作用 |
 |---|---|
-| `contracts/CampaignFactory.sol` | 期次工厂：电路白名单、创建/移除期次 |
-| `contracts/Campaign.sol` | 单期主合约：认筹、买电路、份额转让、官方 PoD 挖矿、退款、产出分配 |
-| `contracts/interfaces/ICircuitMarket.sol` | 官方电路市场（卖单侧）接口 |
-| `contracts/interfaces/IERC721.sol` | 电路 NFT 接口 |
-| `contracts/mocks/` | 测试替身（MockCircuitMarket / MockCircuitNft），**禁止上主网** |
-| `scripts/` | 部署、开源验证、测试网演练、链上探针 |
-| `test/` | Hardhat 测试（当前 76 passing） |
+| `CampaignFactory.sol` | 工厂：白名单、创建/移除期次 |
+| `CampaignDeployer.sol` | 无状态 `new` Campaign（控工厂体积） |
+| `Campaign.sol` | 单期：认筹 → 买电路 → 挖矿 → 退款 / BEM |
+| `mocks/` | 测试替身，**禁止上主网** |
+| `test/` | Hardhat 测试 |
 
-## 1. 官方电路市场
-
-| 项 | 值 |
-|---|---|
-| 市场地址（BSC 主网） | `0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f` |
-| 代理形态 | ERC1967 UUPS |
-| 交易标的 | ERC721 电路 NFT（一笔成交一张） |
-| 挂单 | `list(circuits, tokenId, price)` |
-| 撤单 | `delist(id)` |
-| 买入 | `buy(id, expectedPrice)`，`msg.value` 必须等于挂单价 |
-| 查询 | `listingFor(circuits, tokenId)` / `listingOf(...)` / `listings(id)` / `nextListingId()` |
-| 卖家收款 | `owed(seller)` + `withdraw()`（pull） |
-
-- **只有卖单侧**：没有买单簿、没有 `placeBid` / `fillBid`。
-- **非托管**：成交前 NFT 仍在卖家手里；`buy` 当笔完成付款与 NFT 交割。
-- 官方电路集合：
-  - TapeOut `0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C`
-  - Behemoth `0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c`
-
-## 2. 工厂
-
-```solidity
-constructor(address circuitMarket_, address[] allowedCircuits_)
-```
-
-- `circuitMarket_`：非零、有代码。
-- `allowedCircuits_`：至少一项、每项非零且有代码；部署后**不可增删**。
-- 主网白名单必须是上面两个官方集合；测试网可用 `MockCircuitNft`。
-- 白名单是安全边界：防止把期次指向可无限 mint 的 Mock，从而伪造「电路已到账」。
-
-```solidity
-function createCampaign(
-    uint256 sharePriceBnb,
-    uint256 totalShares,
-    uint64 fundingSeconds,
-    address circuits_
-) external onlyOwner returns (address campaign)
-```
-
-- `circuits_` 必选，必须在白名单内；一期只锁定一个集合。
-- `sharePriceBnb == 0` / `totalShares == 0` 直接拒绝。
-- Campaign 的 owner 初始化为工厂 owner。
-
-其它：`campaignCount()` / `campaigns(i)` / `isRegistered(addr)` /
-`allowedCircuitsCount()` / `allowedCircuitsAt(i)` / `isAllowedCircuits(addr)` /
-`removeCampaign(index)`（onlyOwner，swap-and-pop）。
-
-> `removeCampaign` 不等于冻结期次：Campaign 仍可调用，只是从前端主列表消失；
-> 工厂移除后对公众只开放**可逆**的电路撤单权。
-
-## 3. Campaign 状态机
+## 状态机
 
 ```text
-Funding ──售罄──► Executing/None ──(setPhase 1)──► Executing/Buying
-                                                   │
-                                                   │ buyCircuits() 买入
-                                                   │ confirmCircuits()
-                                                   ▼
-                                              Executing/Ready
-                                                   │ startMining() 逐张
-                                                   ▼
-                                                Mining
+Funding ──subscribe 售罄──► Executing/Buying ──confirmCircuits──► Ready ──startMining──► Mining
+                │                    │
+                │ 超时未售罄          │ 判失败 / 池不足 → refund
+                └─ refund            │ Ready → 只能 returnSurplus（不能退本金）
 ```
 
-- `Scene`：`Funding` / `Executing` / `Mining`
-- `Phase`：`None` / `Buying` / `Ready`
-- `circuits` 与份额价、总份数、截止时间一样，开期后不可更换。
-- `circuitMarket` 可由 owner 通过 `setCircuitMarket` 更换（会先提取旧市场欠款并撤销旧授权）。
+- **Scene**：`Funding` / `Executing` / `Mining`
+- **Phase**（仅 Executing）：`Buying` → `Ready`
+- 开期锁定：单价、总份数、募集截止、电路集合
 
-## 4. 权限
+## 权限
 
-**单钥匙**：没有 operator/admin 等二级角色。所有管理入口 `onlyOwner`，
-owner 应当是**多签 / 硬件钱包**。
+单钥匙 `onlyOwner`（主网须多签）。无 operator。
 
-Owner 可调用（非完整列表）：`setCircuitMarket` / `setPlan` /
-`setServiceFee` / `setPhase` / `buyCircuits` / `listCircuit` / `startMining` /
-`armMining` / `stopMining` /
-`openRefund` / `abandonOrder` / `topUpShortfall` / `halt` / `resume` /
-`recoverBnb` / `recoverCircuits` / `transferOwnership`。
+| 谁 | 能做什么 |
+|---|---|
+| Owner | 设费、买电路、挂卖、开/停矿、开退款、熔断、扫尾差… |
+| 任何人 | 认筹、确认到账、领余款/BEM/服务费、领奖励入账、份额转让；宽限期后可 `markFailed` |
 
-任何人可调用：`subscribe`（付 BNB）、`confirmCircuits`（只校验持有）、
-`withdrawMarketProceeds`、`cancelCircuitListing`（工厂移除后）、`markFailed`
-（宽限期后）、`refund` / `claimSurplus` / `claimFee` / `claimBem` /
-`claimMiningRewards`。
+## 资金口径
 
-## 5. 资金与电路路径
+### 认筹
 
-### 5.1 认筹
+- `subscribe(count)`：`msg.value = count × sharePriceBnb`
+- **必须先** `setServiceFee`（含显式 0 费），否则 `ServiceFeeNotSet`
+- 认筹 BNB **永不收服务费**，进 `raisedBnb`
+- `sold` 只增；退款减 `outstandingShares`
 
-- `subscribe(count)`：`msg.value == count × sharePriceBnb`，不可超卖。
-- 售罄后进入 `Executing`；份额可退款前一直由 `outstandingShares` 记录。
+### 服务费（只动 BEM）
 
-### 5.2 买电路（卖方市场，买方是 Campaign）
+- `setServiceFee`：认筹前写一次，永久锁定；费率 ≤ 10%；分成 ≤ 3 地址且合计 100%
+- 计提：`claimMiningRewards` / `stopMining` 结算毛产出时
+- 领取：分成地址 `claimFee()`（pull）
 
-```solidity
-function buyCircuits(
-    uint256[] listingIds,
-    uint256[] tokenIds,
-    uint96[] prices
-) external onlyOwner
-```
+### 买电路 / 挂卖
 
-- 前置：`Executing` + `Phase.Buying` + 已售罄 + 未熔断。
-- **不额外收 BNB**：采购款直接从 `raisedBnb` 扣，链上要保证 `cost <= raisedBnb`。
-- 买不起：置 `executionFailed = true` 并返回，**不 revert、不滚整批**。
-- 批量是原子的：任一挂单失效 / 价格不符 / 卖家已转走 NFT → 整批回滚。
-- 每张买入记录 `circuitCostBasis[tokenId] = price`（后续卖出的成本底价）。
-- 事件：`CircuitBought(tokenId, listingId, price)`、`CircuitsBought(n, cost)`、
-  `ExecutionFailed(cost, raisedBnb)`。
+- `buyCircuits`：Buying + 已售罄；款从托管扣；Buying 内可多次买
+- `confirmCircuits`：持有 ≥1 张 → Ready（之后不能再买）
+- `listCircuit`：Ready，或 Mining 且已停挖；`price > 0` 即可（可低于买入成本）
+- 有电路挂卖时不能开矿
 
-`confirmCircuits()`：任何人可调，要求合约当前真的持有至少一张电路 NFT，
-进入 `Ready`。不搬代币。
+### 挖矿
 
-### 5.3 卖回市场
+- 电路始终在 Campaign；当前实现为**未验证池**一键 `startMining`
+- 首张开矿会记账剩余募集款为余款，并进入 Mining
+- `claimMiningRewards`：入账 → 扣费 → 按份记账 → 持份人 `claimBem`
 
-```solidity
-function listCircuit(uint256 tokenId, uint96 price) external onlyOwner
-function cancelCircuitListing(uint256 tokenId) external
-```
+### 退出
 
-- 仅 `Ready`、未熔断（Mining 场景须该电路已停挖）。
-- `price > 0` 即可；**允许低于** `circuitCostBasis[tokenId]`（Owner 裁量）。
-- 只做**单 token approve**，不用 `setApprovalForAll`。
-- NFT 不离开 Campaign；成交后市场把净额记到 `owed(address(this))`，
-  由 `withdrawMarketProceeds()` 提回 `raisedBnb`。
-- 撤单：期次在册时仅 owner；工厂移除后任何人可撤（可逆逃生）。
+| 出口 | 何时 | 说明 |
+|---|---|---|
+| `refund` | 募集超时；或 Buying 且失败/池不足 | 退本金；有电路且池不够 → `CircuitsAreCollateral` |
+| `returnSurplus` + `claimSurplus` | Ready | 退未花完的 BNB；期次可继续开矿 |
+| `listShares` | Mining | 份额 P2P 转让 |
+| `topUpShortfall` | Owner | 补托管，使能按原价退完 |
 
-### 5.4 官方 PoD 挖矿（不再有「入池」）
+`openRefund` / `abandonOrder` 只开闸，不代持份人打款。
 
-```solidity
-function armMining(uint256 tokenId) external onlyOwner
-function startMining(uint256 tokenId) external onlyOwner
-function stopMining(uint256 tokenId) external onlyOwner
-function claimMiningRewards() external
-function claimBem() external
-```
+## 熔断
 
-- **电路始终留在 Campaign 名下**，不再转给任何矿池合约：合约就是官方 PoD 挖矿合约里的
-  NFT holder，产出由官方合约直接铸给 Campaign。
-- `startMining`：仅 `Ready`（或已进入 `Mining`）、未熔断、无在售电路、至少一张电路。
-  `taskId == 0` 是未验证池（不需要抽样向量）；已验证池需先 `armMining` 记录锚点块，
-  再在**后面的块**带 `anchorBlock` / `inputs` / `expectedOuts` / `proofs` 调 `start`。
-- `stopMining`：停止某张电路的挖矿，官方合约当场结算产出（COOLING 状态）。
-- `claimMiningRewards`：把官方合约里已产出的 BEM 领回本期，按 `bemAccPerShare` 记账。
-- `claimBem`：持份人按份额领取 `pendingBem`。
-- `depositRevenue`：Owner 手动把链下挖矿收益以 BNB 打进来，按 `serviceFeeBps` 计提服务费。
-- 已删除：`setMiningPool` / `depositToPool` / `miningPool` / `pooled` / `harvest` / `claim`。
-  期次就是矿工（电路 NFT 始终留在 Campaign），挖矿产出只来自官方合约，不存在矿池转账。
+`halt` 关掉认筹/买入/挂卖/开矿/份额交易；**不挡**退款、领款、撤单、领奖、停挖。
 
-### 5.5 退款与余款
+## 不变量（摘要）
 
-- `refund()`：唯一本金出口。售罄前超时、或 `executionFailed` 后，持份人自领。
-  退款不减少 `sold`，只减少 `outstandingShares`。
-- `returnSurplus()`：`Ready` 时把剩余 BNB 记成余款，不结束期次，之后仍可开矿。
-- `claimSurplus()`：持份人按份额领余款。
-- 电路在手且池子不足以按原价覆盖全部份额时，退款出口返回 `CircuitsAreCollateral`；
-  owner 可先 `topUpShortfall()` 补齐，再退款 / 取回电路。
-- `openRefund()` / `abandonOrder()` 只置失败标志与开闸，**不遍历持份人转账**。
+1. 电路是份额抵押：池不够按原价退时不能白送走电路  
+2. `sold` 单调；债务看 `outstandingShares`  
+3. 退款 / 领 BEM / 领费均为 **pull**  
+4. 服务费只从 BEM 毛产出扣；认筹 BNB 不扣  
 
-### 5.6 挖矿产出分配
+## 官方依赖（BSC）
 
-- 官方 PoD 合约按 `minerKey(circuits, tokenId)` 把 BEM 铸给 Campaign（NFT holder）。
-- `claimMiningRewards()` 把 BEM 领回后按份额累加 `bemAccPerShare`。
-- `claimFee()`：服务费收款方自领挖矿产出服务费。
-- `claimBem()`：持份人自领产出，pull 模式，永不主动遍历。
+| 项 | 地址 |
+|---|---|
+| Circuit Market | `0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f` |
+| 工厂 | 见 `deployments.json` |
+| TapeOut / Behemoth / PoD / BEM | 见 `deployments.json` |
 
-## 6. 份额转让
+市场仅卖单；一笔一张 NFT；成交前 NFT 在卖家。
 
-- `listShares(count, price)`：仅 `Mining`；份额进入 escrow。
-- `cancelListing(id)`：挂单方或 owner；释放 escrow。
-- `takeListing(id, count)`：接收方付 BNB，份额与 BNB 原子结算。
-- 余款权益按 `sharesOf + escrowOf` 计，挂单不失去余款资格。
-
-## 7. 熔断
-
-`halt()` / `resume()` 均 `onlyOwner`。
-
-- `whenLive` 只挡**入口**：`subscribe` / `buyCircuits` / `listCircuit` /
-  `startMining` / `listShares` / `takeListing`。
-- `refund` / `claimSurplus` / `claimFee` / `claimBem` / `claimMiningRewards` /
-  `cancelListing` / `cancelCircuitListing` / `markFailed` / `openRefund` /
-  `returnSurplus` / `abandonOrder` / `stopMining` **永远不被熔断挡住**。
-
-## 8. 关键不变量
-
-1. **电路是份额的抵押**：份额未结清且未按原价退完时，当期电路不能离开合约
-   （只能挂回市场卖出，或交给官方 PoD 合约挖矿）。
-2. **挂卖价可由 Owner 低于成本**：`circuitCostBasis` 仅作买入记录 / 前端参考，不再作链上底价。
-3. **退款不减少 `sold`**：售罄闸门只看 `sold`，退款只减 `outstandingShares`。
-4. **退款/开闸只 PULL 不 PUSH**：不遍历持份人，gas 恒定，拒收 BNB 的地址不能卡死整批。
-5. **电路永不离场**：开矿只是调用官方 PoD 合约（`startMining`），ERC721 始终在 Campaign 名下。
-6. **熔断只关入口，不关出口**。
-7. **换市场先提旧账**：`setCircuitMarket` 对旧市场 `withdraw()`，并撤销旧授权。
-8. **`price` 不允许为 0**：买入价格、挂卖价格都拒绝 0。
-
-## 9. 部署与验证
+## 命令
 
 ```bash
 cd contracts
-
-# 编译 / 测试（必须走 bootstrap.js）
 node ./node_modules/hardhat/internal/cli/bootstrap.js compile
 node ./node_modules/hardhat/internal/cli/bootstrap.js test
-
-# 只布工厂（主网推荐；不部署 Mock、不开期）
 node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-factory.js --network bsc
-
-# 完整部署（测试网会部署 MockCircuitMarket + MockCircuitNft）
-node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/deploy-bsc.js --network bscTestnet
-
-# 开源验证
-node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-sourcify.js --network bsc
-node ./node_modules/hardhat/internal/cli/bootstrap.js run scripts/verify-bscscan.js --network bsc
 ```
 
-环境变量（详见脚本头）：
+请用 `bootstrap.js`，不要用 `npx hardhat`。
 
-- `CIRCUIT_MARKET_ADDRESS`（留空 = 官方主网电路市场；**不再兼容旧名 `MINTER_ADDRESS`**，旧地址指向已于废弃的晶体管市场）
-- `ALLOWED_CIRCUITS_ADDRESSES`（留空 = 官方 TapeOut / Behemoth；脚本会逐个校验 `supportsInterface(0x80ac58cd)`，不是 ERC721 直接中止）
-- `DEPLOYER_PRIVATE_KEY`、`DRY_RUN=1`
+## 边界
 
-主网现状（chainId 56，2026-10-25）：
-
-| 角色 | 地址 |
-| --- | --- |
-| 工厂 `CampaignFactory` | `0x6768039789439a9da2044926293d8cc46ee4225e` |
-| 电路市场 | `0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f` |
-| 电路合约 TapeOut（ERC721） | `0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C` |
-| 电路合约 Behemoth（ERC721） | `0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c` |
-| 官方 PoD 挖矿代理 | `0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46` |
-| 官方 PoD Lens（资格判定） | `0xdd20b9537b9f5db9d2a23e6b11ad863cf81930d8` |
-
-工厂已部署但**尚未开期**（`campaignCount == 0`）。开期时必须显式指定白名单内的 ERC721 电路合约。
-
-> 合约创建交易不要依赖 hardhat-ethers 的回读：`scripts/_deploy.js` 会先算出 CREATE 地址再广播，
-> 回读崩溃时按 CREATE 地址找回执；`deploy-factory.js` 还会在发交易前打印预计地址，
-> 避免「其实已上链、脚本却静默退出」被误判成失败而重复部署。
-
-## 10. 测试
-
-当前 `76 passing`，覆盖：
-
-- 工厂白名单 / 创建 / 移除
-- 认筹、售罄、退款
-- 单张与批量买电路、价格/挂单失效回滚、买不起置失败
-- `confirmCircuits` 持有校验
-- 挂卖 / 撤单 / 成本底价 / 换市场提款
-- 开矿（start/stop/claim）、余款、份额转让、服务费、熔断
-- 账本不变量与随机生命周期
-
-## 11. 已知边界
-
-- **官方市场是信任前提**：市场代理若被升级成拒绝服务，挂单中的电路无法成交，
-  但 Campaign 仍持有未挂单的电路，仍可开矿或等待市场恢复。
-- **BEM 产出依赖官方合约**：算式与结算节奏由官方 PoD 决定；本合约只做「领奖 → 按份记账
-  → 持份人 `claimBem` 自领」。挖矿未结算前，前端只显示 `miningPending`，不承诺收益。
-- **owner 单钥匙**：必须使用多签；合约内没有 timelock。
-- **旧工厂期次**：保留在 `legacyFactories`，ABI 可能有旧 getter（`market()` 等），
-  前端读取时做降级，不要用新期次的假设套旧期次。
+- Owner 单钥匙 → 主网多签  
+- BEM 发放节奏由官方 PoD 决定，文档不承诺收益  
+- 市场可升级；未挂卖电路仍可开矿或等待恢复  

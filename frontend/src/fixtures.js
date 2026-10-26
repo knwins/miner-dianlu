@@ -409,38 +409,6 @@ export function resolveCampaignDesign(round, book = null) {
 }
 
 /**
- * 历史期次（展示用）。
- * 数字按真实产出机制反推：`bem = H × 0.004524 × 天数 × 93%`
- * 系数 0.004524 = 7,200 × 99% ÷ 1,575,427（已验证池总权重，链上实读）。
- */
-export const PAST_ROUNDS = [
-  {
-    id: 2,
-    status: "已结算",
-    tone: "done",
-    shares: "100/100",
-    raised: "68.5000 BNB",
-    circuitModelId: DEFAULT_CIRCUIT,
-    quoteMult: 1.5,
-    /** 权重 H = g81 × 6 = 486 */
-    hashpower: "486",
-    bem: "184.0500 BEM",
-    fee: "13.8500 BEM",
-  },
-  {
-    id: 1,
-    status: "未募满",
-    tone: "back",
-    shares: "37/100",
-    raised: "25.3450 BNB",
-    hashpower: "—",
-    bem: "已退回",
-    fee: "—",
-  },
-];
-
-
-/**
  * 募集期的预估分配权重。
  *
  * 权重只由「本期烧多少电路」决定：

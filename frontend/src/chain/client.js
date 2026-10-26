@@ -938,6 +938,62 @@ export async function readAccountAcrossCampaigns(account, addrs) {
   return rows;
 }
 
+/**
+ * 服务费领取页：逐期读分成表 + 当前钱包 pendingFee。
+ * 只返回「当前地址在分成表里」的期次（侧栏入口也靠这份列表是否非空）。
+ */
+export async function readFeeClaimsAcrossCampaigns(account, addrs) {
+  if (!account || !isAddr(account) || !addrs?.length) return [];
+  const me = String(account).toLowerCase();
+  const runner = getReadProvider();
+  const rows = [];
+  for (let i = 0; i < addrs.length; i++) {
+    const address = addrs[i];
+    const id = addrs.length - i;
+    try {
+      const c = campaignContract(runner, address);
+      const zb = (pr, d) => pr.catch(() => d);
+      const [scene, serviceFeeBps, serviceFeeSet, feeRecipientCount, pendingWei] = await Promise.all([
+        zb(c.scene(), 0n),
+        zb(c.serviceFeeBps(), 0n),
+        zb(c.serviceFeeSet(), false),
+        zb(c.feeRecipientCount(), 0n),
+        zb(c.pendingFee(account), 0n),
+      ]);
+      const n = Number(feeRecipientCount);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      let myShareBps = 0;
+      let isRecipient = false;
+      for (let j = 0; j < n; j++) {
+        const [addr, bps] = await Promise.all([
+          zb(c.feeRecipientAt(j), null),
+          zb(c.feeSharesBpsAt(j), 0),
+        ]);
+        if (!addr || String(addr).toLowerCase() !== me) continue;
+        isRecipient = true;
+        myShareBps = Number(bps) || 0;
+        break;
+      }
+      if (!isRecipient) continue;
+      const sceneN = Number(scene);
+      rows.push({
+        id,
+        address,
+        scene: POSITION_SCENE[sceneN] || "funding",
+        sceneLabel: SCENE_LABEL[sceneN] || "—",
+        serviceFeeBps: Number(serviceFeeBps) || 0,
+        serviceFeeSet: Boolean(serviceFeeSet),
+        isRecipient: true,
+        myShareBps,
+        pendingFeeBem: Number(formatUnits(pendingWei || 0n, BEM_DECIMALS)),
+      });
+    } catch {
+      /* 单期失败跳过，不挡其它期 */
+    }
+  }
+  return rows;
+}
+
 /** 读本期锁定的电路市场地址；未配置时返回零地址。 */
 async function readCircuitMarket(c) {
   const a = await c.circuitMarket();

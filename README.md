@@ -2,28 +2,45 @@
 
 > 仓库：<https://github.com/knwins/miner-dianlu>
 
-用户用 BNB 认购一期矿机的份额；募满后，Owner 到**官方电路市场**买入该期锁定的
-ERC721 电路 NFT，确认到账后由期次合约自己调用官方 PoD 合约开矿；挖矿产出按份额分配。
-退出路径只有**挖矿份额转让**，不存在本金/收益赎回。
+用 BNB **按份认筹**一期矿机。售罄后由 Owner 在官方电路市场买入 ERC721 电路，确认到账后合约调用官方 PoD 开矿。产出是 **BEM**：先扣开期写死的服务费，剩下的按份额分给持份人。
+
+## 一句话流程
+
+```text
+认筹（BNB 托管）→ 买电路 → 确认到账 → 开矿 → 领 BEM
+```
+
+## 钱怎么走
+
+| 钱 | 去向 |
+|---|---|
+| 认筹 BNB | 全部进托管，**不收服务费**；用来买电路 |
+| 没花完的 BNB | Ready 后按份退回（余款） |
+| 挖矿 BEM | 先扣服务费给分成地址，净值按份给持份人 |
+
+## 怎么退出
+
+| 阶段 | 做法 |
+|---|---|
+| 募集超时 / Buying 失败或池不够 | `refund` 退本金 |
+| Ready（电路已到账） | `returnSurplus` 退未花完的募集款；**不能**再原路退本金 |
+| Mining | `listShares` 把份额转让给别人 |
+
+没有「本金+收益一键赎回」。电路 NFT 一直留在本期合约里（期次本身是矿工）。
+
+## 开期必做
+
+1. `createCampaign`
+2. **立刻** `setServiceFee`（含「费率 0」也要写一次）  
+   未设费时链上拒绝认筹（`ServiceFeeNotSet`），避免费率被抢先锁死。
 
 ## 目录
 
-| 目录 | 内容 |
+| 路径 | 内容 |
 |---|---|
-| `contracts/` | Hardhat 合约、部署脚本、开源验证脚本、测试 |
-| `frontend/` | Vite 6 + React 19 前端（`frontend/src/chain/` 是链上数据层） |
-| `MEMORY.md` | 项目记忆（当前状态、部署地址、工程踩坑、用户偏好） |
-
-## 电路市场
-
-- **官方 Circuit Market（BSC 主网）**：`0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f`（ERC1967 UUPS 代理）
-- **只有卖单侧**：`list(circuits, tokenId, price)` / `delist(id)` / `buy(id, expectedPrice)` / `withdraw()`
-- 交易标的是 **ERC721 电路 NFT**，一笔成交一张；卖家在成交前仍持有 NFT（非托管）
-- 官方电路集合：TapeOut `0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C`、
-  Behemoth `0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c`
-
-项目合约只做**买方**：`Campaign.buyCircuits()` 用募集款按挂单价买入，确认持有后
-`confirmCircuits()` 进入 `Ready`；需要变现时可把持有的电路按不低于成本价重新挂回市场。
+| [`contracts/`](contracts/) | 合约、测试、部署 |
+| [`frontend/`](frontend/) | Vite + React 前端 |
+| [`MEMORY.md`](MEMORY.md) | 部署地址与踩坑（给开发会话用） |
 
 ## 快速开始
 
@@ -37,13 +54,11 @@ node ./node_modules/hardhat/internal/cli/bootstrap.js test
 cd frontend
 npm install
 npm run dev -- --host
-npm run build
 ```
 
-> `npx hardhat` 在本仓库不可用，必须走 `bootstrap.js`（见 `contracts/README.md`）。
+> 本仓库请用 `bootstrap.js`，不要用 `npx hardhat`。
 
 ## 文档
 
-- 合约接口、状态机、业务口径、部署与验证：[`contracts/README.md`](contracts/README.md)
-- 前端结构、链上数据流、页面与工具模块：[`frontend/README.md`](frontend/README.md)
-- 项目记忆：[`MEMORY.md`](MEMORY.md)
+- 合约状态机 / 接口 / 部署：[`contracts/README.md`](contracts/README.md)
+- 前端页面与字段：[`frontend/README.md`](frontend/README.md)

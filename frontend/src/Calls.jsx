@@ -667,6 +667,12 @@ export function callGate(method, book, round, connected, actor = { role: "user",
   if (method.name === "subscribe") {
     if (!connected) return { ok: false, reason: "subscribe 需要已连接的用户钱包。" };
     if (book.scene !== "funding") return { ok: false, reason: "只有募集中可以认筹（subscribe）。" };
+    if (!book.serviceFeeSet && !round.serviceFeeSet) {
+      return { ok: false, reason: "Owner 尚未设定服务费（ServiceFeeNotSet）：认筹暂未开放，等设费完成后再认购。" };
+    }
+    if (book.endsAt && Date.now() > Number(book.endsAt)) {
+      return { ok: false, reason: "募集已截止，不能再认筹。" };
+    }
     if (book.sold >= round.totalShares) return { ok: false, reason: "份数已售完。" };
     const count = Number(values.shares ?? 0);
     if (!Number.isInteger(count) || count <= 0) return { ok: false, reason: "认筹份数必须是正整数。" };
@@ -1006,15 +1012,14 @@ export function callGate(method, book, round, connected, actor = { role: "user",
     if (!(outstandingOf(book) > 0)) {
       return { ok: false, reason: "份额已全部退完，没有可退对象（合约会以 ZeroShares 回滚）。尾差用 recoverBnb 取回。" };
     }
-    // 合约 openRefund 的两道附加闸：市场欠款未提取（ProceedsPending）、
-    // 电路还在合约里而池子不够按原价退完（PartsAreCollateral）。
+    // 合约 openRefund 附加闸：ProceedsPending、CircuitsAreCollateral。
     if (Number(book.marketOwed) > 0) {
       return { ok: false, reason: "市场还有未提取的卖出款（ProceedsPending），先 withdrawMarketProceeds 再打开退款。" };
     }
     const partsHeld = Number(book.circuitHeldCount) > 0;
     const poolCovers = Number(book.bnbPool || 0) >= outstandingOf(book) * Number(round.sharePriceBnb || 0);
     if (partsHeld && !poolCovers) {
-      return { ok: false, reason: "电路还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口。" };
+      return { ok: false, reason: "电路还在合约里、池子不够按原价退完（CircuitsAreCollateral）：先 topUpShortfall 补齐缺口。" };
     }
     return { ok: true, reason: "打开退款：本期判为执行失败，持份人各自领回本金。若已买过电路且池子不够，先补齐缺口。" };
   }

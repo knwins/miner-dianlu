@@ -26,7 +26,6 @@ import {
 } from "./prices.js";
 import deployments from "./chain/deployments.json";
 import {
-  PAST_ROUNDS,
   QUOTE,
   ROUND,
   buildHolders,
@@ -1025,7 +1024,7 @@ export function OwnerOverview({
   const chainFeePercent = Number(round.serviceFeeBps ?? 0) / 100;
   const chainFeeSet = Boolean(round.serviceFeeSet);
 
-  const historyRows = (history != null ? history : PAST_ROUNDS).map((item) => {
+  const historyRows = (history != null ? history : []).map((item) => {
     const onChainRow = history != null;
     const rowDesign = resolveCampaignDesign(
       { circuitModelId: onChainRow ? null : item.circuitModelId, processorId: onChainRow ? (item.processor || processorFromCircuitContract(item.circuits) || null) : item.processor },
@@ -1887,11 +1886,20 @@ export function OwnerOverview({
  *
  * 每个按钮都先核对角色、场景与链上前置条件：宁可禁用并写明原因，也不发注定 revert 的交易。
  */
-export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPeriod, onInvoke }) {
+export function OwnerAdvanced({
+  round, book, pending, actor, periods, onSwitchPeriod, onInvoke,
+  factoryOwner = "", connectedAccount = "",
+}) {
   const isOwner = actor?.role === "owner";
+  const isFactoryOwner = Boolean(
+    connectedAccount
+    && factoryOwner
+    && String(connectedAccount).toLowerCase() === String(factoryOwner).toLowerCase(),
+  );
   const chainMode = Boolean(book._chain);
   const busy = Boolean(pending);
   const canWrite = isOwner && chainMode && !busy;
+  const canWriteFactory = isFactoryOwner && chainMode && !busy;
   const validAddr = (value) => /^0x[0-9a-fA-F]{40}$/.test(String(value || "").trim());
   const ZERO = /^0x0{40}$/i;
 
@@ -1904,8 +1912,9 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
   const feePercent = Number(book.serviceFeeBps ?? 0) / 100;
   const feeRows = Array.isArray(round.feeShares) ? round.feeShares : [];
 
-  /** 本期 Owner 转移与市场地址：一律留空手填，避免误点把所有权发出去。 */
+  /** 本期 / 工厂 Owner 转移与市场地址：一律留空手填，避免误点把所有权发出去。 */
   const [newOwnerAddr, setNewOwnerAddr] = useState("");
+  const [newFactoryOwnerAddr, setNewFactoryOwnerAddr] = useState("");
   const [marketAddr, setMarketAddr] = useState("");
   useEffect(() => {
     setMarketAddr((cur) => (cur ? cur : (validAddr(marketOnChain) ? marketOnChain : "")));
@@ -1956,14 +1965,19 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
   const write = (method, args) => onInvoke?.(method, args);
 
   /** 可写性徽标：先判身份，再判模式 —— 两种「只读」的原因不同，不能合并成一句话。 */
-  const gate = !isOwner
-    ? { text: "只读 · 当前钱包不是本期 Owner", tone: "is-closed" }
+  const gate = !isOwner && !isFactoryOwner
+    ? { text: "只读 · 当前钱包不是 Owner", tone: "is-closed" }
     : !chainMode
       ? { text: "只读 · 仅链上模式可写", tone: "is-closed" }
-      : { text: "Owner 可写", tone: "is-open" };
+      : isOwner && isFactoryOwner
+        ? { text: "本期 + 工厂 Owner 可写", tone: "is-open" }
+        : isFactoryOwner
+          ? { text: "工厂 Owner · 可转移工厂 / 开新期", tone: "is-open" }
+          : { text: "本期 Owner 可写", tone: "is-open" };
 
   /** 每张卡右上角的「当前值」，与卡片内的动作一一对应，正文里不再复述一遍。 */
   const ownerLabel = validAddr(ownerOnChain) ? shortAddress(ownerOnChain) : "—";
+  const factoryOwnerLabel = validAddr(factoryOwner) ? shortAddress(factoryOwner) : "—";
   const marketLabel = validAddr(marketOnChain) ? shortAddress(marketOnChain) : "—";
   const feeLabel = feeLocked ? `${feePercent}%` : "未设定";
 
@@ -1996,8 +2010,8 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
           )}
         </div>
         <p className="round-hero-lead">
-          只有本期 Owner 能写的治理与安全入口：抬闸、改子状态、换市场、取回资产。
-          日常运营（挂买单 / 卖出 / 退款 / 开矿）在「众筹挖矿列表」。
+          本期 Owner 管抬闸、改子状态、换市场、取回资产；工厂 Owner 管开新期与工厂所有权。
+          只转本期不会关掉侧栏——旧地址若仍是工厂 Owner，仍能进工作台。
         </p>
         <span className={`adv-gate ${gate.tone}`}>{gate.text}</span>
       </header>
@@ -2006,31 +2020,32 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
         <article className="card">
           <div className="card-header">
             <span>权限</span>
-            <span className="stat-label adv-addr">Owner {ownerLabel}</span>
+            <span className="stat-label adv-addr">本期 {ownerLabel} · 工厂 {factoryOwnerLabel}</span>
           </div>
           <div className="card-body adv-rows">
             <div className="adv-row">
               <div className="adv-row-label">
-                <strong>唯一管理角色</strong>
+                <strong>两把钥匙</strong>
                 <span>
-                  Owner 是合约里唯一的钥匙，所有写入口（含熔断 / 抬闸）都只认它；
-                  没有操作员或管理员之类的二级角色。Owner 应当是多签，日常运营直接由多签确认。
+                  本期 Owner 与工厂 Owner 通常同址，但是两笔独立转移。
+                  侧栏「合约工作台」对<strong>任一</strong>可见；要让旧地址完全看不到，须两把都转走。
                 </span>
               </div>
               <div className="adv-control">
-                <span className="adv-addr" aria-label="本期 Owner 地址">{ownerOnChain || "—"}</span>
+                <span className="adv-addr" aria-label="本期 Owner 地址">本期 {ownerOnChain || "—"}</span>
+                <span className="adv-addr" aria-label="工厂 Owner 地址">工厂 {factoryOwner || "—"}</span>
               </div>
             </div>
             <div className="adv-row">
               <div className="adv-row-label">
                 <strong>转移本期 Owner</strong>
-                <span>转出后当前钱包立即失去本期全部 Owner 权限，且不可撤销。</span>
+                <span>只改本期 Campaign；不改工厂。转出后失去本期写权限，侧栏仍可能因工厂 Owner 可见。</span>
               </div>
               <div className="adv-control">
                 <input
                   className="adv-addr"
-                  aria-label="新 Owner 地址"
-                  placeholder="0x…（新 Owner，不可撤回）"
+                  aria-label="新本期 Owner 地址"
+                  placeholder="0x…（新本期 Owner，不可撤回）"
                   value={newOwnerAddr}
                   onChange={(e) => setNewOwnerAddr(e.target.value)}
                 />
@@ -2051,11 +2066,49 @@ export function OwnerAdvanced({ round, book, pending, actor, periods, onSwitchPe
                   }
                   onClick={() => {
                     const next = newOwnerAddr.trim();
-                    if (!window.confirm(`确认把本期 Owner 转给 ${next}？转出后你将失去本期全部 Owner 权限。`)) return;
+                    if (!window.confirm(`确认把本期 Owner 转给 ${next}？这不转移工厂 Owner；若你仍是工厂 Owner，侧栏工作台仍可见。`)) return;
                     write("transferOwnership", { newOwner: next });
                   }}
                 >
-                  {pending === "transferOwnership" ? "转移中…" : "转移"}
+                  {pending === "transferOwnership" ? "转移中…" : "转移本期"}
+                </button>
+              </div>
+            </div>
+            <div className="adv-row">
+              <div className="adv-row-label">
+                <strong>转移工厂 Owner</strong>
+                <span>改工厂开期钥匙；转出后旧地址不再因工厂身份看到工作台（除非仍是某期 Owner）。</span>
+              </div>
+              <div className="adv-control">
+                <input
+                  className="adv-addr"
+                  aria-label="新工厂 Owner 地址"
+                  placeholder="0x…（新工厂 Owner，不可撤回）"
+                  value={newFactoryOwnerAddr}
+                  onChange={(e) => setNewFactoryOwnerAddr(e.target.value)}
+                />
+                <button
+                  className="btn btn-outline"
+                  type="button"
+                  disabled={!canWriteFactory || !validAddr(newFactoryOwnerAddr) || ZERO.test(newFactoryOwnerAddr.trim())}
+                  title={
+                    !chainMode
+                      ? "仅链上模式可用"
+                      : !isFactoryOwner
+                        ? "只有工厂 Owner 能转移工厂所有权"
+                        : !validAddr(newFactoryOwnerAddr)
+                          ? "请填写有效的 20 字节地址"
+                          : ZERO.test(newFactoryOwnerAddr.trim())
+                            ? "不能转给零地址"
+                            : undefined
+                  }
+                  onClick={() => {
+                    const next = newFactoryOwnerAddr.trim();
+                    if (!window.confirm(`确认把工厂 Owner 转给 ${next}？转出后你将失去开新期与工厂治理权限。`)) return;
+                    write("setFactoryOwner", { newOwner: next });
+                  }}
+                >
+                  {pending === "setFactoryOwner" ? "转移中…" : "转移工厂"}
                 </button>
               </div>
             </div>
@@ -2318,8 +2371,12 @@ export function OwnerCreate({
   defaultFeeRecipient = "",
   allowedCircuits = [],
   onConnect,
+  onInvoke,
 }) {
   const [draft, setDraft] = useState(() => ({ ...EMPTY_FORM }));
+  const [newFactoryOwnerAddr, setNewFactoryOwnerAddr] = useState("");
+  const validAddr = (value) => /^0x[0-9a-fA-F]{40}$/.test(String(value || "").trim());
+  const ZERO = /^0x0{40}$/i;
   /**
    * 「碰过才校验」。
    *
@@ -2948,6 +3005,51 @@ export function OwnerCreate({
           </button>
         </div>
       </form>
+
+      {chainMode && isFactoryOwner && (
+        <article className="card" style={{ marginTop: "1.25rem" }}>
+          <div className="card-header">
+            <span>转移工厂 Owner</span>
+            <span className="stat-label adv-addr">{factoryOwner ? shortAddress(factoryOwner) : "—"}</span>
+          </div>
+          <div className="card-body adv-rows">
+            <div className="adv-row">
+              <div className="adv-row-label">
+                <strong>交出工厂钥匙</strong>
+                <span>
+                  只转「本期 Owner」不会关掉侧栏发布入口。要把工厂钥匙也交出去，在这里转移；
+                  转出后本地址不再显示「发布众筹挖矿」。
+                </span>
+              </div>
+              <div className="adv-control">
+                <input
+                  className="adv-addr"
+                  aria-label="新工厂 Owner 地址"
+                  placeholder="0x…（新工厂 Owner，不可撤回）"
+                  value={newFactoryOwnerAddr}
+                  onChange={(e) => setNewFactoryOwnerAddr(e.target.value)}
+                />
+                <button
+                  className="btn btn-outline"
+                  type="button"
+                  disabled={
+                    Boolean(pending)
+                    || !validAddr(newFactoryOwnerAddr)
+                    || ZERO.test(newFactoryOwnerAddr.trim())
+                  }
+                  onClick={() => {
+                    const next = newFactoryOwnerAddr.trim();
+                    if (!window.confirm(`确认把工厂 Owner 转给 ${next}？转出后你将失去开新期权限。`)) return;
+                    onInvoke?.("setFactoryOwner", { newOwner: next });
+                  }}
+                >
+                  {pending === "setFactoryOwner" ? "转移中…" : "转移工厂"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </article>
+      )}
     </section>
   );
 }

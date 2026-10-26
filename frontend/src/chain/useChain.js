@@ -13,6 +13,7 @@ import {
   listCampaigns,
   readCampaignSummary,
   readAccountAcrossCampaigns,
+  readFeeClaimsAcrossCampaigns,
 } from "./client.js";
 import { roundFromDeployment, roundFromState, bookFromState, historyRowFromSummary } from "./adapter.js";
 import deployments from "./deployments.json";
@@ -36,6 +37,8 @@ export function useChain(extra = {}) {
   const [campaignAddrs, setCampaignAddrs] = useState([]);
   const [positions, setPositions] = useState([]);
   const [positionsLoading, setPositionsLoading] = useState(false);
+  const [feeClaims, setFeeClaims] = useState([]);
+  const [feeClaimsLoading, setFeeClaimsLoading] = useState(false);
   const [loading, setLoading] = useState(CHAIN_CONFIGURED);
   const [empty, setEmpty] = useState(false);
   const [error, setError] = useState("");
@@ -177,6 +180,21 @@ export function useChain(extra = {}) {
     }
   }, [account, campaignAddrs]);
 
+  const refreshFeeClaims = useCallback(async () => {
+    if (!CHAIN_CONFIGURED || campaignAddrs.length === 0 || !account) {
+      setFeeClaims([]);
+      return;
+    }
+    setFeeClaimsLoading(true);
+    try {
+      setFeeClaims(await readFeeClaimsAcrossCampaigns(account, campaignAddrs));
+    } catch {
+      /* 保留上一次结果 */
+    } finally {
+      setFeeClaimsLoading(false);
+    }
+  }, [account, campaignAddrs]);
+
   useEffect(() => {
     if (!CHAIN_CONFIGURED || campaignAddrs.length === 0) return undefined;
     let cancelled = false;
@@ -189,6 +207,30 @@ export function useChain(extra = {}) {
         /* 单期失败已在读取函数里吞掉 */
       } finally {
         if (!cancelled) setPositionsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [account, campaignAddrs]);
+
+  useEffect(() => {
+    if (!CHAIN_CONFIGURED) return undefined;
+    if (!account || campaignAddrs.length === 0) {
+      setFeeClaims([]);
+      setFeeClaimsLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      setFeeClaimsLoading(true);
+      try {
+        const rows = await readFeeClaimsAcrossCampaigns(account, campaignAddrs);
+        if (!cancelled) setFeeClaims(rows);
+      } catch {
+        if (!cancelled) setFeeClaims([]);
+      } finally {
+        if (!cancelled) setFeeClaimsLoading(false);
       }
     })();
     return () => {
@@ -328,6 +370,9 @@ export function useChain(extra = {}) {
     positions,
     positionsLoading,
     refreshPositions,
+    feeClaims,
+    feeClaimsLoading,
+    refreshFeeClaims,
     switchCampaign,
     setCampaignAddress: switchCampaign,
     picked,

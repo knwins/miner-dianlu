@@ -2,7 +2,8 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time, loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
 
-// Book identity: balance == raisedBnb + (surplusPool - surplusPaid) + totalPendingFee.
+// Book identity: balance == raisedBnb + (surplusPool - surplusPaid).
+// BEM service fees sit in the BEM token balance (pendingFee), not in the BNB ledger.
 // Circuit collateral: while this round holds a circuit, either shares are outstanding or every share
 // was repaid at the subscription price.
 // Share conservation: sum(sharesOf + escrowOf) == outstandingShares.
@@ -64,6 +65,30 @@ async function deployFixture() {
     .connect(owner)
     .createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await nft.getAddress());
   const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
+  await campaign.connect(owner).setServiceFee(0, [], []);
+  return { market, nft, bem, pod, deployer, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller };
+}
+
+/// Campaign with fee still unset (lifecycle tests that set a non-zero table first).
+async function unsetFeeFixture() {
+  const [owner, alice, bob, carol, feeRecipient, pool, seller] = await ethers.getSigners();
+  const market = await ethers.deployContract("MockCircuitMarket", [FEE_BPS]);
+  const nft = await ethers.deployContract("MockCircuitNft");
+  const bem = await ethers.deployContract("MockBem");
+  const pod = await ethers.deployContract("MockPodMining", [await bem.getAddress()]);
+  const deployer = await ethers.deployContract("CampaignDeployer");
+  const factory = await ethers.deployContract("CampaignFactory", [
+    await market.getAddress(),
+    [await nft.getAddress()],
+    await pod.getAddress(),
+    await bem.getAddress(),
+    await deployer.getAddress(),
+  ]);
+  await pod.setProcessor(await nft.getAddress(), 1);
+  await factory
+    .connect(owner)
+    .createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await nft.getAddress());
+  const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
   return { market, nft, bem, pod, deployer, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller };
 }
 
@@ -80,20 +105,19 @@ async function miningFixture() {
 }
 
 async function ledger(campaign) {
-  const [balance, raised, pool, paid, fee] = await Promise.all([
+  const [balance, raised, pool, paid] = await Promise.all([
     ethers.provider.getBalance(await campaign.getAddress()),
     campaign.raisedBnb(),
     campaign.surplusPool(),
     campaign.surplusPaid(),
-    campaign.totalPendingFee(),
   ]);
-  return { balance, raised, pool, paid, fee };
+  return { balance, raised, pool, paid };
 }
 
 async function expectLedgerClosed(campaign) {
   const l = await ledger(campaign);
   const surplus = l.pool > l.paid ? l.pool - l.paid : 0n;
-  expect(l.balance).to.equal(l.raised + surplus + l.fee);
+  expect(l.balance).to.equal(l.raised + surplus);
   return l;
 }
 
@@ -101,7 +125,7 @@ async function expectNoDustLeft(campaign) {
   const l = await expectLedgerClosed(campaign);
   expect(l.raised).to.equal(0n);
   expect(l.paid).to.equal(l.pool);
-  expect(l.fee).to.equal(0n);
+  expect(await campaign.totalPendingFee()).to.equal(0n);
   expect(l.balance).to.equal(0n);
   await expect(campaign.recoverBnb()).to.be.revertedWithCustomError(campaign, "ZeroShares");
 }
@@ -130,8 +154,8 @@ async function expectCollateralInvariant(campaign) {
 
 describe("ledger identity", () => {
   it("holds at every stage of a full lifecycle and ends with nothing unowned", async () => {
-    const ctx = await loadFixture(deployFixture);
-    const { campaign, owner, alice, bob, feeRecipient } = ctx;
+    const ctx = await loadFixture(unsetFeeFixture);
+    const { campaign, owner, alice, bob, feeRecipient, pod, nft, bem } = ctx;
     await campaign.connect(owner).setServiceFee(500, [feeRecipient.address], [10000]);
 
     await expectLedgerClosed(campaign);
@@ -149,25 +173,33 @@ describe("ledger identity", () => {
     await expectLedgerClosed(campaign);
     expect(await campaign.circuitHeldCount()).to.equal(1n);
 
-    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.05") });
-    await expectLedgerClosed(campaign);
+    // Leftover raisedBnb was booked as surplus on startMining.
     await campaign.connect(alice).claimSurplus();
     await expectLedgerClosed(campaign);
-
-    // 7 wei dust must have an owner too.
-    await campaign.connect(owner).depositRevenue({ value: 7n });
-    await expectLedgerClosed(campaign);
     await campaign.connect(bob).claimSurplus();
-    await campaign.connect(feeRecipient).claimFee();
     await expectNoDustLeft(campaign);
+
+    // BEM harvest: fee to recipient, net to holders — BNB ledger unchanged.
+    const gross = ethers.parseEther("100");
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokens[0]), gross);
+    await campaign.connect(owner).claimMiningRewards();
+    await expectLedgerClosed(campaign);
+    const fee = (gross * 500n) / 10000n;
+    expect(await campaign.pendingFee(feeRecipient.address)).to.equal(fee);
+    await campaign.connect(feeRecipient).claimFee();
+    expect(await bem.balanceOf(feeRecipient.address)).to.equal(fee);
+    await campaign.connect(alice).claimBem();
+    await campaign.connect(bob).claimBem();
+    expect(await campaign.totalPendingFee()).to.equal(0n);
   });
 
   it("pays the surplus pool out to the last wei in either claim order", async () => {
     for (const order of [["alice", "bob"], ["bob", "alice"]]) {
       const ctx = await loadFixture(miningFixture);
-      const { campaign, owner } = ctx;
-      await campaign.connect(owner).depositRevenue({ value: 7n });
+      const { campaign } = ctx;
+      // Surplus already booked from leftover raisedBnb at startMining.
       const total = await campaign.surplusPool();
+      expect(total).to.be.greaterThan(0n);
       for (const who of order) {
         await campaign.connect(ctx[who]).claimSurplus();
       }
@@ -178,18 +210,26 @@ describe("ledger identity", () => {
     }
   });
 
-  it("keeps later revenue claimable after an earlier round was fully claimed", async () => {
-    const { campaign, alice, bob, owner } = await loadFixture(miningFixture);
+  it("keeps later BEM harvest claimable after an earlier round was fully claimed", async () => {
+    const { campaign, alice, bob, owner, pod, nft, tokenId } = await loadFixture(miningFixture);
     await campaign.connect(alice).claimSurplus();
-    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.07") });
     await campaign.connect(bob).claimSurplus();
     expect(await campaign.surplusPaid()).to.equal(await campaign.surplusPool());
 
-    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.11") });
-    expect(await campaign.surplusOf(alice.address)).to.be.greaterThan(0n);
-    expect(await campaign.surplusOf(bob.address)).to.be.greaterThan(0n);
-    await campaign.connect(alice).claimSurplus();
-    await campaign.connect(bob).claimSurplus();
+    const key = await pod.minerKey(await nft.getAddress(), tokenId);
+    await pod.accrue(key, ethers.parseEther("70"));
+    await campaign.connect(owner).claimMiningRewards();
+    expect(await campaign.bemPendingOf(alice.address)).to.be.greaterThan(0n);
+    expect(await campaign.bemPendingOf(bob.address)).to.be.greaterThan(0n);
+    await campaign.connect(alice).claimBem();
+    await campaign.connect(bob).claimBem();
+
+    await pod.accrue(key, ethers.parseEther("110"));
+    await campaign.connect(owner).claimMiningRewards();
+    expect(await campaign.bemPendingOf(alice.address)).to.be.greaterThan(0n);
+    expect(await campaign.bemPendingOf(bob.address)).to.be.greaterThan(0n);
+    await campaign.connect(alice).claimBem();
+    await campaign.connect(bob).claimBem();
     await expectNoDustLeft(campaign);
   });
 
@@ -416,10 +456,13 @@ describe("randomized lifecycles", () => {
       await campaign.connect(owner).startMining(tokenId);
       await expectLedgerClosed(campaign);
 
+      // Harvest a few BEM rounds (fee stays in BEM balance; BNB ledger unchanged).
+      const key = await ctx.pod.minerKey(await ctx.nft.getAddress(), tokenId);
       const rounds = 1 + Math.floor(rand() * 2);
       for (let i = 0; i < rounds; i++) {
         const amount = BigInt(Math.floor(rand() * 1e15)) + 7n;
-        await campaign.connect(owner).depositRevenue({ value: amount });
+        await ctx.pod.accrue(key, amount);
+        await campaign.connect(owner).claimMiningRewards();
         await expectLedgerClosed(campaign);
       }
 
@@ -429,6 +472,9 @@ describe("randomized lifecycles", () => {
           if ((await campaign.surplusOf(who.address)) > 0n) {
             await campaign.connect(who).claimSurplus();
             await expectLedgerClosed(campaign);
+          }
+          if ((await campaign.bemPendingOf(who.address)) > 0n) {
+            await campaign.connect(who).claimBem();
           }
         }
       }

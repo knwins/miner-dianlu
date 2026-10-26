@@ -3,6 +3,7 @@ import { readCall } from "./Calls.jsx";
 import { dealStatus } from "./dealStatus.js";
 import { ENDED, FAILED, PHASE, SCENE, outstandingOf, rowState, roundState } from "./roundState.js";
 import { OwnerAdvanced, OwnerCreate, OwnerOverview } from "./Owner.jsx";
+import FeeClaims from "./FeeClaims.jsx";
 import PeriodNav from "./PeriodNav.jsx";
 import {
   IS_CONFIGURED as CHAIN_CONFIGURED,
@@ -77,6 +78,7 @@ import {
 const LIFE_PAGES = [
   { id: "round", label: "BEM挖矿认筹", hint: "募集 → 待执行 → 挖矿" },
   { id: "assets", label: "我的资产", hint: "认筹 / 持仓 / 领取" },
+  { id: "fees", label: "领取服务费", hint: "分成地址自领 BEM" },
   { id: "transfer", label: "资产转让", hint: "挖矿份额转让" },
   { id: "rules", label: "规则与合约", hint: "资金路径 / 退出 / 合约" },
   { id: "owner", label: "合约工作台", hint: "开期 / 开矿 / 调试" },
@@ -106,7 +108,11 @@ export default function App() {
 
   /** 链上数据源：CHAIN_CONFIGURED 时轮询测试网 Campaign，产出 book/round；否则回退本地模拟。 */
   const chain = useChain();
-  const [factoryOwner, setFactoryOwner] = useState(deployments.deployer || "");
+  /**
+   * 工厂 Owner：只认链上 `factory.owner()`，不用 deployments.deployer 做种子。
+   * 否则转移工厂 Owner 后，旧部署者地址仍会被当成 Owner，侧栏「合约工作台」关不掉。
+   */
+  const [factoryOwner, setFactoryOwner] = useState("");
   /**
    * 工厂电路白名单（部署时写入、之后不可增删）。
    *
@@ -117,14 +123,27 @@ export default function App() {
    * 不能留空、也不能用工厂默认值代替。
    */
   const [allowedCircuits, setAllowedCircuits] = useState([]);
+  function reloadFactoryOwner() {
+    if (!CHAIN_CONFIGURED) return Promise.resolve("");
+    return readFactoryOwner()
+      .then((o) => {
+        setFactoryOwner(o || "");
+        return o || "";
+      })
+      .catch(() => {
+        setFactoryOwner("");
+        return "";
+      });
+  }
   useEffect(() => {
-    if (!CHAIN_CONFIGURED) return;
-    readFactoryOwner()
-      .then((o) => o && setFactoryOwner(o))
-      .catch(() => {});
+    if (!CHAIN_CONFIGURED) return undefined;
+    reloadFactoryOwner();
     readAllowedCircuits()
       .then((list) => setAllowedCircuits(Array.isArray(list) ? list : []))
       .catch(() => {});
+    // 与期次轮询错开：工厂 Owner 变更少，30s 重读一次即可兜住外部多签/另一页转移。
+    const t = setInterval(reloadFactoryOwner, 30_000);
+    return () => clearInterval(t);
   }, []);
 
   /**
@@ -187,33 +206,51 @@ export default function App() {
   const pay = book.picked * round.sharePriceBnb;
   const countdown = Number.isFinite(book.endsAt) ? splitCountdown(book.endsAt - now) : null;
   /**
-   * Owner 地址集合 —— 「合约工作台」可见性的唯一口径。
-   *
-   * 链上：取「工厂 owner」+「本期 Campaign owner」两路。
-   *  两者通常同址（CampaignFactory 把 factory owner 直接传给 Campaign），
-   *  但老工厂开的期次 owner 是老工厂 owner，而工作台/开期权限属于当前工厂，
-   *  所以两路都要留；链上还没开期时读不到本期 owner，必须保留工厂 owner 这一路，
-   *  否则 Owner 在空态下就进不去「发布众筹挖矿」。
-   * 本地演示没有链上地址，退回 fixtures 的 OWNER 常量。
+   * 两把钥匙（均须链上读数，禁止 deployments.deployer 种子）：
+   *   - 本期 Campaign owner：管买电路 / 开矿 / 熔断 / 转移本期
+   *   - 工厂 owner：管开新期 / 转移工厂
+   * 只转本期不会改工厂——旧地址若仍是工厂 Owner，以前会继续看到整块「合约工作台」。
+   * 现口径：有期次时工作台只认本期 Owner；工厂 Owner 若已不是本期 Owner，
+   * 只保留独立的「发布众筹挖矿」（不再占工作台）。
    */
-  const ownerAddresses = useMemo(() => {
-    const list = [];
-    if (CHAIN_CONFIGURED) {
-      if (chain.book?.owner) list.push(String(chain.book.owner).toLowerCase());
-      if (factoryOwner) list.push(String(factoryOwner).toLowerCase());
-    } else {
-      list.push(String(OWNER).toLowerCase());
-    }
-    return Array.from(new Set(list));
-  }, [chain.book, factoryOwner]);
-  /** 当前连接地址是不是 Owner（未连接钱包一律不是） */
-  const isOwnerAddress = Boolean(account) && ownerAddresses.includes(String(account).toLowerCase());
+  const isFactoryOwner = Boolean(
+    account && factoryOwner && String(account).toLowerCase() === String(factoryOwner).toLowerCase(),
+  );
+  const isCampaignOwner = Boolean(
+    account
+    && chain.book?.owner
+    && String(account).toLowerCase() === String(chain.book.owner).toLowerCase(),
+  );
+  /** 本地演示退回 fixtures；链上不用这集合做侧栏。 */
+  const isOwnerAddress = !CHAIN_CONFIGURED
+    ? Boolean(account) && String(account).toLowerCase() === String(OWNER).toLowerCase()
+    : isCampaignOwner || isFactoryOwner;
   /**
-   * 合约工作台入口：只有 Owner。
-   * 合约里只有一把钥匙（owner，原则上是多签）：没有操作员 / 管理员之类的二级角色，
-   * 所以不存在「能进工作台但不能开期」的身份。
+   * 合约工作台：本期 Owner；或空工厂 / 读取中的工厂 Owner。
+   * 读完后若只剩工厂钥匙 → 收起工作台（见 canPublishAsFactory）。
    */
-  const canEnterOwnerDesk = isOwnerAddress;
+  const canEnterOwnerDesk = CHAIN_CONFIGURED
+    ? (isCampaignOwner || (isFactoryOwner && (chainEmpty || chainBooting)))
+    : isOwnerAddress;
+  /** 工厂 Owner 已把本期转走：侧栏只留「发布」，不再显示「合约工作台」。 */
+  const canPublishAsFactory = CHAIN_CONFIGURED
+    && isFactoryOwner
+    && !isCampaignOwner
+    && !chainEmpty
+    && !chainBooting;
+  /**
+   * 「领取服务费」侧栏：仅分成地址可见。
+   * 链上：feeClaims 已过滤「当前钱包在分成表」的期次；未连接或读空则隐藏。
+   * 本地演示：对照本期 round.feeShares。
+   */
+  const canSeeFeeClaims = useMemo(() => {
+    if (!account) return false;
+    if (chain.active) return (chain.feeClaims || []).length > 0;
+    const me = String(account).toLowerCase();
+    return (round?.feeShares || []).some(
+      (r) => String(r.address || "").toLowerCase() === me,
+    );
+  }, [account, chain.active, chain.feeClaims, round?.feeShares]);
   /**
    * 当前身份：Owner 走统一地址判定，其余按持份判定。
    *
@@ -509,7 +546,7 @@ export default function App() {
   function chainInvoke(method, args) {
     setPending(method);
     setPendingTarget(
-      method === "removeCampaign"
+      method === "removeCampaign" || method === "claimFee"
         ? String(args?.campaign || args?.address || "").toLowerCase()
         : ""
     );
@@ -543,7 +580,7 @@ export default function App() {
               throw new Error("电路已到账（UseReturnSurplus）：出口是退余款 + 开矿，不能放弃挂单。");
             }
             if (partsHeld && pool + 1e-12 < need) {
-              throw new Error("电路还在合约里、池子不够按原价退完（PartsAreCollateral）：先 topUpShortfall 补齐缺口。");
+              throw new Error("电路还在合约里、池子不够按原价退完（CircuitsAreCollateral）：先 topUpShortfall 补齐缺口。");
             }
             if (method === "openRefund" && Number(book.marketOwed) > 0) {
               throw new Error("市场还有未提取的卖出款（ProceedsPending）：先 withdrawMarketProceeds 再打开退款。");
@@ -700,8 +737,14 @@ export default function App() {
                       ? "已熔断：认筹、挂单、卖出、开矿与份额交易暂停；退款与撤单仍可用。抬闸同样由 Owner 执行。"
                     : method === "resume"
                       ? "已解除熔断，相关入口恢复。"
-                      : `已确认：${method} ✓`);
+                      : method === "claimFee"
+                        ? "已领取挖矿产出服务费（BEM）。"
+                        : `已确认：${method} ✓`);
         await chain.refresh();
+        // 所有权转移后立刻重读：否则侧栏仍按旧地址放行「合约工作台」。
+        if (method === "setFactoryOwner" || method === "transferOwnership") {
+          await reloadFactoryOwner();
+        }
         if (
           method === "refund"
           || method === "claimSurplus"
@@ -713,6 +756,9 @@ export default function App() {
           || method === "cancelListing"
           || method === "subscribe"
         ) await chain.refreshPositions?.();
+        if (method === "claimFee" || method === "setServiceFee" || method === "createCampaign") {
+          await chain.refreshFeeClaims?.();
+        }
         // 退款会让份数归零、结束状态变化，列表必须重读，否则还停在「待执行」。
         if (["createCampaign", "refund", "openRefund", "abandonOrder", "markFailed"].includes(method)) {
           await chain.refreshHistory?.();
@@ -858,6 +904,9 @@ export default function App() {
     };
     switch (method) {
       case "subscribe": {
+        if (!book.serviceFeeSet && !round.serviceFeeSet) {
+          throw new Error("Owner 尚未设定服务费（ServiceFeeNotSet）：认筹暂未开放。");
+        }
         const shares = uintField(args.shares, "份数");
         if (shares <= 0n) throw new Error("认筹份数必须大于 0");
         const remaining = BigInt(Math.max(0, (Number(round.totalShares) || 0) - (Number(book.sold) || 0)));
@@ -1179,6 +1228,10 @@ export default function App() {
       setNotice("本期已熔断，认筹暂停。等 Owner 抬闸后再认购；退款与领余款不受影响。");
       return;
     }
+    if (!book.serviceFeeSet && !round.serviceFeeSet) {
+      setNotice("Owner 尚未设定服务费，认筹暂未开放（链上 ServiceFeeNotSet）。等设费完成后再认购。");
+      return;
+    }
     if (chain.active) {
       act("subscribe", { shares: book.picked });
       return;
@@ -1263,14 +1316,55 @@ export default function App() {
     setNotice("发布众筹挖矿需要链上工厂：请先部署工厂并连接 Owner 钱包（不使用模拟数据）。");
   }
 
+  // 转移本期 Owner 后：旧地址若只剩工厂钥匙，退出工作台（可去独立「发布」）。
+  useEffect(() => {
+    if (page !== "owner" || !CHAIN_CONFIGURED || !account) return;
+    if (canEnterOwnerDesk) return;
+    if (canPublishAsFactory && ownerTab === "create") return;
+    if (canPublishAsFactory) {
+      setOwnerTab("create");
+      setNotice("本期 Owner 已转出；你仍是工厂 Owner，仅可发布新期或在发布页转移工厂");
+      return;
+    }
+    setPage("round");
+    setNotice("当前钱包已不是本期 Owner，已退出合约工作台");
+  }, [page, account, canEnterOwnerDesk, canPublishAsFactory, ownerTab]);
+
+  // 分成地址切走后：藏入口并退出领取页。
+  useEffect(() => {
+    if (page === "fees" && account && !canSeeFeeClaims) {
+      setPage("round");
+    }
+  }, [page, account, canSeeFeeClaims]);
+
   function openPage(id, ownerSub) {
-    // 合约工作台只对 Owner 开放：其它身份连入口都不给（侧边栏已隐藏，这里再兜一层）。
-    if (id === "owner" && !canEnterOwnerDesk) {
-      setNotice("合约工作台仅 Owner 可见");
+    // 合约工作台：本期 Owner，或空工厂的工厂 Owner。
+    if (id === "owner") {
+      const tab = ownerSub || "overview";
+      if (canPublishAsFactory && tab === "create") {
+        setPage("owner");
+        setOwnerTab("create");
+        setMenuOpen(false);
+        return;
+      }
+      if (!canEnterOwnerDesk) {
+        setNotice(
+          canPublishAsFactory
+            ? "本期 Owner 已转出：侧栏工作台已关闭。发布新期请点「发布众筹挖矿」，或在该页转移工厂 Owner。"
+            : "合约工作台仅本期 Owner 可见",
+        );
+        return;
+      }
+      setPage("owner");
+      setOwnerTab(tab);
+      setMenuOpen(false);
+      return;
+    }
+    if (id === "fees" && !canSeeFeeClaims) {
+      setNotice("领取服务费仅分成地址可见");
       return;
     }
     setPage(id);
-    if (id === "owner") setOwnerTab(ownerSub || "overview");
     setMenuOpen(false);
   }
 
@@ -1299,8 +1393,10 @@ export default function App() {
         <nav className="sidebar-menu">
           <div className="menu-group-title">生命周期</div>
           {LIFE_PAGES.map((item) => {
-            // 合约工作台只对 Owner 展示：其它身份连入口都不给。
+            // 合约工作台：本期 Owner（或空工厂的工厂 Owner）。
             if (item.id === "owner" && !canEnterOwnerDesk) return null;
+            // 领取服务费只对分成地址展示。
+            if (item.id === "fees" && !canSeeFeeClaims) return null;
             if (item.id === "owner") {
               const onOwner = page === "owner";
               const onOverview = onOwner && ownerTab === "overview";
@@ -1325,23 +1421,23 @@ export default function App() {
                     >
                       众筹挖矿列表
                     </button>
-                    {isOwnerAddress && (
-                      <>
-                        <button
-                          className={onCreate ? "nav-sub active" : "nav-sub"}
-                          onClick={() => openPage("owner", "create")}
-                          type="button"
-                        >
-                          发布众筹挖矿
-                        </button>
-                        <button
-                          className={onAdvanced ? "nav-sub active" : "nav-sub"}
-                          onClick={() => openPage("owner", "advanced")}
-                          type="button"
-                        >
-                          高级配置
-                        </button>
-                      </>
+                    {isFactoryOwner && (
+                      <button
+                        className={onCreate ? "nav-sub active" : "nav-sub"}
+                        onClick={() => openPage("owner", "create")}
+                        type="button"
+                      >
+                        发布众筹挖矿
+                      </button>
+                    )}
+                    {isCampaignOwner && (
+                      <button
+                        className={onAdvanced ? "nav-sub active" : "nav-sub"}
+                        onClick={() => openPage("owner", "advanced")}
+                        type="button"
+                      >
+                        高级配置
+                      </button>
                     )}
                   </div>
                 </div>
@@ -1377,6 +1473,18 @@ export default function App() {
               <span className="nav-link-hint">{item.hint}</span>
             </button>
           ))}
+          {/* 工厂 Owner 已转出本期：不再占「合约工作台」，只留发布入口。 */}
+          {canPublishAsFactory && (
+            <button
+              className={page === "owner" && ownerTab === "create" ? "nav-link nav-standalone active" : "nav-link nav-standalone"}
+              onClick={() => openPage("owner", "create")}
+              type="button"
+              title="你仍是工厂 Owner，可开新期；彻底交出权限请在页内转移工厂 Owner"
+            >
+              <span className="nav-link-main">发布众筹挖矿</span>
+              <span className="nav-link-hint">工厂钥匙 · 不含本期操作</span>
+            </button>
+          )}
         </nav>
         <div className="sidebar-footer">
           <p className="sidebar-copy">© 2026 TapeOut 众筹挖矿</p>
@@ -1395,7 +1503,7 @@ export default function App() {
                   {chain.account ? (
                     <>
                       <button className="wallet-chip" type="button">
-                        <span className="topbar-role">{chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Owner" : "已连接"}</span>
+                        <span className="topbar-role">{isCampaignOwner ? "本期 Owner" : isFactoryOwner ? "工厂 Owner" : "已连接"}</span>
                         {shortAddress(chain.account)}
                       </button>
                       <div className="wallet-pop" role="dialog" aria-label="钱包详情">
@@ -1407,7 +1515,7 @@ export default function App() {
                           <div className="wallet-addr">
                             <div className="wallet-addr-top">
                               <div>
-                                <span>当前钱包 · {chain.account && factoryOwner && String(chain.account).toLowerCase() === String(factoryOwner).toLowerCase() ? "Owner" : "已连接"}</span>
+                                <span>当前钱包 · {isCampaignOwner ? "本期 Owner" : isFactoryOwner ? "工厂 Owner" : "已连接"}</span>
                                 <strong>{shortAddress(chain.account)}</strong>
                               </div>
                               <button
@@ -1550,7 +1658,7 @@ export default function App() {
             </div>
           </section>
         )}
-        {!chainBooting && chainEmpty && page !== "owner" && page !== "rules" && page !== "market" && (
+        {!chainBooting && chainEmpty && page !== "owner" && page !== "rules" && page !== "market" && page !== "fees" && (
           <section>
             <div className="empty">
               <p>主网工厂已部署，还没有开期。认筹、资产和转让都会在开期后出现。</p>
@@ -1563,7 +1671,7 @@ export default function App() {
             </div>
           </section>
         )}
-        {!chainBooting && !(chainEmpty && page !== "owner" && page !== "rules" && page !== "market") && page === "round" && (
+        {!chainBooting && !(chainEmpty && page !== "owner" && page !== "rules" && page !== "market" && page !== "fees") && page === "round" && (
           <RoundHub
             round={round}
             book={book}
@@ -1607,6 +1715,24 @@ export default function App() {
             onClaimSurplus={(address) => act("claimSurplus", { campaign: address })}
             onClaimBem={(address) => act("claimBem", { campaign: address })}
             onClaimMiningRewards={(address) => act("claimMiningRewards", { campaign: address })}
+            onOpenPeriod={async (address) => {
+              if (usingChain && address) await chain.switchCampaign(address);
+              openPage("round");
+            }}
+            onConnect={handleConnect}
+          />
+        )}
+        {!chainBooting && page === "fees" && canSeeFeeClaims && (
+          <FeeClaims
+            pending={pending}
+            pendingTarget={pendingTarget}
+            connected={connected}
+            usingChain={usingChain}
+            feeClaims={usingChain ? chain.feeClaims : null}
+            feeClaimsLoading={usingChain ? chain.feeClaimsLoading : false}
+            round={round}
+            account={account}
+            onClaimFee={(campaign) => act("claimFee", { campaign })}
             onOpenPeriod={async (address) => {
               if (usingChain && address) await chain.switchCampaign(address);
               openPage("round");
@@ -1658,7 +1784,7 @@ export default function App() {
             </div>
           </section>
         )}
-        {!chainBooting && page === "owner" && canEnterOwnerDesk && (!chainEmpty || ownerTab === "create") && (
+        {!chainBooting && page === "owner" && (canEnterOwnerDesk || (canPublishAsFactory && ownerTab === "create")) && (!chainEmpty || ownerTab === "create" || canPublishAsFactory) && (
           <OwnerDesk
             tab={ownerTab}
             round={round}
@@ -2288,7 +2414,7 @@ function AssetsHub({
 
       {!connected && (
         <div className="empty">
-          <p>连接钱包后才能读取你在每一期的份数。</p>
+          <p className="empty-muted">连接钱包后才能读取你在每一期的份数。</p>
           <button className="btn btn-primary" type="button" onClick={onConnect}>
             连接钱包
           </button>
@@ -2475,10 +2601,15 @@ function OwnerDesk({
 }) {
   /**
    * 子页面由左侧导航切换（众筹挖矿列表 / 发布众筹挖矿 / 高级配置），这里不再有横排页签。
-   * 高级配置全是 onlyOwner 入口：钱包换成非 Owner 时若还停在这一页，回落到列表。
+   * 高级配置只给本期 Owner；工厂 Owner 已转出本期时只会停在 create。
    */
-  const isOwner = actor?.role === "owner";
-  const activeTab = tab === "advanced" && !isOwner ? "overview" : tab;
+  const isCampaignOwner = actor?.role === "owner";
+  const isFactoryOwner = Boolean(
+    account && factoryOwner && String(account).toLowerCase() === String(factoryOwner).toLowerCase(),
+  );
+  const activeTab = tab === "advanced" && !isCampaignOwner
+    ? (isFactoryOwner ? "create" : "overview")
+    : tab;
   return (
     <section>
       {activeTab === "overview" && (
@@ -2522,6 +2653,8 @@ function OwnerDesk({
           book={book}
           pending={pending}
           actor={actor}
+          factoryOwner={factoryOwner}
+          connectedAccount={account}
           periods={usingChain ? chain.campaigns : []}
           onSwitchPeriod={usingChain ? chain.switchCampaign : null}
           onInvoke={onInvoke}
@@ -2539,6 +2672,7 @@ function OwnerDesk({
           allowedCircuits={allowedCircuits}
           onCreate={onCreate}
           onConnect={onConnect}
+          onInvoke={onInvoke}
         />
       )}
     </section>
@@ -2756,7 +2890,8 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, pend
   const progress = Math.round((book.sold / round.totalShares) * 100);
   const fundingOpen = book.scene === "funding" && (!book.endsAt || Date.now() <= book.endsAt);
   const fundingExpired = book.scene === "funding" && book.endsAt && Date.now() > book.endsAt;
-  const canSubscribe = fundingOpen && remaining > 0 && !book.halted;
+  const feeReady = Boolean(book.serviceFeeSet ?? round.serviceFeeSet);
+  const canSubscribe = fundingOpen && remaining > 0 && !book.halted && feeReady;
   const refundBnb = round4((book.mine || 0) * round.sharePriceBnb);
   const maxPick = Math.max(remaining, 1);
   const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
@@ -2863,14 +2998,9 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, pend
             </ul>
             {/* 停止认筹时不再重复一句「本期已停止认筹」——下方按钮上就写着「已停止认筹」。 */}
             {canSubscribe ? <p className="remain">剩余 {remaining} 份，不能自填金额</p> : null}
-            {/*
-             * C-1 要求的**强制提示**（认购人点下去之前必须看到）：
-             * 电路数不构成本期承诺。
-             *
-             * 之前只有一处小字说明「预估随报价浮动，不是承诺」，
-             * 藏在页面上方的事实卡片里，认购按钮旁边什么都没有。
-             * 认购是花钱动作，风险提示必须贴着按钮，且不能是折叠的、可跳过的。
-             */}
+            {fundingOpen && !feeReady ? (
+              <p className="fine" role="status">Owner 尚未设定服务费，认筹暂未开放。</p>
+            ) : null}
             <div className="commit-warning" role="note">
               <strong>电路数不构成本期承诺。</strong>
               <span>
@@ -2886,9 +3016,17 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, pend
               onClick={onSubscribe}
               title={book.halted
                 ? "本期已熔断：认筹暂停，等 Owner 解除后再认购"
-                : canSubscribe && connected && book.approved ? "Confirm subscription" : undefined}
+                : !feeReady
+                  ? "Owner 尚未设定服务费"
+                  : canSubscribe && connected && book.approved ? "确认认筹" : undefined}
             >
-              {pending || (book.halted ? "已熔断 · 认筹暂停" : subscribeLabel(book, connected, canSubscribe))}
+              {pending === "subscribe"
+                ? "认筹中…"
+                : (book.halted
+                  ? "已熔断 · 认筹暂停"
+                  : !feeReady
+                    ? "待设服务费"
+                    : subscribeLabel(book, connected, canSubscribe))}
             </button>
             <p className="fine">合约按「份数 × {round.sharePriceBnb} BNB」记账。直接转账不会记份。</p>
             <RecentBuys round={round} book={book} usingChain={usingChain || onChain} account={book.selfAddress} />
@@ -3507,7 +3645,10 @@ function Countdown({ countdown }) {
 
 
 function subscribeLabel(book, connected, canSubscribe) {
-  if (!canSubscribe) return "已停止认筹";
+  if (!canSubscribe) {
+    if (book.scene === "funding" && !book.serviceFeeSet) return "待设服务费";
+    return "已停止认筹";
+  }
   if (!connected) return "连接钱包";
   if (!book.approved) return "授权 BNB";
   return "确认认筹";

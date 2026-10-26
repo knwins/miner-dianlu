@@ -77,7 +77,7 @@ async function main() {
   console.log(`  锁定电路    ：${await campaign.circuits()}`);
 
   /**
-   * 服务费与分成表：**第二笔交易**（setServiceFee）。
+   * 服务费与分成表：**第二笔交易**（setServiceFee）。未设费则 subscribe 会 ServiceFeeNotSet。
    * 只能在 sold == 0（刚建期，一定满足）时调一次，之后永久锁定。
    * 环境变量：
    *   SERVICE_FEE_BPS      费率（基点，1/10000），上限 1000 = 10%。不给 = 不设服务费。

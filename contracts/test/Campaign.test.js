@@ -66,6 +66,31 @@ async function deployFixture() {
     .connect(owner)
     .createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await nft.getAddress());
   const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
+  // Funding stays closed until fee is set; unlock with explicit zero for fee-agnostic tests.
+  await campaign.connect(owner).setServiceFee(0, [], []);
+  return { market, nft, bem, pod, deployer, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller, buyer };
+}
+
+/// Fresh campaign with fee still unset (for fee-gate tests).
+async function unsetFeeFixture() {
+  const [owner, alice, bob, carol, feeRecipient, pool, seller, buyer] = await ethers.getSigners();
+  const market = await ethers.deployContract("MockCircuitMarket", [FEE_BPS]);
+  const nft = await ethers.deployContract("MockCircuitNft");
+  const bem = await ethers.deployContract("MockBem");
+  const pod = await ethers.deployContract("MockPodMining", [await bem.getAddress()]);
+  const deployer = await ethers.deployContract("CampaignDeployer");
+  const factory = await ethers.deployContract("CampaignFactory", [
+    await market.getAddress(),
+    [await nft.getAddress()],
+    await pod.getAddress(),
+    await bem.getAddress(),
+    await deployer.getAddress(),
+  ]);
+  await pod.setProcessor(await nft.getAddress(), 1);
+  await factory
+    .connect(owner)
+    .createCampaign(SHARE_PRICE, TOTAL_SHARES, FUNDING_SECONDS, await nft.getAddress());
+  const campaign = await ethers.getContractAt("Campaign", await factory.campaigns(0));
   return { market, nft, bem, pod, deployer, factory, campaign, owner, alice, bob, carol, feeRecipient, pool, seller, buyer };
 }
 
@@ -82,9 +107,9 @@ async function miningFixture() {
   return { ...ctx, tokenId: tokens[0] };
 }
 
-/// Same as miningFixture, with the service fee frozen before the first subscription.
+/// Same as miningFixture, with a non-zero service fee frozen before the first subscription.
 async function feeFixture() {
-  const ctx = await loadFixture(deployFixture);
+  const ctx = await loadFixture(unsetFeeFixture);
   const { campaign, owner, alice, bob, feeRecipient } = ctx;
   await campaign.connect(owner).setServiceFee(500, [feeRecipient.address], [10000]);
   await campaign.connect(alice).subscribe(60n, { value: 60n * SHARE_PRICE });
@@ -685,6 +710,25 @@ describe("official mining rewards", () => {
     expect(await campaign.bemPendingOf(alice.address)).to.equal(ethers.parseEther("60"));
     expect(await campaign.bemPendingOf(bob.address)).to.equal(ethers.parseEther("40"));
   });
+
+  it("partial takeListing resets seller debt so later harvest still accrues", async () => {
+    const { campaign, owner, alice, bob, pod, nft, tokenId } = await loadFixture(miningFixture);
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokenId), ethers.parseEther("100"));
+    await campaign.connect(owner).claimMiningRewards();
+    // Alice keeps 30, sells 30. Without resetting seller debt, the next harvest
+    // would stay stranded under the pre-sale entitlement.
+    await campaign.connect(alice).listShares(30n, ethers.parseEther("0.02"));
+    await campaign.connect(bob).takeListing(0n, 30n, { value: ethers.parseEther("0.6") });
+    expect(await campaign.bemPendingOf(alice.address)).to.equal(ethers.parseEther("60"));
+    expect(await campaign.sharesOf(alice.address)).to.equal(30n);
+    expect(await campaign.sharesOf(bob.address)).to.equal(70n);
+
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokenId), ethers.parseEther("100"));
+    await campaign.connect(owner).claimMiningRewards();
+    // Alice 30/100 of the second harvest (+60 settled earlier); Bob 70/100 (+40 earlier).
+    expect(await campaign.bemPendingOf(alice.address)).to.equal(ethers.parseEther("90"));
+    expect(await campaign.bemPendingOf(bob.address)).to.equal(ethers.parseEther("110"));
+  });
 });
 
 describe("refund / abort", () => {
@@ -786,8 +830,9 @@ describe("refund / abort", () => {
   });
 
   it("a holder that rejects BNB keeps a claimable surplus", async () => {
-    const { campaign, owner, rejector } = await loadFixture(rejectorminingFixture);
-    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.05") });
+    const { campaign, rejector } = await loadFixture(rejectorminingFixture);
+    // startMining already booked leftover raisedBnb as surplus.
+    expect(await campaign.surplusOf(await rejector.getAddress())).to.be.greaterThan(0n);
     await expect(rejector.claimSurplusFrom(await campaign.getAddress())).to.be.revertedWithCustomError(
       campaign,
       "TransferFailed",
@@ -984,25 +1029,41 @@ describe("share transfer (Mining only)", () => {
 });
 
 describe("service fee", () => {
-  it("charges only mining revenue and lets each recipient pull", async () => {
-    const { campaign, owner, feeRecipient } = await loadFixture(feeFixture);
-    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.1") });
-    const expected = (ethers.parseEther("0.1") * 500n) / 10000n;
-    expect(await campaign.pendingFee(feeRecipient.address)).to.equal(expected);
+  it("withholds BEM on harvest and lets each recipient pull", async () => {
+    const { campaign, owner, alice, bob, feeRecipient, pod, nft, tokenId, bem } =
+      await loadFixture(feeFixture);
+    const gross = ethers.parseEther("1000");
+    const key = await pod.minerKey(await nft.getAddress(), tokenId);
+    await pod.accrue(key, gross);
+    await campaign.connect(owner).claimMiningRewards();
+    const expectedFee = (gross * 500n) / 10000n;
+    const net = gross - expectedFee;
+    expect(await campaign.pendingFee(feeRecipient.address)).to.equal(expectedFee);
+    expect(await campaign.bemPendingOf(alice.address)).to.equal((net * 60n) / 100n);
+    expect(await campaign.bemPendingOf(bob.address)).to.equal((net * 40n) / 100n);
+    const before = await bem.balanceOf(feeRecipient.address);
     await campaign.connect(feeRecipient).claimFee();
     expect(await campaign.pendingFee(feeRecipient.address)).to.equal(0n);
+    expect(await bem.balanceOf(feeRecipient.address)).to.equal(before + expectedFee);
   });
 
-  it("cannot be set after somebody subscribed", async () => {
+  it("blocks subscribe until the fee table is set", async () => {
+    const { campaign, alice } = await loadFixture(unsetFeeFixture);
+    await expect(
+      campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE }),
+    ).to.be.revertedWithCustomError(campaign, "ServiceFeeNotSet");
+  });
+
+  it("cannot be changed after it was set (and after subscribe)", async () => {
     const { campaign, owner, alice, feeRecipient } = await loadFixture(deployFixture);
     await campaign.connect(alice).subscribe(1n, { value: SHARE_PRICE });
     await expect(
       campaign.connect(owner).setServiceFee(500, [feeRecipient.address], [10000]),
-    ).to.be.revertedWithCustomError(campaign, "ServiceFeeLocked");
+    ).to.be.revertedWithCustomError(campaign, "ServiceFeeAlreadySet");
   });
 
   it("rejects an invalid table", async () => {
-    const { campaign, owner, alice, bob } = await loadFixture(deployFixture);
+    const { campaign, owner, alice, bob } = await loadFixture(unsetFeeFixture);
     await expect(
       campaign.connect(owner).setServiceFee(1001, [alice.address], [10000]),
     ).to.be.revertedWithCustomError(campaign, "BadFeeConfig");
@@ -1015,16 +1076,19 @@ describe("service fee", () => {
   });
 
   it("an explicit zero fee freezes at no fee", async () => {
-    const ctx = await loadFixture(deployFixture);
-    const { campaign, owner, alice } = ctx;
+    const ctx = await loadFixture(unsetFeeFixture);
+    const { campaign, owner, alice, pod, nft } = ctx;
     await campaign.connect(owner).setServiceFee(0, [], []);
     expect(await campaign.serviceFeeSet()).to.equal(true);
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
     const { tokens } = await buy(ctx, 1, UNIT);
     await campaign.confirmCircuits();
     await campaign.connect(owner).startMining(tokens[0]);
-    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.01") });
+    const gross = ethers.parseEther("10");
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokens[0]), gross);
+    await campaign.connect(owner).claimMiningRewards();
     expect(await campaign.totalPendingFee()).to.equal(0n);
+    expect(await campaign.bemPendingOf(alice.address)).to.equal(gross);
   });
 });
 
@@ -1051,7 +1115,6 @@ describe("single owner key", () => {
       () => campaign.connect(alice).abandonOrder(),
       () => campaign.connect(alice).startMining(1n),
       () => campaign.connect(alice).stopMining(1n),
-      () => campaign.connect(alice).depositRevenue({ value: 1n }),
       () => campaign.connect(alice).recoverBnb(),
       () => campaign.connect(alice).halt(),
       () => campaign.connect(alice).resume(),
@@ -1122,12 +1185,13 @@ describe("circuit breaker", () => {
     expect(await campaign.outstandingShares()).to.equal(0n);
   });
 
-  it("a halt does not stop revenue or the fee pull", async () => {
-    const { campaign, owner, feeRecipient } = await loadFixture(feeFixture);
+  it("a halt does not stop BEM harvest or the fee pull", async () => {
+    const { campaign, owner, feeRecipient, pod, nft, tokenId } = await loadFixture(feeFixture);
     await campaign.connect(owner).halt();
-    await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.01") });
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokenId), ethers.parseEther("100"));
+    await campaign.connect(owner).claimMiningRewards();
     const due = await campaign.pendingFee(feeRecipient.address);
-    expect(due).to.be.greaterThan(0n);
+    expect(due).to.equal((ethers.parseEther("100") * 500n) / 10000n);
     await campaign.connect(feeRecipient).claimFee();
     expect(await campaign.pendingFee(feeRecipient.address)).to.equal(0n);
   });

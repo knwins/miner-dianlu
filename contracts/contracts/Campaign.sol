@@ -19,9 +19,9 @@ import {IBemToken} from "./interfaces/IBemToken.sol";
 ///                    BNB as holder-claimable surplus, and moves the scene to Mining. `stopMining` settles
 ///                    one circuit; `claimMiningRewards` harvests every active circuit. Claimed BEM is
 ///                    booked per share and each holder pulls with `claimBem`.
-///         Holder payouts are pulls (refund / claimSurplus / claimFee / claimBem); share sales are
-///         Mining-only and pay the seller directly. Only a market that served this round may send BNB in
-///         (see receive). Rules: contracts/README.md §8.
+///         Holder payouts are pulls (refund / claimSurplus / claimBem); fee recipients pull BEM via
+///         claimFee. Share sales are Mining-only and pay the seller directly. Only a market that served
+///         this round may send BNB in (see receive). Rules: contracts/README.md §8.
 interface IFactory {
     /// @param campaign Round to look up.
     /// @return True while the factory still lists the round.
@@ -53,7 +53,8 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Grace period before a non-owner may flag the round as failed.
     uint256 internal constant FAIL_GRACE = 3 days;
-    /// @notice Service-fee cap in bps (1000 = 10%). Charged on mining output only, never on subscriptions.
+    /// @notice Service-fee cap in bps (1000 = 10%). Charged on official PoD BEM harvest only;
+    ///         subscription BNB is never charged.
     uint16 internal constant MAX_SERVICE_FEE_BPS = 1000;
     /// @notice Max fee recipients; bounds the accrual loop and storage.
     uint256 internal constant MAX_FEE_RECIPIENTS = 3;
@@ -90,9 +91,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     address[] private _feeRecipients;
     /// @notice Per-recipient share in bps, sums to 10000; aligned with _feeRecipients.
     uint16[] private _feeSharesBps;
-    /// @notice Accrued-but-unclaimed fee per recipient; pulled via claimFee().
+    /// @notice Accrued-but-unclaimed BEM fee per recipient; pulled via claimFee().
     mapping(address => uint256) public pendingFee;
-    /// @notice Sum of pendingFee; reserved by recoverBnb.
+    /// @notice Sum of pendingFee (BEM wei still held for recipients).
     uint256 public totalPendingFee;
     /// @notice Fee table already written; frozen forever after that (even at 0 bps).
     bool public serviceFeeSet;
@@ -107,10 +108,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     uint256 public raisedBnb;
     /// @notice Cumulative principal refunded; surplus payouts move `surplusPaid` instead.
     uint256 public totalRefunded;
-    /// @notice Cumulative service fee paid out.
+    /// @notice Cumulative BEM service fee paid out via claimFee.
     uint256 public totalFeesPaid;
-    /// @notice Cumulative mining revenue net of fee. Display only; the money is booked into surplus.
-    uint256 public revenuePool;
 
     /// @notice Cumulative BNB paid for circuit NFTs. 0 = no purchase, so Ready / Mining cannot be faked.
     uint256 public priceLock;
@@ -230,11 +229,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     event SurplusReturned(uint256 amountBnb, uint256 baseShares);
     /// @notice Fee table set; only possible while nobody has subscribed.
     event ServiceFeeSet(uint16 feeBps, address[] recipients, uint16[] sharesBps);
-    /// @notice Fee share booked for a recipient; pulled via claimFee.
+    /// @notice BEM fee share booked for a recipient; pulled via claimFee.
     event FeeAccrued(address indexed to, uint256 amount);
-    /// @notice Mining revenue deposited; `fee` withheld, `net` booked for holders.
-    event RevenueDeposited(uint256 gross, uint256 fee, uint256 net);
-    /// @notice Fee share paid out by claimFee.
+    /// @notice BEM fee share paid out by claimFee.
     event FeePaid(address indexed to, uint256 amount);
     /// @notice Owner added BNB so every outstanding share can be repaid at the subscription price.
     event ShortfallToppedUp(uint256 amount, uint256 raisedBnb);
@@ -298,6 +295,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     error ServiceFeeAlreadySet();
     /// @notice The fee is frozen because somebody already subscribed.
     error ServiceFeeLocked();
+    /// @notice Funding is closed until the owner calls setServiceFee (including explicit 0).
+    error ServiceFeeNotSet();
     /// @notice The round never sold out; no circuit purchase may be made.
     error NotSoldOutYet();
 
@@ -459,9 +458,11 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Buy `count` shares for exactly count × sharePriceBnb, up to and including the deadline.
     ///         A sell-out moves the round to Executing/Buying. Subscription BNB pays no service fee.
+    ///         Requires `serviceFeeSet` so create→fee cannot be front-run into a permanent 0-fee lock.
     /// @param count Shares to buy; > 0 and within the remaining supply.
     function subscribe(uint256 count) external payable nonReentrant whenLive {
         if (scene != Scene.Funding) revert WrongScene();
+        if (!serviceFeeSet) revert ServiceFeeNotSet();
         if (block.timestamp > fundingDeadline) revert FundingEnded();
         if (count == 0) revert ZeroShares();
         if (sold + count > totalShares) revert ExceedsRemaining();
@@ -483,8 +484,9 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     // ─────────────────────────── service fee (on-chain) ───────────────────────────
 
-    /// @notice Set the service fee and its split table. Owner only, only while `sold == 0`, then frozen.
-    ///         Charged on mining output only, never on subscriptions; 0 bps + empty table = no fee.
+    /// @notice Set the service fee and its split table. Owner only, only while unset and `sold == 0`, then frozen.
+    ///         Must run before any subscribe (subscribe reverts ServiceFeeNotSet until then).
+    ///         Charged on official PoD BEM harvest only; subscription BNB never. 0 bps + empty table = no fee.
     /// @dev Recipients must be non-zero, unique, and not this contract (which could never pull its fee).
     /// @param bps_ Fee rate in bps, at most MAX_SERVICE_FEE_BPS.
     /// @param recipients_ Recipients, at most MAX_FEE_RECIPIENTS; empty only when bps_ == 0.
@@ -544,13 +546,13 @@ contract Campaign is Ownable, ReentrancyGuard {
         return _feeSharesBps[index];
     }
 
-    /// @notice Pull your accrued service fee. A failed send reverts, so the accrual stays claimable.
+    /// @notice Pull your accrued BEM service fee. A failed transfer reverts, so the accrual stays claimable.
     function claimFee() external nonReentrant {
         uint256 amt = pendingFee[msg.sender];
         if (amt == 0) revert ZeroShares();
         pendingFee[msg.sender] = 0;
         totalPendingFee -= amt;
-        if (!_trySend(msg.sender, amt)) {
+        if (!IBemToken(bem).transfer(msg.sender, amt)) {
             pendingFee[msg.sender] = amt;
             totalPendingFee += amt;
             revert TransferFailed();
@@ -559,10 +561,10 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit FeePaid(msg.sender, amt);
     }
 
-    /// @dev Split `gross` into the fee table and the revenue pool, booking each recipient's cut.
-    ///      Rounding dust stays in the revenue pool, so the fee is never over-charged.
-    /// @param gross Deposited mining revenue.
-    /// @return fee Amount withheld as service fee (0 when no fee is configured).
+    /// @dev Split harvested BEM into the fee table; return the sum of cuts actually booked.
+    ///      Rounding dust stays with holders (fee never over-charged).
+    /// @param gross BEM received from the official mining contract in this call.
+    /// @return fee BEM withheld as service fee (0 when no fee is configured).
     function _accrueServiceFee(uint256 gross) internal returns (uint256 fee) {
         if (serviceFeeBps == 0 || _feeRecipients.length == 0) return 0;
         uint256 grossFee = (gross * serviceFeeBps) / 10000;
@@ -706,8 +708,10 @@ contract Campaign is Ownable, ReentrancyGuard {
 
         _escrow[l.seller] -= count;
         _shares[msg.sender] += count;
-        // New shares start earning at the current accumulator; past accrual stays settled above.
+        // Reset debts to post-transfer entitlements. Buyer starts clean; seller must shrink debt
+        // with remaining shares+escrow or later harvests stay stranded under the pre-sale debt.
         _bemDebt[msg.sender] = _bemEntitlement(msg.sender);
+        _bemDebt[l.seller] = _bemEntitlement(l.seller);
         _trackHolder(msg.sender);
         // The surplus counter travels with the shares, so reselling cannot let a fresh wallet re-claim
         // what the seller already counted in this round.
@@ -1014,27 +1018,6 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit BemPaid(msg.sender, amt);
     }
 
-    /// @notice Deposit BNB mining revenue (e.g. an operator's off-chain payout). Owner only; the only BNB
-    ///         fee point. fee = msg.value × serviceFeeBps / 10000 split over the table; the net is booked
-    ///         into the holders' pull-claimable surplus. Rounding dust stays with holders (fee never
-    ///         over-charged) and recipients pull via claimFee, so a rejecting recipient cannot block this.
-    function depositRevenue() external payable onlyOwner nonReentrant {
-        if (scene != Scene.Mining) revert WrongScene();
-        if (msg.value == 0) revert ZeroPrice();
-
-        uint256 fee = _accrueServiceFee(msg.value);
-        uint256 net = msg.value - fee;
-        // Display total only: the money is booked below, so never add this to recoverBnb's reserve.
-        revenuePool += net;
-        if (net != 0) {
-            // With shares outstanding it is immediately claimable; with none left it stays in raisedBnb
-            // so recoverBnb can sweep it.
-            if (outstandingShares == 0) raisedBnb += net;
-            else _bookSurplus(net);
-        }
-        emit RevenueDeposited(msg.value, fee, net);
-    }
-
     // ─────────────────────────── views ───────────────────────────
     // `scene` and `phase` already have public getters.
 
@@ -1265,19 +1248,23 @@ contract Campaign is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Book freshly harvested BEM per share. `outstandingShares` is fixed in Mining, so this is a pure
-    ///      accumulator: no holder loop, and the rounding dust stays in the contract.
+    /// @dev Book freshly harvested BEM: withhold service fee, then credit the net per share.
+    ///      `outstandingShares` is fixed in Mining, so this is a pure accumulator (no holder loop);
+    ///      fee rounding dust stays with holders.
     /// @param gross BEM minted by the official contract in this call.
     function _bookBem(uint256 gross) internal {
         if (gross == 0) return;
         totalBemRewards += gross;
+        uint256 fee = _accrueServiceFee(gross);
+        uint256 net = gross - fee;
+        if (net == 0) return;
         uint256 base = outstandingShares;
         if (base == 0) {
             // No shares left to pay (cannot happen on the start path, but keeps BEM from being stranded).
-            pendingBem[owner] += gross;
+            pendingBem[owner] += net;
             return;
         }
-        bemAccPerShare += (gross * 1e18) / base;
+        bemAccPerShare += (net * 1e18) / base;
     }
 
     /// @dev Every key the official contract still reports as active for a circuit this round owns.
@@ -1404,10 +1391,9 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         and `raisedBnb` is zeroed. Unclaimed fees and surplus are never touched.
     function recoverBnb() external onlyOwner nonReentrant {
         uint256 amount = address(this).balance;
-        // Reserved: unclaimed fees + unclaimed surplus (which already includes booked revenue and
-        // totalPendingSurplus, so never add those again). revenuePool is display only.
-        uint256 reserved = totalPendingFee;
-        if (surplusPool > surplusPaid) reserved += surplusPool - surplusPaid;
+        // Reserved: unclaimed surplus only (BEM fees sit in the BEM token balance, not here).
+        uint256 reserved = 0;
+        if (surplusPool > surplusPaid) reserved = surplusPool - surplusPaid;
         if (outstandingShares == 0) {
             // Every share settled: the escrow pool is released.
             if (amount <= reserved) revert ZeroShares();

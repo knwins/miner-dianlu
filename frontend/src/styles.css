@@ -1492,8 +1492,31 @@ h1, h2, h3, p { margin: 0; }
   border-color: var(--color-primary);
   color: var(--color-primary);
 }
-.empty { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 20px; }
-.empty .btn-primary { width: auto; margin-top: 0; }
+/* 连接钱包 / 空态横幅：文案与按钮同一行垂直居中，避免 p 行高把字顶到上沿 */
+.empty {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 20px;
+}
+.empty > p,
+.empty > .empty-muted {
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  min-width: 0;
+  line-height: 1.4;
+  color: var(--color-text-secondary);
+}
+.empty > .btn,
+.empty > .btn-primary {
+  width: auto;
+  margin: 0;
+  flex-shrink: 0;
+  align-self: center;
+}
 /* 非 Owner 无权发布时的说明文案（替代按钮） */
 .empty-muted { color: var(--color-text-tertiary); font-size: 13px; margin: 0; }
 
@@ -3836,6 +3859,9 @@ tr:last-child td { border-bottom: 0; }
   /* 移动端侧边栏收起，弹窗不用再为它留位置 */
   .sheet-backdrop { padding: 24px 16px 24px; }
   .page-header, .preview-bar, .empty, .app-topbar { align-items: stretch; flex-direction: column; }
+  .empty { padding: 14px 16px; }
+  .empty > .btn,
+  .empty > .btn-primary { width: 100%; }
   .publish-title-row { flex-direction: column; }
   .topbar-wallet { margin-left: 0; justify-content: flex-end; }
   .preview-note { margin-left: 0; }

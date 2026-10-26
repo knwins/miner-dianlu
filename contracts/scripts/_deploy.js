@@ -39,10 +39,16 @@ let readbackGuardInstalled = false;
 function installReadbackGuard() {
   if (readbackGuardInstalled) return;
   readbackGuardInstalled = true;
+  // 不要在 handler 里 throw：Windows 上会让 hardhat run 以 exit 0 静默退出，
+  // 交易已上链但后续写盘/读回全部丢失（2026-10-26 主网换工厂踩过）。
   process.on("unhandledRejection", (reason) => {
     const msg = String((reason && reason.message) || reason || "");
-    if (CREATE_TX_READBACK_BUG.test(msg)) return; // 已知：广播成功，只是回读崩溃
-    throw reason; // 其他未处理拒绝照旧炸
+    if (CREATE_TX_READBACK_BUG.test(msg) || /invalid address.*value\s*=\s*""/.test(msg)) {
+      console.log("   ↳ swallowed CREATE readback bug (broadcast already ok)");
+      return;
+    }
+    console.error("unhandledRejection:", msg);
+    process.exitCode = 1;
   });
 }
 
