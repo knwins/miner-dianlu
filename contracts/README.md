@@ -137,8 +137,8 @@ function listCircuit(uint256 tokenId, uint96 price) external onlyOwner
 function cancelCircuitListing(uint256 tokenId) external
 ```
 
-- 仅 `Ready`、未熔断。
-- `price >= circuitCostBasis[tokenId]`，否则 `PriceBelowCost`。
+- 仅 `Ready`、未熔断（Mining 场景须该电路已停挖）。
+- `price > 0` 即可；**允许低于** `circuitCostBasis[tokenId]`（Owner 裁量）。
 - 只做**单 token approve**，不用 `setApprovalForAll`。
 - NFT 不离开 Campaign；成交后市场把净额记到 `owed(address(this))`，
   由 `withdrawMarketProceeds()` 提回 `raisedBnb`。
@@ -148,7 +148,7 @@ function cancelCircuitListing(uint256 tokenId) external
 
 ```solidity
 function armMining(uint256 tokenId) external onlyOwner
-function startMining(uint256 tokenId, uint32 taskId, uint256 anchorBlock, bytes[] inputs, bytes[] expectedOuts, bytes32[][] proofs) external onlyOwner
+function startMining(uint256 tokenId) external onlyOwner
 function stopMining(uint256 tokenId) external onlyOwner
 function claimMiningRewards() external
 function claimBem() external
@@ -203,8 +203,8 @@ function claimBem() external
 ## 8. 关键不变量
 
 1. **电路是份额的抵押**：份额未结清且未按原价退完时，当期电路不能离开合约
-   （只能按不低于成本的价卖回市场，或交给官方 PoD 合约挖矿）。
-2. **卖出底价 = 该 token 的买入价**：`circuitCostBasis[tokenId]`，低于它 `PriceBelowCost`。
+   （只能挂回市场卖出，或交给官方 PoD 合约挖矿）。
+2. **挂卖价可由 Owner 低于成本**：`circuitCostBasis` 仅作买入记录 / 前端参考，不再作链上底价。
 3. **退款不减少 `sold`**：售罄闸门只看 `sold`，退款只减 `outstandingShares`。
 4. **退款/开闸只 PULL 不 PUSH**：不遍历持份人，gas 恒定，拒收 BNB 的地址不能卡死整批。
 5. **电路永不离场**：开矿只是调用官方 PoD 合约（`startMining`），ERC721 始终在 Campaign 名下。

@@ -77,35 +77,29 @@ function pickBuildInfo(targetBytes, sourceName, contractName) {
   return exact[exact.length - 1];
 }
 
-/** Campaign 的构造参数：6 个（sharePrice, totalShares, fundingDeadline, circuitMarket, owner, circuits）。 */
-async function campaignConstructorArgs(campaignAddr, dep) {
-  const abi = require("../artifacts/contracts/CampaignFactory.sol/CampaignFactory.json").abi;
-  const iface = new ethers.Interface(abi);
-  const logs = await ethers.provider.getLogs({
-    address: dep.factory,
-    // publicnode 等公共节点拒「越过 archive 截止点」的查询（fromBlock: 0 必 403
-    // "Archive requests require a personal token"）。CampaignCreated 只可能出现在
-    // 工厂部署块之后，从那儿起查；记录里没有块号时退回 0（全archive 节点可用）。
-    fromBlock: dep.factoryDeploymentBlock ?? 0,
-    toBlock: "latest",
-    topics: [iface.getEvent("CampaignCreated").topicHash],
-  });
-  for (const log of logs) {
-    const parsed = iface.parseLog(log);
-    if (String(parsed.args.campaign).toLowerCase() !== String(campaignAddr).toLowerCase()) continue;
-    const c = await ethers.getContractAt("Campaign", campaignAddr);
-    // 构造参数里的市场地址：Campaign.circuitMarket()。
-    const marketAddr = await c.circuitMarket();
-    return [
-      parsed.args.sharePriceBnb,
-      parsed.args.totalShares,
-      parsed.args.fundingDeadline,
-      marketAddr,
-      dep.deployer,
-      await c.circuits(),
-    ];
-  }
-  return [];
+/** Campaign 构造 9 参：全部可从链上公开字段还原（不必扫事件 / 不吃 archive）。 */
+async function campaignConstructorArgs(campaignAddr) {
+  const c = await ethers.getContractAt("Campaign", campaignAddr);
+  return [
+    await c.sharePriceBnb(),
+    await c.totalShares(),
+    await c.fundingDeadline(),
+    await c.circuitMarket(),
+    await c.owner(),
+    await c.circuits(),
+    await c.podMining(),
+    await c.bem(),
+    await c.factory(),
+  ];
+}
+
+/** 工厂 registry 里的全部期次（旧→新）。 */
+async function listFactoryCampaigns(factoryAddr) {
+  const f = await ethers.getContractAt("CampaignFactory", factoryAddr);
+  const n = Number(await f.campaignCount());
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(await f.campaigns(i));
+  return out;
 }
 
 /** 构造参数 ABI 编码（不带 0x）。 */
@@ -196,10 +190,23 @@ async function verifyOne({ chainId, address, contractName, args, sourceName: src
 
   const result = await pollVerification(submitted.verificationId);
   if (result.error) {
+    // 任务结束时也可能是 already_verified（未能升到 exact_match），档案里已有 match 即算成功。
+    if (String(result.error.customCode || "").includes("already_verified")
+      || /already verified/i.test(String(result.error.message || ""))) {
+      const verified = await confirmVerified(chainId, address);
+      if (verified?.match === "exact_match" || verified?.match === "match") {
+        console.log(`  ✓ 此前已验证通过：match=${verified.match}  runtimeMatch=${verified.runtimeMatch}`);
+        return { contract: verified, externalVerifications: {} };
+      }
+    }
     throw new Error(`Sourcify 验证未通过：${result.error.customCode} — ${String(result.error.message).slice(0, 300)}`);
   }
+  // hardhat.config 里 metadata.bytecodeHash=none / appendCBOR=false，链上字节码无 metadata hash，
+  // Sourcify 最高只能到 match（归一化后一致），达不到 exact_match——这算开源成功。
   const m = result.contract?.match;
-  if (m !== "exact_match") throw new Error(`Sourcify 匹配等级为 ${m}（未达exact_match）`);
+  if (m !== "exact_match" && m !== "match") {
+    throw new Error(`Sourcify 匹配等级为 ${m}（需要 match 或 exact_match）`);
+  }
   console.log(`  ✓ 验证通过：match=${m}  creationMatch=${result.contract.creationMatch}  runtimeMatch=${result.contract.runtimeMatch}`);
 
   // Sourcify 会自动转发 BscScan；这条本机打不通（代理），只提示状态查询地址。
@@ -216,18 +223,36 @@ async function main() {
     throw new Error(`部署记录网络(${dep.chainId}) 与当前链(${chainId}) 不一致`);
   }
 
-  const targets = [{
+  const targets = [];
+  if (dep.campaignDeployer) {
+    targets.push({
+      address: dep.campaignDeployer,
+      contractName: "CampaignDeployer",
+      args: [],
+      sourceName: "contracts/CampaignDeployer.sol",
+    });
+  }
+  targets.push({
     address: dep.factory,
     contractName: "CampaignFactory",
-    args: [dep.circuitMarket, dep.allowedCircuits],
+    args: [
+      dep.circuitMarket,
+      dep.allowedCircuits,
+      dep.podMining,
+      dep.bem,
+      dep.campaignDeployer,
+    ],
     sourceName: "contracts/CampaignFactory.sol",
     creationTxHash: dep.factoryDeploymentTx,
-  }];
-  if (dep.campaign) {
+  });
+  const campaignAddrs = new Set();
+  if (dep.campaign) campaignAddrs.add(String(dep.campaign));
+  for (const a of await listFactoryCampaigns(dep.factory)) campaignAddrs.add(String(a));
+  for (const addr of campaignAddrs) {
     targets.push({
-      address: dep.campaign,
+      address: addr,
       contractName: "Campaign",
-      args: await campaignConstructorArgs(dep.campaign, dep),
+      args: await campaignConstructorArgs(addr),
       sourceName: "contracts/Campaign.sol",
     });
   }

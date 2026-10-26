@@ -138,12 +138,14 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
     : marketOwedNum > 0 ? "电路市场还欠本期卖出款（ProceedsPending）：先提取"
     : partsHeld > 0 && !poolCoversShares ? "电路还在合约里、池子不够按原价退完（CircuitsAreCollateral）：先 topUpShortfall"
     : "";
+  // Campaign.Phase：1 Buying / 2 Ready（无独立 Listed）。开矿门槛与 _beginMining 对齐。
   const miningGate = !s ? ""
     : halted ? "本期已熔断，开矿已暂停"
-    : s.phase !== 3 ? "先确认电路到账（Ready）再开矿"
+    : s.scene === 1 && s.phase !== 2 ? "先确认电路到账（Ready）再开矿"
     : partsHeld <= 0 ? "合约手上没有电路（NotACircuitOwner）"
     : listedNum > 0 ? "还有电路挂在市场（CircuitStillListed）：先撤单"
     : "";
+  const canMineHere = Boolean(s) && (s.scene === 2 || (s.scene === 1 && s.phase === 2));
   // 买入参数与成本预览。buyCircuits 是 non-payable，采购款直接从募集余额扣；
   // 前端先把超余额挡在签名之外，避免用一次失败把整期标记为执行失败。
   const buyQty = Math.max(0, Math.floor(Number(form.buyQty) || 0));
@@ -244,7 +246,21 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                   {s.executionFailed && <p className="fine chain-warn">本期已判执行失败并回到待挂单。可降低单价重试或退款；没有电路时不要开矿。</p>}
                   {canOperate && (
                     <div className="chain-actions">
-                      {s.phase === 1 && <button className="btn btn-inline" type="button" disabled={busy} onClick={() => run("setPlan", (sg) => tx.setPlan(sg, BigInt(form.est || "0")))}>写入预估算力</button>}
+                      {s.phase === 1 && (
+                        <button
+                          className="btn btn-inline"
+                          type="button"
+                          disabled={busy || heldNum <= 0}
+                          title={heldNum <= 0 ? "请先持有电路，再按张数 × P 写入" : "确认到账前写入；Ready 后再改会 WrongScene"}
+                          onClick={() => run("setPlan", (sg) => {
+                            const n = BigInt(form.est || "0");
+                            if (n <= 0n) throw new Error("请填写预估算力（持有张数 × 处理器 P）");
+                            return tx.setPlan(sg, n);
+                          })}
+                        >
+                          写入预估算力
+                        </button>
+                      )}
                       {s.phase === 1 && isOwner && (
                         <div className="buy-debug">
                           <p className="fine">从官方电路市场买入：电路集合开期已锁定（{short(s.circuits)}）。按市场卖单从低到高挑单，采购款直接从募集余额扣；最高单价留 0 表示不设上限。</p>
@@ -279,7 +295,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                           打开退款
                         </button>
                       )}
-                      {!s.executionFailed && Number(s.surplusBase || 0) === 0 && s.phase !== 3 && (() => {
+                      {!s.executionFailed && Number(s.surplusBase || 0) === 0 && s.phase !== 2 && (() => {
                         // 合约 FAIL_GRACE = 3 天：非 Owner 只能等售罄满 3 天；Owner 随时可判。
                         const waitMs = !canOperate && s.markFailedAt ? Number(s.markFailedAt) - Date.now() : 0;
                         const locked = waitMs > 0;
@@ -301,7 +317,7 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                           </button>
                         );
                       })()}
-                      {s.phase === 2 && heldNum > 0 && (
+                      {s.phase === 1 && heldNum > 0 && (
                         <button
                           className="btn btn-primary"
                           type="button"
@@ -312,10 +328,10 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
                           确认 {heldNum} 张电路到账
                         </button>
                       )}
-                      {s.phase === 2 && heldNum <= 0 && (
+                      {s.phase === 1 && heldNum <= 0 && (
                         <p className="fine">本期合约还没有电路：先在「买入电路」里从市场买入，再确认到账。</p>
                       )}
-                      {s.phase === 3 && !s.executionFailed && isOwner && (
+                      {canMineHere && !s.executionFailed && isOwner && (
                         <>
                           <button
                             className="btn btn-primary"
@@ -350,9 +366,30 @@ export default function OnChainPage({ embedded = false, embeddedAccount = "", em
               {s.scene === 2 && (
                 <div>
                   <p className="fine">
-                    电路由本期合约持有并通过官方 PoD 挖矿合约产出 BEM：先「领取挖矿奖励」把产出收到本期，
-                    持份人再各自 claimBem；退出只能通过「发布转让挂单」走份额转让。
+                    官方挖矿中：产出先 claimMiningRewards 收到本期，持份人再 claimBem。
+                    还可继续对未开矿电路 startMining；退出走份额转让。
                   </p>
+                  {isOwner && (
+                    <div className="chain-actions">
+                      <button
+                        className="btn btn-primary"
+                        type="button"
+                        disabled={busy || Boolean(miningGate)}
+                        title={miningGate || undefined}
+                        onClick={() => run("开启挖矿", (sg) => tx.startMining(sg, BigInt(heldIds[0] ?? 0)))}
+                      >
+                        开启挖矿（第 1 张）
+                      </button>
+                      <button
+                        className="btn btn-inline"
+                        type="button"
+                        disabled={busy || miningActiveNum === 0}
+                        onClick={() => run("领取挖矿奖励", (sg) => tx.claimMiningRewards(sg))}
+                      >
+                        领取挖矿奖励
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

@@ -12,7 +12,7 @@
  * 三层语义，互不重叠 —— 每一层只回答一个问题：
  *
  *   ┌─ 阶段 stage ── 本期走到哪一步？        募集中 / 待执行 / 挖矿中 / 执行失败 / 已结束
- *   ├─ 子状态 phase ─ 待执行里具体卡在哪？    待挂单 / 挂单中 / 已到账
+ *   ├─ 子状态 phase ─ 待执行里具体卡在哪？    待挂单(Buying) / 已到账(Ready)
  *   └─ 认购 deal ─── 认筹这一层达成了吗？    认购中 / 已售罄（已结束/挖矿中不显示，见 dealStatus.js）
  *
  * 渲染原则（避免重复表述）：**同一句话在同一个视图里只出现一次**。
@@ -36,24 +36,23 @@ export const ENDED = { key: "ended", label: "已结束", tone: "done" };
 export const FAILED = { key: "failed", label: "执行失败", tone: "back" };
 
 /**
- * 待执行下的子状态。
+ * 待执行下的子状态（与链上 Phase：Buying / Ready 对齐）。
  *  label    状态词本身（表格、子状态行用）
  *  sub      下一步（当同一屏别处已经说过「到账」时用，避免重复）
  *  full     状态 + 下一步（只在生命周期条用）
  */
 export const PHASE = {
   buying: { key: "buying", label: "待挂单", sub: "待挂单", full: "待挂单" },
-  listed: { key: "listed", label: "挂单中", sub: "挂单中", full: "挂单中" },
   ready: { key: "ready", label: "已到账", sub: "待开矿", full: "已到账 · 待开矿" },
 };
 
-/** 链上 phase 是数字 1/2/3，前端 book.executePhase 是字符串。两种都要吃得下。 */
-const PHASE_BY_NUM = { 1: "buying", 2: "listed", 3: "ready" };
+/** 链上 phase 与 Campaign.Phase 对齐：1 Buying / 2 Ready。 */
+const PHASE_BY_NUM = { 1: "buying", 2: "ready" };
 const SCENE_BY_NUM = { 0: "funding", 1: "executing", 2: "mining" };
 
 /** `config.js` 的数组口径（按链上枚举下标取值）也走这里，别再各写一份。 */
 export const SCENE_LABEL = [SCENE.funding.label, SCENE.executing.label, SCENE.mining.label];
-export const PHASE_LABEL = ["—", PHASE.buying.label, PHASE.listed.label, PHASE.ready.full];
+export const PHASE_LABEL = ["—", PHASE.buying.label, PHASE.ready.full];
 
 export function sceneKeyOf(row) {
   if (typeof row?.scene === "number") return SCENE_BY_NUM[row.scene] || "";
@@ -142,7 +141,7 @@ export function roundState(row, now = Date.now()) {
  *
  *   stage     阶段词（已结束 / 执行失败 / 募集中 / 待执行 / 挖矿中）
  *   deal      认购徽标（认购中 / 已售罄 / 空）
- *   substate  当前卡点或原因（待挂单 / 挂单中 / 已到账 · 待开矿 / 原因）
+ *   substate  当前卡点或原因（待挂单 / 已到账 · 待开矿 / 原因）
  */
 export function rowState(row, nowSec = Math.floor(Date.now() / 1000), dealOf) {
   const state = roundState(row, nowSec * 1000);
@@ -187,9 +186,8 @@ export function nextActionOf(row) {
   if (state.key === "failed") return "原路退款 / 降价重挂";
   if (state.sceneKey === "funding") return "等待售罄";
   if (state.sceneKey === "executing") {
-    if (state.phaseKey === "listed") return "等成交 → 确认到账 → 开矿";
     if (state.phaseKey === "ready") return "退余款 → 开矿";
-    return "挂单 → 确认到账 → 开矿";
+    return "买入 → 确认到账 → 开矿";
   }
   if (state.sceneKey === "mining") return "份额转让";
   return "查看详情";

@@ -1,25 +1,26 @@
 {
   "network": "bsc",
   "chainId": 56,
-  "deployedAt": "2026-10-25T17:48:53.070Z",
+  "deployedAt": "2026-10-26T03:45:00.000Z",
   "circuitMarket": "0x6feEbbEbC07BcB90bd1Ac8b0CF9BaA4f0fF2B46f",
   "podMining": "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46",
   "bem": "0x5ce033B2bFCa3Af30b3e8C8457DeaF776A8b695a",
   "podLens": "0xdd20b9537b9f5db9d2a23e6b11ad863cf81930d8",
-  "campaignDeployer": "0x58CFe89C382e35c93D8b764Bd7cDC273abf04e14",
+  "campaignDeployer": "0x1F255d3Ce4Bc4292d3dBeBDf30B44defde7e2ea3",
   "allowedCircuits": [
     "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C",
     "0x1f5cb4aeae1807bf60c3b9c0d8adbcc14e91f12c"
   ],
-  "factory": "0x81D4dD7f5c2881236bcf441a462423b034FE6F9c",
-  "campaign": "",
+  "factory": "0xFBAE62C730afC0094e021aDe3caA4f87D428Eb63",
+  "campaign": "0x245DFb6CBd95ab94447E120B4E24388E3E2448EF",
   "campaignParams": null,
   "deployer": "0xebA1B24d36487a75C533233A07D6899a268Bb9AA",
   "factoryDeploymentTx": "",
   "factoryDeploymentBlock": null,
-  "factoryRuntimeBytes": 2241,
-  "notes": "含 onERC721Received + 官方 PoD/BEM 的工厂。尚未开期；开期须选白名单内 ERC721。",
+  "factoryRuntimeBytes": 2187,
+  "notes": "2026-10-26 重部署：低价挂卖 / startMining(tokenId) / 去掉 recoverCircuits。第 1 期 0x245D…48EF。",
   "_legacyFactoriesBackup": [
+    "0x81D4dD7f5c2881236bcf441a462423b034FE6F9c",
     "0x6768039789439a9da2044926293d8cc46ee4225e"
   ]
 }

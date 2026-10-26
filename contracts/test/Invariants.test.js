@@ -75,7 +75,7 @@ async function miningFixture() {
   await campaign.connect(owner).setPlan(408n);
   const tokens = await buy(ctx, UNIT);
   await campaign.confirmCircuits();
-  await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+  await campaign.connect(owner).startMining(tokens[0]);
   return { ...ctx, tokenId: tokens[0] };
 }
 
@@ -145,7 +145,7 @@ describe("ledger identity", () => {
 
     await campaign.confirmCircuits();
     await expectLedgerClosed(campaign);
-    await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+    await campaign.connect(owner).startMining(tokens[0]);
     await expectLedgerClosed(campaign);
     expect(await campaign.circuitHeldCount()).to.equal(1n);
 
@@ -202,7 +202,7 @@ describe("ledger identity", () => {
     await campaign.connect(owner).setPlan(408n);
     const tokens = await buy(ctx, UNIT);
     await campaign.confirmCircuits();
-    await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+    await campaign.connect(owner).startMining(tokens[0]);
     await expectLedgerClosed(campaign);
 
     const before = await campaign.surplusOf(await rejector.getAddress());
@@ -297,9 +297,6 @@ describe("shares and circuit conservation", () => {
       campaign,
       "CircuitsAreCollateral",
     );
-    await expect(
-      campaign.connect(owner).recoverCircuits(await nft.getAddress(), tokenId),
-    ).to.be.revertedWithCustomError(campaign, "SharesOutstanding");
     await expectLedgerClosed(campaign);
 
     // Top up the 0.6 BNB the circuit consumed, then holders can take the full principal.
@@ -312,10 +309,8 @@ describe("shares and circuit conservation", () => {
     expect(await campaign.totalRefunded()).to.equal(TOTAL_SHARES * SHARE_PRICE);
     await expectCollateralInvariant(campaign);
     await expectLedgerClosed(campaign);
-
-    await campaign.connect(owner).recoverCircuits(await nft.getAddress(), tokenId);
-    expect(await nft.ownerOf(tokenId)).to.equal(owner.address);
-    expect(await campaign.circuitHeldCount()).to.equal(0n);
+    // Circuits stay with the round after full refund (recoverCircuits removed for size); list to exit.
+    expect(await nft.ownerOf(tokenId)).to.equal(await campaign.getAddress());
     await expectNoDustLeft(campaign);
   });
 
@@ -341,13 +336,9 @@ describe("shares and circuit conservation", () => {
       campaign,
       "CircuitsAreCollateral",
     );
-    await expect(
-      campaign.connect(owner).recoverCircuits(await nft.getAddress(), tokenId),
-    ).to.be.revertedWithCustomError(campaign, "SharesOutstanding");
-
     // Mining is still open: the shares keep their claim on the circuit's output.
     await campaign.connect(owner).setPhase(PHASE.Ready);
-    await campaign.connect(owner).startMining(tokenId, 0, 0, [], [], []);
+    await campaign.connect(owner).startMining(tokenId);
     expect(await campaign.outstandingShares()).to.equal(100n);
     expect(await nft.ownerOf(tokenId)).to.equal(await campaign.getAddress());
     await expectCollateralInvariant(campaign);
@@ -422,7 +413,7 @@ describe("randomized lifecycles", () => {
         await campaign.connect(owner).returnSurplus();
         await expectLedgerClosed(campaign);
       }
-      await campaign.connect(owner).startMining(tokenId, 0, 0, [], [], []);
+      await campaign.connect(owner).startMining(tokenId);
       await expectLedgerClosed(campaign);
 
       const rounds = 1 + Math.floor(rand() * 2);

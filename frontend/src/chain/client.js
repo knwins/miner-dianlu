@@ -1,6 +1,6 @@
 // 链上对接客户端（ethers v6）。读取 Campaign 实时状态、发送写交易。
 // 无钱包时用公共 RPC 只读；有钱包（window.ethereum）时签名发送。
-import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, parseEther, ZeroAddress, keccak256, solidityPacked } from "ethers";
+import { BrowserProvider, FetchRequest, JsonRpcProvider, Network, Contract, Interface, formatEther, formatUnits, parseEther, ZeroAddress, keccak256, solidityPacked } from "ethers";
 import { CAMPAIGN_ABI, FACTORY_ABI, CIRCUIT_MARKET_ABI, MOCK_CIRCUIT_ABI, POD_MINING_ABI } from "./abis.js";
 import {
   CAMPAIGN_ADDRESS,
@@ -13,7 +13,15 @@ import {
   PHASE_LABEL,
   POD_LENS_ADDRESS,
   POD_MINING_ADDRESS,
+  POD_MINING_COOLDOWN_BLOCKS,
+  BEM_DECIMALS,
 } from "./config.js";
+import {
+  OFFICIAL_CIRCUIT_COLLECTIONS,
+  processorFromCircuitContract,
+} from "../tapeout.js";
+
+export { POD_MINING_COOLDOWN_BLOCKS };
 import { discoverWallets, explainConnectError, inAppWalletName, rememberWallet, rememberedWalletId } from "./wallets.js";
 
 export { formatEther, parseEther, ZeroAddress };
@@ -572,8 +580,14 @@ async function readStateOn(runner, account, campaignAddr) {
         c.feeRecipientAt(i).catch(() => null),
         c.feeSharesBpsAt(i).catch(() => null),
       ]);
-      if (!addr || !bps) continue;
-      feeShares.push({ address: addr, sharePercent: Number(bps) / 100 });
+      // bps 是 uint16 / bigint：不能用 !bps（会把合法的 0 以外值搞混的风险小，
+      // 但 null/undefined 必须跳过；0 份额在链上本就不合法，读到也丢弃）。
+      if (!addr || bps == null || Number(bps) <= 0) continue;
+      feeShares.push({
+        address: addr,
+        sharePercent: Number(bps) / 100,
+        shareBps: Number(bps),
+      });
     }
   }
 
@@ -774,7 +788,7 @@ export async function liveReadView(method, args = {}, account = null, campaignAd
       if (!a) return "请填地址";
       const c = campaignContract(getReadProvider(), campaignAddr);
       const v = await c.bemPendingOf(a);
-      return `${Number(formatEther(v)).toFixed(4)} BEM`;
+      return `${Number(formatUnits(v, BEM_DECIMALS)).toFixed(6)} BEM`;
     }
     case "sharesOf": {
       const a = args.account || account;
@@ -859,7 +873,8 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         address,
         scene: POSITION_SCENE[scene] || "funding",
         sceneLabel: SCENE_LABEL[scene] || "—",
-        phase: ["", "buying", "listed", "ready"][phaseN] || "buying",
+        // Campaign.Phase：1 Buying / 2 Ready（无 Listed 子态）。
+        phase: ["", "buying", "ready"][phaseN] || "buying",
         sold: Number(res[1]),
         outstandingShares: Number(res[8]),
         totalShares: Number(res[2]),
@@ -875,8 +890,25 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         pendingSurplusBnb: account
           ? Number(formatEther(res[12] > res[13] ? res[12] : res[13]))
           : 0,
-        bemClaimable: account ? Number(formatEther(res[14])) : 0,
+        bemClaimable: account ? Number(formatUnits(res[14], BEM_DECIMALS)) : 0,
+        miningPendingBem: 0,
+        miningActiveCount: 0,
       });
+      // 挖矿产出 / 活跃矿数：资产页「产出」「领奖励」用。
+      try {
+        const bought = Number(await c.circuitCount().catch(() => 0n));
+        let miningPendingWei = 0n;
+        let miningActiveCount = 0;
+        for (let j = 0; j < bought; j++) {
+          const tid = await c.circuitIds(j).catch(() => null);
+          if (tid == null) continue;
+          const st = Number(await c.miningStatus(tid).catch(() => 0));
+          if (st === 1) miningActiveCount += 1;
+          miningPendingWei += await c.miningPending(tid).catch(() => 0n);
+        }
+        rows[rows.length - 1].miningPendingBem = Number(formatUnits(miningPendingWei, BEM_DECIMALS));
+        rows[rows.length - 1].miningActiveCount = miningActiveCount;
+      } catch { /* 读产出失败时保持 0 */ }
     } catch {
       rows.push({
         id,
@@ -896,6 +928,8 @@ export async function readAccountAcrossCampaigns(account, addrs) {
         refundedBnb: 0,
         pendingSurplusBnb: 0,
         bemClaimable: 0,
+        miningPendingBem: 0,
+        miningActiveCount: 0,
         raisedBnb: 0,
         error: true,
       });
@@ -954,6 +988,18 @@ async function readCircuitOrder(c) {
     const ids = n > 0
       ? await Promise.all(Array.from({ length: n }, (_, i) => c.circuitIds(i).catch(() => null)))
       : [];
+    const podFromCampaign = await c.podMining().catch(() => ZeroAddress);
+    const podAddr = isAddr(podFromCampaign) && podFromCampaign !== ZeroAddress
+      ? podFromCampaign
+      : (isAddr(POD_MINING_ADDRESS) ? POD_MINING_ADDRESS : ZeroAddress);
+    const pod = podAddr !== ZeroAddress
+      ? new Contract(podAddr, POD_MINING_ABI, c.runner)
+      : null;
+    const provider = c.runner?.provider ?? c.runner;
+    const blockNumber = provider?.getBlockNumber
+      ? await provider.getBlockNumber().catch(() => 0)
+      : 0;
+
     const rows = await Promise.all(ids.filter((v) => v != null).map(async (tokenId) => {
       const [cost, listingId, status, pending] = await Promise.all([
         c.circuitCostBasis(tokenId).catch(() => 0n),
@@ -961,6 +1007,16 @@ async function readCircuitOrder(c) {
         c.miningStatus(tokenId).then(Number).catch(() => 0),
         c.miningPending(tokenId).catch(() => 0n),
       ]);
+      let stopBlock = 0;
+      if (pod && (status === 1 || status === 3)) {
+        try {
+          const key = await pod.minerKey(circuits, tokenId);
+          const miner = await pod.getMiner(key);
+          stopBlock = Number(miner.stopBlock || 0);
+        } catch {
+          stopBlock = 0;
+        }
+      }
       let owned = false;
       if (token) {
         try {
@@ -980,7 +1036,10 @@ async function readCircuitOrder(c) {
           listed = false;
         }
       }
-      return { tokenId, cost, listingId, owned, listed, listingPrice, miningStatus: status, miningPending: pending };
+      return {
+        tokenId, cost, listingId, owned, listed, listingPrice,
+        miningStatus: status, miningPending: pending, miningStopBlock: stopBlock,
+      };
     }));
 
     const held = rows.filter((r) => r.owned);
@@ -997,11 +1056,14 @@ async function readCircuitOrder(c) {
       heldCount,
       boughtCount,
       circuitHeldCount: heldCount,
+      blockNumber,
+      miningCooldownBlocks: POD_MINING_COOLDOWN_BLOCKS,
       miningActiveCount: held.filter((r) => r.miningStatus === 1).length,
+      miningCoolingCount: held.filter((r) => r.miningStatus === 3).length,
       miningPendingBem: held.reduce((acc, r) => acc + (r.miningPending || 0n), 0n),
       marketOwed,
       sellSide: Boolean(market),
-      // 每张未挂单的持仓一行；价格预填成本价（>= 成本才允许挂）。
+      // 每张未挂单的持仓一行；价格预填成本价（可改低）。
       sellBids: unlisted.map((r) => ({
         id: r.tokenId,
         tokenId: 0,
@@ -1012,6 +1074,7 @@ async function readCircuitOrder(c) {
         circuitTokenId: r.tokenId,
         miningStatus: r.miningStatus,
         miningPending: r.miningPending,
+        miningStopBlock: r.miningStopBlock,
       })),
       listedCircuits: listed.map((r) => ({
         tokenId: r.tokenId,
@@ -1020,6 +1083,7 @@ async function readCircuitOrder(c) {
         cost: r.cost,
         miningStatus: r.miningStatus,
         miningPending: r.miningPending,
+        miningStopBlock: r.miningStopBlock,
       })),
     };
   } catch {
@@ -1715,7 +1779,7 @@ export async function listCampaigns() {
   return campaignsOf(FACTORY_ADDRESS);
 }
 
-/** 读某期轻量摘要（历史列表用）。缺字段直接抛错，不做旧 ABI 降级。 */
+/** 读某期轻量摘要（历史列表用）。缺字段直接抛错。 */
 export async function readCampaignSummary(address) {
   return withReadProvider((runner) => readCampaignSummaryOn(runner, address));
 }
@@ -2133,15 +2197,208 @@ async function buyCircuitsFromMarket(signer, maxQty, maxPriceWei) {
 }
 
 /**
- * 买入**指定的**市场挂单（Owner 面板勾选模式）。
+ * 把官网可见编号 / 挂单 ID 解析成预览入参。
+ * - `18016.30`：官网「电路」列灰字 → 取小数点前 = 电路 tokenId
+ * - `18016` / `#18016`：先当挂单 ID 试，不行再当电路编号
  *
- * 与按数量自动挑单的区别：这里按 listingId 精确吃单，UI 勾哪几张就买哪几张。
- * 价格与归属**不采信前端缓存**：每笔都在链上重读 `listings(id)` 和
- * `listingFor(circuits, tokenId)`，挂单被撤、被成交、换了集合、改了价，
- * 都在签名前就拒掉 —— 否则整批买会在链上 revert，白付 gas。
+ * @param {string|number} raw
+ * @returns {{ input:string, preferCircuit:boolean, value:bigint }|null}
+ */
+function parseMarketRef(raw) {
+  const input = String(raw ?? "").trim();
+  if (!input) return null;
+  const dotted = input.match(/^#?(\d+)\.(\d+)$/);
+  if (dotted) {
+    const value = BigInt(dotted[1]);
+    if (value <= 0n) return null;
+    return { input, preferCircuit: true, value };
+  }
+  const plain = input.match(/^#?(\d+)$/);
+  if (!plain) return null;
+  const value = BigInt(plain[1]);
+  if (value <= 0n) return null;
+  return { input, preferCircuit: false, value };
+}
+
+function previewFail(input, reason, extra = {}) {
+  return {
+    input: String(input || ""),
+    id: null,
+    tokenId: null,
+    priceBnb: 0,
+    seller: "",
+    ok: false,
+    reason,
+    ...extra,
+  };
+}
+
+function previewOk(input, listingId, tokenId, priceWei, seller, extra = {}) {
+  return {
+    input: String(input || ""),
+    id: Number(listingId),
+    tokenId: Number(tokenId),
+    priceBnb: Number(formatEther(priceWei)),
+    seller: String(seller || ""),
+    ok: true,
+    reason: "",
+    /** 官方 PoD status：0 空闲 / 1 挖矿中 / 2 已撤销 / 3 冷却；null=未读到 */
+    miningStatus: extra.miningStatus ?? null,
+  };
+}
+
+/** 读官方 PoD 矿工 status（买到可能是空闲或挖矿中）。读不到返回 null。 */
+async function readPodMiningStatus(runner, circuitsAddr, tokenId) {
+  if (!isAddr(POD_MINING_ADDRESS) || POD_MINING_ADDRESS === ZeroAddress) return null;
+  try {
+    const key = keccak256(solidityPacked(["address", "uint256"], [circuitsAddr, BigInt(tokenId)]));
+    const pod = new Contract(POD_MINING_ADDRESS, POD_MINING_ABI, runner);
+    const miner = await pod.getMiner(key);
+    if (Number(miner.circuitId) !== Number(tokenId)) return 0;
+    return Number(miner.status);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 官网挑单 → 本站预览。支持：
+ *   1) 官网「电路」列编号 `18016.30`（推荐，取点前电路 tokenId → listingFor）
+ *   2) 纯数字：先 `listings(id)`，失败再按电路 tokenId 查
+ *
+ * @param {string} marketAddr
+ * @param {string} circuitsAddr 本期锁定集合
+ * @param {Array<number|string>} refs
+ * @param {{ expectedName?: string }} [opts]
+ */
+export async function previewCircuitListingsByIds(marketAddr, circuitsAddr, refs, opts = {}) {
+  if (!isAddr(marketAddr) || marketAddr === ZeroAddress) {
+    throw new Error("本期没有配置电路市场");
+  }
+  const wantCircuits = String(circuitsAddr || "").toLowerCase();
+  if (!isAddr(wantCircuits) || wantCircuits === ZeroAddress) {
+    throw new Error("本期没有锁定电路合约（ERC721）");
+  }
+  const wantName = String(opts.expectedName || processorFromCircuitContract(wantCircuits) || "本期集合");
+  const parsed = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(refs) ? refs : []) {
+    const ref = parseMarketRef(raw);
+    if (!ref) continue;
+    const key = `${ref.preferCircuit ? "c" : "a"}:${ref.value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    parsed.push(ref);
+  }
+  if (parsed.length === 0) {
+    throw new Error("请填写电路编号（如 18016.30）");
+  }
+
+  return withReadProvider(async (runner) => {
+    const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, runner);
+
+    const wrongCollection = (input, gotAddr, extra = {}) => {
+      const gotName = processorFromCircuitContract(gotAddr) || "其他集合";
+      return previewFail(input, `非锁定集合（${gotName}，须 ${wantName}）`, {
+        code: "wrongCollection",
+        ...extra,
+      });
+    };
+
+    const fromListingId = async (input, listingId) => {
+      const l = await market.listings(listingId);
+      const seller = String(l.seller || "");
+      const listedCircuits = String(l.circuits || "").toLowerCase();
+      const tokenId = BigInt(l.tokenId);
+      const price = BigInt(l.price || 0);
+      if (!seller || seller === ZeroAddress || listedCircuits === ZeroAddress.toLowerCase() || price <= 0n) {
+        return null;
+      }
+      if (listedCircuits !== wantCircuits) {
+        return wrongCollection(input, listedCircuits, {
+          id: Number(listingId),
+          tokenId: Number(tokenId),
+          priceBnb: Number(formatEther(price)),
+          seller,
+        });
+      }
+      const live = await market.listingFor(l.circuits, l.tokenId);
+      if (!live.valid || BigInt(live.id) !== listingId) {
+        return previewFail(input, "已撤单或已成交", {
+          id: Number(listingId),
+          tokenId: Number(tokenId),
+          priceBnb: Number(formatEther(price)),
+          seller,
+        });
+      }
+      if (BigInt(live.price) !== price) {
+        return previewFail(input, "单价已变，请重预览", {
+          id: Number(listingId),
+          tokenId: Number(tokenId),
+          priceBnb: Number(formatEther(live.price)),
+          seller: String(live.seller || seller),
+        });
+      }
+      const miningStatus = await readPodMiningStatus(runner, wantCircuits, tokenId);
+      return previewOk(input, listingId, tokenId, price, live.seller || seller, { miningStatus });
+    };
+
+    const fromCircuitId = async (input, circuitId) => {
+      const live = await market.listingFor(wantCircuits, circuitId);
+      if (live.valid && BigInt(live.id) > 0n) {
+        return fromListingId(input, BigInt(live.id));
+      }
+      // 锁定集合无此单：看是否挂在其他官方集合上，给出「非锁定」提示。
+      for (const [name, addr] of Object.entries(OFFICIAL_CIRCUIT_COLLECTIONS)) {
+        const other = String(addr).toLowerCase();
+        if (other === wantCircuits) continue;
+        try {
+          const hit = await market.listingFor(other, circuitId);
+          if (hit.valid && BigInt(hit.id) > 0n) {
+            return wrongCollection(input, other, {
+              id: Number(hit.id),
+              tokenId: Number(circuitId),
+              priceBnb: Number(formatEther(hit.price || 0)),
+              seller: String(hit.seller || ""),
+            });
+          }
+        } catch {
+          /* 继续试下一个集合 */
+        }
+        void name;
+      }
+      return previewFail(input, `${wantName} 无此在售`, { tokenId: Number(circuitId) });
+    };
+
+    const rows = [];
+    for (const ref of parsed) {
+      try {
+        if (ref.preferCircuit) {
+          rows.push(await fromCircuitId(ref.input, ref.value));
+          continue;
+        }
+        let row = await fromListingId(ref.input, ref.value);
+        if (!row) {
+          row = await fromCircuitId(ref.input, ref.value);
+        }
+        rows.push(row || previewFail(ref.input, `${wantName} 无此挂单/电路`));
+      } catch (e) {
+        rows.push(previewFail(ref.input, e?.shortMessage || e?.message || "读取失败"));
+      }
+    }
+    return rows;
+  });
+}
+
+/**
+ * 买入**指定的**市场挂单（表单填 ID / 勾选均可）。
+ *
+ * 按 listingId 精确吃单。价格与归属**不采信前端缓存**：每笔都在链上重读
+ * `listings(id)` 和 `listingFor(circuits, tokenId)`。`tokenId` 可省略，以链上为准；
+ * 若传入则必须与链上一致。
  *
  * @param {object} signer ethers Signer
- * @param {Array<{id:number|string, tokenId:number|string}>} picks
+ * @param {Array<{id:number|string, tokenId?:number|string}>} picks
  */
 async function buyCircuitsListings(signer, picks) {
   const campaign = signerOrThrow(signer);
@@ -2150,7 +2407,7 @@ async function buyCircuitsListings(signer, picks) {
   const circuitsAddr = String(await campaign.circuits());
   if (!isAddr(circuitsAddr) || circuitsAddr === ZeroAddress) throw new Error("本期没有锁定电路合约（ERC721）");
   const list = Array.isArray(picks) ? picks : [];
-  if (list.length === 0) throw new Error("请先勾选要买入的电路挂单");
+  if (list.length === 0) throw new Error("请填写要买入的挂单 ID");
 
   const market = new Contract(marketAddr, CIRCUIT_MARKET_ABI, signer);
   const ids = [];
@@ -2159,26 +2416,29 @@ async function buyCircuitsListings(signer, picks) {
   const seen = new Set();
   for (const pick of list) {
     const id = BigInt(Math.floor(Number(pick?.id ?? -1)));
-    const tokenId = BigInt(Math.floor(Number(pick?.tokenId ?? -1)));
-    if (id <= 0n || tokenId < 0n) throw new Error("勾选的挂单无效，请刷新市场卖单后重选");
+    if (id <= 0n) throw new Error("挂单 ID 无效");
     if (seen.has(String(id))) continue; // 同一挂单只吃一次
     seen.add(String(id));
     const l = await market.listings(id);
     if (String(l.circuits).toLowerCase() !== circuitsAddr.toLowerCase()) {
-      throw new Error(`挂单 #${id} 不属于本期锁定的电路合约，请刷新市场卖单`);
+      throw new Error(`挂单 #${id} 不属于本期锁定的电路合约`);
     }
-    if (BigInt(l.tokenId) !== tokenId) {
-      throw new Error(`挂单 #${id} 的 tokenId 已变化，请刷新市场卖单`);
+    const chainTokenId = BigInt(l.tokenId);
+    const wantToken = pick?.tokenId != null && String(pick.tokenId).trim() !== ""
+      ? BigInt(Math.floor(Number(pick.tokenId)))
+      : null;
+    if (wantToken != null && wantToken !== chainTokenId) {
+      throw new Error(`挂单 #${id} 的 tokenId 已变化，请重新预览`);
     }
     const live = await market.listingFor(l.circuits, l.tokenId);
     if (!live.valid || BigInt(live.id) !== id) {
-      throw new Error(`挂单 #${id} 已被撤单或成交，请刷新市场卖单`);
+      throw new Error(`挂单 #${id} 已被撤单或成交，请重新预览`);
     }
     if (BigInt(live.price) !== BigInt(l.price)) {
-      throw new Error(`挂单 #${id} 的单价已变化，请刷新市场卖单`);
+      throw new Error(`挂单 #${id} 的单价已变化，请重新预览`);
     }
     ids.push(id);
-    tokenIds.push(tokenId);
+    tokenIds.push(chainTokenId);
     prices.push(l.price);
   }
   if (ids.length === 0) throw new Error("没有可买入的挂单");
@@ -2235,8 +2495,8 @@ export const tx = {
   refund: (signer, address) => signerOrThrow(signer, address).refund(),
   claimSurplus: (signer, address) => signerOrThrow(signer, address).claimSurplus(),
   claimFee: (signer, address) => signerOrThrow(signer, address).claimFee(),
-  setServiceFee: (signer, bps, recipients, sharesBps) =>
-    signerOrThrow(signer).setServiceFee(bps, recipients, sharesBps),
+  setServiceFee: (signer, bps, recipients, sharesBps, campaignAddr) =>
+    signerOrThrow(signer, campaignAddr).setServiceFee(bps, recipients, sharesBps),
   claimBem: (signer, address) => signerOrThrow(signer, address).claimBem(),
   claimMiningRewards: (signer, address) => signerOrThrow(signer, address).claimMiningRewards(),
   listShares: (signer, count, price) => signerOrThrow(signer).listShares(count, price),
@@ -2276,10 +2536,8 @@ export const tx = {
   setPlan: (signer, est) => signerOrThrow(signer).setPlan(est),
   halt: (signer) => signerOrThrow(signer).halt(),
   resume: (signer) => signerOrThrow(signer).resume(),
-  // 官方 PoD 挖矿：taskId 0 = 未验证池（UI 默认），已验证池需先 armMining 再下一块 startMining。
-  armMining: (signer, tokenId) => signerOrThrow(signer).armMining(tokenId),
-  startMining: (signer, tokenId, taskId = 0, anchorBlock = 0, inputs = [], expectedOuts = [], proofs = []) =>
-    signerOrThrow(signer).startMining(tokenId, taskId, anchorBlock, inputs, expectedOuts, proofs),
+  // 官方 PoD 挖矿：未验证池（taskId=0）。
+  startMining: (signer, tokenId) => signerOrThrow(signer).startMining(tokenId),
   stopMining: (signer, tokenId) => signerOrThrow(signer).stopMining(tokenId),
   createCampaign: (signer, params) => createCampaignTx(signer, params),
   removeCampaignAt: (signer, index) => factoryContract(signer).removeCampaign(index),
@@ -2302,7 +2560,6 @@ export const tx = {
   setCircuitMarket: (signer, circuitMarket) => signerOrThrow(signer).setCircuitMarket(circuitMarket),
   // 无参：一次扫走所有可动 BNB（多余余额，或已无人可退时的整池）。
   recoverBnb: (signer, address) => signerOrThrow(signer, address).recoverBnb(),
-  recoverCircuits: (signer, token, id) => signerOrThrow(signer).recoverCircuits(token, id),
   transferOwnership: (signer, newOwner) => signerOrThrow(signer).transferOwnership(newOwner),
 };
 
@@ -2585,8 +2842,6 @@ function explainParsed(parsed) {
   if (parsed?.name === "Halted") {
     return "本期已熔断：认筹、挂单、卖出、开矿与份额交易暂停；退款、领款、撤单不受影响。等 Owner 解除后再试。";
   }
-  if (parsed?.name === "AlreadyHalted") return "本期已熔断，无需重复操作。";
-  if (parsed?.name === "NotHalted") return "本期未熔断，无需解除。";
   if (parsed?.name === "NotSoldOutYet") return "份数还没售完，不能开始执行（需 sold == totalShares）。";
   if (parsed?.name === "UseReturnSurplus") {
     return "电路已到账：不能退款或放弃采购。可退余款 + 开矿或挂回市场；确要结束本期，先改回待挂单。";
@@ -2594,7 +2849,9 @@ function explainParsed(parsed) {
   if (parsed?.name === "SurplusAlreadyReturned") {
     return "余款已按份退回，本金已在持份人手里。再退款会清零份额（合约拒绝），留着等开矿即可。";
   }
-  if (parsed?.name === "AlreadyMining") return "这张电路已经在挖矿，无需重复开始。";
+  if (parsed?.name === "AlreadyMining") {
+    return "这张电路仍在挖矿（AlreadyMining）：挂卖请先停挖；若是开矿则说明已在挖、无需重复开始。";
+  }
   if (parsed?.name === "NotListed") return "这张电路当前没有挂单，无需撤单。";
   if (parsed?.name === "ZeroShares") return "数量为 0：份数 / 份额 / 余款分母不能为 0。";
   if (parsed?.name === "ZeroPrice") return "金额或单价不能为 0。";
@@ -2625,14 +2882,12 @@ function explainParsed(parsed) {
     return "电路还没到账，不能确认或开矿：先买入电路并确认本期合约真的持有 NFT。";
   }
   if (parsed?.name === "AlreadyListed") return "当前子状态不允许这一步：有电路正在市场挂单，请先撤单。";
-  if (parsed?.name === "AlreadyReady") return "本期已到账，电路锁在合约里。只能开矿或挂回市场。";
   if (parsed?.name === "ProceedsPending") return "市场还有未提取的卖出款，先提取（withdrawMarketProceeds）再继续。";
   if (parsed?.name === "NotACircuit") return "这张挂单的标的不是本期白名单电路合约。";
   if (parsed?.name === "NotACircuitOwner") return "本期合约不持有这张电路 NFT。";
   if (parsed?.name === "CircuitNotDelivered") return "市场成交了，但电路 NFT 没有转到本期合约（CircuitNotDelivered）。";
   if (parsed?.name === "TooManyCircuits") return "一次买入的电路张数超过合约上限（TooManyCircuits）。";
   if (parsed?.name === "CircuitStillListed") return "还有电路挂在市场：先全部撤单再开矿。";
-  if (parsed?.name === "PriceBelowCost") return "挂单价低于本期买入成本，合约拒绝亏本挂出。";
   if (parsed?.name === "SelfTrade") return "不能买回本期自己挂出的电路。";
   if (parsed?.name === "InsufficientCircuits") return "合约里的电路数量不够。";
   if (parsed?.name === "SharesOutstanding") {
@@ -2655,7 +2910,7 @@ function explainParsed(parsed) {
     return `电路合约不在工厂白名单：${p ? `${String(p).slice(0, 10)}… ` : ""}白名单部署时已固化，请改选白名单内的 ERC721 电路合约。`;
   }
   if (parsed?.name === "WrongScene") {
-    return "当前阶段不允许这一步（WrongScene）：按页面提示的下一步操作，或先撤单 / 确认到账。";
+    return "当前阶段不允许这一步（WrongScene）。确认到账仅 Buying→Ready；已进挖矿场景不必再确认。领奖/停挖需有挖矿中电路（冷却中无产出可领）；空闲电路先开矿。setPlan 仅确认前可写。";
   }
   if (parsed?.name === "Reentrancy") {
     return "重入保护触发（Reentrancy）：上一笔还在处理中，等确认后再试。";

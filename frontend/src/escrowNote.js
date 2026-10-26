@@ -66,9 +66,8 @@ export function escrowNote(book, round, now = Date.now()) {
       : { text: "足够按份全额退款", tone: "ok" };
   }
   if (book?.executePhase === "ready") {
-    // 新合约可提前 returnSurplus；旧路径在 startMining 时自动记账。两种都不影响开矿。
     return raised > 0
-      ? { text: "没花完 · 可按份退回，或开矿后自动记账", tone: "muted" }
+      ? { text: "没花完 · 可按份退回（returnSurplus），不影响开矿", tone: "muted" }
       : { text: "已全部用于买电路，无余款可退", tone: "muted" };
   }
   // 待执行 · 待挂单 / 挂单中

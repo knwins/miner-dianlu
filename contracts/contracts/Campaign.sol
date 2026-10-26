@@ -214,8 +214,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     event MarketProceedsWithdrawn(uint256 amount);
     /// @notice BNB swept by recoverBnb; `to` is always the owner.
     event BnbRecovered(uint256 amount, address indexed to);
-    /// @notice A circuit NFT moved by recoverCircuits; `to` is always the owner.
-    event CircuitRecovered(address indexed token, uint256 indexed id, address indexed to);
     /// @notice Official mining started for one circuit; the round is the miner and the NFT holder.
     event MiningStarted(uint256 indexed tokenId, bytes32 indexed key, uint32 taskId);
     /// @notice Official mining stopped for one circuit; `stop` settled its reward to the round.
@@ -245,10 +243,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     error DirectTransferNotAllowed();
     /// @notice Business entry refused by the circuit breaker. Holder exits are never halted.
     error Halted();
-    /// @notice halt() on an already halted round.
-    error AlreadyHalted();
-    /// @notice resume() on a live round.
-    error NotHalted();
     error WrongScene();
     error FundingEnded();
     error CircuitsNotReady();
@@ -272,14 +266,11 @@ contract Campaign is Ownable, ReentrancyGuard {
     error CannotTakeOwnListing();
     error AlreadyListed();
     error NotListed();
-    error AlreadyReady();
     error TransferFailed();
     /// @notice Market proceeds are still in owed(); pull them first so the refund pool is final.
     error ProceedsPending();
     /// @notice buyCircuits: the listing is gone, the price changed, or the token is no longer the seller's.
     error NotACircuit();
-    /// @notice listCircuit: price below the unit price this round paid for that token.
-    error PriceBelowCost();
     /// @notice buyCircuits: the listing belongs to this contract.
     error SelfTrade();
     /// @notice The market returned listing id 0.
@@ -292,8 +283,6 @@ contract Campaign is Ownable, ReentrancyGuard {
     error CircuitStillListed();
     /// @notice startMining: the official mining contract already reports this circuit as active.
     error AlreadyMining();
-    /// @notice Official mining is already on; the scene cannot go back to Executing.
-    error MiningActive();
     /// @notice claimMiningRewards: nothing was harvested.
     error NoRewards();
     /// @notice buyCircuits: the round would exceed MAX_CIRCUITS.
@@ -356,14 +345,14 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         Blocks money-in (`subscribe`), circuit buys / listings, starting mining, and the secondary
     ///         share market. Holder exits are never blocked.
     function halt() external onlyOwner {
-        if (halted) revert AlreadyHalted();
+        if (halted) revert Halted();
         halted = true;
         emit HaltChanged(msg.sender, true);
     }
 
     /// @notice Lift the circuit breaker. Owner only.
     function resume() external onlyOwner {
-        if (!halted) revert NotHalted();
+        if (!halted) revert WrongScene();
         halted = false;
         emit HaltChanged(msg.sender, false);
     }
@@ -456,6 +445,8 @@ contract Campaign is Ownable, ReentrancyGuard {
     }
 
     /// @notice Store the display-only hashpower estimate. Owner only; Funding and Executing/Buying only.
+    ///         UI writes `heldCircuits × processorScale`, not a fundraising guess. Call before confirmCircuits:
+    ///         Ready and Mining refuse (matches mainnet bytecode already deployed).
     /// @param estHashpower_ Read by the UI only.
     function setPlan(uint256 estHashpower_) external onlyOwner {
         if (scene == Scene.Mining) revert WrongScene();
@@ -805,26 +796,31 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         because it only confirms on-chain ownership.
     function confirmCircuits() external {
         _requireExecuting();
-        if (phase == Phase.Ready) revert AlreadyReady();
         if (phase != Phase.Buying) revert WrongScene();
         if (!_circuitsHeld()) revert CircuitsNotReady();
         _setPhase(Phase.Ready);
         emit CircuitsConfirmed();
     }
 
-    /// @notice List a held circuit NFT for resale on the market. Owner only, Ready only.
-    ///         Per-token approval (never setApprovalForAll), price at least the unit price this round paid.
-    ///         The NFT never leaves the contract; the market pays the seller (this round) via owed +
-    ///         withdraw.
+    /// @notice List a held circuit NFT for resale on the market. Owner only.
+    ///         Allowed in Ready, or in Mining after this circuit has been stopped (official stop-then-sell).
+    ///         Per-token approval (never setApprovalForAll). Price may be below cost (Owner discretion).
+    ///         The NFT never leaves the contract until a buyer takes the listing; proceeds via owed + withdraw.
     /// @param tokenId Circuit token to list.
     /// @param price Listing price in wei.
     function listCircuit(uint256 tokenId, uint96 price) external onlyOwner nonReentrant whenLive {
-        _requireReady();
+        if (scene == Scene.Mining) {
+            // Mining scene: sell only after stop (PoD status must not be active).
+        } else {
+            _requireReady();
+        }
         if (price == 0) revert ZeroPrice();
         if (!_ownsCircuit(tokenId)) revert NotACircuitOwner();
         if (circuitListingId[tokenId] != 0) revert AlreadyListed();
-        // A cheap listing would burn the collateral that backs the shares.
-        if (uint256(price) < uint256(circuitCostBasis[tokenId])) revert PriceBelowCost();
+        // Official path: stop mining before listing / transfer.
+        if (IPodMining(podMining).getMiner(IPodMining(podMining).minerKey(circuits, tokenId)).status == 1) {
+            revert AlreadyMining();
+        }
 
         IERC721(circuits).approve(address(circuitMarket), tokenId);
         uint256 id = circuitMarket.list(circuits, tokenId, price);
@@ -924,25 +920,6 @@ contract Campaign is Ownable, ReentrancyGuard {
         emit ExecutionFailed(0, raisedBnb);
     }
 
-    /// @notice Escape hatch: move a circuit NFT held here to the owner so nothing is stranded.
-    ///         Blocked while listed, while mining, and — for this round's own collection — while shares
-    ///         are outstanding or holders were not repaid at the subscription price.
-    /// @param token ERC721 contract; not limited to `circuits`.
-    /// @param id Token id.
-    function recoverCircuits(address token, uint256 id) external onlyOwner nonReentrant {
-        if (activeListingCount != 0) revert AlreadyListed();
-        if (scene == Scene.Mining) revert MiningActive();
-        if (token == address(0)) revert ZeroAddress();
-        if (token == circuits) {
-            // Our circuits back the outstanding shares: they leave only via listCircuit, or once every
-            // holder is settled AND repaid in full.
-            if (outstandingShares != 0) revert SharesOutstanding();
-            if (!_holdersMadeWhole()) revert HoldersNotMadeWhole();
-        }
-        IERC721(token).transferFrom(address(this), owner, id);
-        emit CircuitRecovered(token, id, owner);
-    }
-
     // ─────────────────────────── official mining ───────────────────────────
 
     /// @dev Shared entry into the Mining scene. Books the leftover BNB as holder surplus before any circuit
@@ -968,54 +945,38 @@ contract Campaign is Ownable, ReentrancyGuard {
     ///         `anchorBlock` plus the official task's sampled vectors and Merkle proofs.
     ///         The first call books the leftover BNB as holder surplus and moves the round to Mining.
     ///         Owner only, not halted, all listings cancelled first.
+    ///         Unverified pool only (`taskId = 0`); verified-pool arm/sample path is out of scope to keep
+    ///         CampaignDeployer under the 24KB limit.
     /// @param tokenId Circuit NFT held by the round.
-    /// @param taskId Official task id; 0 = unverified pool.
-    /// @param anchorBlock Block recorded by `armMining`; ignored when taskId is 0.
-    /// @param inputs / expectedOuts / proofs Official sample vectors; empty when taskId is 0.
-    function startMining(
-        uint256 tokenId,
-        uint32 taskId,
-        uint256 anchorBlock,
-        bytes[] calldata inputs,
-        bytes[] calldata expectedOuts,
-        bytes32[][] calldata proofs
-    ) external onlyOwner nonReentrant whenLive {
+    function startMining(uint256 tokenId) external onlyOwner nonReentrant whenLive {
         _beginMining();
-        if (activeListingCount != 0) revert CircuitStillListed();
         if (!_ownsCircuit(tokenId)) revert NotACircuitOwner();
         bytes32 key = IPodMining(podMining).minerKey(circuits, tokenId);
-        if (IPodMining(podMining).getMiner(key).status == 1) revert AlreadyMining();
-        IPodMining(podMining).start(
-            circuits,
-            tokenId,
-            taskId,
-            anchorBlock,
-            inputs,
-            expectedOuts,
-            proofs,
-            bytes32(0)
-        );
-        emit MiningStarted(tokenId, key, taskId);
-    }
-
-    /// @notice Arm a circuit for a verified-pool task: records the current block as the sampling anchor.
-    ///         `startMining` with a non-zero taskId must run in a later block, because the official contract
-    ///         requires `anchorBlock < block.number`. Owner only.
-    /// @param tokenId Circuit NFT held by the round.
-    function armMining(uint256 tokenId) external onlyOwner nonReentrant whenLive {
-        if (!_ownsCircuit(tokenId)) revert NotACircuitOwner();
-        IPodMining(podMining).arm(circuits, tokenId);
+        // Bought an already-active miner (or second start): sync scene and return.
+        if (IPodMining(podMining).getMiner(key).status == 1) {
+            emit MiningStarted(tokenId, key, 0);
+            return;
+        }
+        bytes[] memory none;
+        bytes32[][] memory noneProofs;
+        IPodMining(podMining).start(circuits, tokenId, 0, 0, none, none, noneProofs, bytes32(0));
+        emit MiningStarted(tokenId, key, 0);
     }
 
     /// @notice Stop official mining for one held circuit. `stop` settles the reward to this round, which is
     ///         booked for holders immediately. The NFT stays here, so the circuit can be restarted after the
     ///         official cooldown (or listed back on the market while Ready). Owner only, never halted: the
     ///         stop is the exit from an active miner, not a new irreversible step.
+    ///         If the round is still Ready but PoD already shows this circuit active (bought while mining),
+    ///         enter Mining first so stop is reachable in one call.
     /// @param tokenId Circuit NFT held by the round.
     function stopMining(uint256 tokenId) external onlyOwner nonReentrant {
-        if (scene != Scene.Mining) revert WrongScene();
         if (!_ownsCircuit(tokenId)) revert NotACircuitOwner();
         bytes32 key = IPodMining(podMining).minerKey(circuits, tokenId);
+        if (scene != Scene.Mining) {
+            if (IPodMining(podMining).getMiner(key).status != 1) revert WrongScene();
+            _beginMining();
+        }
         uint256 before = IBemToken(bem).balanceOf(address(this));
         IPodMining(podMining).stop(key);
         _bookBem(IBemToken(bem).balanceOf(address(this)) - before);
@@ -1024,10 +985,16 @@ contract Campaign is Ownable, ReentrancyGuard {
 
     /// @notice Harvest every active miner's reward. Anyone may call: the BEM is minted to this round and
     ///         booked per share, never to the caller. Holders then pull with `claimBem`.
+    ///         If PoD already shows active miners while the round is still Ready (bought while mining),
+    ///         enter Mining first so claim is reachable without a separate startMining.
     function claimMiningRewards() external nonReentrant {
-        if (scene != Scene.Mining) revert WrongScene();
         bytes32[] memory keys = _activeMiningKeys();
-        if (keys.length == 0) revert NoRewards();
+        if (scene != Scene.Mining) {
+            if (keys.length == 0) revert WrongScene();
+            _beginMining();
+        } else if (keys.length == 0) {
+            revert NoRewards();
+        }
         uint256 before = IBemToken(bem).balanceOf(address(this));
         IPodMining(podMining).claimMany(keys);
         uint256 gross = IBemToken(bem).balanceOf(address(this)) - before;
@@ -1118,25 +1085,14 @@ contract Campaign is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @notice Official miner key for a circuit token.
-    /// @param tokenId Circuit NFT.
-    /// @return Stable key used by the official mining contract.
-    function miningKey(uint256 tokenId) public view returns (bytes32) {
-        return IPodMining(podMining).minerKey(circuits, tokenId);
-    }
-
     /// @notice Official miner status: 0 none, 1 active, 2 revoked, 3 cooling.
-    /// @param tokenId Circuit NFT.
-    /// @return Status from the official contract.
     function miningStatus(uint256 tokenId) public view returns (uint8) {
-        return IPodMining(podMining).getMiner(miningKey(tokenId)).status;
+        return IPodMining(podMining).getMiner(IPodMining(podMining).minerKey(circuits, tokenId)).status;
     }
 
     /// @notice Unsettled BEM for one circuit, straight from the official contract.
-    /// @param tokenId Circuit NFT.
-    /// @return Pending BEM wei.
     function miningPending(uint256 tokenId) public view returns (uint256) {
-        return IPodMining(podMining).pending(miningKey(tokenId));
+        return IPodMining(podMining).pending(IPodMining(podMining).minerKey(circuits, tokenId));
     }
 
     /// @notice BEM a holder can pull right now, including accrual not yet settled into pendingBem.

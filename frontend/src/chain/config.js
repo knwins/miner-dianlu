@@ -32,9 +32,21 @@ export const POD_LENS_ADDRESS = deployments.podLens
 export const POD_MINING_ADDRESS = deployments.podMining
   || (CHAIN_ID === 56 ? "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46" : "");
 
+/**
+ * 官方停挖冷却：`block.number > stopBlock + 1200` 才能再 start。
+ * BSC ≈ 3s/块 → 约 1 小时；与官网 / TapeMine 口径一致。
+ */
+export const POD_MINING_COOLDOWN_BLOCKS = 1200;
+
 /** 官方 BEM ERC20；工厂 immutable 写入，每期用它支付挖矿产出。 */
 export const BEM_ADDRESS = deployments.bem
   || (CHAIN_ID === 56 ? "0x5ce033B2bFCa3Af30b3e8C8457DeaF776A8b695a" : "");
+
+/**
+ * 主网官方 BEM 的 decimals（链上 `decimals() == 8`）。
+ * 勿用 formatEther（按 18 位）：会把待领缩小 10^10，钱包显示 0.000173 而页面像灰尘。
+ */
+export const BEM_DECIMALS = 8;
 
 /** 无状态 Campaign 部署器；工厂 createCampaign 时调它 new 一期。 */
 export const CAMPAIGN_DEPLOYER_ADDRESS = deployments.campaignDeployer || "";

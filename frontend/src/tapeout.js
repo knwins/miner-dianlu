@@ -24,6 +24,13 @@ export const OFFICIAL_CIRCUIT_COLLECTIONS = {
 };
 
 /**
+ * 官方新站首页。电路 NFT 市场在站内「电路市场」页（SPA，无独立深链）。
+ * 注意：`/circuit-market` 是老官网路径，不要链过去。
+ * Owner 在官网挑单后，回本站用挂单 ID 表单 → 链上预览 → buyCircuits。
+ */
+export const OFFICIAL_TAPEOUT_HOME = "https://tapeout.net/";
+
+/**
  * 处理器各自的电路合约。
  *
  * ⚠️ 这两个合约都是**真实存在的独立 ERC721 集合**，不是彼此的别名 ——

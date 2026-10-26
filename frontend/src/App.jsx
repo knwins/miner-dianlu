@@ -36,6 +36,12 @@ import { MarketPage } from "./MarketPage.jsx";
 import { RefundRecords } from "./RefundRecords.jsx";
 import { processorScale } from "./prices.js";
 import {
+  canStartPodRow,
+  coolingBlocksLeft,
+  findCircuitRow,
+  POD_MINING_COOLDOWN_BLOCKS,
+} from "./miningFlow.js";
+import {
   OWNER,
   QUOTE,
   ROSTER,
@@ -60,9 +66,11 @@ import {
   formatClock,
   formatRemaining,
   identify,
+  planHashpowerFromHoldings,
   resolveCampaignDesign,
   shortAddress,
   round4,
+  formatBemClaimable,
 } from "./fixtures.js";
 
 /** 按生命周期收口导航（对照 contracts/README.md §6） */
@@ -293,11 +301,11 @@ export default function App() {
     const WRITE_METHODS = [
       "subscribe", "listShares", "cancelListing", "takeListing", "refund", "claimSurplus",
       "buyCircuits", "confirmCircuits", "listCircuit", "cancelCircuitListing", "setPhase",
-      "withdrawMarketProceeds", "setPlan", "armMining", "startMining", "stopMining",
+      "withdrawMarketProceeds", "setPlan", "startMining", "stopMining",
       "claimMiningRewards", "claimBem", "returnSurplus", "topUpShortfall",
       "simulateBuyListing", "simulateExternalListing",
       "createCampaign", "openRefund", "abandonOrder", "markFailed", "removeCampaign", "removeCampaignAt",
-      "setCircuitMarket", "recoverBnb", "recoverCircuits", "transferOwnership",
+      "setCircuitMarket", "recoverBnb", "transferOwnership",
       "setFactoryOwner", "claimFee", "setServiceFee",
       // 熔断：拉闸 / 抬闸都只认 Owner
       "halt", "resume",
@@ -322,22 +330,59 @@ export default function App() {
     else if (method === "takeListing") result = applyTakeListing(round, book, args.listingId, args.shares, actor);
     else if (method === "claimBem") result = { ok: true, message: "模拟：已领取你按份额应得的 BEM（链上走 claimBem）" };
     else if (method === "startMining") {
-      result = book.executePhase === "ready" && Number(book.circuitHeldCount) > 0
-        ? {
-            ok: true,
-            message: "模拟：已调用官方挖矿合约开矿，产出按份额记账",
-            book: { ...book, scene: "mining", miningActiveCount: Number(book.circuitHeldCount) },
-          }
-        : { ok: false, message: "电路还没确认到账（或已没有电路），不能开矿" };
+      const minable = book.scene === "mining"
+        || (book.scene === "executing" && book.executePhase === "ready");
+      const cool = Number(book.miningCooldownBlocks || POD_MINING_COOLDOWN_BLOCKS);
+      const bn = Number(book.blockNumber || 0);
+      const startable = (Array.isArray(book.sellBids) ? book.sellBids : [])
+        .filter((b) => canStartPodRow({
+          listed: false,
+          miningStatus: b.miningStatus,
+          miningStopBlock: b.miningStopBlock,
+        }, bn, cool));
+      const stillCooling = (Array.isArray(book.sellBids) ? book.sellBids : [])
+        .some((b) => Number(b.miningStatus) === 3 && coolingBlocksLeft(b, bn, cool) > 0);
+      result = !minable || Number(book.circuitHeldCount) <= 0
+        ? { ok: false, message: "电路还没确认到账（或已没有电路），不能开矿" }
+        : startable.length === 0
+          ? {
+              ok: false,
+              message: stillCooling
+                ? "冷却未满（官方 stopBlock+1200），满后再开矿"
+                : "没有可开矿的电路",
+            }
+          : {
+              ok: true,
+              message: "模拟：已调用官方挖矿合约开矿，产出按份额记账",
+              book: {
+                ...book,
+                scene: "mining",
+                miningActiveCount: Number(book.miningActiveCount || 0) + startable.length,
+                miningCoolingCount: Math.max(0, Number(book.miningCoolingCount || 0) - startable.filter((b) => Number(b.miningStatus) === 3).length),
+              },
+            };
     }
     else if (method === "stopMining") {
+      // 与链上一致：不硬挡「先领再停」，stop 会结算产出。
       result = Number(book.miningActiveCount) > 0
-        ? { ok: true, message: "模拟：已停止该电路的挖矿，产出已结算到本期", book: { ...book, miningActiveCount: Math.max(0, Number(book.miningActiveCount) - 1) } }
+        ? {
+            ok: true,
+            message: "模拟：已停止该电路的挖矿，进入冷却（约 1200 块后可再开）",
+            book: {
+              ...book,
+              miningActiveCount: Math.max(0, Number(book.miningActiveCount) - 1),
+              miningCoolingCount: Number(book.miningCoolingCount || 0) + 1,
+            },
+          }
         : { ok: false, message: "当前没有挖矿中的电路" };
     }
     else if (method === "claimMiningRewards") {
       result = Number(book.miningActiveCount) > 0
-        ? { ok: true, message: "模拟：已领取官方挖矿奖励，BEM 已按份额记账" }
+        ? {
+            ok: true,
+            message: "模拟：已领取官方挖矿奖励，BEM 已按份额记账；可再停挖",
+            book: { ...book, miningPendingBem: 0n },
+          }
         : { ok: false, message: "当前没有挖矿中的电路，没有可领产出（NoRewards）" };
     }
     else if (method === "setPlan") result = { ok: true, message: "模拟：预估算力与电路数已写入" };
@@ -388,7 +433,6 @@ export default function App() {
     else if (method === "refund") result = applyRefund(round, book, actor);
     else if (method === "createCampaign") result = applyCreate(round, args, quote);
     else if (method === "recoverBnb") result = { ok: true, message: "模拟：可动 BNB 已一次性转给 Owner（不用填数量）" };
-    else if (method === "recoverCircuits") result = { ok: true, message: "模拟：电路已转给 Owner" };
     else if (method === "claimFee") {
       result = { ok: true, message: "模拟：已领取你的挖矿产出服务费（链上走 claimFee）" };
     } else if (method === "setServiceFee") {
@@ -432,7 +476,6 @@ export default function App() {
     simulateBuyListing: "模拟外部买家吃单",
     simulateExternalListing: "模拟外部卖家挂单",
     setPlan: "写入计划",
-    armMining: "预约挖矿",
     startMining: "开启挖矿",
     stopMining: "停止挖矿",
     claimMiningRewards: "领取挖矿奖励",
@@ -446,7 +489,6 @@ export default function App() {
     removeCampaignAt: "移除期次",
     setCircuitMarket: "更换电路市场",
     recoverBnb: "取回 BNB",
-    recoverCircuits: "取回电路",
     transferOwnership: "转移所有权",
     setFactoryOwner: "转移工厂所有权",
     halt: "熔断（halt）",
@@ -570,15 +612,34 @@ export default function App() {
         } else if (method === "startMining" && !args?.tokenId) {
           /**
            * 「开启全部挖矿」：官方 start 一次只收一张电路，所以要逐张发交易。
+           * 只开冷却已满 / 未开过的；冷却中（status=3 且未满 stopBlock+1200）跳过。
            * 每张都等上一张入块再发（avoid nonce 冲突，也让失败停在半路时账本清楚）。
            */
-          const targets = (Array.isArray(book.sellBids) ? book.sellBids : [])
-            .filter((b) => Number(b.miningStatus) !== 1)
-            .map((b) => BigInt(b.circuitTokenId ?? b.id));
-          if (targets.length === 0) throw new Error("没有可开矿的电路（都已在挖矿中）");
+          const minable = book.scene === "mining"
+            || (book.scene === "executing" && book.executePhase === "ready");
+          if (!minable) throw new Error("电路还没确认到账，不能开矿（WrongScene）");
+          const cool = Number(book.miningCooldownBlocks || POD_MINING_COOLDOWN_BLOCKS);
+          const bn = Number(book.blockNumber || 0);
+          const startable = (Array.isArray(book.sellBids) ? book.sellBids : [])
+            .filter((b) => canStartPodRow({
+              listed: false,
+              miningStatus: b.miningStatus,
+              miningStopBlock: b.miningStopBlock,
+            }, bn, cool));
+          const coolingLeft = (Array.isArray(book.sellBids) ? book.sellBids : [])
+            .filter((b) => Number(b.miningStatus) === 3 && coolingBlocksLeft(b, bn, cool) > 0)
+            .length;
+          if (startable.length === 0) {
+            throw new Error(
+              coolingLeft > 0
+                ? `冷却未满（${coolingLeft} 张，官方 stopBlock+1200），满后再开矿`
+                : "没有可开矿的电路（都已在挖矿中或已撤销）",
+            );
+          }
           if (Number(book.listedCircuits?.length || 0) > 0) {
             throw new Error("还有电路挂在市场，先撤单才能开矿（CircuitStillListed）");
           }
+          const targets = startable.map((b) => BigInt(b.circuitTokenId ?? b.id));
           let done = 0;
           let failed = null;
           for (const id of targets) {
@@ -614,13 +675,15 @@ export default function App() {
           : method === "claimMiningRewards"
             ? "已领取官方挖矿奖励：BEM 已收到本期合约，持份人各自 claimBem 领取。"
           : method === "stopMining"
-            ? "已停止该电路的挖矿，产出已结算并按份额记账。"
+            ? "已停挖：产出已结算；冷却约 1200 块后可再开矿。"
           : method === "recoverBnb"
             ? "已把本期可动 BNB 转给 Owner。"
           : method === "abandonOrder"
             ? "已撤未成交买单并打开退款：持份人各自领回本金，退完后剩余电路退回 Owner。"
           : method === "buyCircuits"
-            ? "已从电路市场买入：采购款从募集余额扣除，电路已到账。"
+            ? "本批已买入：采购款已扣。Buying 内还可继续吃单；买够后再确认到账（确认后不能再买）。"
+          : method === "confirmCircuits"
+            ? "已确认到账，进入 Ready：不能再买入；可开矿或挂卖。"
             : method === "listCircuit"
               ? "已把电路挂回市场；成交后卖出款进入市场欠款，需提取。"
               : method === "cancelCircuitListing"
@@ -701,11 +764,19 @@ export default function App() {
       onSigned
     );
 
-    setCampaignAddress(created);
-    await chain.setCampaignAddress(created);
+    /**
+     * 只同步记下新地址，不要在写服务费之前 await 整页状态刷新。
+     *
+     * 曾经这里先 `await chain.setCampaignAddress(created)`（内部会跑完整 readState），
+     * 公共 RPC 一慢就卡住十几秒，第二笔 setServiceFee 的钱包弹窗来得太晚——
+     * 用户以为开期已结束关掉弹窗 / 拒签，notice 就变成「服务费写入失败」。
+     * 链上证据：本期 create 与 setServiceFee 曾相差约 286 个块（后补设成功）。
+     */
+    const campaignAddr = String(created);
+    setCampaignAddress(campaignAddr);
 
     /**
-     * 服务费与分成表：**第二笔交易**，写进刚建好的 Campaign（setServiceFee）。
+     * 服务费与分成表：**第二笔交易**，立刻写进刚建好的 Campaign（setServiceFee）。
      *
      * 合约硬约束：只能在 sold == 0（此刻刚建期，一定满足）时调一次，
      * 之后 serviceFeeSet 永久为 true，任何人不可再改。费率 ≤ 10%，分成 ≤ 3 个地址，
@@ -751,9 +822,16 @@ export default function App() {
         if (sumBps !== 10000) {
           throw new Error(`挖矿产出服务费分成份额合计必须等于 10000（100%），当前 ${sumBps}`);
         }
+        walletAsk("setServiceFee");
         await send(
-          chainTx.setServiceFee(activeSigner, BigInt(feePercent * 100), rows.map((r) => r.address), rows.map((r) => r.bps)),
-          onSigned
+          chainTx.setServiceFee(
+            activeSigner,
+            BigInt(feePercent * 100),
+            rows.map((r) => r.address),
+            rows.map((r) => r.bps),
+            campaignAddr,
+          ),
+          () => walletSigned("setServiceFee"),
         );
         feeNote = `挖矿产出服务费 ${feePercent}% 已写入链上`;
       }
@@ -761,10 +839,12 @@ export default function App() {
       feeNote = `服务费写入失败（期次已建好，可稍后补设）：${e.shortMessage || e.message || e}`;
     }
 
+    // 服务费写完（或明确失败）后再切到新期并拉列表，避免挡住第二笔签名。
+    await chain.setCampaignAddress(campaignAddr);
     await chain.refreshHistory?.();
     setOwnerTab("overview");
     setPage("owner");
-    setNotice(`已发布：${shortAddress(created)} · tx ${shortAddress(hash)} · ${feeNote}`);
+    setNotice(`已发布：${shortAddress(campaignAddr)} · tx ${shortAddress(hash)} · ${feeNote}`);
   }
 
   function buildChainTx(method, args, signer) {
@@ -851,7 +931,7 @@ export default function App() {
         if (recipients.length > 0 && sum !== 10000) {
           throw new Error(`份额合计必须等于 10000，当前 ${sum}`);
         }
-        return chainTx.setServiceFee(signer, bps, recipients, sharesBps);
+        return chainTx.setServiceFee(signer, bps, recipients, sharesBps, args?.campaign);
       }
       case "listShares": {
         const shares = uintField(args.shares, "转让份数");
@@ -883,6 +963,14 @@ export default function App() {
         const tokenId = uintField(args?.tokenId, "电路 tokenId");
         const price = parseEther(String(args?.priceBnb ?? "").trim());
         if (price <= 0n) throw new Error("挂单价必须大于 0");
+        if (book._chain) {
+          // Ready 或 Mining 均可挂；PoD 仍挖中（status=1）会 AlreadyMining。
+          const inMining = book.scene === "mining";
+          const ready = book.scene === "executing" && book.executePhase === "ready";
+          if (!inMining && !ready) {
+            throw new Error("只有确认到账后或挖矿场景才能挂卖。");
+          }
+        }
         return chainTx.listCircuit(signer, tokenId, price);
       }
       case "cancelCircuitListing":
@@ -897,57 +985,120 @@ export default function App() {
         return chainTx.simulateExternalListing(signer, args?.tokenId, args?.price);
       }
       case "confirmCircuits":
-        if (book._chain && !(Number(book.circuitHeldCount) > 0)) {
-          throw new Error("本期合约还没持有电路（CircuitsNotReady），不能确认到账。");
+        if (book._chain) {
+          if (book.scene === "mining" || Number(book.scene) === 2) {
+            throw new Error("已在挖矿场景，无需再确认到账。冷却结束后可再开矿，或直接挂卖。");
+          }
+          if (book.executePhase === "ready") {
+            throw new Error("电路已确认到账，可开矿或挂卖，不必再点确认。");
+          }
+          if (!(Number(book.circuitHeldCount) > 0)) {
+            throw new Error("本期合约还没持有电路（CircuitsNotReady），不能确认到账。");
+          }
         }
         return chainTx.confirmCircuits(signer);
       case "setPlan": {
-        const src = args || {};
-        const raw = src.hashpower ?? ((chainEst && chainEst.hashpower) || book.estimate?.hashpower || 0);
-        const num = Number(raw);
-        if (!Number.isFinite(num) || num <= 0) throw new Error("还没有预估算力，无法写入 setPlan");
-        // Math.round 会把 12.7 悄悄变成 13。算力是链上写入值，取整前先如实拒绝小数。
-        if (!Number.isInteger(num)) throw new Error(`预估算力必须是整数：${num}`);
-        return chainTx.setPlan(signer, BigInt(num));
-      }
-      case "armMining": {
-        const tokenId = uintField(args?.tokenId, "电路 tokenId");
-        return chainTx.armMining(signer, tokenId);
+        /**
+         * 算力只认所持电路：H = 张数 × P。
+         * 主网已部署 Campaign：Ready / Mining 会 WrongScene，必须在 Buying 写入。
+         */
+        if (book._chain) {
+          if (book.scene === "mining" || Number(book.scene) === 2) {
+            throw new Error("挖矿中不能改 setPlan。");
+          }
+          if (book.executePhase && book.executePhase !== "buying") {
+            throw new Error("已确认到账后不能再改 setPlan。请在点「确认到账」之前写入预估算力。");
+          }
+        }
+        const plan = planHashpowerFromHoldings(round, book);
+        if (!plan.ok) throw new Error(plan.reason);
+        const raw = args?.hashpower;
+        if (raw != null && String(raw).trim() !== "") {
+          const override = Number(raw);
+          if (!Number.isInteger(override) || override <= 0) {
+            throw new Error(`预估算力必须是正整数：${raw}`);
+          }
+          if (override !== plan.hashpower) {
+            throw new Error(
+              `setPlan 必须等于持有电路算力 ${plan.hashpower} H（${plan.reason}），不能写 ${override}`,
+            );
+          }
+        }
+        return chainTx.setPlan(signer, BigInt(plan.hashpower));
       }
       case "startMining": {
         /**
          * 开矿（单张）。批量开通走 chainInvoke 的 startMining 分支：
          * 每张电路是一笔独立交易（官方 start 一次只收一张），不能塞进一笔。
-         * 门槛与合约对齐：Ready、未熔断、没有挂单、手上真有电路。
-         * taskId 默认 0（未验证池）——已验证池需要先 armMining，再在**后面的块**
-         * 拿 anchor 调 start，由合约调用页显式传参。
+         * 门槛：Ready/Mining、无挂单、冷却已满（stopBlock+1200）。未验证池。
          */
+        const tokenId = uintField(args?.tokenId, "电路 tokenId");
         if (book._chain) {
-          if (book.executePhase !== "ready" && Number(book.scene) !== 2) {
+          // book.scene 是字符串 funding/executing/mining；首张开矿后 scene=mining，phase 仍为 Ready。
+          const minable = book.scene === "mining"
+            || (book.scene === "executing" && book.executePhase === "ready");
+          if (!minable) {
             throw new Error("电路还没确认到账，不能开矿（WrongScene）");
           }
           if (Number(book.listedCircuits?.length || 0) > 0) {
             throw new Error("还有电路挂在市场，先撤单才能开矿（CircuitStillListed）");
           }
           if (!(Number(book.circuitHeldCount) > 0)) throw new Error("合约手上没有电路（NotACircuitOwner）");
+          const cool = Number(book.miningCooldownBlocks || POD_MINING_COOLDOWN_BLOCKS);
+          const bn = Number(book.blockNumber || 0);
+          const row = findCircuitRow(book, tokenId);
+          if (row && Number(row.miningStatus) === 3) {
+            const left = coolingBlocksLeft(row, bn, cool);
+            if (left > 0) {
+              throw new Error(`冷却未满（剩 ${left} 块，官方 stopBlock+1200），满后再开矿`);
+            }
+          } else if (row && Number(row.miningStatus) === 2) {
+            throw new Error("该电路挖矿已撤销，不能再开");
+          }
+          // status==1：合约会同步进 Mining 后 return；放行以便 Ready+已挖 对齐场景。
         }
-        const taskId = Number(args?.taskId ?? 0);
-        const anchorBlock = args?.anchorBlock ? BigInt(args.anchorBlock) : 0n;
-        return chainTx.startMining(
-          signer,
-          uintField(args?.tokenId, "电路 tokenId"),
-          taskId,
-          anchorBlock,
-          Array.isArray(args?.inputs) ? args.inputs : [],
-          Array.isArray(args?.expectedOuts) ? args.expectedOuts : [],
-          Array.isArray(args?.proofs) ? args.proofs : [],
-        );
+        return chainTx.startMining(signer, tokenId);
       }
       case "stopMining": {
         const tokenId = uintField(args?.tokenId, "电路 tokenId");
+        if (book._chain) {
+          // 不硬挡「先领再停」：stop 会结算产出。Mining 直接停；
+          // Ready + PoD active：先 _beginMining（不能带挂单）。
+          const inMining = book.scene === "mining";
+          const ready = book.scene === "executing" && book.executePhase === "ready";
+          if (!inMining && !ready) {
+            throw new Error("停挖需要本期已确认到账或已在挖矿场景（WrongScene）");
+          }
+          if (!inMining && Number(book.listedCircuits?.length || 0) > 0) {
+            throw new Error("还有电路挂在市场，先撤单再停挖（CircuitStillListed）");
+          }
+        }
         return chainTx.stopMining(signer, tokenId);
       }
-      case "claimMiningRewards": return chainTx.claimMiningRewards(signer, args?.campaign);
+      case "claimMiningRewards": {
+        // 资产页可对任意期次地址领奖；仅当目标=当前 book 时做前端闸门（合约仍是最终校验）。
+        if (book._chain) {
+          const target = String(args?.campaign || "").toLowerCase();
+          const current = String(book.address || round.contract || "").toLowerCase();
+          if (!target || target === current) {
+            const inMining = book.scene === "mining";
+            const ready = book.scene === "executing" && book.executePhase === "ready";
+            const hasActive = Number(book.miningActiveCount || 0) > 0;
+            const hasPod = Number(book.miningPendingBem || 0) > 0;
+            if (!inMining) {
+              if (Number(book.listedCircuits?.length || 0) > 0) {
+                throw new Error("还有电路挂在市场，先撤单再领奖（CircuitStillListed）");
+              }
+              if (!(ready && (hasActive || hasPod))) {
+                throw new Error("领奖需有挖矿中的电路：空闲的先开矿；已挖的在 Ready 也可直接领（会同步进 Mining）");
+              }
+            } else if (!hasActive && !hasPod) {
+              throw new Error("没有挖矿中的电路，没有可领产出（NoRewards）");
+            }
+          }
+        }
+        return chainTx.claimMiningRewards(signer, args?.campaign);
+      }
       case "claimBem": return chainTx.claimBem(signer, args?.campaign);
       case "returnSurplus":
         // 无参：把当前 raisedBnb 按份记账退回持份人，期次继续、仍然可以开矿。
@@ -972,14 +1123,14 @@ export default function App() {
       }
       case "setPhase": {
         const next = Number(args?.next);
-        // 0 (None) 只在开期前存在；Executing 里设它会同时关掉挂单与退款，合约直接拒绝。
-        if (!Number.isInteger(next) || next < 1 || next > 3) throw new Error("子状态只能是 1、2、3");
+        // Campaign.Phase：1 Buying / 2 Ready。0 None 会关掉挂单与退款，合约直接拒绝。
+        if (!Number.isInteger(next) || next < 1 || next > 2) throw new Error("子状态只能是 1（Buying）或 2（Ready）");
         if (book._chain) {
-          // 合约 setPhase：Ready 需要本期真的持有电路；余款已记账后只能回到 Ready。
-          if (next === 3 && !(Number(book.circuitHeldCount) > 0)) {
+          // Ready 需要本期真的持有电路；余款已记账后只能回到 Ready。
+          if (next === 2 && !(Number(book.circuitHeldCount) > 0)) {
             throw new Error("改成「已到账」需要本期合约持有电路（CircuitsNotReady）。");
           }
-          if (Number(book.surplusBase || 0) > 0 && next !== 3) {
+          if (Number(book.surplusBase || 0) > 0 && next !== 2) {
             throw new Error("余款已按份退回，只有改回「已到账」能继续（WrongScene）。");
           }
         }
@@ -988,24 +1139,6 @@ export default function App() {
       case "recoverBnb": {
         // 无参：合约一次扫走所有可动 BNB（多余余额，或已无人可退时的整池剩余）。
         return chainTx.recoverBnb(signer, args?.campaign);
-      }
-      case "recoverCircuits": {
-        const token = String(args?.token || "").trim();
-        const id = uintField(args?.id ?? 0, "电路 ID");
-        if (!/^0x[0-9a-fA-F]{40}$/.test(token)) throw new Error("电路合约地址无效");
-        if (book._chain) {
-          // 合约四道闸：押金不够、挂单中、份额未结清、持份人未按原价收回本金。
-          if (Number(book.listedCircuits?.length || 0) > 0) throw new Error("还有电路挂在市场（AlreadyListed）：先撤单。");
-          if (String(token).toLowerCase() === String(book.circuits || "").toLowerCase()) {
-            if (Number(book.outstandingShares ?? book.sold ?? 0) > 0) {
-              throw new Error("还有持份人没结清（SharesOutstanding）：本期电路是他们的抵押，不能取回。先退款或卖出。");
-            }
-            if (Number(book.refundedTotal || 0) + 1e-12 < Number(book.sold || 0) * Number(round.sharePriceBnb || 0)) {
-              throw new Error("持份人还没按原价收回本金（HoldersNotMadeWhole）：先 topUpShortfall 补齐再退款。");
-            }
-          }
-        }
-        return chainTx.recoverCircuits(signer, token, id);
       }
       case "transferOwnership": return chainTx.transferOwnership(signer, args.newOwner);
       case "setFactoryOwner": return chainTx.setFactoryOwner(signer, args.newOwner);
@@ -1452,6 +1585,8 @@ export default function App() {
             onOpenOwner={() => openPage("owner", "overview")}
             onOpenAssets={() => openPage("assets")}
             onOpenTransfer={() => openPage("transfer")}
+            onClaimMiningRewards={() => act("claimMiningRewards")}
+            onClaimBem={() => act("claimBem")}
             usingChain={usingChain}
             periods={usingChain ? chain.campaigns : []}
             onSwitchPeriod={usingChain ? chain.switchCampaign : null}
@@ -1471,6 +1606,7 @@ export default function App() {
             onMarkFailed={(address) => act("markFailed", { campaign: address })}
             onClaimSurplus={(address) => act("claimSurplus", { campaign: address })}
             onClaimBem={(address) => act("claimBem", { campaign: address })}
+            onClaimMiningRewards={(address) => act("claimMiningRewards", { campaign: address })}
             onOpenPeriod={async (address) => {
               if (usingChain && address) await chain.switchCampaign(address);
               openPage("round");
@@ -1681,6 +1817,7 @@ function LifecycleStrip({ book }) {
 function RoundHub({
   round, book, copy, quote, remaining, pay, countdown,
   pending, connected, actor, onChain, onPick, onSubscribe, onRefund, onAbort, onMarkFailed, onOpenOwner, onOpenAssets, onOpenTransfer, onRecoverBnb,
+  onClaimMiningRewards, onClaimBem,
   usingChain = false, periods, onSwitchPeriod,
 }) {
   const isOwner = actor?.role === "owner";
@@ -1926,6 +2063,17 @@ function RoundHub({
         const mine = Number(book.mine || 0);
         const totalShares = Number(round.totalShares) || 0;
         const sharePercent = totalShares > 0 ? (mine / totalShares) * 100 : 0;
+        const podPending = typeof book.miningPendingBem === "bigint"
+          ? Number(book.miningPendingBem) / 1e8
+          : Number(book.miningPendingBem || 0);
+        const bemClaimable = Number(book.bemClaimable || 0);
+        const pendingTotal = bemClaimable + podPending;
+        const podLabel = formatBemClaimable(podPending) || "0";
+        const pendingLabel = formatBemClaimable(pendingTotal) || "0";
+        const claimLabel = formatBemClaimable(bemClaimable);
+        const miningActive = Number(book.miningActiveCount || 0);
+        const listedN = Array.isArray(book.listedCircuits) ? book.listedCircuits.length : 0;
+        const canHarvest = connected && !pending && (miningActive > 0 || podPending > 0) && listedN === 0;
         return (
           <section className="mining-desk">
             <RoundTitle
@@ -1945,7 +2093,7 @@ function RoundHub({
                   {pooledParts.toLocaleString("zh-CN")}
                   <span className="mining-stat-unit">张</span>
                 </p>
-                <p className="mining-stat-note">合约名下的电路张数（挖矿中 {Number(book.miningActiveCount || 0)} 张）</p>
+                <p className="mining-stat-note">合约名下的电路张数（挖矿中 {miningActive} 张）</p>
               </article>
               <article className="mining-stat">
                 <p className="mining-stat-label">预估算力</p>
@@ -1956,40 +2104,69 @@ function RoundHub({
                 <p className="mining-stat-note">setPlan 写入的估算值，不是实测产出</p>
               </article>
               <article className="mining-stat">
-                <p className="mining-stat-label">我的份数</p>
+                <p className="mining-stat-label">产出</p>
                 <p className="mining-stat-value">
-                  {mine.toLocaleString("zh-CN")}
-                  <span className="mining-stat-unit">/ {totalShares.toLocaleString("zh-CN")} 份</span>
+                  {podLabel}
+                  <span className="mining-stat-unit">BEM</span>
                 </p>
-                <p className="mining-stat-note">
-                  {mine > 0 ? `占本期 ${sharePercent % 1 === 0 ? sharePercent : sharePercent.toFixed(2)}%` : "当前钱包未持有本期份额"}
-                </p>
+                <p className="mining-stat-note">官方 PoD 尚未 harvest 的产出</p>
               </article>
               <article className="mining-stat">
-                <p className="mining-stat-label">本期状态</p>
-                <p className="mining-stat-value is-text">
-                  <span className="mining-pill">挖矿中</span>
+                <p className="mining-stat-label">待领</p>
+                <p className="mining-stat-value">
+                  {pendingLabel}
+                  <span className="mining-stat-unit">BEM</span>
                 </p>
-                <p className="mining-stat-note">产出发给本期合约，按份额分给持份人</p>
+                <p className="mining-stat-note">已记账可领 + 未 harvest 产出</p>
               </article>
             </div>
             <article className="card mining-card">
               <div className="card-header">
-                <span>挖矿状态</span>
+                <span>挖矿奖励</span>
               </div>
               <div className="card-body">
                 <dl className="mining-facts">
                   <div className="mining-fact">
-                    <dt>产出发放</dt>
-                    <dd>分配合约接入前，harvest / claim 为占位空实现，暂不发放</dd>
+                    <dt>我的份数</dt>
+                    <dd>
+                      {mine.toLocaleString("zh-CN")} / {totalShares.toLocaleString("zh-CN")} 份
+                      {mine > 0
+                        ? `（占 ${sharePercent % 1 === 0 ? sharePercent : sharePercent.toFixed(2)}%）`
+                        : " · 当前钱包未持份"}
+                    </dd>
                   </div>
                   <div className="mining-fact">
-                    <dt>退出方式</dt>
-                    <dd>只能把份额挂到转让市场，由其他持份人接收；没有本金赎回</dd>
+                    <dt>领取路径</dt>
+                    <dd>先「领奖励」把产出记入本期；持份人再「领取 BEM」。领奖励任何人可点。</dd>
                   </div>
                 </dl>
                 <div className="mining-actions">
-                  <button className="btn btn-primary" type="button" onClick={onOpenTransfer}>
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    disabled={!canHarvest}
+                    title={
+                      !connected ? "连接钱包后领取"
+                        : listedN > 0 ? "先撤电路挂单再领奖"
+                          : miningActive <= 0 && podPending <= 0 ? "暂无可领产出"
+                            : "claimMiningRewards：任何人可调"
+                    }
+                    onClick={() => onClaimMiningRewards?.()}
+                  >
+                    {pending === "claimMiningRewards" ? "领取中…" : "领奖励"}
+                  </button>
+                  {claimLabel ? (
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={!connected || Boolean(pending)}
+                      title="claimBem：按份额领取已记账 BEM"
+                      onClick={() => onClaimBem?.()}
+                    >
+                      {pending === "claimBem" ? "领取中…" : `领取 BEM（${claimLabel}）`}
+                    </button>
+                  ) : null}
+                  <button className="btn btn-outline" type="button" onClick={onOpenTransfer}>
                     资产转让
                   </button>
                   <button className="btn btn-outline" type="button" onClick={onOpenAssets}>
@@ -2057,8 +2234,11 @@ function refundShortfall(row) {
 function AssetsHub({
   round, book, copy, pending, connected, usingChain,
   positions, positionsLoading,
-  onRefund, onMarkFailed, onClaimSurplus, onClaimBem, onOpenPeriod, onConnect,
+  onRefund, onMarkFailed, onClaimSurplus, onClaimBem, onClaimMiningRewards, onOpenPeriod, onConnect,
 }) {
+  const simPod = typeof book.miningPendingBem === "bigint"
+    ? Number(book.miningPendingBem) / 1e8
+    : Number(book.miningPendingBem || 0);
   const rows = usingChain
     ? (positions || [])
     : [{
@@ -2077,6 +2257,9 @@ function AssetsHub({
         escrow: connected ? book.listingShares || 0 : 0,
         refundedBnb: book.refundedSelf || 0,
         raisedBnb: book.bnbPool || 0,
+        bemClaimable: connected ? Number(book.bemClaimable || 0) : 0,
+        miningPendingBem: connected ? simPod : 0,
+        miningActiveCount: Number(book.miningActiveCount || 0),
       }];
   const mineRows = rows.filter(participated);
   const held = mineRows.filter((row) => Number(row.shares) + Number(row.escrow) > 0);
@@ -2146,7 +2329,8 @@ function AssetsHub({
                   <th>我的份数</th>
                   <th>已退</th>
                   <th>待领余款</th>
-                  <th>待领 BEM</th>
+                  <th title="官方 PoD 尚未 harvest 的产出">产出</th>
+                  <th title="已记账可领 + 未 harvest 产出">待领 BEM</th>
                   <th></th>
                 </tr>
               </thead>
@@ -2171,6 +2355,17 @@ function AssetsHub({
                    */
                   const state = assetState(row, nowSec);
                   const sub = state.hint || state.substate;
+                  const bemRaw = connected ? Number(row.bemClaimable || 0) : 0;
+                  const podRaw = connected ? Number(row.miningPendingBem || 0) : 0;
+                  const bemLabel = bemRaw > 0 ? (formatBemClaimable(bemRaw) || "<0.000001") : "";
+                  const podLabel = podRaw > 0 ? (formatBemClaimable(podRaw) || "<0.000001") : "";
+                  const pendingLabel = (bemRaw + podRaw) > 0
+                    ? (formatBemClaimable(bemRaw + podRaw) || "<0.000001")
+                    : "";
+                  const miningActive = Number(row.miningActiveCount || 0);
+                  const canHarvest = connected && !pending
+                    && (miningActive > 0 || podRaw > 0)
+                    && (row.scene === "mining" || row.scene === "executing");
                   return (
                     <tr key={row.address || row.id}>
                       <td>第 {row.id} 期</td>
@@ -2191,9 +2386,8 @@ function AssetsHub({
                       <td>{connected && Number(row.pendingSurplusBnb || 0) > 0
                         ? `${round4(row.pendingSurplusBnb)} BNB`
                         : "—"}</td>
-                      <td>{connected && Number(row.bemClaimable || 0) > 0
-                        ? `${round4(row.bemClaimable)} BEM`
-                        : "—"}</td>
+                      <td>{podLabel ? `${podLabel} BEM` : "—"}</td>
+                      <td>{pendingLabel ? `${pendingLabel} BEM` : "—"}</td>
                       <td>
                         <div className="actions assets-actions">
                           <button className="btn btn-inline" type="button" onClick={() => onOpenPeriod(row.address)}>
@@ -2231,17 +2425,28 @@ function AssetsHub({
                               {pending === "claimSurplus" ? "领取中…" : `领取 ${round4(row.pendingSurplusBnb)} BNB`}
                             </button>
                           )}
-                          {connected && Number(row.bemClaimable || 0) > 0 && (
+                          {canHarvest && (
+                            <button
+                              className="btn btn-primary"
+                              type="button"
+                              disabled={Boolean(pending)}
+                              onClick={() => onClaimMiningRewards?.(row.address)}
+                              title="claimMiningRewards：任何人可调，把官方产出领回本期并按份记账"
+                            >
+                              {pending === "claimMiningRewards" ? "领取中…" : "领奖励"}
+                            </button>
+                          )}
+                          {bemLabel ? (
                             <button
                               className="btn btn-primary"
                               type="button"
                               disabled={Boolean(pending)}
                               onClick={() => onClaimBem(row.address)}
-                              title="挖矿产出按份额记账后可领；需先有人调用 claimMiningRewards"
+                              title="claimBem：领取已记账的按份 BEM"
                             >
-                              {pending === "claimBem" ? "领取中…" : `领取 ${round4(row.bemClaimable)} BEM`}
+                              {pending === "claimBem" ? "领取中…" : `领取 ${bemLabel} BEM`}
                             </button>
-                          )}
+                          ) : null}
                         </div>
                       </td>
                     </tr>
@@ -3212,7 +3417,7 @@ function RulesPage({ campaigns = [] }) {
         </div>
         <div className="rules-formula">
           <span>开矿条件</span>
-          <strong>份额售罄 → buyCircuits 从电路市场买入 → confirmCircuits 确认到账 → setPlan → returnSurplus（按份退余款）→ startMining → claimMiningRewards → claimBem</strong>
+          <strong>份额售罄 → buyCircuits 可多次买入 → setPlan（所持 × P）→ confirmCircuits（之后不能再买）→ returnSurplus → startMining → claimMiningRewards → claimBem</strong>
         </div>
         {/*
          * 这里原本还有一句「电路入池后不可撤出；挖矿中的退出只有挖矿份额转让」——

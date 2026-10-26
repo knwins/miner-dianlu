@@ -9,6 +9,7 @@ const WARN_MARGIN = 300;
 const artifacts = [
   ["CampaignFactory", "artifacts/contracts/CampaignFactory.sol/CampaignFactory.json"],
   ["Campaign", "artifacts/contracts/Campaign.sol/Campaign.json"],
+  ["CampaignDeployer", "artifacts/contracts/CampaignDeployer.sol/CampaignDeployer.json"],
 ];
 
 let failed = false;

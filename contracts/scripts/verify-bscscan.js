@@ -192,30 +192,29 @@ function setupProxy(env) {
   }
 }
 
-/** Campaign 的构造参数（工厂内部 CREATE，无法从部署交易读到，只能从事件 + 链上状态还原）。 */
-async function campaignConstructorArgs(campaignAddr, dep) {
-  const abi = require("../artifacts/contracts/CampaignFactory.sol/CampaignFactory.json").abi;
-  const iface = new ethers.Interface(abi);
-  const logs = await ethers.provider.getLogs({
-    address: dep.factory,
-    fromBlock: dep.factoryDeploymentBlock ?? 0,
-    toBlock: "latest",
-    topics: [iface.getEvent("CampaignCreated").topicHash],
-  });
-  for (const log of logs) {
-    const parsed = iface.parseLog(log);
-    if (String(parsed.args.campaign).toLowerCase() !== String(campaignAddr).toLowerCase()) continue;
-    const c = await ethers.getContractAt("Campaign", campaignAddr);
-    return [
-      parsed.args.sharePriceBnb,
-      parsed.args.totalShares,
-      parsed.args.fundingDeadline,
-      await c.circuitMarket(),
-      dep.deployer,
-      await c.circuits(),
-    ];
-  }
-  throw new Error(`工厂事件里找不到 ${campaignAddr} 的 CampaignCreated，无法还原构造参数`);
+/** Campaign 构造 9 参：全部可从链上 immutable / 公开字段还原（不必扫事件）。 */
+async function campaignConstructorArgs(campaignAddr) {
+  const c = await ethers.getContractAt("Campaign", campaignAddr);
+  return [
+    await c.sharePriceBnb(),
+    await c.totalShares(),
+    await c.fundingDeadline(),
+    await c.circuitMarket(),
+    await c.owner(),
+    await c.circuits(),
+    await c.podMining(),
+    await c.bem(),
+    await c.factory(),
+  ];
+}
+
+/** 工厂 registry 里的全部期次（旧→新）。 */
+async function listFactoryCampaigns(factoryAddr) {
+  const f = await ethers.getContractAt("CampaignFactory", factoryAddr);
+  const n = Number(await f.campaignCount());
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(await f.campaigns(i));
+  return out;
 }
 
 async function main() {
@@ -231,18 +230,36 @@ async function main() {
     throw new Error(`部署记录网络(${dep.chainId}) 与当前链(${chainId}) 不一致`);
   }
 
-  const targets = [{
+  const targets = [];
+  if (dep.campaignDeployer) {
+    targets.push({
+      address: dep.campaignDeployer,
+      contractName: "CampaignDeployer",
+      sourceName: "contracts/CampaignDeployer.sol",
+      args: [],
+    });
+  }
+  targets.push({
     address: dep.factory,
     contractName: "CampaignFactory",
     sourceName: "contracts/CampaignFactory.sol",
-    args: [dep.circuitMarket, dep.allowedCircuits],
-  }];
-  if (dep.campaign) {
+    args: [
+      dep.circuitMarket,
+      dep.allowedCircuits,
+      dep.podMining,
+      dep.bem,
+      dep.campaignDeployer,
+    ],
+  });
+  const campaignAddrs = new Set();
+  if (dep.campaign) campaignAddrs.add(String(dep.campaign));
+  for (const a of await listFactoryCampaigns(dep.factory)) campaignAddrs.add(String(a));
+  for (const addr of campaignAddrs) {
     targets.push({
-      address: dep.campaign,
+      address: addr,
       contractName: "Campaign",
       sourceName: "contracts/Campaign.sol",
-      args: await campaignConstructorArgs(dep.campaign, dep),
+      args: await campaignConstructorArgs(addr),
     });
   }
 

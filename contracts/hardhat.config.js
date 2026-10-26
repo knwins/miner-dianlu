@@ -30,6 +30,8 @@ module.exports = {
       optimizer: { enabled: true, runs: 1 },
       viaIR: true,
       evmVersion: "paris",
+      // 去掉 metadata hash / CBOR，给 CampaignDeployer（内嵌 Campaign 创建码）腾 EIP-170 余量。
+      metadata: { bytecodeHash: "none", appendCBOR: false },
     },
   },
   sourcify: {

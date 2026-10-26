@@ -1,5 +1,5 @@
 // 与 contracts/contracts/Campaign.sol、CampaignFactory.sol、ICircuitMarket.sol 严格对齐的 ABI
-// （human-readable，ethers v6）。旧期次 / 旧电路市场已废弃，这里不保留兼容条目。
+// （human-readable，ethers v6）。只维护当前 Campaign ABI。
 //
 // 电路市场只有**卖单侧**：list / delist / buy / listingFor / listingOf / listings / owed / withdraw。
 // 买入 = 吃一张挂着的卖单（Campaign.buyCircuits 批量、原子）；卖出 = 把持有的 ERC721 电路挂回市场。
@@ -62,7 +62,6 @@ export const CAMPAIGN_ABI = [
   "function listingCount() view returns (uint256)",
   "function getListing(uint256) view returns (address seller, uint256 shares, uint256 priceBnbPerShare, bool open)",
   "function circuitHeldCount() view returns (uint256)",
-  "function miningKey(uint256) view returns (bytes32)",
   "function miningStatus(uint256) view returns (uint8)",
   "function miningPending(uint256) view returns (uint256)",
   "function bemPendingOf(address) view returns (uint256)",
@@ -93,14 +92,12 @@ export const CAMPAIGN_ABI = [
   "function setPhase(uint8 next)",
   "function setCircuitMarket(address circuitMarket_)",
   "function setPlan(uint256 estHashpower)",
-  "function armMining(uint256 tokenId)",
-  "function startMining(uint256 tokenId, uint32 taskId, uint256 anchorBlock, bytes[] inputs, bytes[] expectedOuts, bytes32[][] proofs)",
+  "function startMining(uint256 tokenId)",
   "function stopMining(uint256 tokenId)",
   "function claimMiningRewards()",
   "function claimBem()",
   "function depositRevenue() payable",
   "function recoverBnb()",
-  "function recoverCircuits(address token, uint256 id)",
   "function transferOwnership(address newOwner)",
   "function halt()",
   "function resume()",
@@ -136,13 +133,10 @@ export const CAMPAIGN_ABI = [
   "event PhaseChanged(uint8 indexed previous, uint8 indexed next)",
   "event PlanUpdated(uint256 estHashpower)",
   "event BnbRecovered(uint256 amount, address indexed to)",
-  "event CircuitRecovered(address indexed token, uint256 indexed id, address indexed to)",
   "event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)",
   // ── 自定义错误（decodeRevert 直接按本 ABI 解码） ──
   "error DirectTransferNotAllowed()",
   "error Halted()",
-  "error AlreadyHalted()",
-  "error NotHalted()",
   "error NotOwner(address caller)",
   "error WrongScene()",
   "error FundingEnded()",
@@ -162,11 +156,9 @@ export const CAMPAIGN_ABI = [
   "error CannotTakeOwnListing()",
   "error AlreadyListed()",
   "error NotListed()",
-  "error AlreadyReady()",
   "error TransferFailed()",
   "error ProceedsPending()",
   "error NotACircuit()",
-  "error PriceBelowCost()",
   "error SelfTrade()",
   "error InsufficientCircuits()",
   "error AlreadyMining()",

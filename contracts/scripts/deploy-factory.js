@@ -85,6 +85,9 @@ async function main() {
   allowedCircuits.forEach((a, i) => console.log(`   [${i}] ${a}`));
   if (factoryRuntime > 24_576) throw new Error("Factory 运行时代码已超限");
   if (campaignRuntime > 24_576) throw new Error("Campaign 运行时代码已超限");
+  if (deployerRuntime > 24_576) {
+    throw new Error(`CampaignDeployer 运行时代码已超限（${deployerRuntime} > 24576），主网无法部署`);
+  }
 
   if (dryRun) {
     console.log("\nDRY_RUN=1，未发送交易。");

@@ -1,6 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { time, loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
+const { time, loadFixture, mine } = require("@nomicfoundation/hardhat-network-helpers");
 
 const SHARE_PRICE = ethers.parseEther("0.01");
 const TOTAL_SHARES = 100n;
@@ -78,7 +78,7 @@ async function miningFixture() {
   await campaign.connect(owner).setPlan(408n);
   const { tokens } = await buy(ctx, 1, UNIT);
   await campaign.confirmCircuits();
-  await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+  await campaign.connect(owner).startMining(tokens[0]);
   return { ...ctx, tokenId: tokens[0] };
 }
 
@@ -92,7 +92,7 @@ async function feeFixture() {
   await campaign.connect(owner).setPlan(408n);
   const { tokens } = await buy(ctx, 1, UNIT);
   await campaign.confirmCircuits();
-  await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+  await campaign.connect(owner).startMining(tokens[0]);
   return { ...ctx, tokenId: tokens[0] };
 }
 
@@ -106,7 +106,7 @@ async function rejectorminingFixture() {
   await campaign.connect(owner).setPlan(408n);
   const { tokens } = await buy(ctx, 1, UNIT);
   await campaign.confirmCircuits();
-  await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+  await campaign.connect(owner).startMining(tokens[0]);
   return { ...ctx, rejector, tokenId: tokens[0] };
 }
 
@@ -407,12 +407,16 @@ describe("confirm / Ready", () => {
     await expect(campaign.connect(owner).setPhase(0)).to.be.revertedWithCustomError(campaign, "WrongScene");
   });
 
-  it("setPlan is refused once Ready, and in Mining", async () => {
+  it("setPlan is allowed while Buying with held circuits, refused once Ready/Mining", async () => {
     const ctx = await loadFixture(deployFixture);
     const { campaign, alice, owner } = ctx;
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await buy(ctx, 1, UNIT);
+    const bought = await buy(ctx, 1, UNIT);
+    await expect(campaign.connect(owner).setPlan(6n)).to.emit(campaign, "PlanUpdated").withArgs(6n);
+    expect(await campaign.estHashpower()).to.equal(6n);
     await campaign.confirmCircuits();
+    await expect(campaign.connect(owner).setPlan(1n)).to.be.revertedWithCustomError(campaign, "WrongScene");
+    await campaign.connect(owner).startMining(bought.tokens[0]);
     await expect(campaign.connect(owner).setPlan(1n)).to.be.revertedWithCustomError(campaign, "WrongScene");
   });
 });
@@ -420,32 +424,144 @@ describe("confirm / Ready", () => {
 describe("startMining", () => {
   it("requires Ready and at least one held circuit", async () => {
     const ctx = await loadFixture(deployFixture);
-    const { campaign, owner, alice } = ctx;
+    const { campaign, owner, alice, nft, pod } = ctx;
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await expect(campaign.connect(owner).startMining(1n, 0, 0, [], [], [])).to.be.revertedWithCustomError(
+    await expect(campaign.connect(owner).startMining(1n)).to.be.revertedWithCustomError(
       campaign,
       "CircuitsNotReady",
     );
 
     const { tokens } = await buy(ctx, 1, UNIT);
     await campaign.confirmCircuits();
-    await expect(campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []))
+    await expect(campaign.connect(owner).startMining(tokens[0]))
       .to.emit(campaign, "MiningStarted")
-      .withArgs(tokens[0], await campaign.miningKey(tokens[0]), 0n);
+      .withArgs(tokens[0], await pod.minerKey(await nft.getAddress(), tokens[0]), 0n);
     expect(await campaign.scene()).to.equal(SCENE.Mining);
     expect(await campaign.miningStatus(tokens[0])).to.equal(1n);
   });
 
-  it("keeps the circuit and refuses to start it twice", async () => {
+  it("keeps the circuit and treats a second start as adopt (idempotent)", async () => {
     const { campaign, owner, alice, tokenId } = await loadFixture(miningFixture);
     await expect(campaign.connect(alice).refund()).to.be.revertedWithCustomError(campaign, "RefundNotAvailable");
-    await expect(
-      campaign.connect(owner).recoverCircuits(await campaign.circuits(), tokenId),
-    ).to.be.revertedWithCustomError(campaign, "MiningActive");
     await expect(campaign.connect(owner).abandonOrder()).to.be.revertedWithCustomError(campaign, "WrongScene");
-    await expect(
-      campaign.connect(owner).startMining(tokenId, 0, 0, [], [], []),
-    ).to.be.revertedWithCustomError(campaign, "AlreadyMining");
+    await expect(campaign.connect(owner).startMining(tokenId))
+      .to.emit(campaign, "MiningStarted");
+    expect(await campaign.miningStatus(tokenId)).to.equal(1n);
+  });
+
+  it("adopts a circuit that was already mining on PoD before buy", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, nft, pod, market, seller } = ctx;
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    const tokenId = BigInt(tokenSeq++);
+    const nftAddr = await nft.getAddress();
+    await nft.mint(seller.address, tokenId);
+    await pod.connect(seller).start(nftAddr, tokenId, 0, 0, [], [], [], ethers.ZeroHash);
+    expect((await pod.getMiner(await pod.minerKey(nftAddr, tokenId))).status).to.equal(1n);
+    await nft.connect(seller).approve(await market.getAddress(), tokenId);
+    const listingId = await market.connect(seller).list.staticCall(nftAddr, tokenId, UNIT);
+    await market.connect(seller).list(nftAddr, tokenId, UNIT);
+    await campaign.connect(owner).buyCircuits([listingId], [tokenId], [UNIT]);
+    await campaign.confirmCircuits();
+    expect(await campaign.scene()).to.equal(SCENE.Executing);
+    expect(await campaign.miningStatus(tokenId)).to.equal(1n);
+    await expect(campaign.connect(owner).startMining(tokenId))
+      .to.emit(campaign, "MiningStarted");
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    expect(await campaign.miningStatus(tokenId)).to.equal(1n);
+  });
+
+  it("stopMining syncs into Mining when PoD is already active under Ready", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, nft, pod, market, seller } = ctx;
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    const tokenId = BigInt(tokenSeq++);
+    const nftAddr = await nft.getAddress();
+    await nft.mint(seller.address, tokenId);
+    await pod.connect(seller).start(nftAddr, tokenId, 0, 0, [], [], [], ethers.ZeroHash);
+    await nft.connect(seller).approve(await market.getAddress(), tokenId);
+    const listingId = await market.connect(seller).list.staticCall(nftAddr, tokenId, UNIT);
+    await market.connect(seller).list(nftAddr, tokenId, UNIT);
+    await campaign.connect(owner).buyCircuits([listingId], [tokenId], [UNIT]);
+    await campaign.confirmCircuits();
+    expect(await campaign.scene()).to.equal(SCENE.Executing);
+    await expect(campaign.connect(owner).stopMining(tokenId)).to.emit(campaign, "MiningStopped");
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    expect(await campaign.miningStatus(tokenId)).to.equal(3n);
+  });
+
+  it("claimMiningRewards syncs into Mining when PoD is already active under Ready", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, nft, pod, market, seller } = ctx;
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    const tokenId = BigInt(tokenSeq++);
+    const nftAddr = await nft.getAddress();
+    await nft.mint(seller.address, tokenId);
+    await pod.connect(seller).start(nftAddr, tokenId, 0, 0, [], [], [], ethers.ZeroHash);
+    await nft.connect(seller).approve(await market.getAddress(), tokenId);
+    const listingId = await market.connect(seller).list.staticCall(nftAddr, tokenId, UNIT);
+    await market.connect(seller).list(nftAddr, tokenId, UNIT);
+    await campaign.connect(owner).buyCircuits([listingId], [tokenId], [UNIT]);
+    await campaign.confirmCircuits();
+    const key = await pod.minerKey(await nft.getAddress(), tokenId);
+    const gross = ethers.parseEther("100");
+    await pod.accrue(key, gross);
+    expect(await campaign.scene()).to.equal(SCENE.Executing);
+    await expect(campaign.connect(alice).claimMiningRewards())
+      .to.emit(campaign, "MiningRewardsClaimed")
+      .withArgs(1n, gross);
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    expect(await campaign.bemPendingOf(alice.address)).to.equal(gross);
+  });
+
+  it("mixed buy: already-mining + idle ? claim only active, then start idle, claimBem", async () => {
+    const ctx = await loadFixture(deployFixture);
+    const { campaign, owner, alice, nft, pod, market, seller } = ctx;
+    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
+    const nftAddr = await nft.getAddress();
+    const marketAddr = await market.getAddress();
+
+    // Circuit A: seller already mining on PoD, then lists.
+    const tokenA = BigInt(tokenSeq++);
+    await nft.mint(seller.address, tokenA);
+    await pod.connect(seller).start(nftAddr, tokenA, 0, 0, [], [], [], ethers.ZeroHash);
+    await nft.connect(seller).approve(marketAddr, tokenA);
+    const idA = await market.connect(seller).list.staticCall(nftAddr, tokenA, UNIT);
+    await market.connect(seller).list(nftAddr, tokenA, UNIT);
+
+    // Circuit B: idle listing.
+    const tokenB = BigInt(tokenSeq++);
+    await nft.mint(seller.address, tokenB);
+    await nft.connect(seller).approve(marketAddr, tokenB);
+    const idB = await market.connect(seller).list.staticCall(nftAddr, tokenB, UNIT);
+    await market.connect(seller).list(nftAddr, tokenB, UNIT);
+
+    await campaign.connect(owner).buyCircuits([idA, idB], [tokenA, tokenB], [UNIT, UNIT]);
+    await campaign.confirmCircuits();
+    expect(await campaign.miningStatus(tokenA)).to.equal(1n);
+    expect(await campaign.miningStatus(tokenB)).to.equal(0n);
+    expect(await campaign.scene()).to.equal(SCENE.Executing);
+
+    const keyA = await pod.minerKey(await nft.getAddress(), tokenA);
+    const gross = ethers.parseEther("80");
+    await pod.accrue(keyA, gross);
+
+    // Claim while still Ready: only active key harvested; scene ? Mining.
+    await expect(campaign.connect(alice).claimMiningRewards())
+      .to.emit(campaign, "MiningRewardsClaimed")
+      .withArgs(1n, gross);
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    expect(await campaign.bemPendingOf(alice.address)).to.equal(gross);
+
+    // Idle circuit can still be started after claim.
+    await expect(campaign.connect(owner).startMining(tokenB))
+      .to.emit(campaign, "MiningStarted");
+    expect(await campaign.miningStatus(tokenB)).to.equal(1n);
+
+    await expect(campaign.connect(alice).claimBem())
+      .to.emit(campaign, "BemPaid")
+      .withArgs(alice.address, gross);
+    expect(await campaign.bemPendingOf(alice.address)).to.equal(0n);
   });
 
   it("refuses to start while a circuit is listed", async () => {
@@ -456,7 +572,7 @@ describe("startMining", () => {
     await campaign.confirmCircuits();
     await campaign.connect(owner).listCircuit(tokens[0], UNIT);
     await expect(
-      campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []),
+      campaign.connect(owner).startMining(tokens[0]),
     ).to.be.revertedWithCustomError(campaign, "CircuitStillListed");
   });
 
@@ -492,7 +608,7 @@ describe("startMining", () => {
     expect(await campaign.surplusPool()).to.be.greaterThan(0n);
     expect(await campaign.raisedBnb()).to.equal(0n);
 
-    await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+    await campaign.connect(owner).startMining(tokens[0]);
     expect(await campaign.scene()).to.equal(SCENE.Mining);
 
     await campaign.connect(alice).claimSurplus();
@@ -512,8 +628,8 @@ describe("startMining", () => {
 
 describe("official mining rewards", () => {
   it("harvests BEM and splits it pro-rata by shares", async () => {
-    const { campaign, owner, alice, bob, pod, tokenId } = await loadFixture(miningFixture);
-    const key = await campaign.miningKey(tokenId);
+    const { campaign, owner, alice, bob, pod, nft, tokenId } = await loadFixture(miningFixture);
+    const key = await pod.minerKey(await nft.getAddress(), tokenId);
     const gross = ethers.parseEther("1000");
     await pod.accrue(key, gross);
     expect(await campaign.miningPending(tokenId)).to.equal(gross);
@@ -526,16 +642,32 @@ describe("official mining rewards", () => {
   });
 
   it("stopMining settles the reward before the miner goes cooling", async () => {
-    const { campaign, owner, alice, pod, tokenId } = await loadFixture(miningFixture);
-    await pod.accrue(await campaign.miningKey(tokenId), ethers.parseEther("50"));
+    const { campaign, owner, alice, pod, nft, tokenId } = await loadFixture(miningFixture);
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokenId), ethers.parseEther("50"));
     await expect(campaign.connect(owner).stopMining(tokenId)).to.emit(campaign, "MiningStopped");
     expect(await campaign.miningStatus(tokenId)).to.equal(3n);
     expect(await campaign.bemPendingOf(alice.address)).to.equal(ethers.parseEther("30"));
   });
 
+  it("claim ? stop ? cool 1200 ? start again (official flow)", async () => {
+    const { campaign, owner, pod, nft, tokenId } = await loadFixture(miningFixture);
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokenId), ethers.parseEther("10"));
+    await campaign.connect(owner).claimMiningRewards();
+    await campaign.connect(owner).stopMining(tokenId);
+    expect(await campaign.miningStatus(tokenId)).to.equal(3n);
+    await expect(
+      campaign.connect(owner).startMining(tokenId),
+    ).to.be.revertedWithCustomError(pod, "Cooling");
+    // Official: restart only when block.number > stopBlock + 1200.
+    await mine(1201);
+    await expect(campaign.connect(owner).startMining(tokenId))
+      .to.emit(campaign, "MiningStarted");
+    expect(await campaign.miningStatus(tokenId)).to.equal(1n);
+  });
+
   it("claimBem pays the holder and cannot pay twice", async () => {
-    const { campaign, owner, alice, pod, tokenId } = await loadFixture(miningFixture);
-    await pod.accrue(await campaign.miningKey(tokenId), ethers.parseEther("100"));
+    const { campaign, owner, alice, pod, nft, tokenId } = await loadFixture(miningFixture);
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokenId), ethers.parseEther("100"));
     await campaign.connect(owner).claimMiningRewards();
     await expect(campaign.connect(alice).claimBem())
       .to.emit(campaign, "BemPaid")
@@ -545,8 +677,8 @@ describe("official mining rewards", () => {
   });
 
   it("settles the seller before shares move, so resale cannot steal earned BEM", async () => {
-    const { campaign, owner, alice, bob, pod, tokenId } = await loadFixture(miningFixture);
-    await pod.accrue(await campaign.miningKey(tokenId), ethers.parseEther("100"));
+    const { campaign, owner, alice, bob, pod, nft, tokenId } = await loadFixture(miningFixture);
+    await pod.accrue(await pod.minerKey(await nft.getAddress(), tokenId), ethers.parseEther("100"));
     await campaign.connect(owner).claimMiningRewards();
     await campaign.connect(alice).listShares(60n, ethers.parseEther("0.02"));
     await campaign.connect(bob).takeListing(0n, 60n, { value: ethers.parseEther("1.2") });
@@ -708,7 +840,7 @@ describe("refund / abort", () => {
     await campaign.connect(owner).withdrawMarketProceeds();
     expect(await campaign.raisedBnb()).to.equal(ethers.parseEther("0.994"));
 
-    // Ready â†?Buying recovery path, then open the pro-rata gate.
+    // Ready ï¿½?Buying recovery path, then open the pro-rata gate.
     await campaign.connect(owner).setPhase(1);
     await campaign.connect(owner).openRefund();
     await campaign.connect(alice).refund();
@@ -718,6 +850,24 @@ describe("refund / abort", () => {
 });
 
 describe("circuit listing (sell side)", () => {
+  it("lists after stopMining while the round is already in Mining", async () => {
+    const { campaign, owner, tokenId } = await loadFixture(miningFixture);
+    expect(await campaign.scene()).to.equal(SCENE.Mining);
+    await campaign.connect(owner).stopMining(tokenId);
+    expect(await campaign.miningStatus(tokenId)).to.equal(3n);
+    await expect(campaign.connect(owner).listCircuit(tokenId, UNIT))
+      .to.emit(campaign, "CircuitListed");
+    expect(await campaign.activeListingCount()).to.equal(1n);
+  });
+
+  it("refuses to list while the circuit is still mining on PoD", async () => {
+    const { campaign, owner, tokenId } = await loadFixture(miningFixture);
+    await expect(campaign.connect(owner).listCircuit(tokenId, UNIT)).to.be.revertedWithCustomError(
+      campaign,
+      "AlreadyMining",
+    );
+  });
+
   it("lists a held circuit at or above cost and pays the seller on withdraw", async () => {
     const ctx = await loadFixture(deployFixture);
     const { campaign, owner, market, nft, buyer } = ctx;
@@ -742,17 +892,17 @@ describe("circuit listing (sell side)", () => {
     expect(await campaign.raisedBnb()).to.equal(before + owed);
   });
 
-  it("refuses a price below cost, a token it does not own, and a double listing", async () => {
+  it("allows a price below cost; refuses a token it does not own and a double listing", async () => {
     const ctx = await loadFixture(deployFixture);
     const { campaign, owner, alice } = ctx;
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
     await buy(ctx, 1, UNIT);
     await campaign.confirmCircuits();
     const tokenId = await campaign.circuitIds(0);
-    await expect(campaign.connect(owner).listCircuit(tokenId, UNIT - 1n)).to.be.revertedWithCustomError(
-      campaign,
-      "PriceBelowCost",
-    );
+    // Below-cost listing is Owner's call (no PriceBelowCost).
+    await campaign.connect(owner).listCircuit(tokenId, UNIT - 1n);
+    expect(await campaign.circuitListingId(tokenId)).to.not.equal(0n);
+    await campaign.connect(owner).cancelCircuitListing(tokenId);
     await expect(campaign.connect(owner).listCircuit(999999n, UNIT)).to.be.revertedWithCustomError(
       campaign,
       "NotACircuitOwner",
@@ -807,25 +957,6 @@ describe("circuit listing (sell side)", () => {
     expect(await campaign.activeListingCount()).to.equal(0n);
   });
 
-  it("recovers a foreign token but not a circuit backing outstanding shares", async () => {
-    const ctx = await loadFixture(deployFixture);
-    const { campaign, owner, nft, alice } = ctx;
-    await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
-    await buy(ctx, 1, UNIT);
-    await campaign.confirmCircuits();
-
-    // A token from another collection can leave: only `circuits` backs the shares.
-    const otherNft = await ethers.deployContract("MockCircuitNft");
-    const foreign = BigInt(tokenSeq++);
-    await otherNft.mint(await campaign.getAddress(), foreign);
-    await campaign.connect(owner).recoverCircuits(await otherNft.getAddress(), foreign);
-    expect(await otherNft.ownerOf(foreign)).to.equal(owner.address);
-
-    const own = await campaign.circuitIds(0);
-    await expect(
-      campaign.connect(owner).recoverCircuits(await nft.getAddress(), own),
-    ).to.be.revertedWithCustomError(campaign, "SharesOutstanding");
-  });
 });
 
 describe("share transfer (Mining only)", () => {
@@ -891,7 +1022,7 @@ describe("service fee", () => {
     await campaign.connect(alice).subscribe(100n, { value: 100n * SHARE_PRICE });
     const { tokens } = await buy(ctx, 1, UNIT);
     await campaign.confirmCircuits();
-    await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+    await campaign.connect(owner).startMining(tokens[0]);
     await campaign.connect(owner).depositRevenue({ value: ethers.parseEther("0.01") });
     expect(await campaign.totalPendingFee()).to.equal(0n);
   });
@@ -918,10 +1049,9 @@ describe("single owner key", () => {
       () => campaign.connect(alice).topUpShortfall({ value: 1n }),
       () => campaign.connect(alice).openRefund(),
       () => campaign.connect(alice).abandonOrder(),
-      () => campaign.connect(alice).startMining(1n, 0, 0, [], [], []),
+      () => campaign.connect(alice).startMining(1n),
       () => campaign.connect(alice).stopMining(1n),
       () => campaign.connect(alice).depositRevenue({ value: 1n }),
-      () => campaign.connect(alice).recoverCircuits(alice.address, 1n),
       () => campaign.connect(alice).recoverBnb(),
       () => campaign.connect(alice).halt(),
       () => campaign.connect(alice).resume(),
@@ -939,7 +1069,7 @@ describe("single owner key", () => {
     await campaign.connect(owner).subscribe(100n, { value: 100n * SHARE_PRICE });
     const { tokens } = await buy(ctx, 1, UNIT);
     await campaign.connect(owner).confirmCircuits();
-    await campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []);
+    await campaign.connect(owner).startMining(tokens[0]);
     expect(await campaign.scene()).to.equal(SCENE.Mining);
     await campaign.connect(owner).halt();
     await campaign.connect(owner).resume();
@@ -977,7 +1107,7 @@ describe("circuit breaker", () => {
       "Halted",
     );
     await expect(
-      campaign.connect(owner).startMining(tokens[0], 0, 0, [], [], []),
+      campaign.connect(owner).startMining(tokens[0]),
     ).to.be.revertedWithCustomError(campaign, "Halted");
     await campaign.connect(owner).resume();
   });

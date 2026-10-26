@@ -252,6 +252,51 @@ export function round4(value) {
   return Math.round(n * 10000) / 10000;
 }
 
+/** 主网官方 BEM decimals（与 chain/config.BEM_DECIMALS 一致）。 */
+export const BEM_DECIMALS = 8;
+
+/**
+ * BEM 展示：最多 6 位小数（去尾零）。
+ * - bigint = 链上最小单位（8 位小数）
+ * - Number = 已换算的人类可读数量
+ */
+export function formatBemClaimable(value) {
+  let n;
+  if (typeof value === "bigint") {
+    if (value <= 0n) return "";
+    const neg = value < 0n;
+    const v = neg ? -value : value;
+    const base = 10n ** BigInt(BEM_DECIMALS);
+    const whole = v / base;
+    const fracRaw = (v % base).toString().padStart(BEM_DECIMALS, "0");
+    // 展示最多 6 位：从第 7 位四舍五入
+    const keep = 6;
+    let head = fracRaw.slice(0, keep);
+    const next = fracRaw.slice(keep, keep + 1);
+    let fracNum = BigInt(head || "0");
+    if (next && Number(next) >= 5) fracNum += 1n;
+    let wholeOut = whole;
+    if (fracNum >= 10n ** BigInt(keep)) {
+      fracNum = 0n;
+      wholeOut += 1n;
+    }
+    let frac = fracNum.toString().padStart(keep, "0").replace(/0+$/, "");
+    const s = frac ? `${wholeOut}.${frac}` : `${wholeOut}`;
+    return neg ? `-${s}` : s;
+  }
+  n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  let s = n.toFixed(6);
+  if (s.includes(".")) s = s.replace(/0+$/, "").replace(/\.$/, "");
+  if (!s || s === "0" || Number(s) === 0) return n > 0 ? "<0.000001" : "";
+  return s;
+}
+
+/** @deprecated 用 formatBemClaimable；保留别名以免旧引用报错。 */
+export function formatBemWei(wei) {
+  return formatBemClaimable(typeof wei === "bigint" ? wei : 0n);
+}
+
 /**
  * 五位小数：电路挂单价。挂单允许填 0.00001 BNB 级别，
  * 用四位会把用户输入静默改小，所以输入框与挂单价展示统一走这里。
@@ -269,9 +314,68 @@ export function clampPriceInput(raw) {
 }
 
 /**
+ * setPlan 写入值：按「所持有 / 正在挖矿的电路」计算，不用募资反推的预估张数。
+ *
+ *   H = 张数 × 处理器每张算力 P
+ *
+ * 张数优先取挖矿中（miningStatus = 1）；还没开矿时用本期持有张数。
+ * 募资期还没买到电路时返回 null，调用方应拒绝上链。
+ */
+export function planHashpowerFromHoldings(round, book = null) {
+  const mining = Number(book?.miningActiveCount ?? 0) || 0;
+  const held = Number(book?.circuitHeldCount ?? 0) || 0;
+  const parts = mining > 0 ? mining : held;
+  const processorId =
+    (PROCESSOR_IDS.includes(round?.processorId) && round.processorId)
+    || (round?.circuitModelId ? findCircuit(round.circuitModelId)?.processor : null)
+    || null;
+  const P = processorId ? processorScale(processorId) : null;
+  if (!(parts > 0) || P == null || !(P >= 0) || !Number.isFinite(P)) {
+    return {
+      ok: false,
+      parts,
+      mining,
+      held,
+      processorId,
+      processorScale: P,
+      hashpower: 0,
+      reason: !(parts > 0)
+        ? "请先买入并持有电路，再按持有张数写入算力"
+        : "读不到本期处理器算力倍率，无法计算 setPlan",
+    };
+  }
+  const hashpower = parts * P;
+  if (!Number.isInteger(hashpower) || hashpower <= 0) {
+    return {
+      ok: false,
+      parts,
+      mining,
+      held,
+      processorId,
+      processorScale: P,
+      hashpower: 0,
+      reason: `按持有电路算出的算力无效：${parts} × ${P} = ${hashpower}`,
+    };
+  }
+  return {
+    ok: true,
+    parts,
+    mining,
+    held,
+    processorId,
+    processorScale: P,
+    hashpower,
+    source: mining > 0 ? "mining" : "held",
+    reason: mining > 0
+      ? `挖矿中 ${mining} 张 × P=${P} = ${hashpower} H`
+      : `持有 ${held} 张 × P=${P} = ${hashpower} H`,
+  };
+}
+
+/**
  * 从链上 / 本地期次字段解析「目标处理器」。
  * 链上只认开期写入的 circuits → round.processorId（adapter.roundFromState），
- * 不做 H÷电路数反推（那是旧合约缺 circuits 时的兜底）。
+ * 不做 H÷电路数反推。
  */
 export function resolveCampaignDesign(round, book = null) {
   const chain = Boolean(book?._chain);
@@ -550,10 +654,12 @@ export function createScene(id, round = ROUND, phase = null, expired = false, ex
     /**
      * 待执行子状态：电路来自电路市场，须由 Owner 钱包发起链上交易去挂单买入并确认到账，
      * 不能指望合约自动去电路市场操作——合约无法替人工下单。
-     * buying = 待挂单；listed = 挂单中（可取消）；ready = 电路已到账，待 execute 流片开矿。
-     * 其他场景无意义，置 undefined。
+     * buying = Buying（待买入）；ready = Ready（已到账，可开矿/挂卖）。
+     * Mining 时链上 phase 仍为 Ready，须保留，否则前端会误判回 Buying 并露出确认按钮。
      */
-    executePhase: id === "executing" ? (phase || seed.executePhase || "buying") : undefined,
+    executePhase: id === "executing" || id === "mining"
+      ? (phase || seed.executePhase || (id === "mining" ? "ready" : "buying"))
+      : undefined,
     sold: seed.sold,
     mine: seed.mine,
     /** 本期「当前钱包」的地址，identify() 用它判断调用者是否持份 */
@@ -984,7 +1090,7 @@ export function applyBuyCircuits(round, book, actor = null, args = {}) {
   const bought = (Number(book.circuitCount) || 0) + count;
   return {
     ok: true,
-    message: `已从电路市场买入 ${count} 张 × ${round4(unit)} BNB（模拟），持仓 ${held} 张。`,
+    message: `本批买入 ${count} 张 × ${round4(unit)} BNB（模拟），累计持仓 ${held} 张；Buying 内还可继续买，确认后不能再买。`,
     book: {
       ...book,
       executionFailed: false,

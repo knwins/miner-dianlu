@@ -15,10 +15,14 @@ contract MockPodMining {
     mapping(bytes32 => uint256) private _pending;
     mapping(bytes32 => uint64) public armedAt;
 
+    /// @notice Official PodMining cooldown after stop: restart only when block.number > stopBlock + this.
+    uint256 public constant COOLDOWN_BLOCKS = 1200;
+
     error MockOnMainnet();
     error NotCircuitOwner();
     error NotEligible();
     error NotActive();
+    error Cooling();
 
     constructor(MockBem bem_) {
         if (block.chainid == 56) revert MockOnMainnet();
@@ -68,12 +72,15 @@ contract MockPodMining {
         if (taskId != 0 && armedAt[key] == 0) revert NotEligible();
         anchorBlock;
         IPodMining.Miner storage m = _miners[key];
+        if (m.status == 3 && block.number <= uint256(m.stopBlock) + COOLDOWN_BLOCKS) revert Cooling();
+        if (m.status == 2) revert NotEligible();
         m.circuits = circuits;
         m.circuitId = uint64(circuitId);
         m.taskId = taskId;
         m.since = uint64(block.timestamp);
         m.status = 1;
         m.registrant = msg.sender;
+        m.stopBlock = 0;
     }
 
     function stop(bytes32 key) external {
@@ -82,6 +89,7 @@ contract MockPodMining {
         if (IERC721(m.circuits).ownerOf(m.circuitId) != msg.sender) revert NotCircuitOwner();
         _harvest(key);
         m.status = 3;
+        m.stopBlock = uint64(block.number);
     }
 
     function claim(bytes32 key) external {

@@ -1,17 +1,25 @@
 // 把链上 readState 的结果适配成前端页面已在消费的 book / round 形状，
 // 使主页面（认购/份数/转让/概览）无需改动即可展示真实测试网数据。
-import { formatEther } from "ethers";
+import { formatEther, formatUnits } from "ethers";
 import { ROUND } from "../fixtures.js";
 import { circuitIdFor } from "../prices.js";
 import { processorFromCircuitContract } from "../tapeout.js";
 import { getCampaignAddress } from "./client.js";
+import { BEM_DECIMALS } from "./config.js";
 import { rowState } from "../roundState.js";
 
 const SCENE_NAME = ["funding", "executing", "mining"];
-const PHASE_NAME = [undefined, "buying", "listed", "ready"];
+/** 与 Campaign.Phase 枚举对齐：0 None / 1 Buying / 2 Ready。挂市场单不是独立 phase。 */
+const PHASE_NAME = [undefined, "buying", "ready"];
 
+/** BNB wei → Number（18 位）。历史函数名 bem，实际只用于 BNB。 */
 const bem = (v) => {
   try { return Number(formatEther(v)); } catch { return 0; }
+};
+
+/** BEM 最小单位 → Number（主网 8 位）。 */
+const bemToken = (v) => {
+  try { return Number(formatUnits(v ?? 0n, BEM_DECIMALS)); } catch { return 0; }
 };
 
 /** 由 deployments.campaignParams 生成页面使用的 round（未上链字段用 ROUND 兜底）。 */
@@ -133,7 +141,13 @@ export function bookFromState(state, account, extra = {}) {
   return {
     _chain: true,
     scene,
-    executePhase: scene === "executing" ? (phase || "buying") : undefined,
+    /**
+     * Mining 时链上 phase 仍为 Ready。必须保留 executePhase，否则 phaseKeyOf 会回落成
+     * buying，持仓页误显「确认到账」→ confirmCircuits 打出 WrongScene。
+     */
+    executePhase: scene === "executing" || scene === "mining"
+      ? (phase || (scene === "mining" ? "ready" : "buying"))
+      : undefined,
     sold: Number(state.sold),
     /**
      * 已售未退（当前债务）。「已售 X/Y」应该用这个，而不是 sold：
@@ -164,10 +178,10 @@ export function bookFromState(state, account, extra = {}) {
      */
     pendingSurplusSelf: bem(self.claimableSurplus ?? self.pendingSurplus),
     pendingSurplusTotal: bem(state.totalPendingSurplus),
-    /** 持有人可领的 BEM（官方挖矿产出按份额记账，claimBem 领取）。 */
-    bemClaimable: bem(self.bemClaimable ?? 0n),
-    /** 本期未领取的挖矿产出（BEM，按官方合约 pending 汇总）。 */
-    miningPendingBem: bem(state.miningPendingBem ?? 0n),
+    /** 持有人可领的 BEM（官方挖矿产出按份额记账，claimBem 领取；8 位小数）。 */
+    bemClaimable: bemToken(self.bemClaimable ?? 0n),
+    /** 本期未领取的挖矿产出（BEM，按官方合约 pending 汇总；8 位小数）。 */
+    miningPendingBem: bemToken(state.miningPendingBem ?? 0n),
     /**
      * 服务费是否已设定（链上）。
      * false = 还能改（只要还没人认购）；true = 已永久锁定。
@@ -200,6 +214,7 @@ export function bookFromState(state, account, extra = {}) {
       cost: bem(c.cost || 0),
       miningStatus: Number(c.miningStatus) || 0,
       miningPending: c.miningPending || 0n,
+      miningStopBlock: Number(c.miningStopBlock) || 0,
     })) : [],
     sellBids: Array.isArray(state.sellBids) ? state.sellBids.map((b) => ({
       id: String(b.id),
@@ -211,9 +226,14 @@ export function bookFromState(state, account, extra = {}) {
       buyer: b.buyer,
       miningStatus: Number(b.miningStatus) || 0,
       miningPending: b.miningPending || 0n,
+      miningStopBlock: Number(b.miningStopBlock) || 0,
     })) : [],
     /** 官方挖矿读数：挖矿中的张数。 */
     miningActiveCount: Number(state.miningActiveCount ?? 0),
+    miningCoolingCount: Number(state.miningCoolingCount ?? 0),
+    /** 读状态时的块高；用于官方 1200 块冷却倒计时。 */
+    blockNumber: Number(state.blockNumber ?? 0),
+    miningCooldownBlocks: Number(state.miningCooldownBlocks ?? 1200),
     /** 订单已成交（本期至少持有过一张电路）。 */
     orderFilled: Boolean(state.orderFilled),
     /** 市场欠本期的 BNB（可 withdrawMarketProceeds）。 */

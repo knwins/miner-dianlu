@@ -133,18 +133,16 @@ chain/config.js ──► chain/client.js ──► chain/adapter.js ──► A
 
 官方 PoD 地址在 `src/chain/config.js`：`POD_MINING_ADDRESS` / `POD_LENS_ADDRESS`。
 电路**始终留在 Campaign 名下**，不再有矿池转账，也没有「入池不可逆」这一步。
-官方市场挂单默认按单价**从低到高**排序，并且只显示 Lens `refsEligible` 判定可挖矿的电路。
 
 买入面板（`Owner.jsx` → `CircuitExecPanel`）：
 
-- 只列**本期开期锁定的 ERC721 集合**在官方市场里的在售挂单，按单价从低到高排序，
-  并且**只显示 Lens `refsEligible` 判定可挖矿的电路**；
-  集合与市场地址都来自链上期次状态（`circuits` / `circuitMarket`），不用前端缓存。
-- 勾选后按 `listingId` 精确吃单（`chainTx.buyCircuitsListings`），提交前在链上重读
-  `listings(id)` 与 `listingFor(circuits, tokenId)`：被撤单、被成交、换集合、改价一律拒发交易。
-- 合计超过募集余额时按钮直接禁用（合约会置 `ExecutionFailed`，前端先挡）。
-- 卖单扫描回看最近 200 笔挂单（市场是全集合共用的一本账）；每批 10 个读，避免限流
-  静默丢单 —— 丢单会让底价看起来比实际更高。
+- **不镜像官方全量盘口**（市场合约无按集合枚举 API）。外链
+  `https://tapeout.net/`（新站内「电路市场」；勿用旧路径 `/circuit-market`）→
+  本站填挂单 ID → `previewCircuitListingsByIds` → `buyCircuitsListings`。
+- 预览 / 提交均重读 `listings(id)` 与 `listingFor(circuits, tokenId)`：
+  撤单、成交、换集合、改价一律拒发；须属于本期锁定的 `circuits`。
+- 预览须全部通过才可买（整批原子）；合计超过募集余额时按钮禁用。
+- Buying 内可多次吃单；`confirmCircuits` 后不能再买。
 
 需要变现时（Ready 或 Mining、无在售挂单）：
 
