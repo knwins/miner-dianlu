@@ -2033,7 +2033,10 @@ function RoundHub({
                * 生命周期条已经在当前步下面说过一次，同一个词在一屏里出现两遍。
                */}
               <ul className="bill">
-                <li><span>已募</span><strong>{book.sold} / {round.totalShares} 份</strong></li>
+                <li>
+                  <span>已售 / 未退</span>
+                  <strong>{book.sold} / {outstandingOf(book)} · 总 {round.totalShares}</strong>
+                </li>
                 <li><span>托管 BNB</span><strong>{round4(book.bnbPool || 0)} BNB</strong></li>
                 <li>
                   <span>
@@ -2050,11 +2053,41 @@ function RoundHub({
                   </strong>
                 </li>
                 <li>
+                  <span>挂卖电路</span>
+                  <strong>
+                    {Array.isArray(book.listedCircuits) && book.listedCircuits.length > 0
+                      ? `${book.listedCircuits.length} 张 · ${book.listedCircuits.map((c) => `${round4(c.price)} BNB`).join(" / ")}`
+                      : "无"}
+                  </strong>
+                </li>
+                <li>
                   <span>{marketOwed > 0 ? "市场欠款" : "市场结算"}</span>
                   <strong style={marketOwed > 0 ? { color: "var(--color-primary)" } : undefined}>
                     {marketOwed > 0 ? `待提取 ${round4(marketOwed)} BNB` : "—"}
                   </strong>
                 </li>
+                <li>
+                  <span>余款</span>
+                  <strong>
+                    {Number(book.surplusBase || 0) > 0
+                      ? (Number(book.surplusOutstanding || 0) > 0
+                        ? `已记账 · 待领 ${round4(book.surplusOutstanding)} BNB`
+                        : "已记账 · 待领 0")
+                      : (book.executePhase === "ready"
+                        ? (Number(book.bnbPool || 0) > 0 ? "未记账 · 可退余款或开矿时记账" : "池中无剩余")
+                        : "—")}
+                  </strong>
+                </li>
+                {book.markFailedAt && !book.executionFailed ? (
+                  <li>
+                    <span>可判失败</span>
+                    <strong>
+                      {Date.now() >= book.markFailedAt
+                        ? "已到期 · 任何人可 markFailed"
+                        : `${formatClock(book.markFailedAt)}（剩 ${formatRemaining(book.markFailedAt - Date.now())}）`}
+                    </strong>
+                  </li>
+                ) : null}
               </ul>
               {/*
                * 这一段只讲**上面没讲过的机制细节**：
@@ -2156,6 +2189,12 @@ function RoundHub({
               </div>
             </div>
           </article>
+          <SubscribeRecords
+            round={round}
+            book={book}
+            usingChain={usingChain || onChain}
+            account={book.selfAddress}
+          />
           {book._chain && !ended && (
             <MarketTrades
               campaignAddr={book.address || round.contract}
@@ -2200,11 +2239,13 @@ function RoundHub({
         const miningActive = Number(book.miningActiveCount || 0);
         const listedN = Array.isArray(book.listedCircuits) ? book.listedCircuits.length : 0;
         const canHarvest = connected && !pending && (miningActive > 0 || podPending > 0) && listedN === 0;
+        const mySurplus = Number(book.pendingSurplusSelf || 0);
+        const surplusPoolLeft = Number(book.surplusOutstanding || 0);
         return (
           <section className="mining-desk">
             <RoundTitle
               id={round.id}
-              lead="本期电路已交给官方 PoD 挖矿合约，进入挖矿。"
+              lead="本期电路已交由官方挖矿，正在产出。"
               badge={state.label}
               tone={state.tone}
               deal={state.deal}
@@ -2212,6 +2253,7 @@ function RoundHub({
               onSwitchPeriod={onSwitchPeriod}
               processor={round.processorId || "未记录"}
             />
+            <RoundFacts round={round} book={book} quote={quote} compact />
             <div className="mining-stats">
               <article className="mining-stat is-accent">
                 <p className="mining-stat-label">在持电路</p>
@@ -2219,7 +2261,11 @@ function RoundHub({
                   {pooledParts.toLocaleString("zh-CN")}
                   <span className="mining-stat-unit">张</span>
                 </p>
-                <p className="mining-stat-note">合约名下的电路张数（挖矿中 {miningActive} 张）</p>
+                <p className="mining-stat-note">
+                  挖矿中 {miningActive} 张
+                  {Number(book.miningCoolingCount || 0) > 0 ? ` · 冷却 ${Number(book.miningCoolingCount)}` : ""}
+                  {listedN > 0 ? ` · 挂卖 ${listedN}` : ""}
+                </p>
               </article>
               <article className="mining-stat">
                 <p className="mining-stat-label">预估算力</p>
@@ -2227,23 +2273,23 @@ function RoundHub({
                   {hashpower.toLocaleString("zh-CN")}
                   <span className="mining-stat-unit">H</span>
                 </p>
-                <p className="mining-stat-note">setPlan 写入的估算值，不是实测产出</p>
+                <p className="mining-stat-note">所有电路累计估算值</p>
               </article>
               <article className="mining-stat">
-                <p className="mining-stat-label">产出</p>
+                <p className="mining-stat-label">$BEM 待领取产出</p>
                 <p className="mining-stat-value">
                   {podLabel}
                   <span className="mining-stat-unit">BEM</span>
                 </p>
-                <p className="mining-stat-note">官方 PoD 尚未 harvest 的产出</p>
+                <p className="mining-stat-note">官方挖矿尚未结算进本期</p>
               </article>
               <article className="mining-stat">
-                <p className="mining-stat-label">待领</p>
+                <p className="mining-stat-label">可领 BEM</p>
                 <p className="mining-stat-value">
-                  {pendingLabel}
+                  {claimLabel || "0"}
                   <span className="mining-stat-unit">BEM</span>
                 </p>
-                <p className="mining-stat-note">已记账可领 + 未 harvest 产出</p>
+                <p className="mining-stat-note">已结算可领；含待结算合计 {pendingLabel}</p>
               </article>
             </div>
             <article className="card mining-card">
@@ -2255,15 +2301,30 @@ function RoundHub({
                   <div className="mining-fact">
                     <dt>我的份数</dt>
                     <dd>
-                      {mine.toLocaleString("zh-CN")} / {totalShares.toLocaleString("zh-CN")} 份
-                      {mine > 0
-                        ? `（占 ${sharePercent % 1 === 0 ? sharePercent : sharePercent.toFixed(2)}%）`
-                        : " · 当前钱包未持份"}
+                      {connected
+                        ? `${mine.toLocaleString("zh-CN")} / ${totalShares.toLocaleString("zh-CN")} 份${
+                          mine > 0
+                            ? `（占 ${sharePercent % 1 === 0 ? sharePercent : sharePercent.toFixed(2)}%）`
+                            : " · 未持份"}`
+                        : "连接钱包后显示"}
                     </dd>
                   </div>
                   <div className="mining-fact">
-                    <dt>领取路径</dt>
-                    <dd>先「领奖励」把产出记入本期；持份人再「领取 BEM」。领奖励任何人可点。</dd>
+                    <dt>我的待领余款</dt>
+                    <dd>
+                      {connected
+                        ? (mySurplus > 0
+                          ? `${round4(mySurplus)} BNB（全期待领 ${round4(surplusPoolLeft)}）`
+                          : (Number(book.surplusBase || 0) > 0 ? "0 BNB" : "本期尚未结算余款"))
+                        : "连接钱包后显示"}
+                    </dd>
+                  </div>
+                  <div className="mining-fact">
+                    <dt>领取说明</dt>
+                    <dd>
+                      先点「领奖励」把产出结算进本期（会预留服务费），再点「领取 BEM」到钱包；
+                      未花完的募资余款在「我的资产」领取。分成地址另走「领取服务费」。
+                    </dd>
                   </div>
                 </dl>
                 <div className="mining-actions">
@@ -2275,7 +2336,7 @@ function RoundHub({
                       !connected ? "连接钱包后领取"
                         : listedN > 0 ? "先撤电路挂单再领奖"
                           : miningActive <= 0 && podPending <= 0 ? "暂无可领产出"
-                            : "claimMiningRewards：任何人可调"
+                            : "把官方挖矿产出结算进本期"
                     }
                     onClick={() => onClaimMiningRewards?.()}
                   >
@@ -2286,10 +2347,20 @@ function RoundHub({
                       className="btn btn-primary"
                       type="button"
                       disabled={!connected || Boolean(pending)}
-                      title="claimBem：按份额领取已记账 BEM"
+                      title="按份额领取已结算的 BEM"
                       onClick={() => onClaimBem?.()}
                     >
                       {pending === "claimBem" ? "领取中…" : `领取 BEM（${claimLabel}）`}
+                    </button>
+                  ) : null}
+                  {mySurplus > 0 ? (
+                    <button
+                      className="btn btn-outline"
+                      type="button"
+                      onClick={onOpenAssets}
+                      title="前往我的资产领取余款"
+                    >
+                      领余款 {round4(mySurplus)} BNB
                     </button>
                   ) : null}
                   <button className="btn btn-outline" type="button" onClick={onOpenTransfer}>
@@ -2301,6 +2372,12 @@ function RoundHub({
                 </div>
               </div>
             </article>
+            <SubscribeRecords
+              round={round}
+              book={book}
+              usingChain={usingChain || onChain}
+              account={book.selfAddress}
+            />
           </section>
         );
       })()}
@@ -2697,48 +2774,55 @@ function ProcessorGlyph({ name, size = 18 }) {
   );
 }
 
-function RoundFacts({ round, book, quote }) {
+function RoundFacts({ round, book, quote, compact = false }) {
   const est = estimateHashpower(round, quote, round.totalShares);
   const namedProcessor = Boolean(round.processorId);
   const hardCap = round.hardCapBnb ?? round.sharePriceBnb * round.totalShares;
   /**
    * 电路数与算力的权威口径：链上以 `circuitHeldCount` / `circuitCount` 为准。
    *  - circuitCount 是累计买入张数（历史事实）；circuitHeldCount 是当前持有张数。
-   *    两者都不从市场挂单反推 —— 官方电路市场买入即交割，没有「等待成交」的挂单量。
    *  - hashpower = estHashpower，是 Owner 用 setPlan 写入的预估算力。
-   * 链下演示模式没有链上数据，仍用募资额反推的估算值。
    */
   const onChain = Boolean(book?._chain);
   const chainParts = Number(book?.circuitHeldCount ?? 0) || 0;
   const boughtParts = Number(book?.circuitCount) || 0;
   const chainHashpower = Number(book?.hashpower) || Number(book?.estHashpower) || 0;
-  /** 链上已有持有电路 → 展示真实值；否则展示募资反推的预期值并标注是预期。 */
   const hasBought = chainParts > 0;
   const partsValue = onChain ? (hasBought ? chainParts : null) : (est.usedParts || null);
   const weightValue = onChain ? (chainHashpower > 0 ? chainHashpower : null) : (est.hashpower || null);
-  /** 电路数与算力是否来自链上真实数据 */
   const partsFromChain = onChain && hasBought;
-  /**
-   * 处理器与每张算力 P：
-   *  - 名称只认合约锁定的 circuits → processorId；
-   *  - P 只在「有已成交电路」且已知处理器时给出，不做 H÷电路数反推。
-   */
   const shownProcessor = round.processorId || (onChain ? null : est.processor) || null;
   const shownScale = onChain
     ? (hasBought && shownProcessor ? processorScale(shownProcessor) : null)
     : (est.processorScale || null);
   /**
-   * 服务费（链上口径）：serviceFeeBps 从 Campaign 读。
-   * serviceFeeSet 区分「还没设过」与「已设为 0」——前者还能改，后者已永久锁定。
-   *
-   * ⚠️ 口径：这里的「服务费」是**挖矿产出奖励的服务费**（从官方 PoD 产出里计提），
-   * **与认筹款无关** —— 认购人付的 BNB 全额进认购托管池，不收任何服务费。
+   * 服务费是挖矿产出 BEM 的计提，不从认筹 BNB 扣。
+   * serviceFeeSet 区分「未设定」与「已锁定为 0%」。
    */
-  const chainFeeSet = Boolean(round.serviceFeeSet);
-  const chainFeePercent = Number(round.serviceFeeBps ?? 0) / 100;
+  const chainFeeSet = Boolean(round.serviceFeeSet ?? book?.serviceFeeSet);
+  const chainFeePercent = Number(round.serviceFeeBps ?? book?.serviceFeeBps ?? 0) / 100;
   const shownScaleText = shownScale == null
     ? "—"
     : Number.isInteger(shownScale) ? String(shownScale) : shownScale.toFixed(2);
+
+  const sold = Number(book?.sold ?? 0);
+  const outstanding = Number(book?.outstandingShares ?? book?.sold ?? 0);
+  const pool = Number(book?.bnbPool ?? 0);
+  const surplusOut = Number(book?.surplusOutstanding ?? 0);
+  const feeShares = Array.isArray(round?.feeShares) ? round.feeShares : [];
+  const feeShareSummary = feeShares.length === 0
+    ? (chainFeeSet ? "无分成地址" : "—")
+    : feeShares
+      .map((row) => `${shortAddress(row.address)} ${Math.round(Number(row.sharePercent ?? (Number(row.shareBps || 0) / 100)))}%`)
+      .join(" · ");
+  const contractAddr = round?.contract || book?.address || "";
+  const ownerAddr = book?.owner || "";
+  const endsLabel = Number.isFinite(book?.endsAt) && book.endsAt > 0
+    ? formatClock(book.endsAt)
+    : null;
+  const miningActive = Number(book?.miningActiveCount || 0);
+  const miningCooling = Number(book?.miningCoolingCount || 0);
+
   return (
     <>
       <div className="stat-grid facts">
@@ -2754,16 +2838,17 @@ function RoundFacts({ round, book, quote }) {
           <div className="stat-note">
             {partsFromChain ? (
               <>
-                权重 {weightValue != null ? weightValue.toLocaleString("zh-CN") : "—"} H
+                算力 {weightValue != null ? weightValue.toLocaleString("zh-CN") : "—"} H
                 {" · "}累计买入 {boughtParts} 张
-                <em className="est-tag">持仓口径</em>
+                {miningActive > 0 ? ` · 挖矿中 ${miningActive}` : ""}
+                {miningCooling > 0 ? ` · 冷却 ${miningCooling}` : ""}
               </>
             ) : onChain ? (
               boughtParts > 0
                 ? `累计买入 ${boughtParts} 张，当前持有 0 张（已卖出）`
                 : "尚未买入，电路与算力待成交后确定"
             ) : est.hashpower ? (
-              `权重 ${est.hashpower}（按募资额预估）`
+              `算力 ${est.hashpower}（按募资额预估）`
             ) : (
               ""
             )}
@@ -2781,11 +2866,6 @@ function RoundFacts({ round, book, quote }) {
             <div className="stat-note">每张算力 P 待电路成交后才有意义</div>
           ) : null}
         </article>
-        {/*
-         * 每份 / 总份数 / 募资总额是同一组发行参数（募资总额 = 每份 × 总份数），
-         * 拆成三张卡等于把一条恒等式摊开占三格。合并成一张三行小卡，
-         * 指标卡从 6 张减到 4 张，首屏不再被发行参数占满。
-         */}
         <article className="stat-card">
           <div className="stat-label">发行参数</div>
           <dl className="stat-rows">
@@ -2796,22 +2876,11 @@ function RoundFacts({ round, book, quote }) {
         </article>
         <article className="stat-card">
           <div className="stat-label">挖矿产出服务费</div>
-          {/*
-           * 服务费**在链上**（口径：服务费真正上链）。
-           * serviceFeeBps 从 Campaign 读，任何人都能看到，分成表也是链上地址表。
-           *
-           * 「未设定」与「设为 0%」是两回事：
-           *  - 未设定（serviceFeeSet == false）：链上还没写过，还能改；
-           *  - 设为 0：serviceFeeSet == true，已永久锁定，只是费率为零。
-           * 所以这里按 serviceFeeSet 区分显示，不混为一谈。
-           *
-           * ⚠️ 这是**挖矿产出奖励**的服务费，不从认筹款里扣。
-           */}
           {onChain ? (
             chainFeeSet ? (
               <>
                 <div className="stat-value">{chainFeePercent}%</div>
-                <div className="stat-note">链上设定 · 不可修改</div>
+                <div className="stat-note">从 BEM 产出计提 · 已锁定</div>
               </>
             ) : (
               <>
@@ -2824,14 +2893,53 @@ function RoundFacts({ round, book, quote }) {
           )}
         </article>
       </div>
-      {/*
-       * 第二排只在「有内容」时出现：
-       *  - 演示模式：给出按报价反推的算力与估算口径；
-       *  - 链上已成交：给出 setPlan 算力与锁价。
-       * 链上尚未成交时，「未写入 / 成交后才出现」这两张空卡不画 —— 那句话已经在
-       * 上面「电路数」卡的备注和下面的强制提示里各有一份，再画一排只会重复。
-       */}
-      {!onChain ? (
+
+      {/* 全阶段本期身份 / 资金 / 分成：看懂「这一期是谁、钱在哪」 */}
+      <div className="stat-grid facts-meta">
+        <article className="stat-card">
+          <div className="stat-label">本期身份</div>
+          <dl className="stat-rows">
+            <div>
+              <dt>Owner</dt>
+              <dd className="mono" title={ownerAddr || undefined}>{ownerAddr ? shortAddress(ownerAddr) : "—"}</dd>
+            </div>
+            <div>
+              <dt>合约</dt>
+              <dd className="mono" title={contractAddr || undefined}>{contractAddr ? shortAddress(contractAddr) : "—"}</dd>
+            </div>
+            {book?.halted ? (
+              <div><dt>状态</dt><dd>已熔断</dd></div>
+            ) : book?.retired ? (
+              <div><dt>状态</dt><dd>已移出工厂</dd></div>
+            ) : endsLabel && book?.scene === "funding" ? (
+              <div><dt>截止</dt><dd>{endsLabel}</dd></div>
+            ) : null}
+          </dl>
+        </article>
+        <article className="stat-card">
+          <div className="stat-label">认筹与托管</div>
+          <dl className="stat-rows">
+            <div>
+              <dt>已售 / 未退</dt>
+              <dd>{sold} / {outstanding}</dd>
+            </div>
+            <div><dt>托管池</dt><dd>{round4(pool)} BNB</dd></div>
+            <div>
+              <dt>待领余款</dt>
+              <dd>{surplusOut > 0 ? `${round4(surplusOut)} BNB` : (Number(book?.surplusBase || 0) > 0 ? "已结算 · 已领完" : "尚未结算")}</dd>
+            </div>
+          </dl>
+        </article>
+        <article className="stat-card span-2">
+          <div className="stat-label">服务费分成</div>
+          <div className="stat-value fee-share-summary">
+            {onChain && chainFeeSet ? feeShareSummary : (onChain ? "待设定" : feeShareSummary)}
+          </div>
+          <div className="stat-note">分成地址自行领取服务费；认筹金额不收服务费</div>
+        </article>
+      </div>
+
+      {!compact && !onChain ? (
         <div className="stat-grid detail">
           <article className="stat-card span-3">
             <div className="stat-label">
@@ -2857,29 +2965,26 @@ function RoundFacts({ round, book, quote }) {
             </p>
           </article>
         </div>
-      ) : hasBought ? (
+      ) : !compact && hasBought ? (
         <div className="stat-grid detail">
           <article className="stat-card accent span-3">
-            <div className="stat-label">算力（setPlan 已上链）</div>
+            <div className="stat-label">算力（已上链）</div>
             <div className="stat-value">
               {chainHashpower > 0 ? `${chainHashpower.toLocaleString("zh-CN")} H` : "未写入"}
             </div>
-            <div className="stat-note">预估，不是实测；harvest / claim 接入前不产出发放</div>
+            <div className="stat-note">所有电路累计估算值</div>
           </article>
           <article className="stat-card span-3">
             <div className="stat-label">锁价</div>
             <div className="stat-value">{Number(book.priceLock) > 0 ? `${round4(book.priceLock)} BNB` : "未锁"}</div>
-            <div className="stat-note">挂单时锁定的电路总成本</div>
+            <div className="stat-note">买入电路时累计成本记录（非强制底价）</div>
           </article>
         </div>
       ) : null}
-      {/*
-       * 强制提示：募集中只在认购按钮旁出现一次，避免同一屏两段相同的风险提示。
-       */}
-      {book.scene !== "funding" && (
+      {!compact && book.scene !== "funding" && (
         <div className="commit-warning wide" role="note">
           <strong>电路数不构成本期承诺。</strong>
-          <span>不约定电路数量与买价，由 Owner 售罄后按市价决定，可能低于按当前报价的估值；分配合约接入前不发放收益。</span>
+          <span>不约定电路数量与买价，由 Owner 售罄后按市价决定，可能低于按当前报价的估值；BEM 由官方 PoD 铸给本期后按份领取。</span>
         </div>
       )}
     </>
@@ -2921,7 +3026,13 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, pend
           <div className="card-body">
             <div className="raise-progress">
               <div className="progress-label">
-                <span>已售 {book.sold} / {round.totalShares} 份</span>
+                <span>
+                  已售 {book.sold} / {round.totalShares} 份
+                  {Number(book.outstandingShares ?? book.sold) !== Number(book.sold)
+                    ? ` · 未退 ${Number(book.outstandingShares)}`
+                    : ""}
+                  {connected && Number(book.mine || 0) > 0 ? ` · 我持有 ${book.mine}` : ""}
+                </span>
                 <strong>{progress}%</strong>
               </div>
               <div className="track track-raise" aria-hidden="true">
@@ -2929,6 +3040,11 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, pend
               </div>
             </div>
             <Countdown countdown={countdown} />
+            {Number.isFinite(book.endsAt) && book.endsAt > 0 ? (
+              <p className="fine">募集截止 {formatClock(book.endsAt)} · 托管 {round4(book.bnbPool || 0)} BNB</p>
+            ) : (
+              <p className="fine">托管 {round4(book.bnbPool || 0)} BNB</p>
+            )}
             {/*
              * 这里原本还有一条 Pipeline（募集 / 买电路 / 开矿），
              * 和页首的生命周期条是同一件事的两种画法，两条进度条并排出现。
@@ -3029,12 +3145,18 @@ function ProductPage({ round, book, copy, quote, remaining, pay, countdown, pend
                     : subscribeLabel(book, connected, canSubscribe))}
             </button>
             <p className="fine">合约按「份数 × {round.sharePriceBnb} BNB」记账。直接转账不会记份。</p>
-            <RecentBuys round={round} book={book} usingChain={usingChain || onChain} account={book.selfAddress} />
               </>
             )}
           </div>
         </article>
       </div>
+      <SubscribeRecords
+        round={round}
+        book={book}
+        usingChain={usingChain || onChain}
+        account={book.selfAddress}
+        compact={false}
+      />
       {book._chain && Number(book.refundedTotal) > 0 && (
         <RefundRecords
           campaignAddr={round.contract || book.address}
@@ -3328,48 +3450,104 @@ function ListingRow({ listing, account, pending, disabled = false, takeDisabled 
   );
 }
 
-function RecentBuys({ round, book, usingChain = false, account = "" }) {
+/**
+ * 认筹记录：读 holderCount / holderAt + sharesOf，不扫 Subscribed 日志。
+ * 展示当前持份；转让后的买家也会出现在名单里（合约 _holders 追加）。
+ */
+function SubscribeRecords({ round, book, usingChain = false, account = "", compact = false }) {
   const [rows, setRows] = useState(null);
+  const campaignAddr = round?.contract || book?.address || "";
+  const price = Number(round?.sharePriceBnb || 0);
+  const refreshKey = `${campaignAddr}|${book?.sold}|${book?.outstandingShares}|${book?.refundedTotal}`;
+
   useEffect(() => {
     if (!usingChain) {
-      setRows(buildHolders(book.sold, book.mine).slice(0, 5));
+      const sim = buildHolders(book.sold, book.mine).slice(0, compact ? 5 : 20);
+      setRows(sim.map((r) => ({
+        address: r.address,
+        shares: r.shares,
+        unlocked: r.shares,
+        escrow: 0,
+        self: Boolean(r.self),
+      })));
+      return undefined;
+    }
+    if (!campaignAddr) {
+      setRows([]);
       return undefined;
     }
     let alive = true;
-    readHolders()
+    setRows(null);
+    readHolders(campaignAddr)
       .then((list) => {
         if (!alive) return;
         const me = String(account || "").toLowerCase();
-        setRows(
-          list.slice(0, 8).map((r) => ({
-            address: r.address,
-            shares: r.shares,
-            self: me && r.address === me,
-          }))
-        );
+        setRows(list.map((r) => ({
+          ...r,
+          self: Boolean(me && r.address === me),
+        })));
       })
       .catch(() => alive && setRows([]));
     return () => {
       alive = false;
     };
-  }, [usingChain, book.sold, account]);
+  }, [usingChain, campaignAddr, refreshKey, account, book.sold, book.mine, compact]);
 
-  if (rows == null) return <p className="fine">加载最近认筹…</p>;
-  if (!rows.length) return <p className="fine">链上暂无认筹记录。</p>;
+  const shown = rows == null ? null : (compact ? rows.slice(0, 8) : rows);
+  const holdSum = (rows || []).reduce((s, r) => s + Number(r.shares || 0), 0);
+
   return (
-    <div className="recent">
-      <p className="fine">认筹地址（合约记录，不扫公共日志）</p>
-      <ul className="bill">
-        {rows.map((row) => (
-          <li key={`${row.address}-${row.shares}-${row.paid ?? row.shares}`}>
-            <span>{row.self ? "当前钱包" : shortAddress(row.address)}</span>
-            <strong>
-              {row.shares} 份 · {(row.paid != null ? row.paid : row.shares * round.sharePriceBnb).toFixed(4)} BNB
-            </strong>
-          </li>
-        ))}
-      </ul>
-    </div>
+    <article className="card">
+      <div className="card-header">
+        <span>认筹记录</span>
+        <span className="stat-label">
+          {rows == null
+            ? "读取中…"
+            : `${rows.length} 址 · 持份 ${holdSum}`}
+        </span>
+      </div>
+      <div className="card-body table-wrap">
+        {rows == null ? (
+          <p className="fine">正在读取持份名单（holderAt，不扫日志）…</p>
+        ) : !rows.length ? (
+          <p className="fine">链上暂无认筹记录。</p>
+        ) : (
+          <>
+            <p className="fine">
+              合约登记过的地址：当前持份（含挂单锁定）。
+              不含认筹时间戳；转让后的买家也会入列。
+            </p>
+            <table>
+              <thead>
+                <tr>
+                  <th>地址</th>
+                  <th>持份</th>
+                  <th>约合 BNB</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((row) => (
+                  <tr key={row.address} className={row.self ? "is-self" : undefined}>
+                    <td className="mono">
+                      {row.self ? `${shortAddress(row.address)} · 当前` : shortAddress(row.address)}
+                    </td>
+                    <td>
+                      {Number(row.shares) > 0
+                        ? `${row.shares} 份${Number(row.escrow) > 0 ? `（锁 ${row.escrow}）` : ""}`
+                        : "—"}
+                    </td>
+                    <td>{Number(row.shares) > 0 ? `${round4(row.shares * price)}` : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {compact && rows.length > shown.length ? (
+              <p className="fine">仅显示前 {shown.length} 条 · 共 {rows.length} 址</p>
+            ) : null}
+          </>
+        )}
+      </div>
+    </article>
   );
 }
 

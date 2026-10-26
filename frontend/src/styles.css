@@ -772,8 +772,20 @@ h1, h2, h3, p { margin: 0; }
 }
 /* 指标区只剩 4 张卡（发行参数已由 3 张合并成 1 张） */
 .stat-grid.facts { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+/* 本期身份 / 托管 / 分成：四列里 1+1+2 */
+.stat-grid.facts-meta {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 12px;
+}
+.stat-card.span-2 { grid-column: span 2; }
+.fee-share-summary {
+  font-size: 13px !important;
+  font-weight: 550 !important;
+  line-height: 1.45;
+  word-break: break-word;
+}
 /* 第二排明细：列数与第一排对齐，保证每排都填满整行，不留孤卡片 */
-.stat-grid.detail { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.stat-grid.detail { grid-template-columns: repeat(6, minmax(0, 1fr)); margin-top: 12px; }
 .stat-card.span-3 { grid-column: span 3; }
 .stat-card, .card, .empty {
   background: #fff;
@@ -3803,6 +3815,7 @@ a.flow-ext-link:hover {
 .result-box.fail { color: var(--color-danger); }
 
 .table-wrap { overflow-x: auto; }
+.table-wrap table tr.is-self td { background: var(--color-primary-light); }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 12px 8px; border-bottom: 1px solid var(--color-border); text-align: left; white-space: nowrap; }
 th { color: var(--color-text-tertiary); font-size: 13px; font-weight: 500; }
@@ -3811,7 +3824,8 @@ tr:last-child td { border-bottom: 0; }
 .mobile-top, .backdrop { display: none; }
 
 @media (max-width: 1100px) {
-  .stat-grid, .holding-grid, .campaign-metrics, .stat-grid.facts, .stat-grid.detail { grid-template-columns: repeat(2, 1fr); }
+  .stat-grid, .holding-grid, .campaign-metrics, .stat-grid.facts, .stat-grid.facts-meta, .stat-grid.detail { grid-template-columns: repeat(2, 1fr); }
+  .stat-card.span-2 { grid-column: span 2; }
   .campaign-card-foot { align-items: flex-start; flex-direction: column; }
   .detail-split, .param-grid { grid-template-columns: 1fr; }
   .stat-card.span-3, .stat-card.note-card.half { grid-column: span 2; }

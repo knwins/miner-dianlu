@@ -810,6 +810,10 @@ async function readHolderAddresses(runner, c) {
   return out;
 }
 
+/**
+ * 认筹 / 持份名单：读 holderCount + holderAt（不扫 Subscribed 日志）。
+ * 含仍持份与已退本金的地址；份额为 0 且未退过的不展示。
+ */
 export async function readHolders(campaignAddr = getCampaignAddress()) {
   if (!isAddr(campaignAddr)) return [];
   return withReadProvider(async (runner) => {
@@ -817,11 +821,22 @@ export async function readHolders(campaignAddr = getCampaignAddress()) {
     const addresses = await readHolderAddresses(runner, c);
     const out = [];
     for (const address of addresses) {
-      const [shares, escrow] = await Promise.all([c.sharesOf(address), c.escrowOf(address)]);
+      const [shares, escrow, refunded] = await Promise.all([
+        c.sharesOf(address),
+        c.escrowOf(address),
+        c.refundedOf(address).catch(() => 0n),
+      ]);
       const total = shares + escrow;
-      if (total > 0n) out.push({ address: address.toLowerCase(), shares: Number(total) });
+      if (total === 0n && refunded === 0n) continue;
+      out.push({
+        address: String(address).toLowerCase(),
+        shares: Number(total),
+        unlocked: Number(shares),
+        escrow: Number(escrow),
+        refundedBnb: Number(formatEther(refunded)),
+      });
     }
-    out.sort((x, y) => y.shares - x.shares);
+    out.sort((x, y) => y.shares - x.shares || y.refundedBnb - x.refundedBnb);
     return out;
   });
 }
