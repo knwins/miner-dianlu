@@ -2253,7 +2253,9 @@ function RoundHub({
               onSwitchPeriod={onSwitchPeriod}
               processor={round.processorId || "未记录"}
             />
-            <RoundFacts round={round} book={book} quote={quote} compact />
+            <div className="mining-panorama">
+              <RoundFacts round={round} book={book} quote={quote} compact />
+            </div>
             <div className="mining-stats">
               <article className="mining-stat is-accent">
                 <p className="mining-stat-label">在持电路</p>
@@ -2273,15 +2275,15 @@ function RoundHub({
                   {hashpower.toLocaleString("zh-CN")}
                   <span className="mining-stat-unit">H</span>
                 </p>
-                <p className="mining-stat-note">所有电路累计估算值</p>
+                <p className="mining-stat-note">所有电路累计估算</p>
               </article>
               <article className="mining-stat">
-                <p className="mining-stat-label">$BEM 待领取产出</p>
+                <p className="mining-stat-label">待领取产出</p>
                 <p className="mining-stat-value">
                   {podLabel}
                   <span className="mining-stat-unit">BEM</span>
                 </p>
-                <p className="mining-stat-note">官方挖矿尚未结算进本期</p>
+                <p className="mining-stat-note">尚未结算进本期</p>
               </article>
               <article className="mining-stat">
                 <p className="mining-stat-label">可领 BEM</p>
@@ -2289,7 +2291,7 @@ function RoundHub({
                   {claimLabel || "0"}
                   <span className="mining-stat-unit">BEM</span>
                 </p>
-                <p className="mining-stat-note">已结算可领；含待结算合计 {pendingLabel}</p>
+                <p className="mining-stat-note">含待结算共 {pendingLabel}</p>
               </article>
             </div>
             <article className="card mining-card">
@@ -2322,8 +2324,7 @@ function RoundHub({
                   <div className="mining-fact">
                     <dt>领取说明</dt>
                     <dd>
-                      先点「领奖励」把产出结算进本期（会预留服务费），再点「领取 BEM」到钱包；
-                      未花完的募资余款在「我的资产」领取。分成地址另走「领取服务费」。
+                      先「领奖励」结算产出，再「领取 BEM」到钱包；余款在「我的资产」领取。
                     </dd>
                   </div>
                 </dl>
@@ -2809,12 +2810,6 @@ function RoundFacts({ round, book, quote, compact = false }) {
   const outstanding = Number(book?.outstandingShares ?? book?.sold ?? 0);
   const pool = Number(book?.bnbPool ?? 0);
   const surplusOut = Number(book?.surplusOutstanding ?? 0);
-  const feeShares = Array.isArray(round?.feeShares) ? round.feeShares : [];
-  const feeShareSummary = feeShares.length === 0
-    ? (chainFeeSet ? "无分成地址" : "—")
-    : feeShares
-      .map((row) => `${shortAddress(row.address)} ${Math.round(Number(row.sharePercent ?? (Number(row.shareBps || 0) / 100)))}%`)
-      .join(" · ");
   const contractAddr = round?.contract || book?.address || "";
   const ownerAddr = book?.owner || "";
   const endsLabel = Number.isFinite(book?.endsAt) && book.endsAt > 0
@@ -2880,12 +2875,12 @@ function RoundFacts({ round, book, quote, compact = false }) {
             chainFeeSet ? (
               <>
                 <div className="stat-value">{chainFeePercent}%</div>
-                <div className="stat-note">从 BEM 产出计提 · 已锁定</div>
+                <div className="stat-note">从 BEM 产出中计提</div>
               </>
             ) : (
               <>
-                <div className="stat-value"><span className="muted-value">未设定</span></div>
-                <div className="stat-note">尚无人认购时可设定，此后永久锁定</div>
+                <div className="stat-value"><span className="muted-value">待开放</span></div>
+                <div className="stat-note">设定完成后即可认筹</div>
               </>
             )
           ) : (
@@ -2894,7 +2889,7 @@ function RoundFacts({ round, book, quote, compact = false }) {
         </article>
       </div>
 
-      {/* 全阶段本期身份 / 资金 / 分成：看懂「这一期是谁、钱在哪」 */}
+      {/* 全阶段本期身份 / 资金：看懂「这一期是谁、钱在哪」；分成表不对外展示 */}
       <div className="stat-grid facts-meta">
         <article className="stat-card">
           <div className="stat-label">本期身份</div>
@@ -2929,13 +2924,6 @@ function RoundFacts({ round, book, quote, compact = false }) {
               <dd>{surplusOut > 0 ? `${round4(surplusOut)} BNB` : (Number(book?.surplusBase || 0) > 0 ? "已结算 · 已领完" : "尚未结算")}</dd>
             </div>
           </dl>
-        </article>
-        <article className="stat-card span-2">
-          <div className="stat-label">服务费分成</div>
-          <div className="stat-value fee-share-summary">
-            {onChain && chainFeeSet ? feeShareSummary : (onChain ? "待设定" : feeShareSummary)}
-          </div>
-          <div className="stat-note">分成地址自行领取服务费；认筹金额不收服务费</div>
         </article>
       </div>
 
@@ -3508,14 +3496,13 @@ function SubscribeRecords({ round, book, usingChain = false, account = "", compa
       </div>
       <div className="card-body table-wrap">
         {rows == null ? (
-          <p className="fine">正在读取持份名单（holderAt，不扫日志）…</p>
+          <p className="fine">正在读取持份名单…</p>
         ) : !rows.length ? (
-          <p className="fine">链上暂无认筹记录。</p>
+          <p className="fine">暂无认筹记录。</p>
         ) : (
           <>
             <p className="fine">
-              合约登记过的地址：当前持份（含挂单锁定）。
-              不含认筹时间戳；转让后的买家也会入列。
+              当前持份地址（含挂单锁定）；转让后的买家也会入列。
             </p>
             <table>
               <thead>

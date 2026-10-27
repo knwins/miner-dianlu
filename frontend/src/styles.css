@@ -772,9 +772,9 @@ h1, h2, h3, p { margin: 0; }
 }
 /* 指标区只剩 4 张卡（发行参数已由 3 张合并成 1 张） */
 .stat-grid.facts { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-/* 本期身份 / 托管 / 分成：四列里 1+1+2 */
+/* 本期身份 / 托管：两列对开（分成表不对外） */
 .stat-grid.facts-meta {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 12px;
 }
 .stat-card.span-2 { grid-column: span 2; }
@@ -4151,39 +4151,106 @@ input[readonly] {
 
 
 /* ── 挖矿中：状态看板 ────────────────────────────────────────────────
- * 四张指标卡共用「标签 / 数值+单位 / 说明」三段结构：
- *   · 数值字号统一 20px，单位单独降级到 13px，长文案（已入池·不可逆）改用胶囊，
- *     避免某个值比同行高出一截、把基线拉歪；
- *   · 说明行贴底（margin-top:auto）且固定两行(36px)高度，四张卡等高、说明首行对齐；
- *   · 标签单行省略，宁可截断也不换行 —— 换行会把同一行的数值推到不同高度。
+ * 整页用 .mining-desk 的 gap 统一行距；字号阶梯：
+ *   标签 12 · 说明 12 · 正文 13 · 数值 18–20 · 单位 12
+ * 指标卡「标签 / 数值+单位 / 说明」三段等高对齐。
  */
-.mining-desk > .round-hero { margin-bottom: 24px; }
+.mining-desk {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mining-desk > .round-hero {
+  margin: 0 0 2px;
+}
+.mining-desk > .round-hero .round-hero-lead {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.65;
+  max-width: 640px;
+}
+.mining-desk > .card + .card {
+  margin-top: 0;
+}
+
+/* 本期全景：两排指标共用同一字号与内边距 */
+.mining-panorama {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mining-panorama .stat-grid,
+.mining-panorama .stat-grid.facts-meta {
+  margin: 0;
+}
+.mining-panorama .stat-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding: 14px 16px;
+}
+.mining-panorama .stat-label {
+  margin-bottom: 8px;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+}
+.mining-panorama .stat-value {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+.mining-panorama .stat-note {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.mining-panorama .stat-rows {
+  gap: 7px;
+}
+.mining-panorama .stat-rows dt {
+  font-size: 12px;
+  line-height: 1.45;
+}
+.mining-panorama .stat-rows dd {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+.mining-panorama .processor-scale {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
 
 .mining-stats {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
-  margin-bottom: 16px;
+  margin: 0;
 }
 .mining-stat {
   display: flex;
   flex-direction: column;
   gap: 6px;
   min-width: 0;
-  padding: 16px 18px;
+  min-height: 108px;
+  padding: 14px 16px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   background: #fff;
   box-shadow: var(--shadow-card);
 }
-/* 只有第一张带主色描边：强调「本期真的拿到了多少电路」。
-   用 3px 左边框时把左内边距减 2px，保证四张卡的文字左边界仍在同一条竖线上。 */
-.mining-stat.is-accent { border-left: 3px solid var(--color-primary); padding-left: 16px; }
+/* 第一张主色描边：左内边距减 2px，四卡文字左缘对齐 */
+.mining-stat.is-accent { border-left: 3px solid var(--color-primary); padding-left: 14px; }
 
 .mining-stat-label {
   color: var(--color-text-tertiary);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
+  letter-spacing: 0.02em;
   line-height: 1.4;
   white-space: nowrap;
   overflow: hidden;
@@ -4192,34 +4259,32 @@ input[readonly] {
 .mining-stat-value {
   display: flex;
   align-items: baseline;
-  gap: 5px;
+  gap: 4px;
   min-height: 28px;
   color: var(--color-text);
-  font-size: 20px;
+  font-size: clamp(17px, 1.6vw, 20px);
   font-weight: 600;
   letter-spacing: -0.01em;
-  line-height: 1.4;
+  line-height: 1.3;
   font-variant-numeric: tabular-nums;
 }
-/* 长文案槽位：与数字同高，但不参与数字的字号规则 */
 .mining-stat-value.is-text { align-items: center; }
 .mining-stat-unit {
   color: var(--color-text-quaternary);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
   letter-spacing: 0;
-  line-height: 1.4;
+  line-height: 1.3;
 }
 .mining-stat-note {
-  /* 说明贴底：卡片被同行拉高时，四行说明仍落在同一条基线 */
   margin-top: auto;
+  min-height: 36px;
   color: var(--color-text-tertiary);
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
 
-/* 状态胶囊：与 .transfer-gate 同一套视觉语言，但更紧凑（放在数值槽位里） */
 .mining-pill {
   display: inline-flex;
   align-items: center;
@@ -4242,66 +4307,112 @@ input[readonly] {
   border-radius: 50%;
   background: currentColor;
 }
-/* 卡片头右侧的弱化标记：只作说明，不做第二个胶囊，免得与数值槽位抢注意力 */
-/* 旧的 .mining-chip（卡片头「电路已入池」）已删除：与「本期状态 · 已入池」重复。 */
 
-.mining-card .card-body { padding: 6px 20px 20px; }
-/* 键值明细：标签列定宽，右侧说明的左边界才严格对齐（换行也从同一条竖线开始） */
 .mining-facts {
   margin: 0;
   padding: 0;
 }
 .mining-fact {
   display: grid;
-  grid-template-columns: 84px minmax(0, 1fr);
+  grid-template-columns: 6.5em minmax(0, 1fr);
   align-items: baseline;
-  gap: 12px;
-  padding: 12px 0;
+  column-gap: 14px;
+  padding: 11px 0;
   border-bottom: 1px solid var(--color-border);
   font-size: 13px;
-  line-height: 1.7;
+  line-height: 1.55;
 }
 .mining-fact:last-child { border-bottom: 0; }
 .mining-fact dt {
   color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.55;
   white-space: nowrap;
 }
 .mining-fact dd {
   margin: 0;
   color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 1.55;
   overflow-wrap: anywhere;
 }
 
-/* 动作区：按钮按内容宽度、同一高度。
- * 旧写法把 .btn-primary 拉满（flex:1 1 168px）而次级按钮 flex:none，
- * 于是出现「一个 800px 长条 + 一个被挤成两行的窄块」。
- */
 .mining-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 10px;
-  margin-top: 10px;
-  padding-top: 16px;
+  margin-top: 4px;
+  padding-top: 14px;
   border-top: 1px solid var(--color-border);
 }
 .mining-actions .btn {
   width: auto;
-  min-width: 112px;
+  min-width: 104px;
   min-height: 38px;
   margin-top: 0;
-  padding: 0 20px;
+  padding: 0 18px;
   font-size: 14px;
   line-height: 1.4;
   white-space: nowrap;
 }
 
+/* 挖矿页卡片：统一头高；奖励卡 body 更紧，认筹记录略松 */
+.mining-desk > .card .card-header {
+  min-height: 48px;
+  padding: 12px 18px;
+}
+.mining-desk > .mining-card .card-body {
+  padding: 4px 18px 18px;
+}
+.mining-desk > .card:not(.mining-card) .card-body {
+  padding: 14px 18px 18px;
+}
+.mining-desk > .card .fine {
+  margin-top: 0;
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.mining-desk > .card table {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.mining-desk > .card th {
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-tertiary);
+}
+.mining-desk > .card td {
+  padding: 10px;
+  vertical-align: middle;
+}
+.mining-desk > .card td.mono {
+  margin-top: 0;
+  font-size: 13px;
+  color: var(--color-text);
+}
+
 @media (max-width: 1040px) {
   .mining-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mining-panorama .stat-grid.facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 560px) {
+  .mining-desk { gap: 12px; }
   .mining-stats { grid-template-columns: minmax(0, 1fr); gap: 10px; }
-  .mining-fact { grid-template-columns: 76px minmax(0, 1fr); gap: 10px; }
+  .mining-stat { min-height: 0; }
+  .mining-stat-note { min-height: 0; }
+  .mining-stat-value { font-size: 18px; }
+  .mining-fact {
+    grid-template-columns: 5.5em minmax(0, 1fr);
+    column-gap: 10px;
+    padding: 10px 0;
+  }
   .mining-actions { flex-direction: column; align-items: stretch; }
   .mining-actions .btn { width: 100%; min-height: 42px; }
+  .mining-panorama .stat-grid.facts,
+  .mining-panorama .stat-grid.facts-meta {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
